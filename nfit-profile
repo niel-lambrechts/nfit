@@ -1,0 +1,526 @@
+#!/usr/bin/env perl
+
+# NAME     : nfit-profile
+# VERSION  : 1.25.144.0
+# AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
+# PURPOSE  : Runs 'nfit' multiple times with user-defined profiles (from INI config file),
+#            calculates peak, optionally merges config data, suggests workload
+#            pattern/tier/shape/pressure hints, and aggregates results into a
+#            single CSV output for spreadsheet import.
+# REQUIRES : Perl, nfit script
+
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions);
+use Cwd qw(abs_path);
+use File::Basename qw(dirname);
+# Removed: use Config::Tiny;
+
+# --- Version ---
+my $SCRIPT_VERSION = '1.25.144.0';
+
+# --- Configuration ---
+my $DEFAULT_ROUND_INCREMENT = 0.05;
+my $DEFAULT_VM_CONFIG_FILE = "config-all.csv";
+my $DEFAULT_PROFILES_CONFIG_FILE = "nfit.profiles.cfg";
+
+# Heuristic Thresholds
+my $PATTERN_RATIO_THRESHOLD = 2.0;
+my $HIGH_PEAK_RATIO = 5.0;
+my $LOW_PEAK_RATIO  = 2.0;
+my $LIMIT_THRESHOLD_PERC = 0.98;
+
+# --- Profile Definitions (Now loaded from file) ---
+my @profiles;
+my $PEAK_PROFILE_NAME = "Peak";
+
+# --- Argument Parsing (Wrapper) ---
+my $nmon_csv_file;
+my $vm_config_file_arg;
+my $profiles_config_file_arg;
+my $start_date_str;
+my $target_vm_name;
+my $round_arg;
+my $roundup_arg;
+my $help = 0;
+my $show_version = 0;
+my $script_dir = dirname(abs_path($0));
+my $nfit_script_path = "$script_dir/nfit";
+
+GetOptions(
+    'file|f=s'           => \$nmon_csv_file,
+    'config=s'           => \$vm_config_file_arg,
+    'profiles-config=s'  => \$profiles_config_file_arg,
+    'startdate|s=s'      => \$start_date_str,
+    'vm|lpar=s'          => \$target_vm_name,
+    'round|r:f'          => \$round_arg,
+    'roundup|u:f'        => \$roundup_arg,
+    'help|h'             => \$help,
+    'nfit-path=s'        => \$nfit_script_path,
+    'version|v'          => \$show_version,
+) or die usage_wrapper();
+
+# --- Validation (Wrapper) ---
+if ($show_version) {
+    print STDERR "nfit-profile version $SCRIPT_VERSION\n";
+    if (-x $nfit_script_path) {
+        my $nfit_ver = `$nfit_script_path -v 2>&1`;
+        chomp $nfit_ver;
+        print STDERR "Using nfit version: $nfit_ver\n";
+    } else {
+        print STDERR "nfit script at '$nfit_script_path' not found or not executable.\n";
+    }
+    exit 0;
+}
+if ($help || !$nmon_csv_file) {
+    print STDERR usage_wrapper();
+    exit 0;
+}
+if (! -f $nmon_csv_file) {
+    die "Error: Input NMON data CSV file (-f) not found: $nmon_csv_file\n";
+}
+if (! -x $nfit_script_path) {
+    die "Error: Cannot find or execute 'nfit' script at '$nfit_script_path'. Use --nfit-path if needed.\n";
+}
+if (defined($round_arg) && defined($roundup_arg)) {
+    die "Error: -round (-r) and -roundup (-u) options are mutually exclusive.\n";
+}
+if (defined $round_arg && length $round_arg && $round_arg !~ /^[0-9.]*$/) {
+    die "Error: Invalid numeric value for -r increment: '$round_arg'\n";
+}
+if (defined $roundup_arg && length $roundup_arg && $roundup_arg !~ /^[0-9.]*$/) {
+    die "Error: Invalid numeric value for -u increment: '$roundup_arg'\n";
+}
+
+# --- Load Profile Definitions ---
+my $profiles_config_path_to_load;
+if (defined $profiles_config_file_arg) {
+    if (-f $profiles_config_file_arg) {
+        $profiles_config_path_to_load = $profiles_config_file_arg;
+    } else {
+        die "Error: Specified profiles configuration file (--profiles-config) not found: $profiles_config_file_arg\n";
+    }
+} else {
+    $profiles_config_path_to_load = "$script_dir/etc/$DEFAULT_PROFILES_CONFIG_FILE";
+    unless (-f $profiles_config_path_to_load) {
+         $profiles_config_path_to_load = "$script_dir/$DEFAULT_PROFILES_CONFIG_FILE"; # Fallback to script dir
+    }
+    unless (-f $profiles_config_path_to_load) {
+        die "Error: Default profiles configuration file '$DEFAULT_PROFILES_CONFIG_FILE' not found in '$script_dir/etc/' or '$script_dir/'.\nPlease create it or specify path with --profiles-config.\nFormat: INI style, sections as profile names, key 'nfit_flags'.\n";
+    }
+}
+print STDERR "Loading profile definitions from: $profiles_config_path_to_load\n";
+@profiles = load_profile_definitions($profiles_config_path_to_load);
+if (scalar @profiles == 0) {
+    die "Error: No profiles loaded from '$profiles_config_path_to_load'. File might be empty or incorrectly formatted.\n";
+}
+print STDERR "Loaded " . scalar(@profiles) . " profiles.\n";
+
+
+# --- Locate and Load VM Configuration Data ---
+my $vm_config_file_path = undef;
+my $vm_config_found = 0;
+my %vm_config_data;
+my %vm_config_col_idx;
+my $vm_config_header_count = 0;
+
+if (defined $vm_config_file_arg) {
+    if (-f $vm_config_file_arg) {
+        $vm_config_file_path = $vm_config_file_arg;
+        $vm_config_found = 1;
+        print STDERR "Using specified VM configuration file: $vm_config_file_path\n";
+    }
+    else {
+        die "Error: Specified VM configuration file (-config) not found: $vm_config_file_arg\n";
+    }
+} else {
+    my $default_vm_cfg_path = "$script_dir/etc/$DEFAULT_VM_CONFIG_FILE";
+    unless (-f $default_vm_cfg_path) {
+         $default_vm_cfg_path = "$script_dir/$DEFAULT_PROFILES_CONFIG_FILE"; # Fallback to script dir
+    }
+    if (-f $default_vm_cfg_path) {
+        $vm_config_file_path = $default_vm_cfg_path;
+        $vm_config_found = 1;
+        print STDERR "Found default VM configuration file: $vm_config_file_path\n";
+    } else {
+        print STDERR "Info: Default VM configuration file '$DEFAULT_VM_CONFIG_FILE' not found in script directory. VM config columns will be blank.\n";
+    }
+}
+
+if ($vm_config_found) {
+    print STDERR "Loading VM configuration data (manual parse)...\n";
+    open my $cfg_fh, '<:encoding(utf8)', $vm_config_file_path or die "Error: Cannot open VM config file '$vm_config_file_path': $!\n";
+
+    my $header_line = <$cfg_fh>;
+    unless (defined $header_line) {
+        die "Error: Could not read header row from VM config file '$vm_config_file_path'\n";
+    }
+    chomp $header_line;
+    $header_line =~ s/\r$//;
+    $header_line =~ s/^\x{FEFF}//;
+    my @raw_headers = split /,/, $header_line;
+    $vm_config_header_count = scalar @raw_headers;
+    my %header_map;
+
+    for my $i (0 .. $#raw_headers) {
+        my $col_name = $raw_headers[$i];
+        $col_name =~ s/^\s*"?|"?\s*$//g;
+        if ($col_name ne '') {
+            $header_map{lc($col_name)} = $i;
+        }
+    }
+
+    my @required_cols = qw(hostname serial systemtype procpool_name procpool_id entitledcpu maxcpu);
+    foreach my $req_col (@required_cols) {
+        unless (exists $header_map{$req_col}) {
+            die "Error: Required column '$req_col' not found in VM config file header '$vm_config_file_path'\n";
+        }
+        $vm_config_col_idx{$req_col} = $header_map{$req_col};
+    }
+
+    while (my $line = <$cfg_fh>) {
+        chomp $line;
+        $line =~ s/\r$//;
+        next if $line =~ /^\s*$/;
+        my @row_values = ($line =~ /"([^"]*)"/g);
+        if (scalar @row_values != $vm_config_header_count) {
+            warn "Warning: Mismatched field count on VM config line $. Skipping: $line\n";
+            next;
+        }
+        my $hostname = $row_values[ $vm_config_col_idx{'hostname'} ];
+        if (defined $hostname && $hostname ne '') {
+            $vm_config_data{$hostname} = {
+                serial      => $row_values[ $vm_config_col_idx{'serial'} ],
+                systemtype  => $row_values[ $vm_config_col_idx{'systemtype'} ],
+                pool_name   => $row_values[ $vm_config_col_idx{'procpool_name'} ],
+                pool_id     => $row_values[ $vm_config_col_idx{'procpool_id'} ],
+                entitlement => $row_values[ $vm_config_col_idx{'entitledcpu'} ],
+                maxcpu      => $row_values[ $vm_config_col_idx{'maxcpu'} ],
+            };
+        } else {
+            warn "Warning: Missing hostname on VM config line $. Skipping.\n";
+        }
+    }
+    close $cfg_fh;
+    print STDERR "Finished loading VM configuration data for " . scalar(keys %vm_config_data) . " VMs.\n";
+}
+
+# --- Construct Common Flags for nfit ---
+my $common_flags = "-k -f \"$nmon_csv_file\""; # Always include -k
+$common_flags .= " -s $start_date_str" if defined $start_date_str;
+$common_flags .= " -vm \"$target_vm_name\"" if defined $target_vm_name;
+if (defined $round_arg) {
+    $common_flags .= " -r";
+    $common_flags .= "=$round_arg" if (length $round_arg && $round_arg !~ /^\s*$/);
+}
+elsif (defined $roundup_arg) {
+    $common_flags .= " -u";
+    $common_flags .= "=$roundup_arg" if (length $roundup_arg && $roundup_arg !~ /^\s*$/);
+}
+
+# --- Main Logic: Run nfit Profiles ---
+my %results_table;
+my @vm_order;
+my %vm_seen; # To preserve order of VMs as encountered
+
+print STDERR "nfit-profile version $SCRIPT_VERSION\n";
+print STDERR "Starting nfit profile runs (Peak calculation included)...\n";
+
+foreach my $profile (@profiles) {
+    my $profile_name = $profile->{name};
+    my $profile_flags = $profile->{flags};
+    print STDERR "Running profile: $profile_name ($profile_flags)...\n";
+
+    my $command = "$nfit_script_path $common_flags $profile_flags";
+    # print STDERR "DEBUG Executing: $command\n";
+
+    my $output = `$command`;
+    my $exit_status = $? >> 8;
+
+    if ($exit_status != 0) {
+        warn "Warning: '$nfit_script_path' command failed for profile '$profile_name' (exit code $exit_status). Check nfit output above. Skipping results for this profile.\n";
+        next;
+    }
+
+    my @output_lines = split /\n/, $output;
+    foreach my $line (@output_lines) {
+        chomp $line;
+        # Regex to capture VM name, PXX=Value, and Peak=Value
+        if ($line =~ /^(.+?):\s+P[\d.]+=([0-9.NA\/ -]+)\s+Peak=([0-9.NA\/ -]+)/) {
+            my ($vm_name, $p_value, $peak_value) = ($1, $2, $3);
+            $p_value =~ s/^\s+|\s+$//g;
+            $peak_value =~ s/^\s+|\s+$//g;
+
+            $results_table{$vm_name}{$profile_name} = $p_value;
+            $results_table{$vm_name}{$PEAK_PROFILE_NAME} = $peak_value;
+
+            unless ($vm_seen{$vm_name}++) {
+                push @vm_order, $vm_name;
+            }
+        }
+        # Handle case where Peak wasn't output by nfit
+        elsif ($line =~ /^(.+?):\s+P[\d.]+=([0-9.NA\/ -]+)/) {
+             my ($vm_name, $p_value) = ($1, $2);
+             $p_value =~ s/^\s+|\s+$//g;
+             $results_table{$vm_name}{$profile_name} = $p_value;
+             unless ($vm_seen{$vm_name}++) {
+                 push @vm_order, $vm_name;
+             }
+             warn "Warning: Peak value potentially missing in nfit output line for profile '$profile_name': $line\n";
+        } else {
+            warn "Warning: Could not parse nfit output line for profile '$profile_name': $line\n" if $line ne '';
+        }
+    }
+}
+print STDERR "Finished all nfit profile runs. Generating CSV output...\n";
+
+# --- Generate CSV Output ---
+my @output_header_cols = (
+    "VM", "Hint", "Type",
+    "Serial", "SystemType", "Pool Name", "Pool ID",
+    $PEAK_PROFILE_NAME
+);
+push @output_header_cols, map { $_->{name} } @profiles;
+push @output_header_cols, ("Current - ENT", "NFIT - ENT", "NETT", "NETT%");
+
+print STDOUT join(",", map { quote_csv($_) } @output_header_cols) . "\n";
+
+foreach my $vm_name (@vm_order) {
+    my @data_row;
+    my $cfg = $vm_config_data{$vm_name};
+
+    my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool) =
+        generate_sizing_hint(\%results_table, $vm_name, $cfg);
+    my $pressure_str = $hint_pressure_bool ? "True" : "False";
+
+    push @data_row, $vm_name;
+    push @data_row, $hint_type_tier;
+    push @data_row, ""; # Blank Type column
+    push @data_row, $hint_pattern_shape;
+    push @data_row, $pressure_str;
+    push @data_row, (defined $cfg ? $cfg->{serial}      : "");
+    push @data_row, (defined $cfg ? $cfg->{systemtype}  : "");
+    push @data_row, (defined $cfg ? $cfg->{pool_name}   : "");
+    push @data_row, (defined $cfg ? $cfg->{pool_id}     : "");
+    push @data_row, ($results_table{$vm_name}{$PEAK_PROFILE_NAME} // "");
+    foreach my $profile (@profiles) {
+        push @data_row, ($results_table{$vm_name}{$profile->{name}} // "");
+    }
+    push @data_row, (defined $cfg ? $cfg->{entitlement} : "");
+    push @data_row, ""; # Blank NFIT - ENT
+    push @data_row, ""; # Blank NETT
+    push @data_row, ""; # Blank NETT%
+
+    print STDOUT join(",", map { quote_csv($_) } @data_row) . "\n";
+}
+
+print STDERR "CSV output generated successfully.\n";
+exit 0;
+
+# ==============================================================================
+# Subroutines
+# ==============================================================================
+
+sub quote_csv
+{
+    my ($field) = @_;
+    $field = '' unless defined $field;
+    $field =~ s/"/""/g;
+    return qq/"$field"/;
+}
+
+sub load_profile_definitions
+{
+    my ($filepath) = @_;
+    my @loaded_profiles_list;
+    my $current_section_name = undef;
+    my $line_number = 0;
+
+    open my $fh, '<:encoding(utf8)', $filepath or die "Error: Cannot open profiles config file '$filepath': $!\n";
+
+    while (my $line = <$fh>) {
+        $line_number++;
+        chomp $line;
+        $line =~ s/\s*#.*//;   # Remove comments starting with #
+        $line =~ s/\s*;.*//;   # Remove comments starting with ;
+        $line =~ s/^\s+|\s+$//g; # Trim leading/trailing whitespace from the whole line
+
+        next if $line eq ''; # Skip blank lines
+
+        if ($line =~ /^\s*\[\s*([^\]]+?)\s*\]\s*$/) { # Section header
+            # If a previous section was being processed and had flags, store it
+            if (defined $current_section_name && exists $loaded_profiles_list[-1] && $loaded_profiles_list[-1]{name} eq $current_section_name && !defined $loaded_profiles_list[-1]{flags}) {
+                 warn "Warning: Profile section '[$current_section_name]' in '$filepath' (around line $line_number) ended without 'nfit_flags'. Skipping previous section.\n";
+                 pop @loaded_profiles_list; # Remove incomplete profile
+            }
+            $current_section_name = $1;
+            $current_section_name =~ s/^\s+|\s+$//g; # Trim section name
+            if ($current_section_name eq '') {
+                warn "Warning: Empty section name found in '$filepath' at line $line_number. Skipping.\n";
+                $current_section_name = undef; # Invalidate current section
+                next;
+            }
+            # Add new profile, flags to be populated by next lines
+            push @loaded_profiles_list, { name => $current_section_name, flags => undef };
+        }
+        elsif (defined $current_section_name && $line =~ /^\s*([^=]+?)\s*=\s*(.+)$/) { # Key-value pair
+            my $key = $1;
+            my $value = $2;
+            $key =~ s/^\s+|\s+$//g;
+            $value =~ s/^\s+|\s+$//g;
+
+            if (lc($key) eq 'nfit_flags') {
+                if (defined $loaded_profiles_list[-1] && $loaded_profiles_list[-1]{name} eq $current_section_name) {
+                    if (defined $loaded_profiles_list[-1]{flags}) {
+                        warn "Warning: Duplicate 'nfit_flags' for profile '[$current_section_name]' in '$filepath' (around line $line_number). Using last one.\n";
+                    }
+                    $loaded_profiles_list[-1]{flags} = $value;
+                } else {
+                     warn "Warning: 'nfit_flags' found outside a valid section or for unexpected section '$current_section_name' in '$filepath' (line $line_number). Check structure. Skipping.\n";
+                }
+            }
+            # Could store other keys here if needed in the future
+        }
+        elsif ($line ne '') { # Non-empty line that isn't a section or valid key=value
+            warn "Warning: Unparseable line $line_number in profiles config '$filepath': $line\n";
+        }
+    }
+    close $fh;
+
+    # Final check for the last profile: ensure it got its flags
+    if (@loaded_profiles_list && defined $loaded_profiles_list[-1]{name} && !defined $loaded_profiles_list[-1]{flags}) {
+        warn "Warning: Last profile section '[" . $loaded_profiles_list[-1]{name} . "]' in '$filepath' is missing 'nfit_flags'. Removing.\n";
+        pop @loaded_profiles_list;
+    }
+    
+    # Filter out any profiles that didn't end up with flags (should have been caught above, but good practice)
+    my @valid_profiles = grep { defined $_->{flags} && $_->{flags} ne '' } @loaded_profiles_list;
+    if (scalar(@valid_profiles) != scalar(@loaded_profiles_list)) {
+        # This implies some profiles were incomplete. Warnings should have been issued.
+    }
+
+    return @valid_profiles;
+}
+
+sub generate_sizing_hint
+{
+    my ($results_ref, $vm, $config_ref) = @_;
+
+    if (defined $config_ref && defined $config_ref->{systemtype} && $config_ref->{systemtype} =~ /VIO Server/i) {
+        return ("P", "VIO Server", 0);
+    }
+
+    my $o3_val = $results_ref->{$vm}{'O3-95W15'} // 0;
+    $o3_val = 0 unless ($o3_val =~ /^-?[0-9.]+\z/);
+    my $b3_val = $results_ref->{$vm}{'B3-95W15'} // 0;
+    $b3_val = 0 unless ($b3_val =~ /^-?[0-9.]+\z/);
+    my $g3_val = $results_ref->{$vm}{'G3-95W15'} // 0;
+    $g3_val = 0 unless ($g3_val =~ /^-?[0-9.]+\z/);
+    my $p99w1_val = $results_ref->{$vm}{'P-99W1'} // 0;
+    $p99w1_val = 0 unless ($p99w1_val =~ /^-?[0-9.]+\z/);
+    my $maxcpu_val = (defined $config_ref && defined $config_ref->{maxcpu} && $config_ref->{maxcpu} =~ /^[0-9.]+$/) ? $config_ref->{maxcpu} : undef;
+
+    my $suggested_pattern = "G";
+    if ($b3_val > 0.01 && $o3_val > ($b3_val * $PATTERN_RATIO_THRESHOLD)) {
+         $suggested_pattern = "O";
+    }
+    elsif ($o3_val > 0.01 && $b3_val > ($o3_val * $PATTERN_RATIO_THRESHOLD)) {
+         $suggested_pattern = "B";
+    }
+
+    my $peakiness_ratio = ($g3_val > 0.01) ? ($p99w1_val / $g3_val) : 0;
+    my $shape_descriptor = "Steady";
+    if ($peakiness_ratio >= $HIGH_PEAK_RATIO) {
+        $shape_descriptor = "Very Peaky";
+    }
+    elsif ($peakiness_ratio >= $LOW_PEAK_RATIO) {
+        $shape_descriptor = "Moderately Peaky";
+    }
+
+    my $pressure_detected = 0;
+    my $pressure_flag_text = "";
+    if (defined $maxcpu_val && $maxcpu_val > 0 && $p99w1_val >= ($maxcpu_val * $LIMIT_THRESHOLD_PERC)) {
+        $pressure_detected = 1;
+        $pressure_flag_text = " - Pressured";
+    }
+
+    my $initial_tier_range_str = "3/4";
+    if ($shape_descriptor eq "Very Peaky") { $initial_tier_range_str = "1/2"; }
+    elsif ($shape_descriptor eq "Moderately Peaky") { $initial_tier_range_str = "2/3"; }
+
+    my $adjusted_tier_str = $initial_tier_range_str;
+    if ($pressure_detected) {
+        if ($initial_tier_range_str eq "3/4") { $adjusted_tier_str = "3"; }
+        elsif ($initial_tier_range_str eq "2/3") { $adjusted_tier_str = "2"; }
+        elsif ($initial_tier_range_str eq "1/2") { $adjusted_tier_str = "1"; }
+    }
+
+    my $final_shape_descriptor = $shape_descriptor;
+    if ($suggested_pattern eq 'B') {
+        $final_shape_descriptor .= " Check Duration";
+    }
+
+    my $pattern_tier_string = $suggested_pattern . $adjusted_tier_str;
+
+    return ($pattern_tier_string, $final_shape_descriptor . $pressure_flag_text, $pressure_detected);
+}
+
+sub usage_wrapper
+{
+    my $script_name = $0;
+    $script_name =~ s{.*/}{};
+    # Keep heredoc formatting as is
+    return <<END_USAGE;
+Usage: $script_name -f <nmon_csv> [-config <vm_cfg_csv>] [--profiles-config <path>]
+                  [-s <date>] [-vm <name>] [-r[=inc]|-u[=inc]] [--nfit-path <path>] [-h|v]
+
+Runs 'nfit' with multiple user-defined profiles (from a config file) AND an
+absolute peak calculation, optionally merging with VM config data, to generate a
+consolidated CSV report. Includes heuristic hint columns.
+
+Arguments:
+  Input/Filtering:
+    -f, --file <nmon_csv>      : Path to input NMON data CSV file (required).
+    -config <vm_cfg_csv>       : Optional. Path to VM configuration CSV file.
+                                 (Default: Checks for '$DEFAULT_VM_CONFIG_FILE' in script dir)
+    --profiles-config <path>   : Optional. Path to profiles definition file (INI format).
+                                 (Default: Checks for '$DEFAULT_PROFILES_CONFIG_FILE' in 'etc/'
+                                  subdirectory or script directory)
+    -s, --startdate <YYYY-MM-DD> : Optional. Ignore NMON data before this date.
+    -vm, --lpar <name>         : Optional. Analyse only the specified VM/LPAR name.
+
+  Rounding (Passed to nfit):
+    -r[=increment]             : Optional. Round results to NEAREST increment.
+                                 Defaults to increment $DEFAULT_ROUND_INCREMENT if '=increment' is omitted.
+    -u[=increment]             : Optional. Round results UP to nearest increment.
+                                 Defaults to increment $DEFAULT_ROUND_INCREMENT if '=increment' is omitted.
+                                 (-r and -u are mutually exclusive)
+  Other:
+    --nfit-path <path>         : Optional. Path to the 'nfit' script.
+                                 (Default: '$nfit_script_path')
+    -h, --help                 : Display this help message.
+    -v, --version              : Display script version and nfit version used.
+
+Output:
+  Prints a CSV formatted table to STDOUT. Progress/status to STDERR.
+
+CSV Columns Output:
+  VM, Hint, Type, Pattern, Pressure, Serial, SystemType, Pool Name, Pool ID, Peak,
+  [Profile Names from Config...], Current - ENT, NFIT - ENT, NETT, NETT%
+  (Type, NFIT - ENT, NETT, NETT% are initially blank)
+  (Hint suggests Pattern+Tier, e.g., G2/3, O1, P for VIO)
+  (Pattern describes shape, e.g., Steady, Very Peaky - Pressured Check Duration)
+  (Pressure is True/False based on P-99W1 vs maxcpu check)
+
+Example Profiles Config File ('$DEFAULT_PROFILES_CONFIG_FILE' or custom path):
+  [P-99W1]
+  nfit_flags = -p 99.75 -w 1
+  [G1-99W5]
+  nfit_flags = -p 99 -w 5 --filter-above-perc 30
+  ...
+
+Example:
+  $script_name -f nmon.csv -u > report.csv
+  $script_name -f nmon.csv --profiles-config ./custom_profiles.cfg --config ./my_vms.csv
+END_USAGE
+}
