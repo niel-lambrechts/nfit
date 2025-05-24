@@ -178,3 +178,6 @@ For commercial or collaboration enquiries, please open a [GitHub Discussion](htt
 ## License
 
 This project is licensed under the [GNU AFFERO GENERAL PUBLIC LICENSE (AGPL-3.0)](LICENSE) - see the LICENSE file for details.
+
+## 🔖 Keywords
+AIX · NMON · Capacity Planning · Right-Sizing · IBM Power · Linux on Power · Performance Tuning · Shell Scripting
