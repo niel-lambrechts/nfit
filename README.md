@@ -100,6 +100,10 @@ This script will run `nfit` multiple times based on your `etc/nfit.profiles.cfg`
 
 By following these steps, you can integrate the `nFit Suite` into your capacity planning workflow to generate data-driven right-sizing recommendations. Remember to consult the detailed documentation for each script (`nfit -h`, `nfit-profile -h`, `nfit-plot --help`, and the `.md` files in `doc/`) for more information on all available options and configurations.
 
+### 📸 Example Output
+
+![nFit Excel output example](docs/screenshot-xlsx.png)
+
 ## Components
 
 The nFit Suite currently consists of three main components:
