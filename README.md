@@ -6,6 +6,8 @@ nFit is designed to assist with AIX and Linux on Power LPAR (Logical Partition) 
 
 This suite helps in optimising resource utilisation, ensuring critical workloads have the guaranteed CPU they need, while identifying potential savings by accurately sizing less critical workloads or standby systems.
 
+This program requires NMON with InfluxDB Time-Series DB and Grafana Graphing Engine. For more information, refer to [njmon Intro and Update](https://www.ibm.com/support/pages/njmon-intro-and-update). For installation, refer to [njmon + InfluxDB + Grafana Series 10: nimon Intro & Setup](https://www.youtube.com/watch?v=9_wG9H60AGg) by Nigel Griffiths.
+
 ## 🚀 QuickStart
 
 This guide will help you get the `nFit Suite` up and running quickly.
@@ -71,7 +73,17 @@ The scripts use configuration files to define profiles, frame setups, and VM ent
 * **Format:** See `examples/config-all.csv.example` for the expected structure.
 * **Save as:** For example, `config-all.csv` (either in the script's root or `etc/` directory, or specify the path with the `-config` option when running `nfit-profile`).
 
-**4. Run `nfit-profile` to Generate Sizing Data**
+**4. Obtain Managed System Data**
+
+- Open Grafana NJMON
+- Open Whole Server by Serial Number
+- Navigate to the graph Physical Consumed CPU - SERIAL
+- Select Last 90 days under the time period. Wait for the load to complete (spinning circles must disappear)
+- Click on the triangle shape on the title, and select Inspect data
+- Click on Data options, and under Show data frame select Series joined by time
+- Download the CSV file
+
+**5. Run `nfit-profile` to Generate Sizing Data**
 
 This script will run `nfit` multiple times based on your `etc/nfit.profiles.cfg` and produce a comprehensive CSV output.
 
@@ -82,7 +94,7 @@ This script will run `nfit` multiple times based on your `etc/nfit.profiles.cfg`
     *(Replace paths with your actual file locations. Add other options like `-s <startdate>`, `-r` or `-u` for rounding as needed.)*
 * **Output:** `nfit_sizing_report.csv` (or your chosen output file) will contain the aggregated metrics for each VM.
 
-**5. Utilise Data in Your Sizing Spreadsheet**
+**6. Utilise Data in Your Sizing Spreadsheet**
 
 * **Spreadsheet Template:** Use a spreadsheet application (like Microsoft Excel, LibreOffice Calc, Google Sheets). You can base your layout on the concepts provided in `examples/nFit.xlsx`.
 * **Import/Copy Data:**
