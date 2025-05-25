@@ -289,5 +289,9 @@ For commercial or collaboration enquiries, please open a [GitHub Discussion](htt
 
 This project is licensed under the [GNU AFFERO GENERAL PUBLIC LICENSE (AGPL-3.0)](LICENSE) - see the LICENSE file for details.
 
+## Contributors
+
+Special thanks to Dewalt Claassen (Senior Capacity Planner at [MentPro Computer Services](https://mentpro.co.za)) for his invaluable insights and recommendations on the statistical methodology and tiering strategy, which helped to shape the nFit sizing approach.
+
 ## 🔖 Keywords
 AIX · NMON · Capacity Planning · Right-Sizing · IBM Power · Linux on Power · Performance Tuning · Shell Scripting
