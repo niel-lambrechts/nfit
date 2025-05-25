@@ -102,7 +102,7 @@ By following these steps, you can integrate the `nFit Suite` into your capacity 
 
 ### 📸 Example Output
 
-![nFit Excel output example](docs/screenshot-xlsx.png)
+![nFit Excel output example](doc/screenshot-xlsx.png)
 
 ## Components
 
