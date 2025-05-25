@@ -6,6 +6,100 @@ nFit is designed to assist with AIX and Linux on Power LPAR (Logical Partition) 
 
 This suite helps in optimising resource utilisation, ensuring critical workloads have the guaranteed CPU they need, while identifying potential savings by accurately sizing less critical workloads or standby systems.
 
+## 🚀 QuickStart
+
+This guide will help you get the `nFit Suite` up and running quickly.
+
+**1. Installation / Setup**
+
+* **Clone the Repository:**
+    ```bash
+    git clone <your_github_repository_url_here> nmon-fit
+    cd nmon-fit
+    ```
+* **Make Scripts Executable:**
+    ```bash
+    chmod +x nfit nfit-profile nfit-plot
+    ```
+* **Install Python Dependencies (for `nfit-plot`):**
+    ```bash
+    pip install -r requirements.txt
+    ```
+    *(Ensure you have Python 3 and pip installed.)*
+* **(Optional) Add to PATH or Create Symlinks:** For easier execution from any directory:
+    * Add the `nmon-fit` directory to your system's `PATH` environment variable.
+    * Or, create symbolic links to the scripts in a directory already in your `PATH` (e.g., `~/bin/` or `/usr/local/bin/`):
+        ```bash
+        # Example for adding to ~/bin
+        mkdir -p ~/bin
+        ln -s "$(pwd)/nfit" ~/bin/nfit
+        ln -s "$(pwd)/nfit-profile" ~/bin/nfit-profile
+        ln -s "$(pwd)/nfit-plot" ~/bin/nfit-plot
+        # Ensure ~/bin is in your PATH (add to .bashrc, .zshrc, etc.)
+        # export PATH="$HOME/bin:$PATH"
+        ```
+
+**2. Initial Configuration**
+
+The scripts use configuration files to define profiles, frame setups, and VM entitlement scenarios. Default templates are provided in the `etc/` directory and more specific examples in the `examples/` directory.
+
+* **Create `etc/` Directory (if it doesn't exist in your working copy for user configs):**
+    ```bash
+    mkdir -p etc
+    ```
+* **Copy Default Configuration Files:** Choose a starting set of `.default` files from the `etc/` directory (if you provide them there) or the themed examples from the `examples/` directory. Copy them into your working `etc/` directory (or the script's root directory if the scripts are coded to fall back there) and remove the `.default` or `.example` suffix.
+    * **For `nfit-profile` (defines calculation profiles):**
+        ```bash
+        cp examples/nfit.profiles.cfg.general_enterprise.example etc/nfit.profiles.cfg
+        ```
+    * **For `nfit-plot` (defines physical frames and plotting scenarios):**
+        ```bash
+        cp examples/nfit.mgsys.cfg.general_enterprise.example etc/nfit.mgsys.cfg
+        cp examples/nfit.scenarios.cfg.general_enterprise.example etc/nfit.scenarios.cfg
+        ```
+* **Customise Configuration Files:**
+    * Edit `etc/nfit.profiles.cfg` to adjust the nFit calculation profiles if needed.
+    * Edit `etc/nfit.mgsys.cfg` to accurately reflect your IBM Power frame setup (number of frames, cores per frame, VIO allocations, DC Name).
+    * Edit `etc/nfit.scenarios.cfg` to define the LPAR entitlement scenarios you want to visualise with `nfit-plot`.
+
+**3. Prepare VM Configuration Data**
+
+`nfit-profile` can merge data from a VM configuration inventory CSV file.
+
+* **Create your VM Configuration CSV:** This file should list your VMs and their attributes.
+* **Required Columns:** `hostname`, `serial`, `systemtype`, `procpool_name`, `procpool_id`, `entitledcpu`, `maxcpu`.
+* **Format:** See `examples/config-all.csv.example` for the expected structure.
+* **Save as:** For example, `config-all.csv` (either in the script's root or `etc/` directory, or specify the path with the `-config` option when running `nfit-profile`).
+
+**4. Run `nfit-profile` to Generate Sizing Data**
+
+This script will run `nfit` multiple times based on your `etc/nfit.profiles.cfg` and produce a comprehensive CSV output.
+
+* **Command:**
+    ```bash
+    ./nfit-profile -f /path/to/your/nmon_data.csv -config /path/to/your/config-all.csv > nfit_sizing_report.csv
+    ```
+    *(Replace paths with your actual file locations. Add other options like `-s <startdate>`, `-r` or `-u` for rounding as needed.)*
+* **Output:** `nfit_sizing_report.csv` (or your chosen output file) will contain the aggregated metrics for each VM.
+
+**5. Utilise Data in Your Sizing Spreadsheet**
+
+* **Spreadsheet Template:** Use a spreadsheet application (like Microsoft Excel, LibreOffice Calc, Google Sheets). You can base your layout on the concepts provided in `examples/nFit.xlsx`.
+* **Import/Copy Data:**
+    * Open `nfit_sizing_report.csv`.
+    * Copy the data from this CSV.
+    * Paste it into a dedicated sheet in your main sizing spreadsheet.
+* **Apply Logic:** Your main sizing spreadsheet should have:
+    * A column for your VMs (matching the "VM" column from `nfit-profile` output).
+    * A "Type" column (e.g., "O1", "B2", "G3") which you manually populate/maintain based on business requirements for each VM.
+    * The "Hint", "Pattern", "Pressure", "Serial", "SystemType", etc., columns from `nfit-profile`.
+    * Columns for each metric generated by `nfit-profile` (Peak, P-99W1, G1-99W5, etc.).
+    * Your "Current - ENT" column.
+    * **"NFIT - ENT" (Recommended Entitlement):** This column will use a formula (e.g., `VLOOKUP` or `INDEX/MATCH` in Excel) to look up the value from the appropriate metric column (P-99W1, G1-99W5, etc.) based on the "Type" code you've assigned to the VM. It should also incorporate your PowerHA standby logic (e.g., halving the looked-up value if it's a standby node).
+    * "NETT" and "NETT%" columns with formulas to calculate the difference and percentage change.
+
+By following these steps, you can integrate the `nFit Suite` into your capacity planning workflow to generate data-driven right-sizing recommendations. Remember to consult the detailed documentation for each script (`nfit -h`, `nfit-profile -h`, `nfit-plot --help`, and the `.md` files in `doc/`) for more information on all available options and configurations.
+
 ## Components
 
 The nFit Suite currently consists of three main components:
