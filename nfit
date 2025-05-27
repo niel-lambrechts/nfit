@@ -1,11 +1,13 @@
 #!/usr/bin/env perl
 
 # NAME     : nfit
-# VERSION  : 1.25.144.0 (2025-05-24)
+# VERSION  : 1.27.144.0 (2025-05-27)
 # AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
-# PURPOSE  : Analyse NMON PhysC data for AIX and Linux on Power VM right-sizing recommendations.
-#            Calculates rolling average percentiles and optionally absolute peaks,
-#            with filtering by date, time, VM, weekends, and percentile threshold,
+# PURPOSE  : Analyse NMON PhysC and optionally RunQ data for AIX and Linux on Power
+#            VM right-sizing recommendations. Calculates rolling average percentiles,
+#            absolute peaks, and specified percentiles of normalised and absolute
+#            run-queue statistics.
+#            Supports filtering by date, time, VM, weekends, and percentile threshold,
 #            plus rounding options.
 # REQUIRES : Perl, Time::Piece, POSIX (for ceil), List::Util (for sum0), Getopt::Long, File::Temp
 
@@ -15,22 +17,26 @@ use Getopt::Long qw(GetOptions);
 use File::Temp qw(tempfile);
 use List::Util qw(sum0);
 use POSIX qw(ceil);
-use Time::Piece; # For date/time parsing and day of week check
-# Time::Seconds is usually included with Time::Piece, explicit use not always needed.
+use Time::Piece;
 
 # --- Version ---
-my $VERSION = '1.25.144.0';
+my $VERSION = '1.27.144.0';
 
 # --- Configuration ---
 my $DEFAULT_WINDOW_MINUTES = 15;
 my $DEFAULT_PERCENTILE     = 95;
 my $DEFAULT_ROUND_INCREMENT= 0.05;
-my $FLOAT_EPSILON          = 1e-9; # Small value for float comparisons
+my $DEFAULT_SMT            = 8;
+my $DEFAULT_RUNQ_NORM_PERC = "50,90"; # Default percentiles for Normalised RunQ
+my $DEFAULT_RUNQ_ABS_PERC  = "90";    # Default percentiles for Absolute RunQ
+my $FLOAT_EPSILON          = 1e-9;
+my $ACTIVE_PHYSC_THRESHOLD = 0.05;
 
 # --- Argument Parsing ---
-my $csv_file;
+my $physc_csv_file;
+my $runq_csv_file;
 my $window_minutes = $DEFAULT_WINDOW_MINUTES;
-my $percentile     = $DEFAULT_PERCENTILE;
+my $percentile     = $DEFAULT_PERCENTILE; # For PhysC rolling average
 my $start_date_str;
 my $calculate_peak = 0;
 my $round_arg;
@@ -41,12 +47,16 @@ my $online_flag = 0;
 my $batch_flag  = 0;
 my $target_vm_name;
 my $no_weekends = 0;
-my $filter_above_perc_value = undef;
+my $filter_above_perc_value = undef; # For PhysC rolling average
+my $smt_value = $DEFAULT_SMT;
+my $runq_norm_perc_str = $DEFAULT_RUNQ_NORM_PERC; # New
+my $runq_abs_perc_str  = $DEFAULT_RUNQ_ABS_PERC;  # New
 my $help           = 0;
 my $show_version   = 0;
 
 GetOptions(
-    'file|f=s'            => \$csv_file,
+    'physc-data|pc=s'     => \$physc_csv_file,
+    'runq-data|rq=s'      => \$runq_csv_file,
     'window|w=i'          => \$window_minutes,
     'percentile|p=f'      => \$percentile,
     'startdate|s=s'       => \$start_date_str,
@@ -60,738 +70,341 @@ GetOptions(
     'vm|lpar=s'           => \$target_vm_name,
     'no-weekends'         => \$no_weekends,
     'filter-above-perc=f' => \$filter_above_perc_value,
+    'smt=i'               => \$smt_value,
+    'runq-norm-perc=s'    => \$runq_norm_perc_str, # New
+    'runq-abs-perc=s'     => \$runq_abs_perc_str,  # New
     'help|h'              => \$help,
     'version|v'           => \$show_version,
-) or die usage(); # Call to usage() directly
+) or die usage();
 
 # --- Validation ---
-if ($show_version) {
-    print STDERR "$VERSION\n";
-    exit 0;
-}
+# (Initial validations for version, help, files, basic numeric ranges)
+if ($show_version) { print STDERR "nfit version $VERSION\n"; exit 0; }
+if ($help || !$physc_csv_file) { print STDERR usage(); exit 0; }
+if (! -f $physc_csv_file) { die "Error: PhysC data file (--physc-data) not found: $physc_csv_file\n"; }
+if (defined $runq_csv_file && ! -f $runq_csv_file) { die "Error: RunQ data file (--runq-data) not found: $runq_csv_file\n"; }
+if ($smt_value <= 0) { die "Error: --smt value must be a positive integer.\n"; }
+if ($window_minutes < 1) { die "Error: Window size (-w) must be at least 1 minute.\n"; }
+if ($percentile < 0 || $percentile > 100) { die "Error: Percentile (-p) must be between 0 and 100.\n"; }
+# (Date, rounding, time filter validations remain the same)
+if (defined $start_date_str && $start_date_str !~ /^\d{4}-\d{2}-\d{2}$/) { die "Error: Invalid startdate (-s) format '$start_date_str'. Use YYYY-MM-DD.\n"; }
+if (defined($round_arg) && defined($roundup_arg)) { die "Error: -round (-r) and -roundup (-u) options are mutually exclusive.\n"; }
+if (defined $round_arg && length $round_arg && $round_arg !~ /^[0-9.]*$/) { die "Error: Invalid value for -r increment: '$round_arg'\n"; }
+if (defined $roundup_arg && length $roundup_arg && $roundup_arg !~ /^[0-9.]*$/) { die "Error: Invalid value for -u increment: '$roundup_arg'\n"; }
+if (($online_flag || $batch_flag) && (defined $start_time_str || defined $end_time_str)) { die "Error: Cannot use -online or -batch with -startt or -endt.\n"; }
+if ($online_flag && $batch_flag) { die "Error: Cannot use -online and -batch together.\n"; }
+if ((defined $start_time_str && !defined $end_time_str) || (!defined $start_time_str && defined $end_time_str)) { die "Error: Must specify both -startt and -endt.\n"; }
+if (defined $start_time_str && $start_time_str !~ /^\d{2}:\d{2}$/) { die "Error: Invalid startt format '$start_time_str'. Use HH:MM.\n"; }
+if (defined $end_time_str && $end_time_str !~ /^\d{2}:\d{2}$/) { die "Error: Invalid endt format '$end_time_str'. Use HH:MM.\n"; }
+if (defined $filter_above_perc_value && ($filter_above_perc_value < 0 || $filter_above_perc_value > 100)) { die "Error: --filter-above-perc value must be between 0 and 100.\n"; }
 
-if ($help || !$csv_file) {
-    print STDERR usage(); # Call to usage()
-    exit 0;
-}
-
-if (! -f $csv_file) {
-    die "Error: CSV file not found: $csv_file\n";
-}
-if ($window_minutes < 1) {
-    die "Error: Window size must be at least 1 minute.\n";
-}
-if ($percentile < 0 || $percentile > 100) {
-    die "Error: Percentile (-p) must be between 0 and 100.\n";
-}
-if (defined $start_date_str && $start_date_str !~ /^\d{4}-\d{2}-\d{2}$/) {
-    die "Error: Invalid startdate format '$start_date_str'. Use YYYY-MM-DD.\n";
-}
-if (defined($round_arg) && defined($roundup_arg)) {
-    die "Error: -round (-r) and -roundup (-u) options are mutually exclusive.\n";
-}
-if (($online_flag || $batch_flag) && (defined $start_time_str || defined $end_time_str)) {
-    die "Error: Cannot use -online or -batch with -startt or -endt.\n";
-}
-if ($online_flag && $batch_flag) {
-    die "Error: Cannot use -online and -batch together.\n";
-}
-if ((defined $start_time_str && !defined $end_time_str) || (!defined $start_time_str && defined $end_time_str)) {
-    die "Error: Must specify both -startt and -endt if using manual time filters.\n";
-}
-if (defined $start_time_str && $start_time_str !~ /^\d{2}:\d{2}$/) {
-    die "Error: Invalid startt format '$start_time_str'. Use HH:MM.\n";
-}
-if (defined $end_time_str && $end_time_str !~ /^\d{2}:\d{2}$/) {
-    die "Error: Invalid endt format '$end_time_str'. Use HH:MM.\n";
-}
-if (defined $filter_above_perc_value && ($filter_above_perc_value < 0 || $filter_above_perc_value > 100)) {
-    die "Error: --filter-above-perc value must be between 0 and 100.\n";
-}
-
+# Validate and parse RunQ percentile lists
+my @runq_norm_percentiles_to_calc = parse_percentile_list($runq_norm_perc_str, "runq-norm-perc");
+my @runq_abs_percentiles_to_calc  = parse_percentile_list($runq_abs_perc_str,  "runq-abs-perc");
 
 # --- Determine Rounding Method and Increment ---
-my $rounding_method = 'none';
-my $round_increment = undef;
-my $output_dp = 4; # Default decimal places
-if (defined $round_arg) {
-    $rounding_method = 'standard';
-    $round_increment = (defined $round_arg && $round_arg =~ /^[0-9]*\.?[0-9]+$/) ? $round_arg : $DEFAULT_ROUND_INCREMENT;
-    print STDERR "Applying standard rounding to nearest $round_increment\n";
-}
-elsif (defined $roundup_arg) {
-    $rounding_method = 'up';
-    $round_increment = (defined $roundup_arg && $roundup_arg =~ /^[0-9]*\.?[0-9]+$/) ? $roundup_arg : $DEFAULT_ROUND_INCREMENT;
-    print STDERR "Applying ceiling rounding up to nearest $round_increment\n";
-}
-if ($rounding_method ne 'none') {
-    if (!defined $round_increment || $round_increment <= 0) {
-        die "Error: Rounding increment must be positive (got '$round_increment').\n";
-    }
-    $output_dp = get_decimal_places($round_increment);
-}
+# (No change)
+my $rounding_method = 'none'; my $round_increment = undef; my $output_dp = 4;
+if (defined $round_arg) { $rounding_method = 'standard'; $round_increment = (length $round_arg && $round_arg =~ /^[0-9.]*$/) ? $round_arg : $DEFAULT_ROUND_INCREMENT; print STDERR "Applying standard rounding to nearest $round_increment\n"; }
+elsif (defined $roundup_arg) { $rounding_method = 'up'; $round_increment = (length $roundup_arg && $roundup_arg =~ /^[0-9.]*$/) ? $roundup_arg : $DEFAULT_ROUND_INCREMENT; print STDERR "Applying ceiling rounding up to nearest $round_increment\n"; }
+if ($rounding_method ne 'none') { if (!defined $round_increment || $round_increment <= 0) { die "Error: Rounding increment must be positive (got '$round_increment').\n"; } $output_dp = get_decimal_places($round_increment); }
 
 # --- Determine Time Filter Window ---
-my $time_filter_active = 0;
-my $time_filter_start = undef;
-my $time_filter_end = undef;
-my $time_filter_overnight = 0;
-my $time_filter_desc = "";
-if ($online_flag) {
-    $time_filter_active = 1;
-    $time_filter_start = "08:00";
-    $time_filter_end = "17:00";
-    $time_filter_desc = "ONLINE ($time_filter_start <= time < $time_filter_end)";
-}
-elsif ($batch_flag) {
-    $time_filter_active = 1;
-    $time_filter_start = "18:00";
-    $time_filter_end = "06:00";
-    $time_filter_overnight = 1;
-    $time_filter_desc = "BATCH (time >= $time_filter_start OR time < $time_filter_end)";
-}
-elsif (defined $start_time_str) {
-    $time_filter_active = 1;
-    $time_filter_start = $start_time_str;
-    $time_filter_end = $end_time_str;
-    if ($time_filter_end lt $time_filter_start) {
-        $time_filter_overnight = 1;
-        $time_filter_desc = "OVERNIGHT (time >= $time_filter_start OR time < $time_filter_end)";
-    }
-    else {
-        $time_filter_desc = "MANUAL ($time_filter_start <= time < $time_filter_end)";
-    }
-}
+# (No change)
+my $time_filter_active = 0; my $time_filter_start = undef; my $time_filter_end = undef; my $time_filter_overnight = 0; my $time_filter_desc = "";
+if ($online_flag) { $time_filter_active = 1; $time_filter_start = "08:00"; $time_filter_end = "17:00"; $time_filter_desc = "ONLINE ($time_filter_start <= time < $time_filter_end)"; }
+elsif ($batch_flag) { $time_filter_active = 1; $time_filter_start = "18:00"; $time_filter_end = "06:00"; $time_filter_overnight = 1; $time_filter_desc = "BATCH (time >= $time_filter_start OR time < $time_filter_end)"; }
+elsif (defined $start_time_str) { $time_filter_active = 1; $time_filter_start = $start_time_str; $time_filter_end = $end_time_str; if ($time_filter_end lt $time_filter_start) { $time_filter_overnight = 1; $time_filter_desc = "OVERNIGHT (time >= $time_filter_start OR time < $time_filter_end)"; } else { $time_filter_desc = "MANUAL ($time_filter_start <= time < $time_filter_end)"; } }
 
 # --- Main Processing ---
 my $start_time = time();
-# Status messages to STDERR
-print STDERR "Starting processing for file: $csv_file\n";
-print STDERR "Using rolling window: $window_minutes minutes\n";
-print STDERR "Calculating percentile: P$percentile\n";
-print STDERR "Calculating absolute peak: " . ($calculate_peak ? "Yes" : "No") . "\n";
-if (defined $start_date_str) {
-    print STDERR "Ignoring data before start date: $start_date_str\n";
+# (Status prints updated for new arguments)
+print STDERR "nfit version $VERSION\n";
+print STDERR "Processing PhysC data from: $physc_csv_file\n";
+if (defined $runq_csv_file) {
+    print STDERR "Processing RunQ data from: $runq_csv_file (using SMT: $smt_value for normalisation)\n";
+    print STDERR "Calculating Normalised RunQ Percentiles: " . join(", ", map {"P$_"} @runq_norm_percentiles_to_calc) . "\n";
+    print STDERR "Calculating Absolute RunQ Percentiles: " . join(", ", map {"P$_"} @runq_abs_percentiles_to_calc) . "\n";
 }
-if ($no_weekends) {
-    print STDERR "Applying filter: Excluding Weekends (Sat/Sun)\n";
-}
-if ($time_filter_active) {
-    print STDERR "Applying time filter: $time_filter_desc\n";
-}
-if (defined $filter_above_perc_value) {
-    print STDERR "Applying percentile filter: Using values >= P$filter_above_perc_value of rolling averages\n";
-}
-if (defined $target_vm_name) {
-    print STDERR "Filtering for VM/LPAR: $target_vm_name\n";
-}
+my $p_label_display = sprintf("P%.2f", $percentile); $p_label_display =~ s/\.?0+$//;
+print STDERR "Using rolling window for PhysC: $window_minutes minutes\n";
+print STDERR "Calculating PhysC percentile: $p_label_display\n";
+print STDERR "Calculating absolute PhysC peak: " . ($calculate_peak ? "Yes" : "No") . "\n";
+if (defined $start_date_str) { print STDERR "Ignoring data before start date: $start_date_str\n"; }
+if ($no_weekends) { print STDERR "Applying filter: Excluding Weekends (Sat/Sun)\n"; }
+if ($time_filter_active) { print STDERR "Applying time filter: $time_filter_desc\n"; }
+if (defined $filter_above_perc_value) { my $filter_p_label = sprintf("P%.2f", $filter_above_perc_value); $filter_p_label =~ s/\.?0+$//; print STDERR "Applying PhysC percentile filter: Using rolling averages >= $filter_p_label of all rolling averages\n"; }
+if (defined $target_vm_name) { print STDERR "Filtering for VM/LPAR: $target_vm_name\n"; }
 
 # --- Initialization ---
-my @vm_names;
-my $target_vm_index = undef;
-my @vm_windows;
-my $vm_window_ref;
-my @vm_max_peaks;
-my $vm_max_peak = undef;
-my @temp_fh;
-my $temp_fh; # Scalar for single VM case
-my @temp_filenames;
-my $temp_filename; # Scalar for single VM case
+# (Variable names updated for clarity PhysC vs RunQ related storage)
+my @vm_names_from_physc_header;
+my $target_vm_index_in_physc = undef;
+my @vm_physc_rolling_windows_list_of_arefs;
+my $vm_physc_rolling_window_aref;
+my @vm_physc_max_peaks_list;
+my $vm_physc_max_peak_scalar = undef;
+my @temp_fh_physc_list;
+my $temp_fh_physc_scalar;
+my @temp_filenames_physc_list;
+my $temp_filename_physc_scalar;
+
+my %runq_data_store; # $runq_data_store{vm_name}{timestamp_str} = runq_value
+my @vm_collected_norm_runq_values_list_of_arefs; # Stores NormalisedRunQ_interval
+my $vm_collected_norm_runq_values_aref;
+my @vm_collected_abs_runq_values_list_of_arefs;  # Stores RunQ_interval (absolute)
+my $vm_collected_abs_runq_values_aref;
+
 my $line_count = 0;
 my $data_lines_processed = 0;
 
-open my $csv_fh, '<', $csv_file or die "Error: Cannot open CSV file '$csv_file': $!\n";
+# --- Load RunQ Data (if provided) ---
+if (defined $runq_csv_file) {
+    # (This logic remains largely the same as v1.26)
+    print STDERR "Pre-loading RunQ data...\n";
+    open my $runq_fh, '<:encoding(utf8)', $runq_csv_file or die "Error: Cannot open RunQ CSV file '$runq_csv_file': $!\n";
+    my $runq_line_count = 0; my @runq_vm_names_header;
+    while (my $line = <$runq_fh>) {
+        chomp $line; $line =~ s/\r$//; $runq_line_count++; next if ($line =~ /^\s*$/o); $line =~ s/^\x{FEFF}// if $runq_line_count == 1;
+        my @fields = split /,/, $line, -1;
+        if ($runq_line_count == 1) { shift @fields; @runq_vm_names_header = map { my ($name) = split / /; $name =~ s/^"|"$//g; $name } @fields; if (defined $target_vm_name && !grep { $_ eq $target_vm_name } @runq_vm_names_header) { print STDERR "Warning: Target VM '$target_vm_name' not found in RunQ CSV header. RunQ metrics for it will be N/A.\n"; } next; }
+        my $timestamp_str = $fields[0]; shift @fields;
+        for (my $i = 0; $i <= $#fields; $i++) { my $vm_name = $runq_vm_names_header[$i]; next unless (defined $vm_name && $vm_name ne ''); if (!defined $target_vm_name || $vm_name eq $target_vm_name) { if (defined $fields[$i] && $fields[$i] =~ /^[0-9.]+$/) { $runq_data_store{$vm_name}{$timestamp_str} = $fields[$i]; } } }
+    }
+    close $runq_fh; print STDERR "Finished pre-loading RunQ data for " . scalar(keys %runq_data_store) . " VMs from $runq_line_count lines.\n";
+}
 
-# --- Main Loop ---
-while (my $line = <$csv_fh>) {
-    # --- Line Setup ---
-    chomp $line;
-    $line =~ s/\r$//; # Remove potential carriage return
-    $line_count++;
-    next if ($line =~ /^\s*$/o); # Skip blank lines, thanks user for this!
-    $line =~ s/^\x{FEFF}// if $line_count == 1; # Remove UTF-8 BOM if present
-
-    my @fields = split /,/, $line, -1; # -1 preserves trailing empty fields
-
-    # --- Process Header (Line 1) ---
+# --- Process PhysC Data (Main Loop) ---
+# (Initial part of the loop remains the same, parsing header and initializing structures)
+print STDERR "Processing PhysC data and calculating metrics...\n";
+open my $physc_csv_fh, '<:encoding(utf8)', $physc_csv_file or die "Error: Cannot open PhysC CSV file '$physc_csv_file': $!\n";
+while (my $line = <$physc_csv_fh>) {
+    chomp $line; $line =~ s/\r$//; $line_count++; next if ($line =~ /^\s*$/o); $line =~ s/^\x{FEFF}// if $line_count == 1;
+    my @fields = split /,/, $line, -1;
     if ($line_count == 1) {
-        shift @fields; # Remove "Time" column header
-        my $num_vms_found = 0;
-        my $current_index = 0;
+        shift @fields; my $num_vms_found = 0; my $current_index = 0;
         foreach my $header_field (@fields) {
-            $header_field =~ s/^\s+|\s+$//g; # Trim whitespace
-            $header_field =~ s/^"|"$//g;    # Remove surrounding quotes
-            my ($vm_name) = split / /, $header_field, 2; # Extract first part
-            if (defined $vm_name && $vm_name ne '') {
-                push @vm_names, $vm_name;
-                if (defined $target_vm_name && $vm_name eq $target_vm_name) {
-                    $target_vm_index = $current_index;
-                }
-                $num_vms_found++;
-            }
-            else {
-                print STDERR "Warning: Could not extract VM name from header field index $current_index: '$header_field'\n";
-                push @vm_names, "UNKNOWN_VM_$current_index"; # Add placeholder
-            }
+            $header_field =~ s/^\s+|\s+$//g; $header_field =~ s/^"|"$//g; my ($vm_name) = split / /, $header_field, 2;
+            if (defined $vm_name && $vm_name ne '') { push @vm_names_from_physc_header, $vm_name; if (defined $target_vm_name && $vm_name eq $target_vm_name) { $target_vm_index_in_physc = $current_index; } $num_vms_found++; }
+            else { print STDERR "Warning: Could not extract VM name from PhysC header index $current_index: '$header_field'\n"; push @vm_names_from_physc_header, "UNKNOWN_VM_PHYSC_$current_index"; }
             $current_index++;
         }
-
-        my $num_vms = scalar(@vm_names);
-        if ($num_vms == 0) {
-            die "Error: No valid VM columns found in header.\n";
-        }
-        print STDERR "Found $num_vms VMs in header.\n";
-
-        if (defined $target_vm_name && !defined $target_vm_index) {
-             my $avail_vms = join(", ", @vm_names);
-             $avail_vms = substr($avail_vms, 0, 200) . "..." if length($avail_vms) > 200;
-             die "Error: Specified VM/LPAR '$target_vm_name' not found in CSV header.\nAvailable VMs: $avail_vms\n";
-        }
-
-        # Initialize data structures
-        if (defined $target_vm_index) {
-            $vm_window_ref = [];
-            $vm_max_peak = undef;
-            my ($fh, $fname) = tempfile(UNLINK => 0); # Keep file for re-reading
-            unless ($fh) {
-                die "Error: Could not create temporary file: $!\n";
-            }
-            $temp_fh = $fh;
-            $temp_filename = $fname;
-        }
-        else { # Processing all VMs
-            for (my $i = 0; $i < $num_vms; $i++) {
-                $vm_windows[$i] = [];
-                $vm_max_peaks[$i] = undef;
-                my ($fh, $fname) = tempfile(UNLINK => 0);
-                unless ($fh) {
-                    die "Error: Could not create temporary file for VM $vm_names[$i]: $!\n";
-                }
-                $temp_fh[$i] = $fh;
-                $temp_filenames[$i] = $fname;
-            }
-        }
-        next; # Done with header, skip to next line
-    }
-
-    # --- Process Data Line ---
-    my $timestamp_str = $fields[0];
-
-    # Apply filters first
-    # <<< DATE/TIME OBJECT PARSING >>>
-    my $tp;
-    eval {
-        $tp = Time::Piece->strptime($timestamp_str, "%Y-%m-%d %H:%M:%S");
-    };
-    if ($@ || !defined $tp) { # Check if strptime failed or returned undef
-        print STDERR "Warning: Could not parse timestamp '$timestamp_str' on line $line_count. Skipping.\n";
+        my $num_vms = scalar(@vm_names_from_physc_header); if ($num_vms == 0) { die "Error: No valid VM columns found in PhysC header.\n"; }
+        print STDERR "Found $num_vms VMs in PhysC header.\n";
+        if (defined $target_vm_name && !defined $target_vm_index_in_physc) { my $avail_vms = join(", ", @vm_names_from_physc_header); $avail_vms = substr($avail_vms, 0, 200) . "..." if length($avail_vms) > 200; die "Error: Target VM '$target_vm_name' not found in PhysC CSV header.\nAvailable VMs: $avail_vms\n"; }
+        if (defined $target_vm_index_in_physc) { $vm_physc_rolling_window_aref = []; $vm_physc_max_peak_scalar = undef; my ($fh, $fname) = tempfile(UNLINK => 0); unless ($fh) { die "Error: Could not create PhysC temp file: $!\n"; } $temp_fh_physc_scalar = $fh; $temp_filename_physc_scalar = $fname; if (defined $runq_csv_file) { $vm_collected_norm_runq_values_aref = []; $vm_collected_abs_runq_values_aref = []; } }
+        else { for (my $i = 0; $i < $num_vms; $i++) { $vm_physc_rolling_windows_list_of_arefs[$i] = []; $vm_physc_max_peaks_list[$i] = undef; my ($fh, $fname) = tempfile(UNLINK => 0); unless ($fh) { die "Error: Could not create PhysC temp file for $vm_names_from_physc_header[$i]: $!\n"; } $temp_fh_physc_list[$i] = $fh; $temp_filenames_physc_list[$i] = $fname; if (defined $runq_csv_file) { $vm_collected_norm_runq_values_list_of_arefs[$i] = []; $vm_collected_abs_runq_values_list_of_arefs[$i] = []; } } }
         next;
     }
+    my $timestamp_str = $fields[0]; my $tp; eval { $tp = Time::Piece->strptime($timestamp_str, "%Y-%m-%d %H:%M:%S"); }; if ($@ || !defined $tp) { print STDERR "Warning: Could not parse timestamp '$timestamp_str' line $line_count. Skipping.\n"; next; }
+    if (defined $start_date_str) { if ($tp->ymd('-') lt $start_date_str) { next; } }
+    if ($no_weekends) { my $day_of_week = $tp->day_of_week; if ($day_of_week == 1 || $day_of_week == 7) { next; } }
+    if ($time_filter_active) { my $line_time = substr($tp->hms(':'), 0, 5); my $include_line = 0; if ($time_filter_overnight) { if ($line_time ge $time_filter_start || $line_time lt $time_filter_end) { $include_line = 1; } } else { if ($line_time ge $time_filter_start && $line_time lt $time_filter_end) { $include_line = 1; } } unless ($include_line) { next; } }
+    $data_lines_processed++; shift @fields; my $num_data_fields = scalar @fields; my $num_header_vms = scalar @vm_names_from_physc_header;
+    if ($num_data_fields != $num_header_vms) { print STDERR "Warning: Line $line_count PhysC field count mismatch ($num_data_fields vs $num_header_vms). Skipping.\n"; next; }
 
-    # <<< START DATE FILTERING >>>
-    if (defined $start_date_str) {
-        if ($tp->ymd('-') lt $start_date_str) {
-            next;
-        }
-    }
-    # <<< WEEKEND FILTERING >>>
-    if ($no_weekends) {
-        my $day_of_week = $tp->day_of_week; # Sunday=1, ..., Saturday=7 as per Time::Piece
-        if ($day_of_week == 1 || $day_of_week == 7) {
-            next; # Skip weekends
-        }
-    }
-    # <<< TIME OF DAY FILTERING >>>
-    if ($time_filter_active) {
-        my $line_time = $tp->hms(':');      # Get HH:MM:SS
-        $line_time = substr($line_time, 0, 5); # Keep only HH:MM for comparison
-
-        my $include_line = 0;
-        if ($time_filter_overnight) {
-            if ($line_time ge $time_filter_start || $line_time lt $time_filter_end) {
-                $include_line = 1;
+    if (defined $target_vm_index_in_physc) { # Single VM
+        my $i = $target_vm_index_in_physc; my $current_vm_name = $target_vm_name;
+        my $physc_value_str = defined $fields[$i] ? $fields[$i] : ''; my $physc_value;
+        if ($physc_value_str =~ /^\s*([0-9.]+)\s*$/) { $physc_value = $1; } else { $physc_value = undef; }
+        if ($calculate_peak && defined $physc_value) { if (!defined($vm_physc_max_peak_scalar) || $physc_value > $vm_physc_max_peak_scalar) { $vm_physc_max_peak_scalar = $physc_value; } }
+        push @{ $vm_physc_rolling_window_aref }, $physc_value; shift @{ $vm_physc_rolling_window_aref } while scalar @{ $vm_physc_rolling_window_aref } > $window_minutes;
+        if (scalar @{ $vm_physc_rolling_window_aref } == $window_minutes) { my $avg = calculate_average(@{ $vm_physc_rolling_window_aref }); if (defined $avg) { print { $temp_fh_physc_scalar } "$avg\n" or die "Error writing PhysC temp file for $current_vm_name: $!"; } }
+        if (defined $runq_csv_file && defined $physc_value && $physc_value >= $ACTIVE_PHYSC_THRESHOLD) {
+            if (exists $runq_data_store{$current_vm_name}{$timestamp_str}) {
+                my $runq_value = $runq_data_store{$current_vm_name}{$timestamp_str};
+                push @{$vm_collected_abs_runq_values_aref}, $runq_value; # Collect absolute runq
+                my $effective_lcpus = $physc_value * $smt_value;
+                if ($effective_lcpus > $FLOAT_EPSILON) { my $norm_runq = $runq_value / $effective_lcpus; push @{$vm_collected_norm_runq_values_aref}, $norm_runq; }
             }
         }
-        else { # Not overnight
-            if ($line_time ge $time_filter_start && $line_time lt $time_filter_end) {
-                $include_line = 1;
-            }
-        }
-        unless ($include_line) {
-            next; # Skip line if it's outside the specified time window
-        }
-    }
-
-    # If we passed all filters, process data for the VM(s)
-    $data_lines_processed++;
-    shift @fields; # Remove timestamp field now, as it's processed
-    my $num_data_fields = scalar @fields;
-    my $num_header_vms = scalar @vm_names; # Total VMs found in header
-
-    if ($num_data_fields != $num_header_vms) {
-        print STDERR "Warning: Line $line_count has $num_data_fields data columns, but header had $num_header_vms VMs. Skipping line data.\n";
-        next;
-    }
-
-    # Process VM Data (Single VM or All VMs)
-    if (defined $target_vm_index) { # Process only the target VM
-        my $i = $target_vm_index; # Use the stored index for the target VM
-        my $value_str = defined $fields[$i] ? $fields[$i] : '';
-        my $value;
-        if ($value_str =~ /^\s*([0-9.]+)\s*$/) { $value = $1; } else { $value = undef; }
-
-        if ($calculate_peak && defined $value) {
-            if (!defined($vm_max_peak) || $value > $vm_max_peak) {
-                $vm_max_peak = $value;
-            }
-        }
-
-        push @{ $vm_window_ref }, $value;
-        shift @{ $vm_window_ref } while scalar @{ $vm_window_ref } > $window_minutes;
-
-        if (scalar @{ $vm_window_ref } == $window_minutes) {
-            my $avg = calculate_average(@{ $vm_window_ref });
-            if (defined $avg) {
-                print { $temp_fh } "$avg\n" or die "Error writing temp file for $target_vm_name: $!";
-            }
-        }
-    }
-    else { # Process all VMs
+    } else { # All VMs
         for (my $i = 0; $i < $num_header_vms; $i++) {
-            my $value_str = defined $fields[$i] ? $fields[$i] : '';
-            my $value;
-            if ($value_str =~ /^\s*([0-9.]+)\s*$/) { $value = $1; } else { $value = undef; }
-
-            if ($calculate_peak && defined $value) {
-                if (!defined($vm_max_peaks[$i]) || $value > $vm_max_peaks[$i]) {
-                    $vm_max_peaks[$i] = $value;
-                }
-            }
-
-            push @{ $vm_windows[$i] }, $value;
-            shift @{ $vm_windows[$i] } while scalar @{ $vm_windows[$i] } > $window_minutes;
-
-            if (scalar @{ $vm_windows[$i] } == $window_minutes) {
-                my $avg = calculate_average(@{ $vm_windows[$i] });
-                if (defined $avg) {
-                    print { $temp_fh[$i] } "$avg\n" or die "Error writing temp file for $vm_names[$i]: $!";
+            my $current_vm_name = $vm_names_from_physc_header[$i];
+            my $physc_value_str = defined $fields[$i] ? $fields[$i] : ''; my $physc_value;
+            if ($physc_value_str =~ /^\s*([0-9.]+)\s*$/) { $physc_value = $1; } else { $physc_value = undef; }
+            if ($calculate_peak && defined $physc_value) { if (!defined($vm_physc_max_peaks_list[$i]) || $physc_value > $vm_physc_max_peaks_list[$i]) { $vm_physc_max_peaks_list[$i] = $physc_value; } }
+            push @{ $vm_physc_rolling_windows_list_of_arefs[$i] }, $physc_value; shift @{ $vm_physc_rolling_windows_list_of_arefs[$i] } while scalar @{ $vm_physc_rolling_windows_list_of_arefs[$i] } > $window_minutes;
+            if (scalar @{ $vm_physc_rolling_windows_list_of_arefs[$i] } == $window_minutes) { my $avg = calculate_average(@{ $vm_physc_rolling_windows_list_of_arefs[$i] }); if (defined $avg) { print { $temp_fh_physc_list[$i] } "$avg\n" or die "Error writing PhysC temp file for $current_vm_name: $!"; } }
+            if (defined $runq_csv_file && defined $physc_value && $physc_value >= $ACTIVE_PHYSC_THRESHOLD) {
+                if (exists $runq_data_store{$current_vm_name}{$timestamp_str}) {
+                    my $runq_value = $runq_data_store{$current_vm_name}{$timestamp_str};
+                    push @{$vm_collected_abs_runq_values_list_of_arefs[$i]}, $runq_value; # Collect absolute runq
+                    my $effective_lcpus = $physc_value * $smt_value;
+                    if ($effective_lcpus > $FLOAT_EPSILON) { my $norm_runq = $runq_value / $effective_lcpus; push @{$vm_collected_norm_runq_values_list_of_arefs[$i]}, $norm_runq; }
                 }
             }
         }
-    } # End if/else target_vm_index for processing VM data
-
-    # Progress Indicator
-    if ($data_lines_processed > 0 && $data_lines_processed % 10000 == 0) {
-        print STDERR "Processed $data_lines_processed data lines (matching filters)...\n";
     }
-} # End while loop over lines
-
-# --- Close Files ---
-close $csv_fh;
-print STDERR "Finished reading $line_count total lines from input file.\n";
+    if ($data_lines_processed > 0 && $data_lines_processed % 10000 == 0) { print STDERR "Processed $data_lines_processed data lines (matching filters)...\n"; }
+}
+# (Closing files, calculating results, and outputting results need to be updated for RunQ metrics)
+close $physc_csv_fh;
+print STDERR "Finished reading $line_count total lines from PhysC file.\n";
 print STDERR "Processed $data_lines_processed data lines matching filters.\n";
-print STDERR "Closing temporary files...\n";
-if (defined $target_vm_index) { # Close single temp file
-     if (defined $temp_fh) {
-         close $temp_fh or warn "Warning: Could not close temporary file handle: $!";
-     }
-}
-else { # Close all temp files
-    foreach my $fh (@temp_fh) {
-        if (defined $fh) {
-            close $fh or warn "Warning: Could not close temporary file handle: $!";
-        }
-    }
-}
-
+print STDERR "Closing PhysC temporary files...\n";
+if (defined $target_vm_index_in_physc) { if (defined $temp_fh_physc_scalar) { close $temp_fh_physc_scalar or warn "Warning: Could not close PhysC temp file handle: $!"; } }
+else { foreach my $fh (@temp_fh_physc_list) { if (defined $fh) { close $fh or warn "Warning: Could not close PhysC temp file handle: $!"; } } }
 
 # --- Calculate Percentiles and Format Output ---
-print STDERR "Calculating results...\n";
-my @results_data; # Store results as hash refs for potential later use/sorting
+print STDERR "Calculating final results...\n";
+my @results_data;
 
-if (defined $target_vm_index) { # Process single VM result
-    my $vm_name = $target_vm_name;
-    my $temp_file = $temp_filename;
-    my @averages;
-    my $percentile_val_raw = undef;
-    my $peak_val_raw = $vm_max_peak; # Use scalar peak value
+if (defined $target_vm_index_in_physc) {
+    my $vm_name = $target_vm_name; my $temp_file_physc = $temp_filename_physc_scalar; my @physc_averages;
+    my $percentile_val_raw = undef; my $peak_val_raw = $vm_physc_max_peak_scalar;
+    my %runq_percentile_results; # Store results like NormRunQ_P90 => value
 
-    # Read temp file into @averages
-    if (! -f $temp_file || ! -s $temp_file) {
-        print STDERR "Warning: Temp file '$temp_file' for VM '$vm_name' empty/missing. Skip percentile.\n" if -e $temp_file;
-        unlink $temp_file or warn "Warning: Del '$temp_file': $!" if -e $temp_file;
-    }
-    else {
-        open my $in_fh, '<', $temp_file or die "Error opening temp file $temp_file: $!";
-        while (my $num = <$in_fh>) {
-            chomp $num;
-            if ($num =~ /^-?[0-9]+(?:\.[0-9]+)?$/) { push @averages, $num; }
-            else { print STDERR "Warning: Non-numeric '$num' in temp file for $vm_name, skipping.\n"; }
+    if (! -f $temp_file_physc || ! -s $temp_file_physc) { print STDERR "Warning: PhysC Temp file '$temp_file_physc' for VM '$vm_name' empty/missing. Skip percentile.\n" if -e $temp_file_physc; unlink $temp_file_physc or warn "Warning: Del '$temp_file_physc': $!" if -e $temp_file_physc; }
+    else { open my $in_fh, '<', $temp_file_physc or die "Error opening PhysC temp file $temp_file_physc: $!"; while (my $num = <$in_fh>) { chomp $num; if ($num =~ /^-?[0-9]+(?:\.[0-9]+)?$/) { push @physc_averages, $num; } else { print STDERR "Warning: Non-numeric '$num' in PhysC temp file for $vm_name, skipping.\n"; } } close $in_fh; unlink $temp_file_physc or warn "Warning: Could not delete PhysC temporary file '$temp_file_physc': $!"; }
+    if (@physc_averages && defined $filter_above_perc_value) { my @sff = sort { $a <=> $b } @physc_averages; my $ft = calculate_percentile(\@sff, $filter_above_perc_value); if (defined $ft) { my @fa = grep { defined($_) && $_ >= ($ft - $FLOAT_EPSILON) } @physc_averages; my $fpl = sprintf("P%.2f", $filter_above_perc_value); $fpl =~ s/\.?0+$//; print STDERR "Info ($vm_name): Filtered " . scalar(@physc_averages) . " PhysC avgs >= $fpl (" . sprintf("%.4f", $ft) . "), -> " . scalar(@fa) . " values for P$percentile calc.\n"; if (@fa) { my @sf = sort { $a <=> $b } @fa; $percentile_val_raw = calculate_percentile(\@sf, $percentile); } else { print STDERR "Warning ($vm_name): Filtering PhysC avgs removed all data. Percentile N/A.\n"; $percentile_val_raw = undef; } } else { print STDERR "Warning ($vm_name): Could not calc PhysC filter threshold. Using all avgs.\n"; if (@physc_averages) { my @sa = sort { $a <=> $b } @physc_averages; $percentile_val_raw = calculate_percentile(\@sa, $percentile); } } }
+    elsif (@physc_averages) { my @sa = sort { $a <=> $b } @physc_averages; $percentile_val_raw = calculate_percentile(\@sa, $percentile); }
+
+    # Calculate requested RunQ percentiles
+    if (defined $runq_csv_file && defined $vm_collected_norm_runq_values_aref && @{$vm_collected_norm_runq_values_aref}) {
+        my @sorted_norm_runq = sort { $a <=> $b } @{$vm_collected_norm_runq_values_aref};
+        foreach my $p_val (@runq_norm_percentiles_to_calc) {
+            my $val = calculate_percentile(\@sorted_norm_runq, $p_val);
+            my $p_label = sprintf("P%.2f", $p_val); $p_label =~ s/\.?0+$//;
+            $runq_percentile_results{"NormRunQ_$p_label"} = defined($val) ? sprintf("%.2f", $val) : "N/A";
         }
-        close $in_fh;
-        unlink $temp_file or warn "Warning: Could not delete temporary file '$temp_file': $!";
     }
-
-    # <<< PERCENTILE FILTERING LOGIC >>>
-    if (@averages && defined $filter_above_perc_value) {
-        my @sorted_for_filter_threshold = sort { $a <=> $b } @averages;
-        my $filter_threshold = calculate_percentile(\@sorted_for_filter_threshold, $filter_above_perc_value);
-
-        if (defined $filter_threshold) {
-            my @filtered_averages = grep { defined($_) && $_ >= ($filter_threshold - $FLOAT_EPSILON) } @averages;
-            print STDERR "Info ($vm_name): Filtered " . scalar(@averages) . " rolling averages >= P$filter_above_perc_value ($filter_threshold), resulting in " . scalar(@filtered_averages) . " values for P$percentile calculation.\n";
-            if (@filtered_averages) {
-                my @sorted_for_final_percentile = sort { $a <=> $b } @filtered_averages;
-                $percentile_val_raw = calculate_percentile(\@sorted_for_final_percentile, $percentile);
-            } else {
-                print STDERR "Warning ($vm_name): Filtering >= P$filter_above_perc_value removed all data points. Percentile is N/A.\n";
-                $percentile_val_raw = undef; # Ensure it's undef
-            }
-        } else {
-             print STDERR "Warning ($vm_name): Could not calculate filter threshold P$filter_above_perc_value. Skipping filtering. Using all averages.\n";
-             if (@averages) {
-                 my @sorted_unfiltered = sort { $a <=> $b } @averages;
-                 $percentile_val_raw = calculate_percentile(\@sorted_unfiltered, $percentile);
-             }
-        }
-    } elsif (@averages) {
-        # Calculate percentile normally if no filtering requested or @averages is empty (handled by calculate_percentile)
-        my @sorted_averages = sort { $a <=> $b } @averages;
-        $percentile_val_raw = calculate_percentile(\@sorted_averages, $percentile);
-    }
-    # <<< END PERCENTILE FILTERING LOGIC >>>
-
-    # Apply Rounding and Format
-    my $percentile_val_final_str;
-    my $peak_val_final_str;
-    my $sprintf_format = "%.".$output_dp."f";
-
-    if (defined $percentile_val_raw) {
-        my $rounded_val = apply_rounding($percentile_val_raw, $round_increment, $rounding_method);
-        $percentile_val_final_str = sprintf($sprintf_format, $rounded_val);
-    } else {
-        $percentile_val_final_str = "N/A";
-    }
-
-    if ($calculate_peak) {
-        if (defined $peak_val_raw) {
-            my $rounded_val = apply_rounding($peak_val_raw, $round_increment, $rounding_method);
-            $peak_val_final_str = sprintf($sprintf_format, $rounded_val);
-        } else {
-            $peak_val_final_str = "N/A";
+    if (defined $runq_csv_file && defined $vm_collected_abs_runq_values_aref && @{$vm_collected_abs_runq_values_aref}) {
+        my @sorted_abs_runq = sort { $a <=> $b } @{$vm_collected_abs_runq_values_aref};
+        foreach my $p_val (@runq_abs_percentiles_to_calc) {
+            my $val = calculate_percentile(\@sorted_abs_runq, $p_val);
+            my $p_label = sprintf("P%.2f", $p_val); $p_label =~ s/\.?0+$//;
+            $runq_percentile_results{"AbsRunQ_$p_label"} = defined($val) ? sprintf("%.2f", $val) : "N/A";
         }
     }
 
-    my $result_percentile_label = sprintf("P%.2f", $percentile);
-    $result_percentile_label =~ s/\.?0+$//; # Clean up trailing .0 or .00
-    my $output_line = "$vm_name: $result_percentile_label=$percentile_val_final_str";
-    if ($calculate_peak) {
-        $output_line .= " Peak=$peak_val_final_str";
-    }
-    push @results_data, { line => $output_line };
+    my $percentile_final_str; my $peak_final_str; my $sprintf_format = "%.".$output_dp."f";
+    if (defined $percentile_val_raw) { my $r = apply_rounding($percentile_val_raw, $round_increment, $rounding_method); $percentile_final_str = sprintf($sprintf_format, $r); } else { $percentile_final_str = "N/A"; }
+    if ($calculate_peak) { if (defined $peak_val_raw) { my $r = apply_rounding($peak_val_raw, $round_increment, $rounding_method); $peak_final_str = sprintf($sprintf_format, $r); } else { $peak_final_str = "N/A"; } }
+    my $p_label = sprintf("P%.2f", $percentile); $p_label =~ s/\.?0+$//;
+    my $out_line = "$vm_name: $p_label=$percentile_final_str";
+    if ($calculate_peak) { $out_line .= " Peak=$peak_final_str"; }
+    foreach my $key (sort keys %runq_percentile_results) { $out_line .= " $key=$runq_percentile_results{$key}"; }
+    push @results_data, { line => $out_line };
 }
 else { # Process all VMs
-    for (my $i = 0; $i <= $#vm_names; $i++) {
-        my $vm_name = $vm_names[$i];
-        my $temp_file = $temp_filenames[$i];
-        my @averages;
-        my $percentile_val_raw = undef;
-        my $peak_val_raw = $vm_max_peaks[$i]; # Use array peak value
+    for (my $i = 0; $i <= $#vm_names_from_physc_header; $i++) {
+        my $vm_name = $vm_names_from_physc_header[$i]; my $temp_file_physc = $temp_filenames_physc_list[$i]; my @physc_averages;
+        my $percentile_val_raw = undef; my $peak_val_raw = $vm_physc_max_peaks_list[$i];
+        my %runq_percentile_results;
 
-        # Read temp file into @averages
-        if (! -f $temp_file || ! -s $temp_file) {
-            print STDERR "Warning: Temp file '$temp_file' for VM '$vm_name' empty/missing. Skip percentile.\n" if -e $temp_file;
-            unlink $temp_file or warn "Warning: Del '$temp_file': $!" if -e $temp_file;
+        if (! -f $temp_file_physc || ! -s $temp_file_physc) { print STDERR "Warning: PhysC Temp file '$temp_file_physc' for VM '$vm_name' empty/missing. Skip percentile.\n" if -e $temp_file_physc; unlink $temp_file_physc or warn "Warning: Del '$temp_file_physc': $!" if -e $temp_file_physc; }
+        else { open my $in_fh, '<', $temp_file_physc or die "Error opening PhysC temp file $temp_file_physc: $!"; while (my $num = <$in_fh>) { chomp $num; if ($num =~ /^-?[0-9]+(?:\.[0-9]+)?$/) { push @physc_averages, $num; } else { print STDERR "Warning: Non-numeric '$num' in PhysC temp file for $vm_name, skipping.\n"; } } close $in_fh; unlink $temp_file_physc or warn "Warning: Could not delete PhysC temporary file '$temp_file_physc': $!"; }
+        if (@physc_averages && defined $filter_above_perc_value) { my @sff = sort { $a <=> $b } @physc_averages; my $ft = calculate_percentile(\@sff, $filter_above_perc_value); if (defined $ft) { my @fa = grep { defined($_) && $_ >= ($ft - $FLOAT_EPSILON) } @physc_averages; if (@fa) { my @sf = sort { $a <=> $b } @fa; $percentile_val_raw = calculate_percentile(\@sf, $percentile); } else { print STDERR "Warning ($vm_name): Filtering PhysC avgs removed all data. Percentile N/A.\n"; $percentile_val_raw = undef; } } else { print STDERR "Warning ($vm_name): Could not calc PhysC filter threshold. Using all avgs.\n"; if (@physc_averages) { my @sa = sort { $a <=> $b } @physc_averages; $percentile_val_raw = calculate_percentile(\@sa, $percentile); } } }
+        elsif (@physc_averages) { my @sa = sort { $a <=> $b } @physc_averages; $percentile_val_raw = calculate_percentile(\@sa, $percentile); }
+
+        if (defined $runq_csv_file && defined $vm_collected_norm_runq_values_list_of_arefs[$i] && @{$vm_collected_norm_runq_values_list_of_arefs[$i]}) {
+            my @sorted_norm_runq = sort { $a <=> $b } @{$vm_collected_norm_runq_values_list_of_arefs[$i]};
+            foreach my $p_val (@runq_norm_percentiles_to_calc) { my $val = calculate_percentile(\@sorted_norm_runq, $p_val); my $p_lbl = sprintf("P%.2f", $p_val); $p_lbl =~ s/\.?0+$//; $runq_percentile_results{"NormRunQ_$p_lbl"} = defined($val) ? sprintf("%.2f", $val) : "N/A"; }
         }
-        else {
-            open my $in_fh, '<', $temp_file or die "Error opening temp file $temp_file: $!";
-            while (my $num = <$in_fh>) {
-                chomp $num;
-                if ($num =~ /^-?[0-9]+(?:\.[0-9]+)?$/) { push @averages, $num; }
-                else { print STDERR "Warning: Non-numeric '$num' in temp file for $vm_name, skipping.\n"; }
-            }
-            close $in_fh;
-            unlink $temp_file or warn "Warning: Could not delete temporary file '$temp_file': $!";
+        if (defined $runq_csv_file && defined $vm_collected_abs_runq_values_list_of_arefs[$i] && @{$vm_collected_abs_runq_values_list_of_arefs[$i]}) {
+            my @sorted_abs_runq = sort { $a <=> $b } @{$vm_collected_abs_runq_values_list_of_arefs[$i]};
+            foreach my $p_val (@runq_abs_percentiles_to_calc) { my $val = calculate_percentile(\@sorted_abs_runq, $p_val); my $p_lbl = sprintf("P%.2f", $p_val); $p_lbl =~ s/\.?0+$//; $runq_percentile_results{"AbsRunQ_$p_lbl"} = defined($val) ? sprintf("%.2f", $val) : "N/A"; }
         }
 
-        # <<< PERCENTILE FILTERING LOGIC (inside loop) >>>
-        if (@averages && defined $filter_above_perc_value) {
-             my @sorted_for_filter_threshold = sort { $a <=> $b } @averages;
-             my $filter_threshold = calculate_percentile(\@sorted_for_filter_threshold, $filter_above_perc_value);
-             if (defined $filter_threshold) {
-                 my @filtered_averages = grep { defined($_) && $_ >= ($filter_threshold - $FLOAT_EPSILON) } @averages;
-                 if (@filtered_averages) {
-                     my @sorted_for_final_percentile = sort { $a <=> $b } @filtered_averages;
-                     $percentile_val_raw = calculate_percentile(\@sorted_for_final_percentile, $percentile);
-                 } else {
-                     print STDERR "Warning ($vm_name): Filtering >= P$filter_above_perc_value removed all data points. Percentile is N/A.\n";
-                     $percentile_val_raw = undef;
-                 }
-             } else {
-                  print STDERR "Warning ($vm_name): Could not calculate filter threshold P$filter_above_perc_value. Skipping filtering. Using all averages.\n";
-                  if (@averages) {
-                      my @sorted_unfiltered = sort { $a <=> $b } @averages;
-                      $percentile_val_raw = calculate_percentile(\@sorted_unfiltered, $percentile);
-                  }
-             }
-         } elsif (@averages) {
-             my @sorted_averages = sort { $a <=> $b } @averages;
-             $percentile_val_raw = calculate_percentile(\@sorted_averages, $percentile);
-         }
-         # <<< END PERCENTILE FILTERING LOGIC >>>
-
-        # Apply Rounding and Format
-        my $percentile_val_final_str;
-        my $peak_val_final_str;
-        my $sprintf_format = "%.".$output_dp."f";
-        if (defined $percentile_val_raw) {
-            my $rounded_val = apply_rounding($percentile_val_raw, $round_increment, $rounding_method);
-            $percentile_val_final_str = sprintf($sprintf_format, $rounded_val);
-        } else { $percentile_val_final_str = "N/A"; }
-        if ($calculate_peak) {
-            if (defined $peak_val_raw) {
-                my $rounded_val = apply_rounding($peak_val_raw, $round_increment, $rounding_method);
-                $peak_val_final_str = sprintf($sprintf_format, $rounded_val);
-            } else { $peak_val_final_str = "N/A"; }
-        }
-        my $result_percentile_label = sprintf("P%.2f", $percentile);
-        $result_percentile_label =~ s/\.?0+$//;
-        my $output_line = "$vm_name: $result_percentile_label=$percentile_val_final_str";
-        if ($calculate_peak) { $output_line .= " Peak=$peak_val_final_str"; }
-        push @results_data, { line => $output_line };
-
-        if (($i + 1) % 100 == 0) {
-            print STDERR "Processed results for " . ($i+1) . " VMs...\n";
-        }
+        my $percentile_final_str; my $peak_final_str; my $sprintf_format = "%.".$output_dp."f";
+        if (defined $percentile_val_raw) { my $r = apply_rounding($percentile_val_raw, $round_increment, $rounding_method); $percentile_final_str = sprintf($sprintf_format, $r); } else { $percentile_final_str = "N/A"; }
+        if ($calculate_peak) { if (defined $peak_val_raw) { my $r = apply_rounding($peak_val_raw, $round_increment, $rounding_method); $peak_final_str = sprintf($sprintf_format, $r); } else { $peak_final_str = "N/A"; } }
+        my $p_label = sprintf("P%.2f", $percentile); $p_label =~ s/\.?0+$//;
+        my $out_line = "$vm_name: $p_label=$percentile_final_str";
+        if ($calculate_peak) { $out_line .= " Peak=$peak_final_str"; }
+        foreach my $key (sort keys %runq_percentile_results) { $out_line .= " $key=$runq_percentile_results{$key}"; }
+        push @results_data, { line => $out_line };
+        if (($i + 1) % 100 == 0) { print STDERR "Processed results for " . ($i+1) . " VMs...\n"; }
     }
 }
 
 # --- Output Results ---
-# Calculate label for the header *before* the print statement
-my $header_percentile_label = sprintf("P%.2f", $percentile);
-$header_percentile_label =~ s/\.?0+$//;
-
-my $rounding_note = ($rounding_method ne 'none') ? " (Rounded $rounding_method to increment $round_increment)" : "";
-my $filter_note = $time_filter_active ? " (Time Filter: $time_filter_desc)" : "";
-my $weekend_note = $no_weekends ? " (Weekends Excluded)" : "";
-my $perc_filter_note = defined($filter_above_perc_value) ? " (Perc Filter >= P$filter_above_perc_value)" : "";
-my $peak_note = $calculate_peak ? " (Peak Calc: Yes)" : "";
-
-if (@results_data) {
-    print STDERR "\n--- Run Summary ($header_percentile_label, W=$window_minutes)$peak_note$rounding_note$filter_note$weekend_note$perc_filter_note ---\n";
-} else {
-    print STDERR "\n--- No results generated for this run (check filters/data) ---\n";
-}
-
-# Print the actual result lines to STDOUT
-foreach my $res (@results_data) {
-    print STDOUT $res->{line} . "\n";
-}
-
-my $end_time = time();
-my $duration = $end_time - $start_time;
+# (Summary header construction logic is the same as v1.26)
+my $header_run_params_label = sprintf("P%.2f", $percentile); $header_run_params_label =~ s/\.?0+$//; $header_run_params_label .= ", W=$window_minutes"; my $rounding_note = ($rounding_method ne 'none') ? " (Rounded $rounding_method to $round_increment)" : ""; my $filter_note = $time_filter_active ? " (Time Filter: $time_filter_desc)" : ""; my $weekend_note = $no_weekends ? " (Weekends Excluded)" : ""; my $perc_filter_note = defined($filter_above_perc_value) ? " (PhysC Perc Filter >= P$filter_above_perc_value)" : ""; my $peak_note = $calculate_peak ? " (Peak Calc: Yes)" : ""; my $runq_note = defined($runq_csv_file) ? " (RunQ SMT: $smt_value, NormPercs: $runq_norm_perc_str, AbsPercs: $runq_abs_perc_str)" : ""; # Updated RunQ Note
+if (@results_data) { print STDERR "\n--- Run Summary ($header_run_params_label)$peak_note$runq_note$rounding_note$filter_note$weekend_note$perc_filter_note ---\n"; } else { print STDERR "\n--- No results generated for this run (check filters/data) ---\n"; }
+foreach my $res (@results_data) { print STDOUT $res->{line} . "\n"; }
+my $end_time = time(); my $duration = $end_time - $start_time;
 print STDERR "\nProcessing completed in $duration seconds.\n";
 exit 0;
 
 # ==============================================================================
 # Subroutines
 # ==============================================================================
+# (calculate_average, calculate_percentile, apply_rounding, get_decimal_places - no change)
+sub calculate_average { my @values = @_; my @defined_values = grep { defined($_) && $_ ne '' } @values; my $count = scalar @defined_values; return undef if $count == 0; my $sum = sum0(@defined_values); return $sum / $count; }
+sub calculate_percentile { my ($sorted_data_ref, $p) = @_; unless (defined $sorted_data_ref && ref $sorted_data_ref eq 'ARRAY') { print STDERR "Warning: Invalid data reference to calculate_percentile\n"; return undef; } my @data = @{$sorted_data_ref}; my $n = scalar @data; return undef if $n == 0; return $data[0] if $n == 1; my $rank_fractional = ($p / 100) * ($n - 1); my $k = int($rank_fractional); my $d = $rank_fractional - $k; if ($k >= $n - 1) { return $data[$n - 1]; } elsif ($k < 0) { return $data[0]; } else { my $next_val = ($k + 1 < $n) ? $data[$k + 1] : $data[$k]; return $data[$k] + $d * ($next_val - $data[$k]); } }
+sub apply_rounding { my ($value, $increment, $method) = @_; return $value unless (defined $value && $value =~ /^-?[0-9]+(?:\.[0-9]+)?$/); return $value if $method eq 'none' || !defined $increment || $increment <= 0; my $rounded_value; if ($method eq 'standard') { $rounded_value = int( ($value / $increment) + 0.5 ) * $increment; } elsif ($method eq 'up') { $rounded_value = ceil( $value / $increment ) * $increment; } else { $rounded_value = $value; } return $rounded_value; }
+sub get_decimal_places { my ($number) = @_; $number = sprintf("%.15f", $number) if ($number =~ /e/i); if ($number =~ /\.(\d+)$/) { return length($1); } else { return 0; } }
 
-sub calculate_average
+# --- New Subroutine to parse percentile lists ---
+sub parse_percentile_list
 {
-    my @values = @_;
-    my @defined_values = grep { defined($_) && $_ ne '' } @values;
-    my $count = scalar @defined_values;
-    return undef if $count == 0;
-    my $sum = sum0(@defined_values); # sum0 handles numbers, treats undef in list as 0
-    return $sum / $count;
+    my ($perc_str, $arg_name) = @_;
+    my @percentiles;
+    if (defined $perc_str && $perc_str ne '') {
+        @percentiles = split /,\s*/, $perc_str;
+        foreach my $p (@percentiles) {
+            if ($p !~ /^[0-9]+(?:\.[0-9]+)?$/ || $p < 0 || $p > 100) {
+                die "Error: Invalid percentile value '$p' in --$arg_name list. Must be numeric between 0 and 100.\n";
+            }
+        }
+    }
+    return @percentiles;
 }
 
-sub calculate_percentile
-{
-    my ($sorted_data_ref, $p) = @_;
-    unless (defined $sorted_data_ref && ref $sorted_data_ref eq 'ARRAY') {
-         print STDERR "Warning: Invalid data reference passed to calculate_percentile\n";
-         return undef;
-    }
-    my @data = @{$sorted_data_ref};
-    my $n = scalar @data;
-
-    return undef if $n == 0; # Handle empty array after filtering
-    return $data[0] if $n == 1;
-
-    # Calculate rank using linear interpolation (like Excel PERCENTILE.INC)
-    my $rank_fractional = ($p / 100) * ($n - 1);
-
-    my $k = int($rank_fractional);      # Integer part of the rank (lower index)
-    my $d = $rank_fractional - $k;      # Fractional part of the rank
-
-    if ($k >= $n - 1) { # Handle case where rank is at or beyond the last element
-        return $data[$n - 1];
-    }
-    elsif ($k < 0) { # Should not happen with p>=0 and n>0, but safeguard
-        return $data[0];
-    }
-    else {
-        # Linear interpolation: value_at_k + fraction * (value_at_k+1 - value_at_k)
-        # Ensure k+1 is within bounds, if k is last possible index (n-1), next_val is same
-        my $next_val = ($k + 1 < $n) ? $data[$k + 1] : $data[$k];
-        return $data[$k] + $d * ($next_val - $data[$k]);
-    }
-}
-
-sub apply_rounding
-{
-    my ($value, $increment, $method) = @_;
-    return $value unless (defined $value && $value =~ /^-?[0-9]+(?:\.[0-9]+)?$/);
-    return $value if $method eq 'none' || !defined $increment || $increment <= 0;
-
-    my $rounded_value;
-    if ($method eq 'standard') {
-        $rounded_value = int( ($value / $increment) + 0.5 ) * $increment;
-    }
-    elsif ($method eq 'up') {
-        # Use POSIX::ceil for reliable ceiling function
-        $rounded_value = ceil( $value / $increment ) * $increment;
-    }
-    else { # Fallback
-        $rounded_value = $value;
-    }
-    return $rounded_value;
-}
-
-sub get_decimal_places
-{
-    my ($number) = @_;
-    # Convert scientific notation if present before checking format
-    $number = sprintf("%.15f", $number) if ($number =~ /e/i); # Handle potential sci notation
-    if ($number =~ /\.(\d+)$/) {
-        return length($1);
-    }
-    else {
-        return 0; # Integer increment
-    }
-}
-
+# Updated usage subroutine
 sub usage
 {
-    my $script_name = $0;
-    $script_name =~ s{.*/}{}; # Get basename of script for usage message
-    # Keep heredoc formatting as is for multi-line string
+    my $script_name = $0; $script_name =~ s{.*/}{};
     return <<END_USAGE;
-Usage: $script_name -f <csv> [-w <win>] [-p <perc>] [-s <date>] [-k] [-r[=inc]|-u[=inc]]
-          [-vm <name>] [-startt <HH:MM> -endt <HH:MM> | -online | -batch]
-          [-no-weekends] [--filter-above-perc <N>] [-h|v]
+Usage: $script_name --physc-data <file> [--runq-data <file>] [--smt <N>]
+                  [--runq-norm-perc <list>] [--runq-abs-perc <list>] [options]
 
-Analyses NMON PhysC data for AIX and Linux on Power VM right-sizing recommendations.
-Calculates rolling average percentiles and optionally absolute peaks,
-with filtering by date, time, VM, weekends, and percentile threshold,
-plus rounding options.
+Analyses NMON PhysC and optionally RunQ data for AIX/Linux on Power VM right-sizing.
 
-Arguments:
-  Filtering:
-    -f, --file <csv_file>      : Path to input CSV file (required).
-    -vm, --lpar <name>         : Optional. Analyse only the specified VM/LPAR name.
-    -s, --startdate <YYYY-MM-DD> : Optional. Ignore data before this date.
-    -startt <HH:MM>            : Optional. Start time for daily filter (requires -endt).
-    -endt <HH:MM>              : Optional. End time (exclusive) for daily filter (requires -startt).
-    -online                    : Shortcut for -startt 08:00 -endt 17:00.
-    -batch                     : Shortcut for -startt 18:00 -endt 06:00 (overnight).
-                                 (Cannot mix shortcuts with manual startt/endt)
-    -no-weekends               : Optional. Exclude data from Saturdays and Sundays.
+Core Input:
+  --physc-data, -pc <file> : Path to input CSV file with PhysC data (required).
+  --runq-data, -rq <file>  : Optional. Path to input CSV file with RunQ data.
+                           Format: "Time","VM1 RunQ","VM2 RunQ",...
+  --smt <N>                : Optional. SMT level for RunQ normalisation (Default: $DEFAULT_SMT).
 
-  Calculation:
-    -w, --window <minutes>     : Rolling average window size (Default: $DEFAULT_WINDOW_MINUTES).
-    -p, --percentile <value>   : Final percentile to calculate (0-100) (Default: $DEFAULT_PERCENTILE).
-    -k, --peak                 : Optional. Calculate the absolute maximum peak PhysC value.
-    --filter-above-perc <N>    : Optional. Calculate final percentile (-p) only using rolling
-                                 average values that are >= the Nth percentile (0-100)
-                                 of all rolling averages in the filtered dataset.
+RunQ Percentile Options (if --runq-data specified):
+  --runq-norm-perc <list>  : Optional. Comma-separated list of percentiles for Normalised RunQ
+                           (e.g., "50,90", Default: "$DEFAULT_RUNQ_NORM_PERC").
+  --runq-abs-perc <list>   : Optional. Comma-separated list of percentiles for Absolute RunQ
+                           (e.g., "90", Default: "$DEFAULT_RUNQ_ABS_PERC").
 
-  Rounding:
-    -r[=increment]             : Optional. Round results to NEAREST increment.
-                                 Defaults to increment $DEFAULT_ROUND_INCREMENT if '=increment' is omitted.
-    -u[=increment]             : Optional. Round results UP to nearest increment.
-                                 Defaults to increment $DEFAULT_ROUND_INCREMENT if '=increment' is omitted.
-                                 (-r and -u are mutually exclusive)
-  Other:
-    -h, --help                 : Display this help message.
-    -v, --version              : Display script version.
+Filtering Options:
+  -s, --startdate <YYYY-MM-DD> : Ignore data before this date.
+  -startt <HH:MM>            : Start time for daily filter (requires -endt).
+  -endt <HH:MM>              : End time (exclusive) for daily filter (requires -startt).
+  -online                    : Shortcut for -startt 08:00 -endt 17:00.
+  -batch                     : Shortcut for -startt 18:00 -endt 06:00 (overnight).
+  -no-weekends               : Exclude data from Saturdays and Sundays.
+  -vm, --lpar <name>         : Analyse only the specified VM/LPAR name.
+
+PhysC Calculation Options:
+  -w, --window <minutes>     : Rolling average window size for PhysC (Default: $DEFAULT_WINDOW_MINUTES min).
+  -p, --percentile <value>   : Final percentile of PhysC rolling average (0-100) (Default: P$DEFAULT_PERCENTILE).
+  -k, --peak                 : Calculate the absolute maximum peak PhysC value.
+  --filter-above-perc <N>    : Optional. Calculate final PhysC percentile (-p) only using rolling
+                               average PhysC values >= the Nth percentile (0-100)
+                               of all rolling PhysC averages in the filtered dataset.
+Rounding Options:
+  -r[=increment]             : Round results to NEAREST increment (Default: $DEFAULT_ROUND_INCREMENT).
+  -u[=increment]             : Round results UP to nearest increment (Default: $DEFAULT_ROUND_INCREMENT).
+                               (-r and -u are mutually exclusive)
+Other:
+  -h, --help                 : Display this help message.
+  -v, --version              : Display script version.
 
 Output Format (to STDOUT):
-  VMName: PXX=PercentileValue [Peak=PeakValue]
-  (Peak value is only included if -k option is used)
-  (Values formatted to 4 decimals by default, or matching increment if rounded)
+  VMName: PXX=Val Peak=Val [NormRunQ_P50=Val NormRunQ_P90=Val AbsRunQ_P90=Val ...]
+  (RunQ metrics included if --runq-data is specified, labels match requested percs)
 
 Example:
-  # P95 (15m win) using only rolling averages >= P50, Online hours, No weekends, Peak, Round up 0.05
-  $script_name -f data.csv -w 15 -p 95 --filter-above-perc 50 -online -no-weekends -k -u
-
-  # P90 (30m win) for 'vm01', Batch hours only
-  $script_name -f data.csv -w 30 -p 90 -batch -vm vm01
+  $script_name -pc nmon_physc.csv -rq nmon_runq.csv --smt 8 -p 95 -w 15 -k \\
+    --runq-norm-perc "50,75,90" --runq-abs-perc "90,95"
 END_USAGE
 }
-
-# ==============================================================================
-# Script Purpose & Calculation Method Explanation (Embedded)
-# ==============================================================================
-# (As generated in a previous response, for user to paste in or keep separate)
-#
-# Goal:
-# This script analyses historical CPU usage data (specifically PhysC from NMON)
-# for multiple AIX and/or Linux on Power VMs to generate data points useful for recommending CPU
-# entitlement values. It aims to provide statistically derived values that
-# reflect different aspects of system load (sustained usage, absolute peaks),
-# allowing for informed decisions that balance performance needs with efficient
-# resource allocation across different service tiers (e.g., Tier 1, 2, 3).
-#
-# Input Data:
-# The script processes a CSV file containing time-series data, typically with
-# columns like: "Time","VM1 PhysC","VM2 PhysC",...
-# - "Time": Timestamp for the data row (e.g., "2025-04-15 11:48:00").
-# - "VMn PhysC": Physical CPU cores consumed by the specific LPAR (VM)
-#   during that interval. This is the primary metric used.
-#
-# Core Calculation Methods:
-# 1. Percentile of Rolling Average (Output: PXX=Value):
-#    - Calculates a 'rolling average' of the PhysC for each VM over a specified
-#      time 'window' (e.g., default 15 minutes, set by -w). This smooths out
-#      very brief spikes and reflects the *sustained* CPU load over the window.
-#    - It then computes a specified statistical percentile (e.g., 95th, set by -p)
-#      from the *distribution* of all the rolling average values calculated during
-#      the analysed timeframe (after filtering).
-#    - Meaning (e.g., P95): Represents the sustained CPU load level (rolling avg)
-#      that the VM was at or below for 95% of the analysed time.
-#    - Use Case: Useful for sizing Tiers that need to handle typical high load
-#      but not necessarily the absolute, potentially anomalous, peak moment
-#      (e.g., Tier 2, Tier 3).
-#
-# 2. Absolute Peak (Output: Peak=Value, Optional):
-#    - If requested via the '-k' flag, the script also finds the single highest
-#      instantaneous 'PhysC' value recorded for the VM during the analysed
-#      timeframe (after filtering).
-#    - Meaning: Represents the maximum physical CPU resource the VM consumed in
-#      any single measurement interval.
-#    - Use Case: Useful for sizing Tiers that require guaranteed resources to
-#      meet the absolute maximum demand, regardless of how brief it was
-#      (e.g., Tier 1, mission-critical low-latency systems).
-#
-# Data Filtering Options:
-# 1. Date Filtering (-s YYYY-MM-DD):
-#    - Ignores data points from before the given start date.
-# 2. Time-of-Day Filtering (-startt HH:MM, -endt HH:MM, -online, -batch):
-#    - Restricts calculations to specific hours within each day.
-#    - '-online' (08:00-<17:00), '-batch' (18:00-<06:00 overnight).
-# 3. Weekend Filtering (-no-weekends):
-#    - Excludes data from Saturdays and Sundays.
-# 4. Percentile Filtering (--filter-above-perc N):
-#    - Calculates the final percentile (-p) using only those rolling average
-#      values that are themselves at or above the Nth percentile of all
-#      rolling averages from the (already filtered) dataset. This helps focus
-#      on the busier periods of sustained load.
-#
-# Optional Rounding (-r[=inc], -u[=inc]):
-# - Aligns outputs with specific hardware entitlement increments (default 0.05).
-# - '-r' rounds to nearest, '-u' rounds up (ceiling).
-#
-# ==============================================================================
