@@ -1,13 +1,13 @@
 #!/usr/bin/env perl
 
 # NAME     : nfit-profile
-# VERSION  : 2.33.147.0 # Added profile-controlled runq_modifier_behavior
+# VERSION  : 2.34.147.0 # Added --nfit-runq-avg-method to pass to nfit
 # AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
-# PURPOSE  : Runs 'nfit' (which can now do internal windowed decay)
+# PURPOSE  : Runs 'nfit' (which can now do internal windowed decay and RunQ smoothing)
 #            multiple times with user-defined profiles.
 #            Applies RunQ modifiers (behavior controllable per profile),
 #            generates hints, and aggregates to CSV.
-# REQUIRES : Perl, nfit script (v2.27.0+ with internal windowed decay),
+# REQUIRES : Perl, nfit script (v2.28.0+ with internal windowed decay & runq-avg-method),
 #            Time::Piece, List::Util, version
 
 use strict;
@@ -16,11 +16,11 @@ use Getopt::Long qw(GetOptions);
 use Cwd qw(abs_path);
 use File::Basename qw(dirname);
 use Time::Piece;
-use List::Util qw(sum min max); # Ensure max is included if used
+use List::Util qw(sum min max);
 use version;
 
 # --- Version ---
-my $SCRIPT_VERSION = '2.33.147.0';
+my $SCRIPT_VERSION = '2.34.147.0';
 
 # --- Configuration ---
 my $DEFAULT_ROUND_INCREMENT = 0.05;
@@ -29,6 +29,7 @@ my $DEFAULT_PROFILES_CONFIG_FILE = "nfit.profiles.cfg";
 my $DEFAULT_SMT_VALUE_PROFILE = 8;
 my $DEFAULT_RUNQ_NORM_PERCS = "50,90";
 my $DEFAULT_RUNQ_ABS_PERCS  = "90";
+my $DEFAULT_NFIT_RUNQ_AVG_METHOD = "ema"; # Default to ema for RunQ smoothing in nfit
 
 # Windowed Decay Defaults (passed to nfit if enabled)
 my $DEFAULT_PROCESS_WINDOW_UNIT_FOR_NFIT = "weeks";
@@ -85,6 +86,7 @@ my $nfit_window_unit_str = $DEFAULT_PROCESS_WINDOW_UNIT_FOR_NFIT;
 my $nfit_window_size_val = $DEFAULT_PROCESS_WINDOW_SIZE_FOR_NFIT;
 my $nfit_decay_half_life_days_val = $DEFAULT_DECAY_HALF_LIFE_DAYS_FOR_NFIT;
 my $nfit_analysis_reference_date_str;
+my $nfit_runq_avg_method_str = $DEFAULT_NFIT_RUNQ_AVG_METHOD; # New option
 
 GetOptions(
     'physc-data|pc=s'         => \$physc_data_file,
@@ -107,6 +109,7 @@ GetOptions(
     'nfit-process-window-size=i'     => \$nfit_window_size_val,
     'nfit-decay-half-life-days=i'    => \$nfit_decay_half_life_days_val,
     'nfit-analysis-reference-date=s' => \$nfit_analysis_reference_date_str,
+    'nfit-runq-avg-method=s'         => \$nfit_runq_avg_method_str, # New CLI option
 ) or die usage_wrapper();
 
 # --- Validation ---
@@ -120,19 +123,24 @@ if ($show_version)
         if (defined $nfit_ver)
         {
             print STDERR "Uses nfit version: $nfit_ver\n";
-            # Assuming nfit version with internal windowed decay is 2.27.0+
-            # And that it also supports the --enddate flag used by older nfit-profile windowing logic
-            if ($nfit_enable_windowed_decay && version->parse($nfit_ver) < version->parse("2.27.0"))
+            my $required_nfit_ver_for_windowing = "2.27.0"; # nfit version with internal windowed decay
+            my $required_nfit_ver_for_runq_avg = "2.28.0"; # Hypothetical nfit version with runq-avg-method
+            
+            if ($nfit_enable_windowed_decay && version->parse($nfit_ver) < version->parse($required_nfit_ver_for_windowing))
             {
-                print STDERR "Warning: --nfit-enable-windowed-decay requires nfit version 2.27.0 or higher for internal windowed decay support. Your nfit version ($nfit_ver) may not support this.\n";
+                print STDERR "Warning: --nfit-enable-windowed-decay requires nfit version $required_nfit_ver_for_windowing or higher. Your nfit version ($nfit_ver) may not support this.\n";
+            }
+            if (defined $nfit_runq_avg_method_str && $nfit_runq_avg_method_str ne 'none' && version->parse($nfit_ver) < version->parse($required_nfit_ver_for_runq_avg))
+            {
+                 print STDERR "Warning: --nfit-runq-avg-method (sma/ema) requires nfit version $required_nfit_ver_for_runq_avg or higher. Your nfit version ($nfit_ver) may not support this specific RunQ processing.\n";
             }
         }
         else
         {
             print STDERR "Could not determine nfit version from output: $nfit_ver_output\n";
-            if ($nfit_enable_windowed_decay)
+            if ($nfit_enable_windowed_decay || (defined $nfit_runq_avg_method_str && $nfit_runq_avg_method_str ne 'none'))
             {
-                print STDERR "Warning: --nfit-enable-windowed-decay requires nfit with internal windowed decay support. Cannot verify nfit version.\n";
+                print STDERR "Warning: Advanced nfit features are enabled but nfit version cannot be verified.\n";
             }
         }
     }
@@ -150,16 +158,26 @@ if ($default_smt_arg <= 0) { die "Error: --default-smt value must be a positive 
 if (! -x $nfit_script_path) { die "Error: Cannot find or execute 'nfit' script at '$nfit_script_path'. Use --nfit-path.\n"; }
 if (defined($round_arg) && defined($roundup_arg)) { die "Error: -round (-r) and -roundup (-u) options are mutually exclusive.\n"; }
 if (defined $start_date_str && $start_date_str !~ /^\d{4}-\d{2}-\d{2}$/) { die "Error: Invalid startdate (-s) format '$start_date_str'. Use YYYY-MM-DD.\n"; }
+
 if ($nfit_enable_windowed_decay) {
     if ($nfit_window_unit_str ne "days" && $nfit_window_unit_str ne "weeks") { die "Error: --nfit-process-window-unit must be 'days' or 'weeks'.\n"; }
     if ($nfit_window_size_val < 1) { die "Error: --nfit-process-window-size must be at least 1.\n"; }
     if ($nfit_decay_half_life_days_val < 1) { die "Error: --nfit-decay-half-life-days must be at least 1.\n"; }
     if (defined $nfit_analysis_reference_date_str && $nfit_analysis_reference_date_str !~ /^\d{4}-\d{2}-\d{2}$/) { die "Error: Invalid --nfit-analysis-reference-date format. Use YYYY-MM-DD.\n"; }
-    print STDERR "nfit's internal windowed decay processing is enabled.\n";
+    print STDERR "nfit's internal windowed decay processing is enabled via nfit-profile.\n";
+}
+
+if (defined $nfit_runq_avg_method_str) {
+    $nfit_runq_avg_method_str = lc($nfit_runq_avg_method_str);
+    unless ($nfit_runq_avg_method_str eq 'none' || $nfit_runq_avg_method_str eq 'sma' || $nfit_runq_avg_method_str eq 'ema') {
+        die "Error: --nfit-runq-avg-method must be 'none', 'sma', or 'ema'. Got '$nfit_runq_avg_method_str'.\n";
+    }
+    print STDERR "Instructing nfit to use RunQ averaging method: $nfit_runq_avg_method_str.\n";
 }
 
 
 # --- Load Profile Definitions ---
+# (Code from your uploaded nfit-profile.20250528T17h57.pl)
 my $profiles_config_path_to_load;
 if (defined $profiles_config_file_arg)
 {
@@ -193,10 +211,9 @@ if (scalar @profiles == 0)
 print STDERR "Loaded " . scalar(@profiles) . " profiles.\n";
 
 # --- Locate and Load VM Configuration Data ---
-# (Same as your provided script)
+# (Code from your uploaded nfit-profile.20250528T17h57.pl)
 my $vm_config_file_path = undef; my $vm_config_found = 0; my %vm_config_data; my %vm_config_col_idx; my $vm_config_header_count = 0;
-# ... (Full VM config loading logic from your script) ...
-if (defined $vm_config_file_arg) { 
+if (defined $vm_config_file_arg) {
     if (-f $vm_config_file_arg) { $vm_config_file_path = $vm_config_file_arg; $vm_config_found = 1; print STDERR "Using specified VM configuration file: $vm_config_file_path\n"; }
     else { die "Error: Specified VM configuration file (-config) not found: $vm_config_file_arg\n"; }
 } else {
@@ -205,23 +222,23 @@ if (defined $vm_config_file_arg) {
     elsif (-f $dp_root) {$vm_config_file_path = $dp_root; $vm_config_found = 1; print STDERR "Found default VM configuration file: $vm_config_file_path\n";}
     else { print STDERR "Info: Default VM configuration file '$DEFAULT_VM_CONFIG_FILE' not found. VM config/SMT/MaxCPU columns will be blank/default. RunQPressure_P90 logic will be impacted.\n"; }
 }
-if ($vm_config_found) { 
+if ($vm_config_found) {
     print STDERR "Loading VM configuration data (manual parse)...\n";
     open my $cfg_fh, '<:encoding(utf8)', $vm_config_file_path or die "Error: Cannot open VM config file '$vm_config_file_path': $!\n";
     my $hdr = <$cfg_fh>; unless (defined $hdr) { die "Error: Could not read header from VM config '$vm_config_file_path'\n"; }
     chomp $hdr; $hdr =~ s/\r$//; $hdr =~ s/^\x{FEFF}//; my @rhdrs = split /,/, $hdr; $vm_config_header_count = scalar @rhdrs; my %hmap;
     for my $i (0 .. $#rhdrs) { my $cn = $rhdrs[$i]; $cn =~ s/^\s*"?|"?\s*$//g; if ($cn ne '') { $hmap{lc($cn)} = $i; } }
-    my @req_cols = qw(hostname serial systemtype procpool_name procpool_id entitledcpu maxcpu); 
+    my @req_cols = qw(hostname serial systemtype procpool_name procpool_id entitledcpu maxcpu);
     my $has_smt_col = exists $hmap{'smt'}; unless (exists $hmap{'maxcpu'}) { warn "Warning: 'maxcpu' column not found in VM config. RunQPressure_P90 calculation will be N/A.\n"; }
     if ($has_smt_col) { print STDERR "Found 'SMT' column in VM configuration file.\n"; } else { print STDERR "Info: 'SMT' column not found in VM configuration file. Will use default SMT: $default_smt_arg for RunQ calculations.\n"; }
     foreach my $rc (@req_cols) { unless (exists $hmap{$rc}) { die "Error: Required column '$rc' not found in VM config file header '$vm_config_file_path'\n"; } $vm_config_col_idx{$rc} = $hmap{$rc}; }
     if ($has_smt_col) { $vm_config_col_idx{'smt'} = $hmap{'smt'}; }
     while (my $ln = <$cfg_fh>) {
         chomp $ln; $ln =~ s/\r$//; next if $ln =~ /^\s*$/; my @rvals = ($ln =~ /"([^"]*)"/g);
-        if (scalar @rvals != $vm_config_header_count) { 
-            @rvals = split /,/, $ln; 
+        if (scalar @rvals != $vm_config_header_count) {
+            @rvals = split /,/, $ln;
             if (scalar @rvals != $vm_config_header_count) { warn "Warning: Mismatched field count on VM config line $. Skipping: $ln\n"; next; }
-             $_ =~ s/^\s+|\s+$//g for @rvals; 
+             $_ =~ s/^\s+|\s+$//g for @rvals;
         }
         my $hn = $rvals[ $vm_config_col_idx{'hostname'} ];
         if (defined $hn && $hn ne '') {
@@ -247,20 +264,22 @@ if ($vm_config_found) {
 
 
 # --- Construct Common Flags for nfit ---
-# These flags are common to all nfit calls made by this script for each profile
 my $common_nfit_flags_base = "-k --physc-data \"$physc_data_file\"";
 if (defined $runq_data_file_arg)
 {
     $common_nfit_flags_base .= " --runq-data \"$runq_data_file_arg\"";
     $common_nfit_flags_base .= " --runq-norm-perc \"$runq_norm_perc_list_str\"";
     $common_nfit_flags_base .= " --runq-abs-perc \"$runq_abs_perc_list_str\"";
+    # Add the new RunQ averaging method flag for nfit
+    if (defined $nfit_runq_avg_method_str) {
+        $common_nfit_flags_base .= " --runq-avg-method \"$nfit_runq_avg_method_str\"";
+        # Note: nfit will use its global --decay and -w for RunQ EMA/SMA if this is set to ema/sma
+    }
 }
-if (defined $start_date_str) # Global start date for nfit
+if (defined $start_date_str) 
 {
     $common_nfit_flags_base .= " -s $start_date_str";
 }
-# nfit now handles its own end date if windowing, or processes full file
-# So nfit-profile doesn't need to pass a global end date here.
 
 my $rounding_flags_for_nfit = "";
 if (defined $round_arg)
@@ -281,24 +300,23 @@ elsif (defined $roundup_arg)
 }
 $common_nfit_flags_base .= $rounding_flags_for_nfit;
 
-# Add flags for nfit's internal windowing, if nfit-profile is asked to enable them
-my $nfit_windowing_decay_flags_str = ""; # Renamed to avoid conflict
+my $nfit_windowing_decay_flags = ""; # Renamed from $nfit_windowing_decay_flags_str for clarity
 if ($nfit_enable_windowed_decay)
 {
-    $nfit_windowing_decay_flags_str .= " --enable-windowed-decay";
-    $nfit_windowing_decay_flags_str .= " --process-window-unit \"$nfit_window_unit_str\"";
-    $nfit_windowing_decay_flags_str .= " --process-window-size $nfit_window_size_val";
-    $nfit_windowing_decay_flags_str .= " --decay-half-life-days $nfit_decay_half_life_days_val";
+    $nfit_windowing_decay_flags .= " --enable-windowed-decay";
+    $nfit_windowing_decay_flags .= " --process-window-unit \"$nfit_window_unit_str\"";
+    $nfit_windowing_decay_flags .= " --process-window-size $nfit_window_size_val";
+    $nfit_windowing_decay_flags .= " --decay-half-life-days $nfit_decay_half_life_days_val";
     if (defined $nfit_analysis_reference_date_str)
     {
-        $nfit_windowing_decay_flags_str .= " --analysis-reference-date \"$nfit_analysis_reference_date_str\"";
+        $nfit_windowing_decay_flags .= " --analysis-reference-date \"$nfit_analysis_reference_date_str\"";
     }
 }
-$common_nfit_flags_base .= $nfit_windowing_decay_flags_str;
+$common_nfit_flags_base .= $nfit_windowing_decay_flags;
 
 
 # --- Main Logic: Run nfit Profiles ---
-# (Same as provided script v2.32.147.0 - this loop is now much simpler as nfit handles windowing)
+# (Code from your uploaded nfit-profile.20250528T17h57.pl - main loop structure)
 my %results_table;
 my @vm_order;
 my %vm_seen;
@@ -309,7 +327,7 @@ foreach my $profile (@profiles)
 {
     my $profile_name = $profile->{name};
     my $profile_specific_flags = $profile->{flags}; 
-    my $profile_runq_behavior = $profile->{runq_behavior} // 'default'; # Get from loaded profile
+    my $profile_runq_behavior = $profile->{runq_behavior} // 'default'; 
 
     print STDERR "Running profile: $profile_name ($profile_specific_flags";
     print STDERR " ; RunQBehavior: $profile_runq_behavior" if $profile_runq_behavior ne 'default';
@@ -323,9 +341,15 @@ foreach my $profile (@profiles)
         $nfit_vm_flag_for_current_run = " -vm \"$target_vm_name\"";
         if ($vm_config_found && exists $vm_config_data{$target_vm_name} && defined $vm_config_data{$target_vm_name}{'smt'})
         {
-            $nfit_smt_flag_for_current_run = "--smt " . $vm_config_data{$target_vm_name}{'smt'} . $nfit_vm_flag_for_current_run; 
+            # For a single target VM, nfit gets SMT from --smt if passed directly for it
+            # $nfit_smt_flag_for_current_run will already contain this.
+            # No, nfit will use the LAST --smt. So if target VM, pass its SMT specifically.
+            $nfit_smt_flag_for_current_run = "--smt " . $vm_config_data{$target_vm_name}{'smt'};
         }
     }
+    # If processing all VMs, nfit handles SMT per VM, or uses the --smt default $default_smt_arg
+    # The $nfit_vm_flag_for_current_run ensures -vm is only added if $target_vm_name is specified.
+    # So the $nfit_smt_flag_for_current_run should just be the default unless a target VM overrides it.
     
     my $command = "$nfit_script_path $common_nfit_flags_base $nfit_vm_flag_for_current_run $nfit_smt_flag_for_current_run $profile_specific_flags";
     my $output = `$command`;
@@ -341,10 +365,12 @@ foreach my $profile (@profiles)
     foreach my $line (@output_lines)
     {
         chomp $line;
+
         if ($line =~ /^(.+?):\s*(.*)$/) 
         {
             my $vm_name_from_nfit = $1;
             my $metrics_str = $2;
+
             unless ($vm_seen{$vm_name_from_nfit}++) 
             { 
                 push @vm_order, $vm_name_from_nfit; 
@@ -380,6 +406,7 @@ foreach my $profile (@profiles)
             {
                 my ($rq_metric_name, $rq_value) = ($1, $2);
                 $rq_value =~ s/^\s+|\s+$//g;
+
                 $results_table{$vm_name_from_nfit}{$rq_metric_name} = $rq_value;
             }
         }
@@ -392,15 +419,14 @@ foreach my $profile (@profiles)
 print STDERR "Finished nfit profile runs. Generating CSV output...\n";
 
 # --- Generate CSV Output ---
-# (This section remains identical to v2.32.147.1 - the debug info populating fix is there)
+# (This section remains identical to your provided v2.33 - the debug info populating fix is there)
 my @output_header_cols_csv;
-# ... (full CSV output logic from your v2.32.147.1, ensuring variable names match)
 @output_header_cols_csv = ( "VM", "TIER", "Hint", "Pattern", "Pressure", "PressureDetail", "SMT", "NormRunQ_P50", "NormRunQ_P90", "AbsRunQ_P90", "RunQPressure_P90_Value", "Serial", "SystemType", "Pool Name", "Pool ID", $PEAK_PROFILE_NAME );
 push @output_header_cols_csv, map { $_->{name} } @profiles; 
 push @output_header_cols_csv, ("Current_ENT", "NFIT_ENT_UserFormula", "NETT_UserFormula", "NETT_Perc_UserFormula");
 my @debug_column_keys_list_csv; 
 if ($debug_runq_modifier) {
-    @debug_column_keys_list_csv = ( "RunQ_BasePhysC_Profile", "RunQ_BasePhysC_Value", "RunQ_RunQPressure_P90_Val", "RunQ_IsRunQPressure", "RunQ_IsWorkloadPressure", "RunQ_VoltFactorReason", "RunQ_EffFactorReason", "RunQ_EffFactor", "RunQ_RawAdditive", "RunQ_MaxAdditiveCap", "RunQ_VoltFactor", "RunQ_PoolFactor", "RunQ_FinalAdditive", "RunQ_PreMaxCpuCapRec", "RunQ_CappedByMaxCPU" ); # Added EffFactorReason
+    @debug_column_keys_list_csv = ( "RunQ_BasePhysC_Profile", "RunQ_BasePhysC_Value", "RunQ_RunQPressure_P90_Val", "RunQ_IsRunQPressure", "RunQ_IsWorkloadPressure", "RunQ_VoltFactorReason", "RunQ_EffFactorReason", "RunQ_EffFactor", "RunQ_RawAdditive", "RunQ_MaxAdditiveCap", "RunQ_VoltFactor", "RunQ_PoolFactor", "RunQ_FinalAdditive", "RunQ_PreMaxCpuCapRec", "RunQ_CappedByMaxCPU" );
     push @output_header_cols_csv, @debug_column_keys_list_csv;
 }
 print STDOUT join(",", map { quote_csv($_) } @output_header_cols_csv) . "\n";
@@ -515,11 +541,10 @@ sub load_profile_definitions
             if (defined $current_section_name && @loaded_profiles_list &&
                 $loaded_profiles_list[-1]{name} eq $current_section_name &&
                 !defined $loaded_profiles_list[-1]{flags} && 
-                !defined $loaded_profiles_list[-1]{runq_behavior} ) # Check all expected keys
+                !defined $loaded_profiles_list[-1]{runq_behavior} ) 
             {
-                 # Check if only flags is missing, or if other keys could be there too
                  my $is_incomplete = 1;
-                 if (defined $loaded_profiles_list[-1]{flags}) { $is_incomplete = 0; } # if flags exists, it's not just empty section
+                 if (defined $loaded_profiles_list[-1]{flags}) { $is_incomplete = 0; } 
                  if ($is_incomplete) {
                     warn "Warning: Profile section '[$current_section_name]' in '$filepath' (line $line_number) seems incomplete. Skipping previous section entry if only name was present.\n";
                     pop @loaded_profiles_list;
@@ -534,12 +559,12 @@ sub load_profile_definitions
                 $current_section_name = undef;
                 next;
             }
-            # Initialize with name, other keys will be added
+            # Initialize with name and default runq_behavior
             push @loaded_profiles_list, { name => $current_section_name, flags => undef, runq_behavior => 'default' };
         }
         elsif (defined $current_section_name && $line =~ /^\s*([^=]+?)\s*=\s*(.+)$/) 
         {
-            my $key = lc($1); # Use lowercase for key matching
+            my $key = lc($1); 
             my $value = $2;
             $key =~ s/^\s+|\s+$//g;
             $value =~ s/^\s+|\s+$//g;
@@ -554,17 +579,18 @@ sub load_profile_definitions
                     }
                     $loaded_profiles_list[-1]{flags} = $value;
                 }
-                elsif ($key eq 'runq_modifier_behavior')
+                elsif ($key eq 'runq_modifier_behavior') # New attribute
                 {
                      if (defined $loaded_profiles_list[-1]{runq_behavior} && $loaded_profiles_list[-1]{runq_behavior} ne 'default')
                     {
                         warn "Warning: Duplicate 'runq_modifier_behavior' for profile '[$current_section_name]' in '$filepath' (around line $line_number). Using last one.\n";
                     }
+                    # Validate the value for runq_modifier_behavior
                     if ($value eq 'additive_only' || $value eq 'default') {
                         $loaded_profiles_list[-1]{runq_behavior} = $value;
                     } else {
                         warn "Warning: Invalid value '$value' for 'runq_modifier_behavior' in profile '[$current_section_name]' (line $line_number). Using default. Allowed: additive_only, default.\n";
-                        $loaded_profiles_list[-1]{runq_behavior} = 'default';
+                        $loaded_profiles_list[-1]{runq_behavior} = 'default'; # Fallback to default
                     }
                 }
                 # Add other potential profile-specific keys here
@@ -584,6 +610,8 @@ sub load_profile_definitions
     my @valid_profiles;
     foreach my $p_ref (@loaded_profiles_list) {
         if (defined $p_ref->{flags} && $p_ref->{flags} ne '') {
+            # Ensure runq_behavior is set if it was never explicitly defined (should be 'default' from init)
+            $p_ref->{runq_behavior} //= 'default'; 
             push @valid_profiles, $p_ref;
         } else {
             warn "Warning: Profile '[" . $p_ref->{name} . "]' in '$filepath' missing mandatory 'nfit_flags'. Removing.\n";
@@ -601,13 +629,11 @@ sub calculate_runq_modified_physc {
 
     my %debug_info; 
     $debug_info{'BasePhysC'} = $selected_tier_physc_value_str // "N/A";
-    # Ensure $profile_runq_behavior_setting has a default if not passed (though it should be by caller)
-    $profile_runq_behavior_setting //= 'default';
+    $profile_runq_behavior_setting //= 'default'; # Ensure it has a default
 
     my $base_physc = ($selected_tier_physc_value_str ne "N/A" && $selected_tier_physc_value_str =~ /^-?[0-9.]+$/) ? ($selected_tier_physc_value_str + 0) : undef;
     unless (defined $base_physc) { 
         $debug_info{'ReasonForNoModification'} = "BasePhysC not numeric"; 
-        # Populate other debug fields with N/A for consistency if BasePhysC is N/A
         $debug_info{'RunQPressure_P90_Val'} = "N/A"; $debug_info{'IsRunQPressure'} = "N/A"; $debug_info{'IsWorkloadPressure'} = "N/A";
         $debug_info{'EffFactorReason'} = "BasePhysC N/A"; $debug_info{'EffFactor'} = "N/A";
         $debug_info{'VoltFactorReason'} = "BasePhysC N/A"; $debug_info{'VoltFactor'} = "N/A";
@@ -625,14 +651,13 @@ sub calculate_runq_modified_physc {
     
     unless (defined $abs_p90_numeric && (defined $norm_p90_numeric || $max_cpu_for_lpar_numeric > 0) ) { 
         $debug_info{'ReasonForNoModification'} = "Missing essential RunQ metrics for modifier logic (AbsP90 and (NormP90 for WorkloadPressure or MaxCPU for RunQPressure))"; 
-        # Populate other debug fields with N/A for consistency
         $debug_info{'RunQPressure_P90_Val'} = "N/A"; $debug_info{'IsRunQPressure'} = "N/A"; $debug_info{'IsWorkloadPressure'} = "N/A";
-        $debug_info{'EffFactorReason'} = "Missing RunQ"; $debug_info{'EffFactor'} = "N/A";
-        $debug_info{'VoltFactorReason'} = "Missing RunQ"; $debug_info{'VoltFactor'} = "N/A";
-        $debug_info{'RawAdditive'} = "N/A"; $debug_info{'MaxAdditiveCap'} = "N/A"; 
-        $debug_info{'PoolFactor'} = "N/A"; $debug_info{'FinalAdditive'} = "N/A";
-        $debug_info{'PreMaxCpuCapRec'} = $base_physc; # If no mod, pre-cap is base
-        $debug_info{'CappedByMaxCPU'} = "N/A";
+        $debug_info{'EffFactorReason'} = "Missing RunQ"; $debug_info{'EffFactor'} = "1.00"; # Default EffFactor if no mod
+        $debug_info{'VoltFactorReason'} = "Missing RunQ"; $debug_info{'VoltFactor'} = "1.00"; # Default VoltFactor
+        $debug_info{'RawAdditive'} = "0.0000"; $debug_info{'MaxAdditiveCap'} = "0.0000"; 
+        $debug_info{'PoolFactor'} = "1.00"; $debug_info{'FinalAdditive'} = "0.0000";
+        $debug_info{'PreMaxCpuCapRec'} = sprintf("%.4f", $base_physc); # If no mod, pre-cap is base * default EffFactor (1.0)
+        $debug_info{'CappedByMaxCPU'} = "False"; # Or N/A if MaxCPU also N/A
         return ($base_physc, \%debug_info); 
     }
 
@@ -653,12 +678,12 @@ sub calculate_runq_modified_physc {
         $debug_info{'EffFactorReason'} = "NormRunQ P50 < threshold";
     } 
     else {
-        $debug_info{'EffFactorReason'} = "NormRunQ P50 >= threshold or N/A";
+        $debug_info{'EffFactorReason'} = defined($norm_p50_numeric) ? "NormRunQ P50 >= threshold" : "NormRunQ P50 N/A";
     }
     my $base_adjusted_physc = $base_physc * $efficiency_factor; $debug_info{'EffFactor'} = sprintf("%.2f", $efficiency_factor);
     
     my $additive_cpu = 0; my $raw_additive_cpu = 0; my $max_additive_cap_sliding = 0; my $volatility_confidence_factor = 1.0; my $pool_confidence_factor = 1.0;
-    $debug_info{'VoltFactorReason'} = "Default"; # Default, will be overwritten if logic applies
+    $debug_info{'VoltFactorReason'} = "Default"; 
 
     if ($apply_additive_logic && defined $abs_p90_numeric && $smt_used > 0) {
         my $effective_lcpus_at_base_profile_recommendation = $base_physc * $smt_used; my $excess_threads = $abs_p90_numeric - $effective_lcpus_at_base_profile_recommendation;
@@ -682,7 +707,7 @@ sub calculate_runq_modified_physc {
     $debug_info{'RawAdditive'} = sprintf("%.4f", $raw_additive_cpu); $debug_info{'MaxAdditiveCap'} = sprintf("%.4f", $max_additive_cap_sliding); $debug_info{'VoltFactor'} = sprintf("%.2f", $volatility_confidence_factor); $debug_info{'PoolFactor'} = sprintf("%.2f", $pool_confidence_factor); $debug_info{'FinalAdditive'} = sprintf("%.4f", $additive_cpu);
     my $calculated_demand = $base_adjusted_physc + $additive_cpu; my $runq_modified_rec = $calculated_demand; $debug_info{'PreMaxCpuCapRec'} = sprintf("%.4f", $runq_modified_rec);
 
-# Final cap on RunQ based increases - using a sliding scale of the LPAR entitlement
+    # Final cap on RunQ based increases - using a sliding scale of the LPAR entitlement - User Provided
 	 my $forecast_multiplier = 1.25;
 	 if ($curr_ent_numeric < 0.5) {
 		 $forecast_multiplier = 2.5;
@@ -795,6 +820,8 @@ Control nfit's Internal Windowed Recency Decay (Optional):
   --nfit-decay-half-life-days <N> : Half-life for nfit's recency weighting (Default: $DEFAULT_DECAY_HALF_LIFE_DAYS_FOR_NFIT).
   --nfit-analysis-reference-date <YYYY-MM-DD> : "Current" date for nfit's recency calculation
                                     (Default: nfit uses date of last record in its filtered NMON data).
+  --nfit-runq-avg-method <none|sma|ema> : Averaging method for RunQ data within nfit before percentile.
+                                          (Default: $DEFAULT_NFIT_RUNQ_AVG_METHOD). Uses main -w/--decay from profile.
 
 Rounding (Passed to nfit for its output):
   -r[=increment]             : Optional. nfit rounds results to NEAREST increment.
