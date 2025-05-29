@@ -1,14 +1,13 @@
 #!/usr/bin/env perl
 
 # NAME     : nfit-profile
-# VERSION  : 2.34.147.1 # RunQ PXX columns now from first profile; Allman style
+# VERSION  : 2.35.0.0 # Added Rationale Logging, removed specific RunQ CSV columns & --debug-runq
 # AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
 # PURPOSE  : Runs 'nfit' (which can now do internal windowed decay and RunQ smoothing)
 #            multiple times with user-defined profiles.
 #            Applies RunQ modifiers (behavior controllable per profile),
-#            generates hints, and aggregates to CSV.
-# REQUIRES : Perl, nfit script (v2.28.0.4+ with internal windowed decay & runq-avg-method & runq-decay),
-#            Time::Piece, List::Util, version
+#            generates hints, logs rationale, and aggregates to CSV.
+# REQUIRES : Perl, nfit script (v2.28.0.4+), Time::Piece, List::Util, IO::File, version
 
 use strict;
 use warnings;
@@ -16,49 +15,59 @@ use Getopt::Long qw(GetOptions);
 use Cwd qw(abs_path);
 use File::Basename qw(dirname);
 use Time::Piece;
-use List::Util qw(sum min max); # Ensure sum0 if needed, script uses sum
+use List::Util qw(sum min max);
+use IO::File;
 use version;
 
+# --- Store original ARGV for logging ---
+my @original_argv = @ARGV;
+
+# --- Capture nfit-profile.pl start time ---
+my $PROFILE_SCRIPT_START_TIME_EPOCH = time(); # Store epoch seconds for duration calculation
+my $PROFILE_SCRIPT_START_TIME_STR = localtime($PROFILE_SCRIPT_START_TIME_EPOCH)->strftime("%Y-%m-%d %H:%M:%S %Z");
+
 # --- Version ---
-my $SCRIPT_VERSION = '2.34.147.1';
+my $SCRIPT_VERSION = '2.35.0.0';
 
 # --- Configuration ---
 my $DEFAULT_ROUND_INCREMENT = 0.05;
 my $DEFAULT_VM_CONFIG_FILE = "config-all.csv";
 my $DEFAULT_PROFILES_CONFIG_FILE = "nfit.profiles.cfg";
 my $DEFAULT_SMT_VALUE_PROFILE = 8;
-my $DEFAULT_RUNQ_NORM_PERCS = "50,90";
-my $DEFAULT_RUNQ_ABS_PERCS  = "90";
-my $DEFAULT_NFIT_RUNQ_AVG_METHOD = "ema"; # Default to ema for RunQ smoothing in nfit
+my $DEFAULT_RUNQ_NORM_PERCS = "50,90"; # Still needed for nfit calls
+my $DEFAULT_RUNQ_ABS_PERCS  = "90";  # Still needed for nfit calls
+my $DEFAULT_NFIT_RUNQ_AVG_METHOD = "ema";
 
 # Windowed Decay Defaults (passed to nfit if enabled)
 my $DEFAULT_PROCESS_WINDOW_UNIT_FOR_NFIT = "weeks";
 my $DEFAULT_PROCESS_WINDOW_SIZE_FOR_NFIT = 1;
 my $DEFAULT_DECAY_HALF_LIFE_DAYS_FOR_NFIT = 30;
 
-# Heuristic Thresholds (remain in nfit-profile)
+# Heuristic Thresholds
 my $PATTERN_RATIO_THRESHOLD = 2.0;
 my $HIGH_PEAK_RATIO_THRESHOLD = 5.0;
 my $LOW_PEAK_RATIO_THRESHOLD  = 2.0;
 my $LIMIT_THRESHOLD_PERC = 0.98;
 
-# RunQ Modifier Thresholds (remain in nfit-profile)
+# RunQ Modifier Thresholds
 my $RUNQ_EFFICIENCY_NORM_P50_THRESHOLD = 0.5;
 my $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD = 1.2;
-my $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD = 0.75;
+my $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD = 0.90;
 
-# Max_Additive_CPU Sliding Scale Thresholds (remain in nfit-profile)
+# Max_Additive_CPU Sliding Scale Thresholds
 my $MAX_ADD_ENT_THRESH1 = 1.0; my $MAX_ADD_ABS_VAL1 = 1.0;
 my $MAX_ADD_ENT_THRESH2 = 2.0; my $MAX_ADD_PERC_VAL2 = 1.0;
 my $MAX_ADD_ENT_THRESH3 = 4.0; my $MAX_ADD_PERC_VAL3 = 0.75;
 my $MAX_ADD_PERC_VAL_ELSE = 0.5;
 
-# RunQ Volatility Confidence Factor Thresholds & Values (remain in nfit-profile)
+# RunQ Volatility Confidence Factor Thresholds & Values
 my $VOLATILITY_SPIKY_THRESHOLD = 0.5; my $VOLATILITY_SPIKY_FACTOR = 0.70;
 my $VOLATILITY_MODERATE_THRESHOLD = 0.8; my $VOLATILITY_MODERATE_FACTOR = 0.85;
 my $RUNQ_PRESSURE_SATURATION_CONFIDENCE_FACTOR = 1.0;
 
 my $POOL_CONSTRAINT_CONFIDENCE_FACTOR = 0.80;
+
+my $LOG_FILE_PATH = "/tmp/nfit-profile.log";
 
 # --- Profile Definitions (Loaded from file) ---
 my @profiles;
@@ -74,9 +83,8 @@ my $target_vm_name;
 my $round_arg;
 my $roundup_arg;
 my $default_smt_arg = $DEFAULT_SMT_VALUE_PROFILE;
-my $runq_norm_perc_list_str = $DEFAULT_RUNQ_NORM_PERCS;
-my $runq_abs_perc_list_str  = $DEFAULT_RUNQ_ABS_PERCS;
-my $debug_runq_modifier = 0;
+my $runq_norm_perc_list_str = $DEFAULT_RUNQ_NORM_PERCS; # Passed to nfit
+my $runq_abs_perc_list_str  = $DEFAULT_RUNQ_ABS_PERCS;  # Passed to nfit
 my $help = 0;
 my $show_version = 0;
 my $script_dir = dirname(abs_path($0));
@@ -100,7 +108,7 @@ GetOptions(
     'default-smt|smt=i'       => \$default_smt_arg,
     'runq-norm-percentiles=s' => \$runq_norm_perc_list_str,
     'runq-abs-percentiles=s'  => \$runq_abs_perc_list_str,
-    'debug-runq'              => \$debug_runq_modifier,
+    # --debug-runq removed
     'help|h'                  => \$help,
     'nfit-path=s'             => \$nfit_script_path,
     'version|v'               => \$show_version,
@@ -113,18 +121,20 @@ GetOptions(
 ) or die usage_wrapper();
 
 # --- Validation ---
+my $nfit_ver = "N/A"; # To store nfit version for logging
 if ($show_version)
 {
     print STDERR "nfit-profile version $SCRIPT_VERSION\n";
     if (-x $nfit_script_path)
     {
         my $nfit_ver_output = `$nfit_script_path -v 2>&1`;
-        my ($nfit_ver) = ($nfit_ver_output =~ /nfit version\s*([0-9.]+)/i);
-        if (defined $nfit_ver)
+        my ($parsed_nfit_ver) = ($nfit_ver_output =~ /nfit version\s*([0-9.a-zA-Z-]+)/i); # Allow for alphanumeric like 2.28.0.4
+        if (defined $parsed_nfit_ver)
         {
+            $nfit_ver = $parsed_nfit_ver; # Store for later logging
             print STDERR "Uses nfit version: $nfit_ver\n";
             my $required_nfit_ver_for_windowing = "2.27.0";
-            my $required_nfit_ver_for_runq_avg_and_decay = "2.28.0.4"; # nfit version with runq-avg-method and runq-decay
+            my $required_nfit_ver_for_runq_avg_and_decay = "2.28.0.4";
             
             if ($nfit_enable_windowed_decay && version->parse($nfit_ver) < version->parse($required_nfit_ver_for_windowing))
             {
@@ -212,6 +222,36 @@ if (defined $nfit_runq_avg_method_str)
     print STDERR "Instructing nfit to use RunQ averaging method: $nfit_runq_avg_method_str.\n";
 }
 
+# --- Open Log File ---
+my $LOG_FH = IO::File->new($LOG_FILE_PATH, '>')
+    or warn "Error: Cannot open rationale log file '$LOG_FILE_PATH' for writing: $!. Rationale logging will be skipped.\n";
+
+if ($LOG_FH)
+{
+    $LOG_FH->autoflush(1);
+    print {$LOG_FH} "======================================================================\n";
+    print {$LOG_FH} "nFit Profile Rationale Log\n";
+    print {$LOG_FH} "======================================================================\n";
+    my $current_datetime_log = localtime->strftime("%Y-%m-%d %H:%M:%S");
+    print {$LOG_FH} "Date                     : $current_datetime_log\n";
+    print {$LOG_FH} "nfit-profile.pl Run      : $PROFILE_SCRIPT_START_TIME_STR\n";
+    print {$LOG_FH} "nfit-profile.pl Version  : $SCRIPT_VERSION\n";
+    # Get nfit version again if not run with -v for logging
+    if ($nfit_ver eq "N/A" && -x $nfit_script_path) {
+        my $nfit_ver_output_log = `$nfit_script_path -v 2>&1`;
+        ($nfit_ver) = ($nfit_ver_output_log =~ /nfit version\s*([0-9.a-zA-Z-]+)/i);
+        $nfit_ver //= "Unknown (parse failed)";
+    }
+    print {$LOG_FH} "nfit.pl Version Used     : $nfit_ver\n";
+    print {$LOG_FH} "----------------------------------------------------------------------\n";
+    print {$LOG_FH} "Invocation:\n";
+    print {$LOG_FH} "  $0 " . join(" ", @original_argv) . "\n"; # Log original arguments
+    print {$LOG_FH} "----------------------------------------------------------------------\n";
+    print {$LOG_FH} "Key Global Settings:\n";
+    print {$LOG_FH} "  - PhysC Data File          : $physc_data_file\n";
+    print {$LOG_FH} "  - RunQ Data File           : " . ($runq_data_file_arg // "Not Provided") . "\n";
+}
+
 # --- Load Profile Definitions ---
 my $profiles_config_path_to_load;
 if (defined $profiles_config_file_arg)
@@ -238,6 +278,7 @@ else
     }
 }
 print STDERR "Loading profile definitions from: $profiles_config_path_to_load\n";
+if ($LOG_FH) { print {$LOG_FH} "  - Profiles Config File     : $profiles_config_path_to_load\n"; }
 @profiles = load_profile_definitions($profiles_config_path_to_load);
 if (scalar @profiles == 0)
 {
@@ -285,6 +326,8 @@ else
         print STDERR "Info: Default VM configuration file '$DEFAULT_VM_CONFIG_FILE' not found. VM config/SMT/MaxCPU columns will be blank/default. RunQPressure_P90 logic will be impacted.\n";
     }
 }
+if ($LOG_FH) { print {$LOG_FH} "  - VM Config File           : " . ($vm_config_file_path // "Not Provided/Default Attempted") . "\n"; }
+
 if ($vm_config_found)
 {
     print STDERR "Loading VM configuration data (manual parse)...\n";
@@ -313,7 +356,7 @@ if ($vm_config_found)
     my $has_smt_col = exists $hmap{'smt'};
     unless (exists $hmap{'maxcpu'})
     {
-        warn "Warning: 'maxcpu' column not found in VM config. RunQPressure_P90 calculation will be N/A.\n";
+        warn "Warning: 'maxcpu' column not found in VM config. Final MaxCPU capping logic will be affected.\n";
     }
     if ($has_smt_col)
     {
@@ -375,7 +418,7 @@ if ($vm_config_found)
             my $max_cpu_val = $rvals[$vm_config_col_idx{'maxcpu'}];
             unless (defined $max_cpu_val && $max_cpu_val =~ /^[0-9.]+$/ && ($max_cpu_val+0) > 0)
             {
-                $max_cpu_val = 0; # Treat as 0 if invalid or not positive
+                $max_cpu_val = 0;
             }
             $vm_config_data{$hn} = {
                 serial => $rvals[$vm_config_col_idx{'serial'}],
@@ -383,7 +426,7 @@ if ($vm_config_found)
                 pool_name => $rvals[$vm_config_col_idx{'procpool_name'}],
                 pool_id => $rvals[$vm_config_col_idx{'procpool_id'}],
                 entitlement => $rvals[$vm_config_col_idx{'entitledcpu'}],
-                maxcpu => ($max_cpu_val + 0), # Store as numeric
+                maxcpu => ($max_cpu_val + 0),
                 smt => $smt_v,
             };
         }
@@ -397,16 +440,17 @@ if ($vm_config_found)
 }
 else
 {
-     print STDERR "Warning: VM configuration file not loaded. RunQPressure_P90 calculation will be N/A and SMT will use default.\n";
+     print STDERR "Warning: VM configuration file not loaded. MaxCPU capping logic will be affected, and SMT will use default.\n";
 }
+
 
 # --- Construct Common Flags for nfit ---
 my $common_nfit_flags_base = "-k --physc-data \"$physc_data_file\"";
 if (defined $runq_data_file_arg)
 {
     $common_nfit_flags_base .= " --runq-data \"$runq_data_file_arg\"";
-    $common_nfit_flags_base .= " --runq-norm-perc \"$runq_norm_perc_list_str\"";
-    $common_nfit_flags_base .= " --runq-abs-perc \"$runq_abs_perc_list_str\"";
+    $common_nfit_flags_base .= " --runq-norm-perc \"$runq_norm_perc_list_str\""; # Still pass to nfit
+    $common_nfit_flags_base .= " --runq-abs-perc \"$runq_abs_perc_list_str\"";   # Still pass to nfit
     if (defined $nfit_runq_avg_method_str)
     {
         $common_nfit_flags_base .= " --runq-avg-method \"$nfit_runq_avg_method_str\"";
@@ -450,16 +494,27 @@ if ($nfit_enable_windowed_decay)
 }
 $common_nfit_flags_base .= $nfit_windowing_decay_flags;
 
+if ($LOG_FH) {
+    print {$LOG_FH} "  - nfit Common Base Flags   : $common_nfit_flags_base\n"; # Common flags are now built
+    print {$LOG_FH} "  - nfit Windowed Decay Opts : " . ($nfit_windowing_decay_flags || "Not Enabled") . "\n";
+    print {$LOG_FH} "  - nfit RunQ Avg Method     : $nfit_runq_avg_method_str\n";
+    print {$LOG_FH} "  - Default SMT for Profile  : $default_smt_arg\n";
+    print {$LOG_FH} "======================================================================\n\n";
+    print {$LOG_FH} "===== Per-VM / Per-Profile RunQ Adjustment Details =====\n\n";
+}
+
+
 # --- Main Logic: Run nfit Profiles ---
 my %results_table;
 my @vm_order;
 my %vm_seen;
 my %primary_runq_metrics_captured_for_vm; # Key: vm_name, Value: hash {metric_key => 1}
+my %source_profile_for_global_runq;       # Key: vm_name, Value: profile_name
 
 print STDERR "nfit-profile version $SCRIPT_VERSION\n";
 print STDERR "Starting nfit profile runs...\n";
 
-foreach my $profile (@profiles) # Process profiles in the order they are loaded from config
+foreach my $profile (@profiles)
 {
     my $profile_name = $profile->{name};
     my $profile_specific_flags = $profile->{flags};
@@ -482,13 +537,19 @@ foreach my $profile (@profiles) # Process profiles in the order they are loaded 
     }
     
     my $command = "$nfit_script_path $common_nfit_flags_base $nfit_vm_flag_for_current_run $nfit_smt_flag_for_current_run $profile_specific_flags";
-    # print STDERR "DEBUG_NFIT_PROFILE: Executing: $command\n";
     my $output = `$command`;
     my $exit_status = $? >> 8;
 
     if ($exit_status != 0)
     {
         warn "Warning: '$nfit_script_path' cmd failed for profile '$profile_name' (exit $exit_status). Command was: $command. Output: $output. Skip.\n";
+        if ($LOG_FH)
+        {
+             print {$LOG_FH} "ERROR: nfit.pl execution FAILED for profile '$profile_name' on VM(s) '$target_vm_name // All'.\n";
+             print {$LOG_FH} "  Command: $command\n";
+             print {$LOG_FH} "  Exit Status: $exit_status\n";
+             print {$LOG_FH} "  Output: $output\n";
+        }
         next;
     }
 
@@ -496,28 +557,22 @@ foreach my $profile (@profiles) # Process profiles in the order they are loaded 
     foreach my $line (@output_lines)
     {
         chomp $line;
-        # print STDERR "DEBUG_NFIT_PROFILE: nfit output line: [$line]\n";
-
         if ($line =~ /^(.+?):\s*(.*)$/)
         {
             my $vm_name_from_nfit = $1;
             my $metrics_str = $2;
-            # print STDERR "DEBUG_NFIT_PROFILE: VM: [$vm_name_from_nfit], Metrics String: [$metrics_str]\n";
 
             unless ($vm_seen{$vm_name_from_nfit}++)
             {
                 push @vm_order, $vm_name_from_nfit;
             }
             
-            # Initialize capture flags for this VM if this is the first time we process output for it
-            # (across all profile runs for this VM)
             $primary_runq_metrics_captured_for_vm{$vm_name_from_nfit} //= {
                 'NormRunQ_P50' => 0,
                 'NormRunQ_P90' => 0,
                 'AbsRunQ_P90'  => 0,
             };
 
-            # --- Parse and store PhysC PXX for the current profile ---
             my ($profile_p_flag_val_num) = ($profile_specific_flags =~ /-p\s+([0-9.]+)/);
             if (defined $profile_p_flag_val_num)
             {
@@ -534,7 +589,6 @@ foreach my $profile (@profiles) # Process profiles in the order they are loaded 
                 }
             }
 
-            # --- Parse and store Peak (always overwritten by last profile that reports it) ---
             if ($metrics_str =~ /Peak=([0-9.NA\/ -]+?)(?:\s+|$)/)
             {
                 my $peak_value = $1;
@@ -542,8 +596,6 @@ foreach my $profile (@profiles) # Process profiles in the order they are loaded 
                 $results_table{$vm_name_from_nfit}{$PEAK_PROFILE_NAME} = $peak_value;
             }
 
-            # --- Parse and store primary RunQ metrics ---
-            # These will be captured ONLY if not already captured from a previous profile for this VM.
             my %first_capture_target_keys = (
                 'NormRunQ_P50' => 1,
                 'NormRunQ_P90' => 1,
@@ -557,23 +609,15 @@ foreach my $profile (@profiles) # Process profiles in the order they are loaded 
 
                 if (exists $first_capture_target_keys{$rq_metric_name})
                 {
-                    # Only store if this specific primary RunQ metric hasn't been captured yet for this VM
                     if (!$primary_runq_metrics_captured_for_vm{$vm_name_from_nfit}{$rq_metric_name})
                     {
                         $results_table{$vm_name_from_nfit}{$rq_metric_name} = $rq_value;
-                        $primary_runq_metrics_captured_for_vm{$vm_name_from_nfit}{$rq_metric_name} = 1; # Mark as captured
-                        # print STDERR "DEBUG_NFIT_PROFILE: First capture for $vm_name_from_nfit (from profile $profile_name): $rq_metric_name = $rq_value\n";
+                        $primary_runq_metrics_captured_for_vm{$vm_name_from_nfit}{$rq_metric_name} = 1;
+                        $source_profile_for_global_runq{$vm_name_from_nfit} //= $profile_name; # Capture source profile for this VM
                     }
                 }
-                # else
-                # {
-                    # For other RunQ metrics not in %first_capture_target_keys (e.g. NormRunQ_P75 if requested by user):
-                    # If we want them to be stored and overwritten by last profile (original behavior for them):
-                    # $results_table{$vm_name_from_nfit}{$rq_metric_name} = $rq_value;
-                    # For now, this change strictly makes the three main RunQ columns sourced from first profile.
-                    # Other potential RunQ values won't be stored by this loop unless added to first_capture_target_keys
-                    # or the 'else' block above is uncommented and logic adjusted if necessary.
-                # }
+                # Any other RunQ metrics not in first_capture_target_keys are not explicitly stored
+                # by this loop, which is fine as CSV does not have dedicated columns for them.
             }
         }
         elsif ($line ne '')
@@ -582,30 +626,18 @@ foreach my $profile (@profiles) # Process profiles in the order they are loaded 
         }
     }
 }
-print STDERR "Finished nfit profile runs. Generating CSV output...\n";
+print STDERR "Finished nfit profile runs. Generating CSV output and rationale log...\n";
 
 # --- Generate CSV Output ---
 my @output_header_cols_csv;
 @output_header_cols_csv = (
     "VM", "TIER", "Hint", "Pattern", "Pressure", "PressureDetail", "SMT",
-    "NormRunQ_P50", "NormRunQ_P90", "AbsRunQ_P90", "RunQPressure_P90_Value",
+    # Removed: "NormRunQ_P50", "NormRunQ_P90", "AbsRunQ_P90", "RunQPressure_P90_Value",
     "Serial", "SystemType", "Pool Name", "Pool ID", $PEAK_PROFILE_NAME
 );
 push @output_header_cols_csv, map { $_->{name} } @profiles;
 push @output_header_cols_csv, ("Current_ENT", "NFIT_ENT_UserFormula", "NETT_UserFormula", "NETT_Perc_UserFormula");
-
-my @debug_column_keys_list_csv;
-if ($debug_runq_modifier)
-{
-    @debug_column_keys_list_csv = (
-        "RunQ_BasePhysC_Profile", "RunQ_BasePhysC_Value", "RunQ_RunQPressure_P90_Val",
-        "RunQ_IsRunQPressure", "RunQ_IsWorkloadPressure", "RunQ_VoltFactorReason",
-        "RunQ_EffFactorReason", "RunQ_EffFactor", "RunQ_RawAdditive",
-        "RunQ_MaxAdditiveCap", "RunQ_VoltFactor", "RunQ_PoolFactor",
-        "RunQ_FinalAdditive", "RunQ_PreMaxCpuCapRec", "RunQ_CappedByMaxCPU"
-    );
-    push @output_header_cols_csv, @debug_column_keys_list_csv;
-}
+# Debug columns entirely removed
 print STDOUT join(",", map { quote_csv($_) } @output_header_cols_csv) . "\n";
 
 foreach my $vm_name (@vm_order)
@@ -615,17 +647,18 @@ foreach my $vm_name (@vm_order)
     my $smt_used_for_vm_csv = (defined $cfg_csv && defined $cfg_csv->{smt}) ? $cfg_csv->{smt} : $default_smt_arg;
     my $max_cpu_for_vm_csv  = (defined $cfg_csv && defined $cfg_csv->{maxcpu} && $cfg_csv->{maxcpu} > 0) ? $cfg_csv->{maxcpu} : 0;
     
-    # These will now be from the first profile run that provided them
+    # These values are still needed for logic and logging, sourced from first profile
     my $norm_runq_p50_for_vm_str_csv = $results_table{$vm_name}{'NormRunQ_P50'} // "N/A";
     my $norm_runq_p90_for_vm_str_csv = $results_table{$vm_name}{'NormRunQ_P90'} // "N/A";
     my $abs_runq_p90_for_vm_str_csv  = $results_table{$vm_name}{'AbsRunQ_P90'}  // "N/A";
+    my $runq_metrics_source_profile_name = $source_profile_for_global_runq{$vm_name} // "First Profile Processed";
     
-    my $runq_pressure_p90_value_for_csv_out = "N/A";
+    # This was for a removed column, but the value might be useful for hint/log.
+    my $runq_pressure_p90_value_for_logic = "N/A";
     my $abs_runq_p90_numeric_for_calc_csv = ($abs_runq_p90_for_vm_str_csv ne "N/A" && $abs_runq_p90_for_vm_str_csv =~ /^-?[0-9.]+$/) ? ($abs_runq_p90_for_vm_str_csv + 0) : undef;
-
     if (defined $abs_runq_p90_numeric_for_calc_csv && $max_cpu_for_vm_csv > 0 && $smt_used_for_vm_csv > 0)
     {
-        $runq_pressure_p90_value_for_csv_out = sprintf("%.4f", $abs_runq_p90_numeric_for_calc_csv / ($max_cpu_for_vm_csv * $smt_used_for_vm_csv));
+        $runq_pressure_p90_value_for_logic = sprintf("%.4f", $abs_runq_p90_numeric_for_calc_csv / ($max_cpu_for_vm_csv * $smt_used_for_vm_csv));
     }
     
     my ($hint_type_tier_csv, $hint_pattern_shape_csv, $hint_pressure_bool_csv, $pressure_detail_str_csv) =
@@ -633,64 +666,70 @@ foreach my $vm_name (@vm_order)
             'results_ref'              => \%results_table,
             'vm' => $vm_name,
             'config_ref' => $cfg_csv,
-            'norm_runq_p90_for_vm_str' => $norm_runq_p90_for_vm_str_csv, # Uses potentially first-profile sourced value
-            'abs_runq_p90_for_vm_str'  => $abs_runq_p90_for_vm_str_csv,  # Uses potentially first-profile sourced value
+            'norm_runq_p90_for_vm_str' => $norm_runq_p90_for_vm_str_csv,
+            'abs_runq_p90_for_vm_str'  => $abs_runq_p90_for_vm_str_csv,
             'max_cpu_for_vm_numeric'   => $max_cpu_for_vm_csv,
             'smt_used_for_vm_numeric'  => $smt_used_for_vm_csv
         );
     my $pressure_bool_str_csv = $hint_pressure_bool_csv ? "True" : "False";
     
     push @data_row_csv, $vm_name, "", $hint_type_tier_csv, $hint_pattern_shape_csv, $pressure_bool_str_csv, $pressure_detail_str_csv, $smt_used_for_vm_csv;
-    push @data_row_csv, $norm_runq_p50_for_vm_str_csv, $norm_runq_p90_for_vm_str_csv, $abs_runq_p90_for_vm_str_csv, $runq_pressure_p90_value_for_csv_out;
+    # Removed RunQ PXX columns from CSV data row
     
-    my %captured_debug_info_for_vm_csv;
     push @data_row_csv, (defined $cfg_csv ? $cfg_csv->{serial} : ""), (defined $cfg_csv ? $cfg_csv->{systemtype} : ""), (defined $cfg_csv ? $cfg_csv->{pool_name} : ""), (defined $cfg_csv ? $cfg_csv->{pool_id} : "");
     push @data_row_csv, ($results_table{$vm_name}{$PEAK_PROFILE_NAME} // "");
     
-    my $debug_info_captured_flag_csv = 0;
     foreach my $profile (@profiles)
     {
-        my $profile_name = $profile->{name};
-        my $raw_physc_profile_value_str = $results_table{$vm_name}{$profile_name}; # This is PXX for this specific profile
+        my $profile_name_being_adjusted = $profile->{name};
+        my $raw_physc_profile_value_str = $results_table{$vm_name}{$profile_name_being_adjusted};
         my $adjusted_value_str = "N/A";
         my $current_profile_runq_behavior = $profile->{runq_behavior} // 'default';
+        my $debug_info_ref_profile_for_log; # To store the hash for logging
 
         if (defined $raw_physc_profile_value_str && $raw_physc_profile_value_str ne "N/A" && $raw_physc_profile_value_str =~ /^-?[0-9.]+$/)
         {
             my $raw_physc_profile_value = $raw_physc_profile_value_str + 0;
             my $is_non_default_pool = (defined $cfg_csv && defined $cfg_csv->{pool_name} && lc($cfg_csv->{pool_name}) ne 'defaultpool' && $cfg_csv->{pool_name} ne '');
             
-            # calculate_runq_modified_physc uses the NormP50, NormP90, AbsP90 that were sourced from the first profile.
-            my ($runq_modified_physc_for_profile, $debug_info_ref_profile) = calculate_runq_modified_physc(
+            my ($runq_modified_physc_for_profile, $debug_info_ref) = calculate_runq_modified_physc(
                 $raw_physc_profile_value, $norm_runq_p50_for_vm_str_csv, $norm_runq_p90_for_vm_str_csv, $abs_runq_p90_for_vm_str_csv,
                 $smt_used_for_vm_csv, (defined $cfg_csv ? $cfg_csv->{entitlement} : "0"), $max_cpu_for_vm_csv, $is_non_default_pool,
                 $current_profile_runq_behavior
             );
+            $debug_info_ref_profile_for_log = $debug_info_ref; # Capture for logging
             
             my $current_profile_nfit_flags = $profile->{flags};
             my $current_profile_output_dp = get_nfit_output_dp_from_flags($rounding_flags_for_nfit . " " . $current_profile_nfit_flags);
             my $current_sprintf_format = "%." . $current_profile_output_dp . "f";
             $adjusted_value_str = sprintf($current_sprintf_format, $runq_modified_physc_for_profile);
-            
-            if ($debug_runq_modifier && defined $debug_info_ref_profile && !$debug_info_captured_flag_csv)
-            {
-                if (defined $debug_info_ref_profile->{'BasePhysC'} &&
-                    $debug_info_ref_profile->{'BasePhysC'} ne "N/A" &&
-                    (!exists $debug_info_ref_profile->{'ReasonForNoModification'} ||
-                     $debug_info_ref_profile->{'ReasonForNoModification'} ne 'BasePhysC not numeric')
-                   )
-                {
-                    %captured_debug_info_for_vm_csv = %{$debug_info_ref_profile};
-                    $captured_debug_info_for_vm_csv{'BasePhysC_Profile'} = $profile_name; # This profile's PhysC was used as base for this *debug capture*
-                    $debug_info_captured_flag_csv = 1;
-                }
-            }
         }
         else
         {
             $adjusted_value_str = $raw_physc_profile_value_str // "N/A";
+            # Create a minimal debug_info if base PhysC was N/A, for consistent logging structure
+            $debug_info_ref_profile_for_log = {
+                 BasePhysC => $raw_physc_profile_value_str // "N/A",
+                 ReasonForNoModification => "Base PhysC for profile '$profile_name_being_adjusted' was N/A or not numeric.",
+                 FinalAdjustedPhysC => $adjusted_value_str, # Will also be N/A
+            };
         }
         push @data_row_csv, $adjusted_value_str;
+
+        # --- Call Rationale Logger ---
+        if ($LOG_FH)
+        {
+            log_profile_rationale(
+                $LOG_FH, $vm_name, $profile_name_being_adjusted,
+                $raw_physc_profile_value_str,
+                $runq_metrics_source_profile_name,
+                $abs_runq_p90_for_vm_str_csv, $norm_runq_p50_for_vm_str_csv, $norm_runq_p90_for_vm_str_csv,
+                $cfg_csv, $smt_used_for_vm_csv, $max_cpu_for_vm_csv,
+                $current_profile_runq_behavior,
+                $debug_info_ref_profile_for_log, # Contains all intermediate calculation results
+                $adjusted_value_str # Final value for this profile column in CSV
+            );
+        }
     }
     
     my $current_ent_display_csv_out = (defined $cfg_csv && defined $cfg_csv->{entitlement}) ? $cfg_csv->{entitlement} : "";
@@ -700,38 +739,7 @@ foreach my $vm_name (@vm_order)
     }
     push @data_row_csv, $current_ent_display_csv_out, "NFIT_Formula", "NETT_UserFormula", "NETT_Perc_UserFormula";
     
-    if ($debug_runq_modifier)
-    {
-        foreach my $csv_col_key (@debug_column_keys_list_csv)
-        {
-            my $val_to_push = "N/A";
-            my $hash_key = $csv_col_key;
-            if ($csv_col_key eq "RunQ_BasePhysC_Profile")
-            {
-                $hash_key = 'BasePhysC_Profile';
-            }
-            elsif ($csv_col_key eq "RunQ_BasePhysC_Value")
-            {
-                $hash_key = 'BasePhysC';
-            }
-            elsif ($csv_col_key eq "RunQ_RunQPressure_P90_Val")
-            {
-                # This value is already calculated from the (now first-profile-sourced) AbsRunQ_P90
-                $val_to_push = $runq_pressure_p90_value_for_csv_out;
-                push @data_row_csv, $val_to_push;
-                next; # Already pushed
-            }
-            else
-            {
-                $hash_key =~ s/^RunQ_//;
-            }
-            if (exists $captured_debug_info_for_vm_csv{$hash_key})
-            {
-                $val_to_push = $captured_debug_info_for_vm_csv{$hash_key};
-            }
-            push @data_row_csv, $val_to_push;
-        }
-    }
+    # Debug columns are removed from CSV
     print STDOUT join(",", map { quote_csv($_) } @data_row_csv) . "\n";
 }
 
@@ -740,11 +748,175 @@ if ($nfit_enable_windowed_decay)
 {
     print STDERR "Note: nfit was instructed to use internal windowed decay processing.\n";
 }
+if ($LOG_FH)
+{
+    my $PROFILE_SCRIPT_END_TIME_EPOCH = time();
+    my $PROFILE_SCRIPT_END_TIME_STR = localtime($PROFILE_SCRIPT_END_TIME_EPOCH)->strftime("%Y-%m-%d %H:%M:%S %Z");
+    my $PROFILE_SCRIPT_DURATION = $PROFILE_SCRIPT_END_TIME_EPOCH - $PROFILE_SCRIPT_START_TIME_EPOCH;
+
+    print {$LOG_FH} "\n----------------------------------------------------------------------\n"; # Added newline for separation
+    print {$LOG_FH} "nfit-profile.pl Run Ended  : $PROFILE_SCRIPT_END_TIME_STR\n";
+    print {$LOG_FH} "Total Duration             : $PROFILE_SCRIPT_DURATION seconds\n";
+    print {$LOG_FH} "======================================================================\n";
+    print {$LOG_FH} "End of Rationale Log.\n";
+    print {$LOG_FH} "======================================================================\n";
+    close $LOG_FH;
+    print STDERR "Rationale log written to: $LOG_FILE_PATH\n";
+}
+
 exit 0;
 
 # ==============================================================================
 # Subroutines
 # ==============================================================================
+
+sub log_profile_rationale
+{
+    my ($fh, $vm_name, $profile_being_adjusted,
+        $raw_physc_for_profile,
+        $runq_metrics_source_profile,
+        $absP90_global, $normP50_global, $normP90_global,
+        $vm_cfg_ref, $smt_val, $lpar_max_cpu_cfg_val,
+        $profile_rq_behavior,
+        $calc_debug_info_ref,
+        $final_csv_value_for_profile
+    ) = @_;
+
+    return unless $fh; # Do nothing if filehandle is invalid
+
+    my $na = 'N/A'; # Consistent N/A string
+
+    print {$fh} "----------------------------------------------------------------------\n";
+    print {$fh} "VM Name                 : $vm_name\n";
+    print {$fh} "Profile Adjusted        : $profile_being_adjusted\n";
+    print {$fh} "----------------------------------------------------------------------\n\n";
+
+    print {$fh} "Section A: Inputs for RunQ Adjustment\n";
+    printf {$fh} "  1. Base PhysC for this Profile : %s cores (Value from nfit for profile '%s')\n", ($raw_physc_for_profile // $na), $profile_being_adjusted;
+    printf {$fh} "  2. RunQ Metrics Source Profile : %s (Metrics from this nfit run used for common RunQ calculation)\n", $runq_metrics_source_profile;
+    printf {$fh} "     - AbsRunQ P90             : %s threads\n", ($absP90_global // $na);
+    printf {$fh} "     - NormRunQ P50            : %s\n", ($normP50_global // $na);
+    printf {$fh} "     - NormRunQ P90            : %s\n", ($normP90_global // $na);
+    print {$fh} "  3. VM Configuration:\n";
+    printf {$fh} "     - SMT                     : %s\n", $smt_val;
+    printf {$fh} "     - Current Entitlement     : %s cores\n", (defined $vm_cfg_ref && defined $vm_cfg_ref->{entitlement} ? $vm_cfg_ref->{entitlement} : $na);
+    printf {$fh} "     - LPAR MaxCPU             : %s cores\n", ($lpar_max_cpu_cfg_val > 0 ? $lpar_max_cpu_cfg_val : $na);
+    my $is_non_default_pool_log = (defined $vm_cfg_ref && defined $vm_cfg_ref->{pool_name} && lc($vm_cfg_ref->{pool_name}) ne 'defaultpool' && $vm_cfg_ref->{pool_name} ne '') ? "Yes" : "No";
+    printf {$fh} "     - In Non-Default Pool     : %s\n", $is_non_default_pool_log;
+    printf {$fh} "  4. Profile RunQ Behavior    : %s\n\n", $profile_rq_behavior;
+
+    if (defined $calc_debug_info_ref->{'ReasonForNoModification'} && $calc_debug_info_ref->{'ReasonForNoModification'} ne '')
+    {
+        printf {$fh} "RunQ Modification Skipped: %s\n", $calc_debug_info_ref->{'ReasonForNoModification'};
+        printf {$fh} "Final Value for Profile '%s': %s cores (same as Base PhysC due to skip)\n\n", $profile_being_adjusted, ($raw_physc_for_profile // $na);
+        return;
+    }
+
+    print {$fh} "Section B: RunQ-Driven CPU Adjustment Calculation\n";
+    print {$fh} "  1. Efficiency Adjustment:\n";
+    my $eff_factor_log = $calc_debug_info_ref->{'EffFactor'} // $na;
+    my $eff_reason_log = $calc_debug_info_ref->{'EffFactorReason'} // $na;
+    printf {$fh} "     - Efficiency Factor       : %s (Reason: %s)\n", $eff_factor_log, $eff_reason_log;
+    my $base_adj_physc_log = $calc_debug_info_ref->{'BaseAdjustedPhysC'} // $na;
+    printf {$fh} "     - PhysC after Efficiency  : %s cores\n\n", ($base_adj_physc_log eq $na ? $na : sprintf "%.4f", $base_adj_physc_log);
+
+    print {$fh} "  2. Pressure Assessment (based on RunQ Metrics Source Profile values):\n";
+    my $runq_pressure_val_log = $calc_debug_info_ref->{'RunQPressure_P90_Val'} // $na;
+    my $is_rq_pressure_log = $calc_debug_info_ref->{'IsRunQPressure'} // $na;
+    my $is_wl_pressure_log = $calc_debug_info_ref->{'IsWorkloadPressure'} // $na;
+    my $apply_additive = ($is_rq_pressure_log eq "True" || $is_wl_pressure_log eq "True");
+
+# RunQ Pressure: This value represents the P90 absolute run queue demand (AbsRunQ_P90) as a fraction of the LPAR's total logical CPU capacity (if it were fully utilised up to its MaxCPU setting). A value > 1.0 implies that at the P90 level of absolute run queue, the demand for threads exceeds the LPAR's maximum thread capacity.
+
+    print {$fh} "     - RunQ Pressure            : AbsRunQ P90 / (LPAR MaxCPU * SMT)               : A value of > 1.0 indicates that demand exceeds maximum thread capacity\n";
+    my $abs_p90_num = ($absP90_global ne $na && $absP90_global =~ /^-?[0-9.]+$/) ? ($absP90_global + 0) : 0;
+    my $max_cpu_num = ($lpar_max_cpu_cfg_val > 0) ? $lpar_max_cpu_cfg_val : 0;
+    my $smt_num = ($smt_val > 0) ? $smt_val : 1;
+    my $denominator_rp = $max_cpu_num * $smt_num;
+    my $calc_detail_rp = ($denominator_rp > 0) ? sprintf("%.2f / (%.2f * %d) = %.4f", $abs_p90_num, $max_cpu_num, $smt_num, ($abs_p90_num / $denominator_rp)) : sprintf("%.2f / (Denominator_Zero_Or_Invalid_LPAR_MaxCPU_SMT)", $abs_p90_num);
+     print {$fh} "                               : $calc_detail_rp\n";
+    printf {$fh} "     - RunQ Pressure Value     : %s (Threshold: > %.2f) -> IsRunQPressure? %s\n", $runq_pressure_val_log, $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD, $is_rq_pressure_log;
+
+# Absolute Run Queue: The total count of threads that are currently running on a CPU hardware thread plus threads that are ready to run and waiting for a CPU hardware thread to become available.
+# PhysC_consumed_at_that_moment: The amount of physical CPU cores the LPAR was actually using at that specific time interval.
+# SMT: The Simultaneous Multi-Threading level (e.g., SMT8 means one physical core can present as 8 hardware threads or logical CPUs).
+# (PhysC_consumed_at_that_moment * SMT) = the number of effective hardware threads (or logical CPUs) that were actively being utilised by the LPAR at that moment.
+# NormRunQ: 0.5 : For SMT-8, implies 4 active threads.
+
+# Note: RunQ Pressure Value tells you about queuing relative to what the LPAR could maximally use. NormRunQ tells you about queuing relative to what's currently being used.
+
+     print {$fh} "     - Workload Pressure       : Absolute RunQ / (PhysC_Consumed * SMT)          : High values (> 1.2) indicate CPU wait due to queueing\n";
+    printf {$fh} "     - Workload Pressure (NormP90): %s (Threshold: > %.2f) -> IsWorkloadPressure? %s\n", ($normP90_global // $na), $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD, $is_wl_pressure_log;
+    printf {$fh} "     >> Additive Logic Applies  : %s\n\n", ($apply_additive ? "Yes" : "No");
+
+    my $final_additive_log = $calc_debug_info_ref->{'FinalAdditive'} // "0.0000"; # Default to 0 if not applicable
+    if ($apply_additive)
+    {
+        print {$fh} "  3. Additive CPU Calculation:\n";
+        my $base_physc_for_add_log = $calc_debug_info_ref->{'BasePhysCForAdditive'} // $na;
+
+        my $physc_msg;
+        if ($base_physc_for_add_log ne $na && $base_physc_for_add_log =~ /^-?[0-9.]+$/) {
+            $physc_msg = sprintf("     - Base PhysC for Additive : %.4f cores (Raw PhysC of profile '%s')\n",
+                                 $base_physc_for_add_log, $profile_being_adjusted);
+        } else {
+            $physc_msg = sprintf("     - Base PhysC for Additive : %s (Raw PhysC of profile '%s')\n",
+                                 $raw_physc_for_profile, $profile_being_adjusted);
+        }
+        print {$fh} $physc_msg;
+
+        my $eff_lcpus_log = $calc_debug_info_ref->{'EffectiveLCPUsAtBase'} // $na;
+        printf {$fh} "     - Effective LCPUs for Base: %s threads (Base PhysC * SMT)\n", ($eff_lcpus_log eq $na ? $na : sprintf "%.4f", $eff_lcpus_log);
+        my $excess_threads_log = $calc_debug_info_ref->{'ExcessThreads'} // $na;
+        my $excess_threads_display_log = $calc_debug_info_ref->{'ExcessThreads'} // $na;
+        printf {$fh} "     - Excess Threads          : %s threads (AbsRunQ P90 - Effective LCPUs)\n", $excess_threads_display_log;
+        printf {$fh} "     - Raw Additive CPU        : %s cores (Excess Threads / SMT)\n", ($calc_debug_info_ref->{'RawAdditive'} // $na);
+        printf {$fh} "     - Max Additive Cap        : %s cores (Derived from Entitlement: %s)\n", ($calc_debug_info_ref->{'MaxAdditiveCap'} // $na), (defined $vm_cfg_ref && defined $vm_cfg_ref->{entitlement} ? $vm_cfg_ref->{entitlement} : $na);
+        my $capped_raw_add_log = $calc_debug_info_ref->{'CappedRawAdditive'} // $na;
+        printf {$fh} "     - Capped Raw Additive     : %s cores (Min(Raw Additive, Max Cap))\n", ($capped_raw_add_log eq $na ? $na : sprintf "%.4f", $capped_raw_add_log);
+        printf {$fh} "     - Volatility Factor       : %s (Reason: %s)\n", ($calc_debug_info_ref->{'VoltFactor'} // $na), ($calc_debug_info_ref->{'VoltFactorReason'} // $na);
+        printf {$fh} "     - Pool Factor             : %s\n", ($calc_debug_info_ref->{'PoolFactor'} // $na);
+        printf {$fh} "     - Final Additive CPU      : %s cores\n\n", ($final_additive_log eq $na ? $na : sprintf "%.4f", $final_additive_log);
+    }
+    else
+    {
+        print {$fh} "  3. Additive CPU Calculation : Skipped (No significant pressure detected to trigger additive logic).\n\n";
+        $final_additive_log = 0; # Ensure it's numeric for the next step
+    }
+
+    print {$fh} "  4. CPU Recommendation (Pre LPAR MaxCPU Cap):\n";
+    my $pre_cap_rec_log = $calc_debug_info_ref->{'PreMaxCpuCapRec'} // $na;
+    printf {$fh} "     - Pre-Cap Value           : %s cores (PhysC after Efficiency + Final Additive)\n\n", ($pre_cap_rec_log eq $na ? $na : sprintf "%.4f", $pre_cap_rec_log);
+
+    print {$fh} "Section C: LPAR MaxCPU Capping\n";
+    my $lpar_max_display = ($lpar_max_cpu_cfg_val > 0) ? sprintf("%.2f", $lpar_max_cpu_cfg_val) : $na;
+    printf {$fh} "  1. LPAR MaxCPU (from config)  : %s cores\n", $lpar_max_display;
+
+    my $ent_for_forecast_log = (defined $vm_cfg_ref && defined $vm_cfg_ref->{entitlement} ? $vm_cfg_ref->{entitlement} : $na);
+    printf {$fh} "  2. Entitlement (for multiplier): %s cores\n", $ent_for_forecast_log;
+
+    my $fm_display_log = $calc_debug_info_ref->{'ForecastMultiplier'};
+	 if (defined $fm_display_log && $fm_display_log ne $na && $fm_display_log =~ /^-?[0-9.]+$/) {
+		 printf {$fh} "  3. Forecast Multiplier        : %.2f\n", $fm_display_log;
+	 } else {
+		 printf {$fh} "  3. Forecast Multiplier        : %s\n", $fm_display_log // $na;
+	 }
+
+    my $eff_max_cap_log = $calc_debug_info_ref->{'EffectiveMaxCPUCap'} // $na;
+    printf {$fh} "  4. Effective MaxCPU Cap       : %s cores (LPAR MaxCPU * Forecast Multiplier)\n", ($eff_max_cap_log eq $na ? $na : sprintf "%.4f", $eff_max_cap_log);
+    printf {$fh} "  5. Is Capped by MaxCPU?       : %s\n\n", ($calc_debug_info_ref->{'CappedByMaxCPU'} // $na);
+
+    print {$fh} "Section D: Final Result for Profile '$profile_being_adjusted'\n";
+    printf {$fh} "  - Final Adjusted Value      : %s cores\n", ($final_csv_value_for_profile // $na);
+    print {$fh} "\n";
+}
+
+
+# (Rest of subroutines: quote_csv, load_profile_definitions, calculate_runq_modified_physc (to be augmented),
+#  generate_sizing_hint, parse_percentile_list_for_header, ensure_percentiles_requested,
+#  get_nfit_output_dp_from_flags, get_decimal_places, usage_wrapper)
+# ... Make sure calculate_runq_modified_physc adds the new keys to its returned %debug_info hash ...
+
 sub quote_csv
 {
     my ($field) = @_;
@@ -779,16 +951,18 @@ sub load_profile_definitions
             if (defined $current_section_name && @loaded_profiles_list &&
                 $loaded_profiles_list[-1]{name} eq $current_section_name &&
                 !defined $loaded_profiles_list[-1]{flags} &&
-                !defined $loaded_profiles_list[-1]{runq_behavior} )
+                # Check runq_behavior default assignment
+                (!defined $loaded_profiles_list[-1]{runq_behavior} || $loaded_profiles_list[-1]{runq_behavior} eq 'default') )
             {
                  my $is_incomplete = 1;
-                 if (defined $loaded_profiles_list[-1]{flags}) # Check if flags were actually set
+                 # A profile is only incomplete if it has a name but no flags. Behavior defaults.
+                 if (defined $loaded_profiles_list[-1]{flags})
                  {
                     $is_incomplete = 0;
                  }
                  if ($is_incomplete)
                  {
-                    warn "Warning: Profile section '[$current_section_name]' in '$filepath' (line $line_number) seems incomplete. Skipping previous section entry if only name was present.\n";
+                    warn "Warning: Profile section '[$current_section_name]' in '$filepath' (line $line_number) appears incomplete (missing nfit_flags). Skipping this potentially malformed entry.\n";
                     pop @loaded_profiles_list;
                  }
             }
@@ -873,38 +1047,47 @@ sub calculate_runq_modified_physc
     ) = @_;
 
     my %debug_info;
+    # Store inputs for logging, ensure N/A for undefined
     $debug_info{'BasePhysC'} = $selected_tier_physc_value_str // "N/A";
     $profile_runq_behavior_setting //= 'default';
 
     my $base_physc = ($selected_tier_physc_value_str ne "N/A" && $selected_tier_physc_value_str =~ /^-?[0-9.]+$/) ? ($selected_tier_physc_value_str + 0) : undef;
+    
+    # Initialize all debug fields to N/A or defaults for cases where logic is skipped
+    $debug_info{'EffFactorReason'} = "N/A"; $debug_info{'EffFactor'} = "1.00"; # Default EffFactor if not modified
+    $debug_info{'BaseAdjustedPhysC'} = defined($base_physc) ? sprintf("%.4f", $base_physc * 1.00) : "N/A"; # Initial value before logic
+    $debug_info{'RunQPressure_P90_Val'} = "N/A"; $debug_info{'IsRunQPressure'} = "N/A"; $debug_info{'IsWorkloadPressure'} = "N/A";
+    $debug_info{'EffectiveLCPUsAtBase'} = "N/A"; $debug_info{'ExcessThreads'} = "N/A";
+    $debug_info{'RawAdditive'} = "0.0000"; $debug_info{'MaxAdditiveCap'} = "0.0000"; $debug_info{'CappedRawAdditive'} = "0.0000";
+    $debug_info{'VoltFactorReason'} = "N/A"; $debug_info{'VoltFactor'} = "1.00"; # Default VoltFactor
+    $debug_info{'PoolFactor'} = "1.00"; # Default PoolFactor
+    $debug_info{'FinalAdditive'} = "0.0000";
+    $debug_info{'PreMaxCpuCapRec'} = defined($base_physc) ? sprintf("%.4f", $base_physc) : "N/A"; # Initial value
+    $debug_info{'LPARMaxCPUConfig'} = ($max_cpu_config_str ne "" && $max_cpu_config_str =~ /^[0-9.]+$/ && ($max_cpu_config_str+0) > 0) ? ($max_cpu_config_str+0) : "N/A";
+    $debug_info{'EntitlementForForecast'} = (defined $current_entitlement_str && $current_entitlement_str ne "" && $current_entitlement_str =~ /^-?[0-9.]+$/) ? ($current_entitlement_str + 0) : 0;
+    $debug_info{'ForecastMultiplier'} = "N/A"; $debug_info{'EffectiveMaxCPUCap'} = "N/A";
+    $debug_info{'CappedByMaxCPU'} = "N/A";
+    $debug_info{'FinalAdjustedPhysC'} = $debug_info{'BasePhysC'}; # Start with base, will be overwritten
+
     unless (defined $base_physc)
     {
-        $debug_info{'ReasonForNoModification'} = "BasePhysC not numeric";
-        $debug_info{'RunQPressure_P90_Val'} = "N/A"; $debug_info{'IsRunQPressure'} = "N/A"; $debug_info{'IsWorkloadPressure'} = "N/A";
-        $debug_info{'EffFactorReason'} = "BasePhysC N/A"; $debug_info{'EffFactor'} = "N/A";
-        $debug_info{'VoltFactorReason'} = "BasePhysC N/A"; $debug_info{'VoltFactor'} = "N/A";
-        $debug_info{'RawAdditive'} = "N/A"; $debug_info{'MaxAdditiveCap'} = "N/A";
-        $debug_info{'PoolFactor'} = "N/A"; $debug_info{'FinalAdditive'} = "N/A";
-        $debug_info{'PreMaxCpuCapRec'} = "N/A"; $debug_info{'CappedByMaxCPU'} = "N/A";
+        $debug_info{'ReasonForNoModification'} = "BasePhysC for profile not numeric or N/A";
         return ($selected_tier_physc_value_str // "N/A", \%debug_info);
     }
+    $debug_info{'BaseAdjustedPhysC'} = sprintf("%.4f", $base_physc); # Base * 1.0 initially
 
     my $norm_p50_numeric = ($norm_runq_p50_str ne "N/A" && $norm_runq_p50_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p50_str + 0) : undef;
     my $norm_p90_numeric = ($norm_runq_p90_str ne "N/A" && $norm_runq_p90_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p90_str + 0) : undef;
     my $abs_p90_numeric  = ($abs_runq_p90_str  ne "N/A" && $abs_runq_p90_str  =~ /^-?[0-9.]+$/) ? ($abs_runq_p90_str + 0)  : undef;
-    my $curr_ent_numeric = (defined $current_entitlement_str && $current_entitlement_str ne "" && $current_entitlement_str =~ /^-?[0-9.]+$/) ? ($current_entitlement_str + 0) : 0;
-    my $max_cpu_for_lpar_numeric = (defined $max_cpu_config_str && $max_cpu_config_str ne "" && $max_cpu_config_str =~ /^-?[0-9.]+$/ && ($max_cpu_config_str+0) > 0) ? ($max_cpu_config_str + 0) : 0;
+    my $curr_ent_numeric = $debug_info{'EntitlementForForecast'}; # Already parsed
+    my $max_cpu_for_lpar_numeric = ($debug_info{'LPARMaxCPUConfig'} ne "N/A") ? $debug_info{'LPARMaxCPUConfig'} : 0;
     
-    unless (defined $abs_p90_numeric && (defined $norm_p90_numeric || $max_cpu_for_lpar_numeric > 0) )
+    unless (defined $abs_p90_numeric && $smt_used > 0 && (defined $norm_p90_numeric || $max_cpu_for_lpar_numeric > 0) )
     {
-        $debug_info{'ReasonForNoModification'} = "Missing essential RunQ metrics for modifier logic (AbsP90 and (NormP90 for WorkloadPressure or MaxCPU for RunQPressure))";
-        $debug_info{'RunQPressure_P90_Val'} = "N/A"; $debug_info{'IsRunQPressure'} = "N/A"; $debug_info{'IsWorkloadPressure'} = "N/A";
-        $debug_info{'EffFactorReason'} = "Missing RunQ"; $debug_info{'EffFactor'} = "1.00";
-        $debug_info{'VoltFactorReason'} = "Missing RunQ"; $debug_info{'VoltFactor'} = "1.00";
-        $debug_info{'RawAdditive'} = "0.0000"; $debug_info{'MaxAdditiveCap'} = "0.0000";
-        $debug_info{'PoolFactor'} = "1.00"; $debug_info{'FinalAdditive'} = "0.0000";
-        $debug_info{'PreMaxCpuCapRec'} = sprintf("%.4f", $base_physc);
-        $debug_info{'CappedByMaxCPU'} = "False";
+        $debug_info{'ReasonForNoModification'} = "Missing essential RunQ (AbsP90, SMT) or contextual metrics (NormP90 or MaxCPU) for modifier logic.";
+        $debug_info{'EffFactorReason'} = $debug_info{'ReasonForNoModification'}; # No mod, so no specific efficiency reason
+        $debug_info{'VoltFactorReason'} = $debug_info{'ReasonForNoModification'};
+        $debug_info{'FinalAdjustedPhysC'} = sprintf("%.4f", $base_physc);
         return ($base_physc, \%debug_info);
     }
 
@@ -923,83 +1106,66 @@ sub calculate_runq_modified_physc
     my $efficiency_factor = 1.0;
     if ($profile_runq_behavior_setting eq 'additive_only')
     {
-        $debug_info{'EffFactorReason'} = "Profile additive_only";
+        $debug_info{'EffFactorReason'} = "Profile runq_behavior=additive_only";
     }
     elsif (defined $norm_p50_numeric && $norm_p50_numeric < $RUNQ_EFFICIENCY_NORM_P50_THRESHOLD)
     {
         $efficiency_factor = 0.90;
-        $debug_info{'EffFactorReason'} = "NormRunQ P50 < threshold";
+        $debug_info{'EffFactorReason'} = sprintf("NormRunQ P50 (%.2f) < threshold (%.2f)", $norm_p50_numeric, $RUNQ_EFFICIENCY_NORM_P50_THRESHOLD);
     }
     else
     {
-        $debug_info{'EffFactorReason'} = defined($norm_p50_numeric) ? "NormRunQ P50 >= threshold" : "NormRunQ P50 N/A";
+        $debug_info{'EffFactorReason'} = defined($norm_p50_numeric) ? sprintf("NormRunQ P50 (%.2f) >= threshold (%.2f)", $norm_p50_numeric, $RUNQ_EFFICIENCY_NORM_P50_THRESHOLD) : "NormRunQ P50 N/A";
     }
     my $base_adjusted_physc = $base_physc * $efficiency_factor;
     $debug_info{'EffFactor'} = sprintf("%.2f", $efficiency_factor);
+    $debug_info{'BaseAdjustedPhysC'} = sprintf("%.4f", $base_adjusted_physc);
     
     my $additive_cpu = 0;
     my $raw_additive_cpu = 0;
     my $max_additive_cap_sliding = 0;
+    my $capped_raw_additive_val = 0;
     my $volatility_confidence_factor = 1.0;
     my $pool_confidence_factor = 1.0;
-    $debug_info{'VoltFactorReason'} = "Default";
+    $debug_info{'VoltFactorReason'} = "Default (no overriding condition met or additive not applied)";
 
-    if ($apply_additive_logic && defined $abs_p90_numeric && $smt_used > 0)
+    if ($apply_additive_logic) # $abs_p90_numeric and $smt_used are already confirmed > 0 if we reach here
     {
-        my $effective_lcpus_at_base_profile_recommendation = $base_physc * $smt_used;
-        my $excess_threads = $abs_p90_numeric - $effective_lcpus_at_base_profile_recommendation;
+        # Use $base_physc (original value for this profile) for LCPUs calculation, not $base_adjusted_physc
+        my $effective_lcpus_at_base = $base_physc * $smt_used;
+        $debug_info{'EffectiveLCPUsAtBase'} = sprintf("%.4f", $effective_lcpus_at_base);
+        my $excess_threads = $abs_p90_numeric - $effective_lcpus_at_base;
+        $debug_info{'ExcessThreads'} = ($excess_threads > 0) ? sprintf("%.4f", $excess_threads) : "0.0000 (No excess)";
+
         if ($excess_threads > 0)
         {
             $raw_additive_cpu = $excess_threads / $smt_used;
-            if ($curr_ent_numeric < $MAX_ADD_ENT_THRESH1)
-            {
-                $max_additive_cap_sliding = $MAX_ADD_ABS_VAL1;
-            }
-            elsif ($curr_ent_numeric < $MAX_ADD_ENT_THRESH2)
-            {
-                $max_additive_cap_sliding = $curr_ent_numeric * $MAX_ADD_PERC_VAL2;
-            }
-            elsif ($curr_ent_numeric < $MAX_ADD_ENT_THRESH3)
-            {
-                $max_additive_cap_sliding = $curr_ent_numeric * $MAX_ADD_PERC_VAL3;
-            }
-            else
-            {
-                $max_additive_cap_sliding = $curr_ent_numeric * $MAX_ADD_PERC_VAL_ELSE;
-            }
-            if ($curr_ent_numeric == 0 && $max_additive_cap_sliding == 0) # Edge case for 0 entitlement
-            {
-                $max_additive_cap_sliding = $MAX_ADD_ABS_VAL1;
-            }
-            my $capped_additive_cpu = ($raw_additive_cpu < $max_additive_cap_sliding) ? $raw_additive_cpu : $max_additive_cap_sliding;
+            if ($curr_ent_numeric < $MAX_ADD_ENT_THRESH1) { $max_additive_cap_sliding = $MAX_ADD_ABS_VAL1; }
+            elsif ($curr_ent_numeric < $MAX_ADD_ENT_THRESH2) { $max_additive_cap_sliding = $curr_ent_numeric * $MAX_ADD_PERC_VAL2; }
+            elsif ($curr_ent_numeric < $MAX_ADD_ENT_THRESH3) { $max_additive_cap_sliding = $curr_ent_numeric * $MAX_ADD_PERC_VAL3; }
+            else { $max_additive_cap_sliding = $curr_ent_numeric * $MAX_ADD_PERC_VAL_ELSE; }
+            if ($curr_ent_numeric == 0 && $max_additive_cap_sliding == 0) { $max_additive_cap_sliding = $MAX_ADD_ABS_VAL1; }
+            
+            $capped_raw_additive_val = ($raw_additive_cpu < $max_additive_cap_sliding) ? $raw_additive_cpu : $max_additive_cap_sliding;
             
             if ($is_runq_pressure)
             {
                 $volatility_confidence_factor = $RUNQ_PRESSURE_SATURATION_CONFIDENCE_FACTOR;
-                $debug_info{'VoltFactorReason'} = "RunQPressure Saturation (Factor set to " . $RUNQ_PRESSURE_SATURATION_CONFIDENCE_FACTOR . ")";
+                $debug_info{'VoltFactorReason'} = sprintf("RunQPressure Saturation (Factor set to %.2f)", $RUNQ_PRESSURE_SATURATION_CONFIDENCE_FACTOR);
             }
-            elsif ($is_workload_pressure && defined $norm_p50_numeric && defined $norm_p90_numeric && $norm_p90_numeric > 0.01) # Avoid division by zero or tiny P90
+            elsif ($is_workload_pressure && defined $norm_p50_numeric && defined $norm_p90_numeric && $norm_p90_numeric > 0.01)
             {
                 my $volatility_ratio = $norm_p50_numeric / $norm_p90_numeric;
-                if ($volatility_ratio < $VOLATILITY_SPIKY_THRESHOLD)
-                {
-                    $volatility_confidence_factor = $VOLATILITY_SPIKY_FACTOR;
-                }
-                elsif ($volatility_ratio < $VOLATILITY_MODERATE_THRESHOLD)
-                {
-                    $volatility_confidence_factor = $VOLATILITY_MODERATE_FACTOR;
-                }
-                else
-                {
-                    $volatility_confidence_factor = 1.0;
-                }
-                $debug_info{'VoltFactorReason'} = "Calculated (NormRQ P50/P90 ratio for WorkloadPressure)";
+                if ($volatility_ratio < $VOLATILITY_SPIKY_THRESHOLD) { $volatility_confidence_factor = $VOLATILITY_SPIKY_FACTOR; }
+                elsif ($volatility_ratio < $VOLATILITY_MODERATE_THRESHOLD) { $volatility_confidence_factor = $VOLATILITY_MODERATE_FACTOR; }
+                else { $volatility_confidence_factor = 1.0; }
+                $debug_info{'VoltFactorReason'} = sprintf("Calculated (NormRQ P50/P90 ratio %.2f for WorkloadPressure)", $volatility_ratio);
             }
             else
             {
-                 $debug_info{'VoltFactorReason'} = "Additive conditions met but P50/P90 NormRQ not usable for volatility calc";
+                 $debug_info{'VoltFactorReason'} = "Additive conditions met but NormP50/P90 not usable for volatility calc";
             }
-            $additive_cpu = $capped_additive_cpu * $volatility_confidence_factor;
+            $additive_cpu = $capped_raw_additive_val * $volatility_confidence_factor;
             if ($is_in_non_default_pool && $additive_cpu > 0)
             {
                 $pool_confidence_factor = $POOL_CONSTRAINT_CONFIDENCE_FACTOR;
@@ -1009,6 +1175,7 @@ sub calculate_runq_modified_physc
     }
     $debug_info{'RawAdditive'} = sprintf("%.4f", $raw_additive_cpu);
     $debug_info{'MaxAdditiveCap'} = sprintf("%.4f", $max_additive_cap_sliding);
+    $debug_info{'CappedRawAdditive'} = sprintf("%.4f", $capped_raw_additive_val);
     $debug_info{'VoltFactor'} = sprintf("%.2f", $volatility_confidence_factor);
     $debug_info{'PoolFactor'} = sprintf("%.2f", $pool_confidence_factor);
     $debug_info{'FinalAdditive'} = sprintf("%.4f", $additive_cpu);
@@ -1017,37 +1184,29 @@ sub calculate_runq_modified_physc
     my $runq_modified_rec = $calculated_demand;
     $debug_info{'PreMaxCpuCapRec'} = sprintf("%.4f", $runq_modified_rec);
 
-    my $forecast_multiplier = 1.25;
-    if ($curr_ent_numeric < 0.5)
-    {
-        $forecast_multiplier = 2.5;
-    }
-    elsif ($curr_ent_numeric < 1.0)
-    {
-        $forecast_multiplier = 2.0;
-    }
-    elsif ($curr_ent_numeric < 2.0)
-    {
-        $forecast_multiplier = 1.75;
-    }
-    elsif ($curr_ent_numeric < 4.0)
-    {
-        $forecast_multiplier = 1.5;
-    }
+    my $forecast_multiplier_val = 1.25;
+    if ($curr_ent_numeric < 0.5) { $forecast_multiplier_val = 2.5; }
+    elsif ($curr_ent_numeric < 1.0) { $forecast_multiplier_val = 2.0; }
+    elsif ($curr_ent_numeric < 2.0) { $forecast_multiplier_val = 1.75; }
+    elsif ($curr_ent_numeric < 4.0) { $forecast_multiplier_val = 1.5; }
+    $debug_info{'ForecastMultiplier'} = $forecast_multiplier_val;
 
-    if (defined $max_cpu_for_lpar_numeric && $max_cpu_for_lpar_numeric > 0 && $calculated_demand > ($max_cpu_for_lpar_numeric * $forecast_multiplier))
+    my $effective_max_cpu_cap_val = ($max_cpu_for_lpar_numeric > 0) ? ($max_cpu_for_lpar_numeric * $forecast_multiplier_val) : undef;
+    $debug_info{'EffectiveMaxCPUCap'} = defined($effective_max_cpu_cap_val) ? sprintf("%.4f", $effective_max_cpu_cap_val) : "N/A";
+    
+    if (defined $effective_max_cpu_cap_val && $calculated_demand > $effective_max_cpu_cap_val)
     {
-        $runq_modified_rec = $max_cpu_for_lpar_numeric * $forecast_multiplier;
+        $runq_modified_rec = $effective_max_cpu_cap_val;
         $debug_info{'CappedByMaxCPU'} = "True";
     }
     else
     {
-      $debug_info{'CappedByMaxCPU'} = "False";
+      $debug_info{'CappedByMaxCPU'} = (defined $effective_max_cpu_cap_val) ? "False" : "N/A (No LPAR MaxCPU for cap check)";
     }
-    if ($runq_modified_rec < 0) # Ensure recommendation is not negative
-    {
-        $runq_modified_rec = 0;
-    }
+
+    if ($runq_modified_rec < 0) { $runq_modified_rec = 0; }
+    $debug_info{'FinalAdjustedPhysC'} = sprintf("%.4f", $runq_modified_rec); # Store it before returning
+
     return ($runq_modified_rec, \%debug_info);
 }
 
@@ -1064,26 +1223,26 @@ sub generate_sizing_hint
 
     if (defined $config_ref && defined $config_ref->{'systemtype'} && $config_ref->{'systemtype'} =~ /VIO Server/i)
     {
-        return ("P", "VIO Server", 0, "");
+        return ("P", "VIO Server", 0, ""); # Pressure False for VIO
     }
     
-    my $o3_val = $results_ref->{$vm}{'O3-95W15'} // 0; $o3_val = 0 unless ($o3_val =~ /^-?[0-9.]+\z/);
-    my $b3_val = $results_ref->{$vm}{'B3-95W15'} // 0; $b3_val = 0 unless ($b3_val =~ /^-?[0-9.]+\z/);
-    my $g3_val = $results_ref->{$vm}{'G3-95W15'} // 0; $g3_val = 0 unless ($g3_val =~ /^-?[0-9.]+\z/);
-    my $p99w1_val = $results_ref->{$vm}{'P-99W1'} // 0; $p99w1_val = 0 unless ($p99w1_val =~ /^-?[0-9.]+\z/);
+    my $o3_val = $results_ref->{$vm}{'O3-95W15'} // "0"; $o3_val = "0" unless ($o3_val =~ /^-?[0-9.]+\z/ && $o3_val ne "N/A"); $o3_val += 0;
+    my $b3_val = $results_ref->{$vm}{'B3-95W15'} // "0"; $b3_val = "0" unless ($b3_val =~ /^-?[0-9.]+\z/ && $b3_val ne "N/A"); $b3_val += 0;
+    my $g3_val = $results_ref->{$vm}{'G3-95W15'} // "0"; $g3_val = "0" unless ($g3_val =~ /^-?[0-9.]+\z/ && $g3_val ne "N/A"); $g3_val += 0;
+    my $p99w1_val = $results_ref->{$vm}{'P-99W1'} // "0"; $p99w1_val = "0" unless ($p99w1_val =~ /^-?[0-9.]+\z/ && $p99w1_val ne "N/A"); $p99w1_val += 0;
     
-    my $suggested_pattern = "G"; # Default to General
+    my $suggested_pattern = "G";
     if ($b3_val > 0.01 && $o3_val > ($b3_val * $PATTERN_RATIO_THRESHOLD))
     {
-        $suggested_pattern = "O"; # Online
+        $suggested_pattern = "O";
     }
     elsif ($o3_val > 0.01 && $b3_val > ($o3_val * $PATTERN_RATIO_THRESHOLD))
     {
-        $suggested_pattern = "B"; # Batch
+        $suggested_pattern = "B";
     }
     
     my $peakiness_ratio = 0;
-    if ($g3_val > 0.01) # Avoid division by zero if G3 is zero or very small
+    if ($g3_val > 0.01)
     {
         $peakiness_ratio = ($p99w1_val / $g3_val);
     }
@@ -1140,7 +1299,7 @@ sub generate_sizing_hint
         $pressure_detail_str = join(", ", @pressure_points);
     }
     
-    my $initial_tier_range_str = "3/4"; # Default to General
+    my $initial_tier_range_str = "3/4";
     if ($shape_descriptor eq "Very Peaky")
     {
         $initial_tier_range_str = "1/2";
@@ -1196,37 +1355,37 @@ sub ensure_percentiles_requested
 {
     my ($perc_list_str, @required_percs) = @_;
     return 1 unless defined $perc_list_str && $perc_list_str ne '';
-    my $parsed_percs_ref = parse_percentile_list_for_header($perc_list_str, 0); # Get raw numbers
+    my $parsed_percs_ref = parse_percentile_list_for_header($perc_list_str, 0);
     my %present_map = map { $_ => 1 } @{$parsed_percs_ref};
     foreach my $req_p (@required_percs)
     {
         unless (exists $present_map{$req_p})
         {
-            return 0; # Required percentile not found
+            return 0;
         }
     }
-    return 1; # All required percentiles are present
+    return 1;
 }
 
 sub get_nfit_output_dp_from_flags
 {
     my ($nfit_flags_str_for_this_run) = @_;
-    if ($nfit_flags_str_for_this_run =~ /-r(?:=(\d*\.\d+))?|-u(?:=(\d*\.\d+))?/) # Regex for -r=0.05 or -r or -u=0.1 or -u
+    if ($nfit_flags_str_for_this_run =~ /-r(?:=(\d*\.\d+))?|-u(?:=(\d*\.\d+))?/)
     {
-        my $increment_val = $1 // $2; # $1 for -r, $2 for -u
-        if (!(defined $increment_val && $increment_val ne "")) # If -r or -u was used without a value
+        my $increment_val = $1 // $2;
+        if (!(defined $increment_val && $increment_val ne ""))
         {
             $increment_val = $DEFAULT_ROUND_INCREMENT;
         }
         return get_decimal_places($increment_val);
     }
-    return 4; # Default DP if no rounding specified
+    return 4;
 }
 
 sub get_decimal_places
 {
     my ($number) = @_;
-    $number = sprintf("%.15f", $number) if ($number =~ /e/i); # Handle scientific notation
+    $number = sprintf("%.15f", $number) if ($number =~ /e/i);
     if ($number =~ /\.(\d+)$/)
     {
         return length($1);
@@ -1240,7 +1399,7 @@ sub get_decimal_places
 sub usage_wrapper
 {
     my $script_name = $0;
-    $script_name =~ s{.*/}{}; # Get only script name
+    $script_name =~ s{.*/}{};
     return <<END_USAGE;
 Usage: $script_name --physc-data <pc_file> [options]
 
@@ -1248,13 +1407,14 @@ Runs 'nfit' for multiple profiles. Applies RunQ modifiers and generates hints.
 The RunQ modifier behavior (standard vs. additive-only) can be controlled
 per profile via the 'runq_modifier_behavior' attribute in nfit.profiles.cfg.
 Optionally passes flags to nfit for its internal windowed decay processing.
+A detailed rationale log is written to /tmp/nfit-profile-rationale.log.
 
 Core Input:
   --physc-data, -pc <file> : Path to NMON PhysC data CSV (required).
   --runq-data, -rq <file>  : Optional. Path to NMON RunQ data CSV.
   --default-smt, --smt <N> : Optional. Default SMT level (Default: $DEFAULT_SMT_VALUE_PROFILE).
 
-RunQ Metric Configuration (for nfit, and used by this script's modifier logic):
+RunQ Metric Configuration (for nfit calls):
   --runq-norm-percentiles <list> : For Normalised RunQ (Default: "$DEFAULT_RUNQ_NORM_PERCS").
   --runq-abs-percentiles <list>  : For Absolute RunQ (Default: "$DEFAULT_RUNQ_ABS_PERCS").
 
@@ -1284,14 +1444,12 @@ Rounding (Passed to nfit for its output):
                                (Default increment: $DEFAULT_ROUND_INCREMENT)
 Other:
   --nfit-path <path>         : Optional. Path to the 'nfit' script.
-  --debug-runq               : Optional. Output intermediate RunQ modifier calculation columns.
   -h, --help                 : Display this help message.
   -v, --version              : Display script version and nfit version used.
 
 Output CSV Columns (Illustrative):
   VM,TIER,Hint,Pattern,Pressure,PressureDetail,SMT,
-  NormRunQ_P50,NormRunQ_P90,AbsRunQ_P90,RunQPressure_P90_Value,
-  [Debug RunQ Cols if --debug-runq], Serial,SystemType,Pool Name,Pool ID,Peak,
+  Serial,SystemType,Pool Name,Pool ID,Peak,
   [Profile Names (values are potentially recency-weighted by nfit & RunQ-modified by nfit-profile)...],
   Current_ENT,NFIT_ENT_UserFormula,NETT_UserFormula,NETT_Perc_UserFormula
 
