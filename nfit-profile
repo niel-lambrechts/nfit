@@ -318,6 +318,30 @@ if (scalar @profiles == 0)
 {
     die "Error: No profiles loaded from '$profiles_config_path_to_load'.\n";
 }
+
+# This profile's CPU value is used for MaxCPU pressure checks,
+# and its RunQ metrics will now be used for global RunQ pressure hints.
+my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1";
+
+# --- Ensure the Mandatory P-99W1 Profile is Defined ---
+# This check occurs after profiles are loaded.
+my $mandatory_profile_is_present = 0;
+foreach my $profile_entry (@profiles)
+{
+    if (defined $profile_entry->{name} && $profile_entry->{name} eq $MANDATORY_PEAK_PROFILE_FOR_HINT)
+    {
+        $mandatory_profile_is_present = 1;
+        last;
+    }
+}
+
+unless ($mandatory_profile_is_present)
+{
+    die "ERROR: Mandatory profile \"$MANDATORY_PEAK_PROFILE_FOR_HINT\" is not defined in the profiles configuration file: '$profiles_config_path_to_load'.\n" .
+        "       This profile is essential for core pressure detection logic in nfit-profile.\n" .
+        "       Please add a profile named \"$MANDATORY_PEAK_PROFILE_FOR_HINT\" to your profiles configuration.\n";
+}
+
 print STDERR "Loaded " . scalar(@profiles) . " profiles.\n";
 
 # --- Locate and Load VM Configuration Data ---
@@ -828,17 +852,27 @@ foreach my $vm_name (@vm_order)
     my $hint_norm_runq_p90_str = $results_table{$vm_name}{'NormRunQ_P90'} // "N/A";
     my $hint_abs_runq_p90_str  = $results_table{$vm_name}{'AbsRunQ_P90'}  // "N/A";
 
-    my ($hint_type_tier_csv, $hint_pattern_shape_csv, $hint_pressure_bool_csv, $pressure_detail_str_csv) =
+    my ($hint_type_tier_csv, $hint_pattern_shape_csv, $hint_pressure_bool_csv, $pressure_detail_str_csv, $global_pressure_log_details_str, $p99w1_vm_has_abs_runq_pressure, $p99w1_vm_has_norm_runq_pressure) =
         generate_sizing_hint(
             'results_ref'              => \%results_table, 
             'vm'                       => $vm_name,
             'config_ref'               => $cfg_csv,        
-            'norm_runq_p90_for_vm_str' => $hint_norm_runq_p90_str, 
-            'abs_runq_p90_for_vm_str'  => $hint_abs_runq_p90_str,
-            'max_cpu_for_vm_numeric'   => $max_cpu_for_vm_csv,
-            'smt_used_for_vm_numeric'  => $smt_used_for_vm_csv
+            'max_cpu_for_vm_numeric'        => $max_cpu_for_vm_csv,
+            'smt_used_for_vm_numeric'       => $smt_used_for_vm_csv,
+            'per_profile_runq_metrics_ref'  => \%per_profile_runq_metrics # Pass the global hash
         );
     my $pressure_bool_str_csv = $hint_pressure_bool_csv ? "True" : "False";
+
+    # --- Log Global Pressure Assessment Details for Sizing Hint ---
+    if ($LOG_FH)
+    {
+        print {$LOG_FH} "----------------------------------------------------------------------\n";
+        print {$LOG_FH} "Global Sizing Hint Pressure Assessment (VM: $vm_name)\n";
+        # The $global_pressure_log_details_str already starts with "Section G..."
+        print {$LOG_FH} $global_pressure_log_details_str . "\n";
+        # No need for an extra trailing line of dashes if the string itself is well-formed.
+        # The next major log section will be the per-profile ones.
+    }
     
     # Add VM, TIER, Hint, Pattern etc. columns to CSV row
     # As per user feedback: TIER (column B) is user-populated/empty from script,
@@ -914,10 +948,18 @@ foreach my $vm_name (@vm_order)
             my $is_non_default_pool = (defined $cfg_csv && defined $cfg_csv->{pool_name} && lc($cfg_csv->{pool_name}) ne 'defaultpool' && $cfg_csv->{pool_name} ne '');
             
             my ($runq_modified_physc_for_profile, $calc_debug_info_ref) = calculate_runq_modified_physc(
-                $raw_physc_profile_value, $this_profile_norm_p50, $this_profile_norm_p90,
-                $abs_runq_p_value_to_use_for_calc, $abs_runq_key_actually_used,
-                $smt_used_for_vm_csv, (defined $cfg_csv ? $cfg_csv->{entitlement} : "0"),
-                $max_cpu_for_vm_csv, $is_non_default_pool, $current_profile_runq_behavior
+                $raw_physc_profile_value,
+                $this_profile_norm_p50,
+                $this_profile_norm_p90,
+                $abs_runq_p_value_to_use_for_calc,
+                $abs_runq_key_actually_used,
+                $smt_used_for_vm_csv,
+                (defined $cfg_csv ? $cfg_csv->{entitlement} : "0"),
+                $max_cpu_for_vm_csv,
+                $is_non_default_pool,
+                $current_profile_runq_behavior,
+                $p99w1_vm_has_abs_runq_pressure,
+                $p99w1_vm_has_norm_runq_pressure
             );
             %$debug_info_for_log = ( %$debug_info_for_log, %$calc_debug_info_ref );
             $debug_info_for_log->{AbsRunQKeyUsed} = $abs_runq_key_actually_used;
@@ -1787,7 +1829,9 @@ sub calculate_runq_modified_physc
         $current_entitlement_str,
         $max_cpu_config_str,
         $is_in_non_default_pool,
-        $profile_runq_behavior_setting
+        $profile_runq_behavior_setting,
+        $p99w1_overall_vm_has_abs_runq_pressure,
+        $p99w1_overall_vm_has_norm_runq_pressure 
     ) = @_;
 
     my %debug_info;
@@ -1865,17 +1909,33 @@ sub calculate_runq_modified_physc
 
     # --- Step 1: Enhanced Efficiency Factor Logic (with Guards, Blending, Volatility Cap) ---
     my $efficiency_factor_numeric = 1.00; # Default: no reduction
+    $debug_info{'EffFactor'} = sprintf("%.2f", $efficiency_factor_numeric);
+    $debug_info{'EffFactorReason'} = "Default (No reduction applied or eligible).";
     my $analytical_efficiency_path_attempted = 0; # Flag to track if we entered the core analytical logic
 
-    # Guard 1: Profile Behavior
-    if ($profile_runq_behavior_setting eq 'additive_only') {
+    # REFINED GUARD: Prevent efficiency reduction if P-99W1's RunQ metrics indicate pressure.
+    # Guard 1: P-99W1's RunQ pressure
+    if ( (defined $p99w1_overall_vm_has_abs_runq_pressure && $p99w1_overall_vm_has_abs_runq_pressure) ||
+         (defined $p99w1_overall_vm_has_norm_runq_pressure && $p99w1_overall_vm_has_norm_runq_pressure) )
+    {
+        $debug_info{'EffFactorReason'} = sprintf(
+            "Skipped Efficiency Reduction: VM's %s profile shows RunQ pressure (Abs P-99W1 pressure: %s, Norm P-99W1 pressure: %s).",
+            $MANDATORY_PEAK_PROFILE_FOR_HINT,
+            $p99w1_overall_vm_has_abs_runq_pressure ? "TRUE" : "FALSE",
+            $p99w1_overall_vm_has_norm_runq_pressure ? "TRUE" : "FALSE"
+        );
+        # $efficiency_factor_numeric remains 1.00, no reduction applied due to this guard.
+    }
+
+    # Guard 2: Profile Behavior
+    elsif ($profile_runq_behavior_setting eq 'additive_only') {
         $debug_info{'EffFactorReason'} = "Skipped: Profile runq_behavior=additive_only";
     }
-    # Guard 2: Bursting Condition
+    # Guard 3: Bursting Condition
     elsif (defined $curr_ent_numeric && $curr_ent_numeric > 0 && defined $eff_p_base_numeric && $eff_p_base_numeric > $curr_ent_numeric) {
         $debug_info{'EffFactorReason'} = sprintf("Skipped: Base PhysC (%.4f) > Entitlement (%.2f)", $eff_p_base_numeric, $curr_ent_numeric);
     }
-    # Guard 3: High Existing Constraint (Base PhysC near MaxCPU AND RunQ Pressure high)
+    # Guard 4: High Existing Constraint (Base PhysC near MaxCPU AND RunQ Pressure high)
     elsif ($max_cpu_for_lpar_numeric > 0 && defined $eff_p_base_numeric && $eff_p_base_numeric > ($max_cpu_for_lpar_numeric * $BASE_PHYSC_VS_MAXCPU_THRESH_FOR_CONSTRAINT_GUARD)) {
         my $temp_runq_pressure_val = 0;
         if (defined $abs_runq_p_numeric && $smt_used > 0) {
@@ -1884,8 +1944,12 @@ sub calculate_runq_modified_physc
         if ($temp_runq_pressure_val > ($RUNQ_PRESSURE_P90_SATURATION_THRESHOLD * $RUNQ_PRESSURE_FOR_CONSTRAINT_GUARD_FACTOR)) {
             $debug_info{'EffFactorReason'} = sprintf("Skipped: High existing constraint. Base PhysC (%.4f) > %.0f%% of MaxCPU (%.2f) AND RunQ Pressure (%.2f) is high.",
                                                      $eff_p_base_numeric, $BASE_PHYSC_VS_MAXCPU_THRESH_FOR_CONSTRAINT_GUARD*100, $max_cpu_for_lpar_numeric, $temp_runq_pressure_val);
-        } else { $analytical_efficiency_path_attempted = 1; }
-    } else { $analytical_efficiency_path_attempted = 1; }
+        } else {
+            $analytical_efficiency_path_attempted = 1;
+        }
+    } else {
+        $analytical_efficiency_path_attempted = 1;
+    }
 
     if ($analytical_efficiency_path_attempted && defined $norm_p50_numeric && defined $norm_p90_numeric && defined $abs_runq_p_numeric && $smt_used > 0 && defined $eff_p_base_numeric)
     {
@@ -2011,9 +2075,9 @@ sub calculate_runq_modified_physc
     }
     # If $analytical_efficiency_path_attempted was false, the original skip reason from guards remains.
 
-    $debug_info{'EffFactor'} = $debug_info{'EffFinalFactorApplied'}; # Store the formatted factor as the main one
+    $debug_info{'EffFactor'} = sprintf("%.2f", $efficiency_factor_numeric);
 
-    my $base_adjusted_physc = $eff_p_base_numeric * ($debug_info{'EffFactor'} + 0); # Use numeric factor
+    my $base_adjusted_physc = (defined $eff_p_base_numeric ? $eff_p_base_numeric : 0) * $efficiency_factor_numeric;
     $debug_info{'BaseAdjustedPhysC'} = sprintf("%.4f", $base_adjusted_physc);
     # --- End of Enhanced Efficiency Factor Logic ---
 
@@ -2193,156 +2257,218 @@ sub calculate_runq_modified_physc
     return ($runq_modified_rec, \%debug_info);
 }
 
-# --- generate_sizing_hint ---
-# Generates a sizing tier hint (e.g., G3, O2, P1) based on profile values,
-# peakiness, and pressure indicators (MaxCPU limit, RunQ pressure).
+# --- generate_sizing_hint (Unified Global Pressure Detection with Logging Rationale) ---
+# Generates a sizing tier hint, pattern, and overall pressure indication for a VM.
+# Also returns a detailed rationale string for its pressure assessment, AND
+# specific boolean flags for P-99W1's RunQ pressure conditions.
 sub generate_sizing_hint
 {
     my %args = @_;
-    my $results_ref = $args{'results_ref'}; # Hash ref to %results_table (contains raw nfit outputs)
-    my $vm = $args{'vm'};                   # Current VM name
-    my $config_ref = $args{'config_ref'};   # Hash ref to this VM's config from vm_config_data
-    my $norm_runq_p90_for_vm_str = $args{'norm_runq_p90_for_vm_str'}; # Global NormRunQ P90 for this VM
-    my $abs_runq_p90_for_vm_str  = $args{'abs_runq_p90_for_vm_str'};  # Global AbsRunQ P90 for this VM
-    my $max_cpu_for_vm_numeric   = $args{'max_cpu_for_vm_numeric'};   # LPAR MaxCPU from config
-    my $smt_used_for_vm_numeric  = $args{'smt_used_for_vm_numeric'};  # SMT used for this VM
+    my $results_ref                  = $args{'results_ref'};
+    my $vm                           = $args{'vm'};
+    my $config_ref                   = $args{'config_ref'};
+    my $max_cpu_for_vm_numeric       = $args{'max_cpu_for_vm_numeric'} // 0;
+    my $smt_used_for_vm_numeric      = $args{'smt_used_for_vm_numeric'} // 0;
+    my $per_profile_runq_metrics_ref = $args{'per_profile_runq_metrics_ref'};
 
-    my $na_str_hint = "N/A"; # Local N/A string for clarity
+    # $MANDATORY_PEAK_PROFILE_FOR_HINT should be globally available or passed.
+    # Example: my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1"; (defined outside)
+
+    my $na_str_hint = "N/A";
+    my @global_pressure_rationale_lines;
+
+    # ... (initial part of rationale logging: Inputs like MaxCPU, SMT etc. - as in previous version) ...
+    push @global_pressure_rationale_lines, sprintf("  Input LPAR MaxCPU              : %.2f cores", $max_cpu_for_vm_numeric);
+    push @global_pressure_rationale_lines, sprintf("  Input SMT for VM               : %d", $smt_used_for_vm_numeric);
+
 
     # --- VIO Server Check ---
-    # If system type indicates VIO Server, assign "P" (Peak) tier and skip further analysis.
-    if (defined $config_ref && defined $config_ref->{'systemtype'} && $config_ref->{'systemtype'} =~ /VIO Server/i)
+    if (defined $config_ref &&
+        defined $config_ref->{'systemtype'} &&
+        $config_ref->{'systemtype'} =~ /VIO Server/i)
     {
-        return ("P", "VIO Server", 0, "VIO Server - Manual/Peak Sizing"); # Tier, Pattern, Pressure (bool), Detail
+        my $vio_rationale = join("\n", @global_pressure_rationale_lines);
+        $vio_rationale .= "\n  VM identified as VIO Server. Standard pressure checks skipped for hint.\n  Hint set to P / VIO Server.";
+        # Return dummy FALSE for P-99W1 specific RunQ pressures for VIOs
+        return ("P", "VIO Server", 0, "VIO Server - Manual/Peak Sizing", $vio_rationale, 0, 0);
     }
-    
-    # --- Profile Value Parsing for Pattern/Peakiness ---
-    # Use specific profile values (e.g., O3-95W15, B3-95W15, G3-95W15, P-99W1) from nfit's raw output.
-    # Convert to numeric, default to 0 if N/A or invalid.
-    my $o3_val = $results_ref->{$vm}{'O3-95W15'} // "0"; 
-    $o3_val = ($o3_val ne $na_str_hint && $o3_val =~ /^-?[0-9.]+\z/) ? ($o3_val+0) : 0;
-    my $b3_val = $results_ref->{$vm}{'B3-95W15'} // "0"; 
-    $b3_val = ($b3_val ne $na_str_hint && $b3_val =~ /^-?[0-9.]+\z/) ? ($b3_val+0) : 0;
-    my $g3_val = $results_ref->{$vm}{'G3-95W15'} // "0"; 
-    $g3_val = ($g3_val ne $na_str_hint && $g3_val =~ /^-?[0-9.]+\z/) ? ($g3_val+0) : 0;
-    my $p99w1_val = $results_ref->{$vm}{'P-99W1'} // "0"; # Peak-like profile
-    $p99w1_val = ($p99w1_val ne $na_str_hint && $p99w1_val =~ /^-?[0-9.]+\z/) ? ($p99w1_val+0) : 0;
-    
-    # --- Determine Base Pattern (O, B, G) ---
-    my $suggested_pattern = "G"; # Default to General Purpose
-    if ($b3_val > 0.01 && $o3_val > ($b3_val * $PATTERN_RATIO_THRESHOLD)) # If Online profile significantly larger than Batch
-    {
-        $suggested_pattern = "O"; # Online pattern
-    }
-    elsif ($o3_val > 0.01 && $b3_val > ($o3_val * $PATTERN_RATIO_THRESHOLD)) # If Batch profile significantly larger than Online
-    {
-        $suggested_pattern = "B"; # Batch pattern
-    }
-    # Else, remains "G"
-    
-    # --- Determine Peakiness Shape (Steady, Moderately Peaky, Very Peaky) ---
-    my $peakiness_ratio = 0;
-    if ($g3_val > 0.01) # Avoid division by zero if G3 (general baseline) is very low
-    {
-        $peakiness_ratio = ($p99w1_val / $g3_val); # Ratio of peak-like profile to general baseline
-    }
-    
-    my $shape_descriptor = "Steady"; # Default shape
-    if ($peakiness_ratio >= $HIGH_PEAK_RATIO_THRESHOLD)
-    {
-        $shape_descriptor = "Very Peaky";
-    }
-    elsif ($peakiness_ratio >= $LOW_PEAK_RATIO_THRESHOLD)
-    {
-        $shape_descriptor = "Moderately Peaky";
-    }
-    
-    # --- Detect Pressure Indicators ---
-    my $pressure_detected_maxcpu_limit = 0;    # Flag for hitting MaxCPU limit
-    my $pressure_detected_runq_pressure = 0;   # Flag for high absolute RunQ pressure
-    my $pressure_detected_workload_pressure = 0; # Flag for high normalized RunQ (workload intensity)
-    my $pressure_detail_str = "";              # String to describe pressure points
 
-    # 1. MaxCPU Limit Pressure: P99W1 (peak-like profile) vs. LPAR MaxCPU
-    # $max_cpu_for_vm_numeric is LPAR MaxCPU from config (already numeric or 0)
-    if ($max_cpu_for_vm_numeric > 0 && $p99w1_val >= ($max_cpu_for_vm_numeric * $LIMIT_THRESHOLD_PERC))
+    # --- Profile Value Parsing (Pattern/Peakiness & P-99W1 PhysC) ---
+    my $o3_val_str = $results_ref->{$vm}{'O3-95W15'} // "0";
+    my $o3_val_num = ($o3_val_str ne $na_str_hint && $o3_val_str =~ /^-?[0-9.]+\z/) ? ($o3_val_str + 0) : 0;
+    my $b3_val_str = $results_ref->{$vm}{'B3-95W15'} // "0";
+    my $b3_val_num = ($b3_val_str ne $na_str_hint && $b3_val_str =~ /^-?[0-9.]+\z/) ? ($b3_val_str + 0) : 0;
+    my $g3_val_str = $results_ref->{$vm}{'G3-95W15'} // "0";
+    my $g3_val_num = ($g3_val_str ne $na_str_hint && $g3_val_str =~ /^-?[0-9.]+\z/) ? ($g3_val_str + 0) : 0;
+    my $p99w1_physc_val_str = $results_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT} // $na_str_hint;
+    my $p99w1_physc_val_num = ($p99w1_physc_val_str ne $na_str_hint && $p99w1_physc_val_str =~ /^-?[0-9.]+\z/)
+                           ? ($p99w1_physc_val_str + 0)
+                           : 0;
+    push @global_pressure_rationale_lines, sprintf("  Input %s PhysC Value  : %s (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_physc_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
+
+    # (Pattern and Peakiness logic - unchanged)
+    my $suggested_pattern = "G";
+    if ($b3_val_num > 0.01 && $o3_val_num > ($b3_val_num * $PATTERN_RATIO_THRESHOLD)) { $suggested_pattern = "O"; }
+    elsif ($o3_val_num > 0.01 && $b3_val_num > ($o3_val_num * $PATTERN_RATIO_THRESHOLD)) { $suggested_pattern = "B"; }
+    my $peakiness_ratio = ($g3_val_num > 0.001) ? ($p99w1_physc_val_num / $g3_val_num) : 0;
+    my $shape_descriptor = "Steady";
+    if ($peakiness_ratio >= $HIGH_PEAK_RATIO_THRESHOLD) { $shape_descriptor = "Very Peaky"; }
+    elsif ($peakiness_ratio >= $LOW_PEAK_RATIO_THRESHOLD) { $shape_descriptor = "Moderately Peaky"; }
+
+
+    # --- Unified Pressure Detection ---
+    my $pressure_detected_maxcpu_limit = 0;
+    # Specific P-99W1 RunQ pressure flags to be returned
+    my $p99w1_has_absolute_runq_pressure = 0;
+    my $p99w1_has_normalized_runq_pressure = 0;
+    my @pressure_points;
+
+    # Fetch P-99W1's specific RunQ metrics
+    my $p99w1_abs_runq_p90_val_str = $na_str_hint;
+    my $p99w1_norm_runq_p90_val_str = $na_str_hint;
+    # ... (logic to fetch $p99w1_abs_runq_p90_val_str and $p99w1_norm_runq_p90_val_str as before) ...
+    # ... (logging of these input RunQ values to @global_pressure_rationale_lines as before) ...
+    if (defined $per_profile_runq_metrics_ref &&
+        exists $per_profile_runq_metrics_ref->{$vm} &&
+        exists $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT})
+    {
+        my $p99w1_runq_metrics = $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
+        $p99w1_abs_runq_p90_val_str = $p99w1_runq_metrics->{'AbsRunQ_P90'} // $na_str_hint;
+        $p99w1_norm_runq_p90_val_str = $p99w1_runq_metrics->{'NormRunQ_P90'} // $na_str_hint;
+    }
+    push @global_pressure_rationale_lines, sprintf("  Input %s AbsRunQ P90    : %s threads (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
+    push @global_pressure_rationale_lines, sprintf("  Input %s NormRunQ P90   : %s (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_norm_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
+    push @global_pressure_rationale_lines, "";
+
+
+    # 1. MaxCPU Limit Pressure
+    # ... (logic as before, sets $pressure_detected_maxcpu_limit, logs to @global_pressure_rationale_lines) ...
+    # ... (ensure push @pressure_points, "MaxCPU"; happens if $pressure_detected_maxcpu_limit = 1;) ...
+    push @global_pressure_rationale_lines, sprintf("  1. MaxCPU Limit Pressure Check (%s PhysC vs LPAR MaxCPU):", $MANDATORY_PEAK_PROFILE_FOR_HINT);
+    # ... (detailed logging lines for MaxCPU check)
+    my $maxcpu_limit_calc_threshold = ($max_cpu_for_vm_numeric > 0) ? ($max_cpu_for_vm_numeric * $LIMIT_THRESHOLD_PERC) : 0;
+    my $maxcpu_condition_met_str = "FALSE";
+    if ($max_cpu_for_vm_numeric > 0 && $p99w1_physc_val_num >= $maxcpu_limit_calc_threshold)
     {
         $pressure_detected_maxcpu_limit = 1;
+        $maxcpu_condition_met_str = "TRUE";
+        push @pressure_points, "MaxCPU";
     }
-    
-    # 2. RunQ Pressure (Absolute): AbsRunQ_P90 / (LPAR_MaxCPU * SMT)
-    # Uses the global AbsRunQ_P90 passed to this subroutine.
-    my $abs_runq_p90_for_hint_numeric = ($abs_runq_p90_for_vm_str ne $na_str_hint && $abs_runq_p90_for_vm_str =~ /^-?[0-9.]+$/) 
-                                     ? ($abs_runq_p90_for_vm_str + 0) 
-                                     : undef;
-    my $runq_pressure_p90_calculated_value = 0;
-    if (defined $abs_runq_p90_for_hint_numeric && $max_cpu_for_vm_numeric > 0 && $smt_used_for_vm_numeric > 0)
-    {
-        $runq_pressure_p90_calculated_value = $abs_runq_p90_for_hint_numeric / ($max_cpu_for_vm_numeric * $smt_used_for_vm_numeric);
-    }
-    if ($runq_pressure_p90_calculated_value > $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD)
-    {
-        $pressure_detected_runq_pressure = 1;
-    }
-    
-    # 3. Workload Pressure (Normalized): NormRunQ_P90 vs. threshold, considering AbsRunQ magnitude
-    # Uses the global NormRunQ_P90 passed to this subroutine.
-    my $norm_runq_p90_for_hint_numeric = ($norm_runq_p90_for_vm_str ne $na_str_hint && $norm_runq_p90_for_vm_str =~ /^-?[0-9.]+$/) 
-                                       ? ($norm_runq_p90_for_vm_str + 0) 
-                                       : undef;
-    my $min_absrunq_threshold_for_hint_check = $smt_used_for_vm_numeric; # Only flag if AbsRunQ is at least SMT level
+    push @global_pressure_rationale_lines, sprintf("     - %s PhysC Value        : %.2f", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_physc_val_num);
+    push @global_pressure_rationale_lines, sprintf("     - LPAR MaxCPU             : %.2f", $max_cpu_for_vm_numeric);
+    push @global_pressure_rationale_lines, sprintf("     - Threshold (>= %.0f%%)      : %.2f cores", $LIMIT_THRESHOLD_PERC * 100, $maxcpu_limit_calc_threshold);
+    push @global_pressure_rationale_lines, sprintf("     - Condition Met           : (%.2f >= %.2f) -> %s", $p99w1_physc_val_num, $maxcpu_limit_calc_threshold, $maxcpu_condition_met_str);
+    push @global_pressure_rationale_lines, sprintf("     - MaxCPU Pressure Flag    : %s", $maxcpu_condition_met_str);
+    push @global_pressure_rationale_lines, "";
 
-    if (defined $norm_runq_p90_for_hint_numeric && $norm_runq_p90_for_hint_numeric > $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD)
+
+    # 2. Absolute RunQ Pressure (using P-99W1's AbsRunQ_P90)
+    # ... (logic as before, sets $p99w1_has_absolute_runq_pressure, logs to @global_pressure_rationale_lines) ...
+    # ... (ensure push @pressure_points, ... happens if $p99w1_has_absolute_runq_pressure = 1;) ...
+    my $p99w1_abs_runq_p90_num = ($p99w1_abs_runq_p90_val_str ne $na_str_hint && $p99w1_abs_runq_p90_val_str =~ /^-?[0-9.]+$/) ? ($p99w1_abs_runq_p90_val_str + 0) : undef;
+    my $calculated_abs_runq_pressure_ratio = 0;
+    my $lpar_max_lcpu_capacity = ($max_cpu_for_vm_numeric > 0 && $smt_used_for_vm_numeric > 0) ? ($max_cpu_for_vm_numeric * $smt_used_for_vm_numeric) : 0;
+    push @global_pressure_rationale_lines, sprintf("  2. Absolute RunQ Pressure Check (%s AbsRunQ P90 vs LPAR Capacity):", $MANDATORY_PEAK_PROFILE_FOR_HINT);
+    # ... (detailed logging lines for AbsRunQ check)
+    if (defined $p99w1_abs_runq_p90_num && $lpar_max_lcpu_capacity > 0)
     {
-        # Also check if absolute queue is non-trivial
-        if (defined $abs_runq_p90_for_hint_numeric && $abs_runq_p90_for_hint_numeric >= $min_absrunq_threshold_for_hint_check)
+        $calculated_abs_runq_pressure_ratio = $p99w1_abs_runq_p90_num / $lpar_max_lcpu_capacity;
+    }
+    my $absrunq_cond_met_str = "FALSE";
+    if ($calculated_abs_runq_pressure_ratio > $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD)
+    {
+        $p99w1_has_absolute_runq_pressure = 1; # Set the specific flag
+        $absrunq_cond_met_str = "TRUE";
+        push @pressure_points, sprintf("RunQAbs_%s(P90=%.2f)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $calculated_abs_runq_pressure_ratio);
+    }
+    push @global_pressure_rationale_lines, sprintf("     - %s AbsRunQ P90      : %s threads", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str);
+    push @global_pressure_rationale_lines, sprintf("     - LPAR Max LCPU Capacity  : (%.2f MaxCPU * %d SMT) = %.2f threads", $max_cpu_for_vm_numeric, $smt_used_for_vm_numeric, $lpar_max_lcpu_capacity);
+    push @global_pressure_rationale_lines, sprintf("     - Calculated Ratio        : %.4f", $calculated_abs_runq_pressure_ratio);
+    push @global_pressure_rationale_lines, sprintf("     - Threshold               : > %.2f", $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD);
+    push @global_pressure_rationale_lines, sprintf("     - Condition Met           : (%.4f > %.2f) -> %s", $calculated_abs_runq_pressure_ratio, $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD, $absrunq_cond_met_str);
+    push @global_pressure_rationale_lines, sprintf("     - %s Specific Absolute RunQ Pressure Flag: %s", $MANDATORY_PEAK_PROFILE_FOR_HINT, $absrunq_cond_met_str);
+    push @global_pressure_rationale_lines, "";
+
+
+    # 3. Normalized Workload Pressure (using P-99W1's NormRunQ_P90)
+    # ... (logic as before, sets $p99w1_has_normalized_runq_pressure, logs to @global_pressure_rationale_lines) ...
+    # ... (ensure push @pressure_points, ... happens if $p99w1_has_normalized_runq_pressure = 1;) ...
+    my $p99w1_norm_runq_p90_num = ($p99w1_norm_runq_p90_val_str ne $na_str_hint && $p99w1_norm_runq_p90_val_str =~ /^-?[0-9.]+$/) ? ($p99w1_norm_runq_p90_val_str + 0) : undef;
+    my $min_abs_runq_for_norm_check = $smt_used_for_vm_numeric > 0 ? $smt_used_for_vm_numeric : 1.0;
+    push @global_pressure_rationale_lines, sprintf("  3. Normalized Workload Pressure Check (%s NormRunQ P90):", $MANDATORY_PEAK_PROFILE_FOR_HINT);
+    # ... (detailed logging lines for NormRunQ check)
+    my $normrunq_cond1_met_str = (defined $p99w1_norm_runq_p90_num && $p99w1_norm_runq_p90_num > $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD) ? "TRUE" : "FALSE";
+    my $normrunq_cond2_met_str = (defined $p99w1_abs_runq_p90_num && $p99w1_abs_runq_p90_num >= $min_abs_runq_for_norm_check) ? "TRUE" : "FALSE";
+    my $normrunq_overall_cond_met_str = "FALSE";
+    if ($normrunq_cond1_met_str eq "TRUE" && $normrunq_cond2_met_str eq "TRUE")
+    {
+        $p99w1_has_normalized_runq_pressure = 1; # Set the specific flag
+        $normrunq_overall_cond_met_str = "TRUE";
+        push @pressure_points, sprintf("RunQNorm_%s(P90=%.2f)", $MANDATORY_PEAK_PROFILE_FOR_HINT, defined $p99w1_norm_runq_p90_num ? $p99w1_norm_runq_p90_num : 0);
+    }
+    push @global_pressure_rationale_lines, sprintf("     - %s NormRunQ P90     : %s", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_norm_runq_p90_val_str);
+    push @global_pressure_rationale_lines, sprintf("     - Threshold               : > %.2f", $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD);
+    push @global_pressure_rationale_lines, sprintf("     - Condition Met (Norm)    : (%s > %.2f) -> %s", $p99w1_norm_runq_p90_val_str, $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD, $normrunq_cond1_met_str);
+    push @global_pressure_rationale_lines, sprintf("     - %s AbsRunQ P90      : %s (for magnitude check)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str);
+    push @global_pressure_rationale_lines, sprintf("     - Min AbsRunQ Threshold   : %.2f (typically SMT)", $min_abs_runq_for_norm_check);
+    push @global_pressure_rationale_lines, sprintf("     - Condition Met (Mag)     : (%s >= %.2f) -> %s", $p99w1_abs_runq_p90_val_str, $min_abs_runq_for_norm_check, $normrunq_cond2_met_str);
+    push @global_pressure_rationale_lines, sprintf("     - %s Specific Normalized Workload Pressure Flag: %s", $MANDATORY_PEAK_PROFILE_FOR_HINT, $normrunq_overall_cond_met_str);
+    push @global_pressure_rationale_lines, "";
+
+
+    # --- Combine pressure flags & Pool Context ---
+    my $overall_pressure_detected_for_csv = $pressure_detected_maxcpu_limit ||
+                                            $p99w1_has_absolute_runq_pressure || # Use the specific P-99W1 flags here for overall CSV flag
+                                            $p99w1_has_normalized_runq_pressure;
+    # ... (Pool context logic and $pressure_detail_str generation as before, using @pressure_points) ...
+    push @global_pressure_rationale_lines, "  4. Pool Context:";
+    my $pool_name_log = (defined $config_ref && defined $config_ref->{pool_name} && $config_ref->{pool_name} ne '') ? $config_ref->{pool_name} : $na_str_hint;
+    my $is_non_default_pool_log_str = "FALSE";
+    if (defined $config_ref && defined $config_ref->{pool_name} && lc($config_ref->{pool_name}) ne 'defaultpool' && $config_ref->{pool_name} ne '')
+    {
+        $is_non_default_pool_log_str = "TRUE";
+        if ($overall_pressure_detected_for_csv)
         {
-            $pressure_detected_workload_pressure = 1;
+            push @pressure_points, "Pool(" . $config_ref->{'pool_name'} . ")"; # Removed '?'
         }
     }
-    
-    # Combine pressure flags and build detail string
-    my $overall_pressure_detected = $pressure_detected_maxcpu_limit || $pressure_detected_runq_pressure || $pressure_detected_workload_pressure;
-    if ($overall_pressure_detected)
-    {
-        my @pressure_points;
-        if ($pressure_detected_maxcpu_limit) { push @pressure_points, "MaxCPU"; }
-        if ($pressure_detected_runq_pressure) { push @pressure_points, "RunQPressure(P90=" . sprintf("%.2f", $runq_pressure_p90_calculated_value) . ")"; }
-        if ($pressure_detected_workload_pressure) { push @pressure_points, "Workload(NormP90=" . sprintf("%.2f", $norm_runq_p90_for_hint_numeric // 0) . ")"; }
-        # Check if in a non-default pool (potential shared resource constraint)
-        if (defined $config_ref && defined $config_ref->{'pool_name'} && lc($config_ref->{'pool_name'}) ne 'defaultpool' && $config_ref->{'pool_name'} ne '')
-        {
-            push @pressure_points, "Pool(" . $config_ref->{'pool_name'} . ")?"; # "?" indicates potential, not confirmed pressure from pool alone
-        }
-        $pressure_detail_str = join(", ", @pressure_points);
-    }
-    
-    # --- Determine Tier Number based on Shape and Pressure ---
-    # Tier ranges (1/2 for peaky, 2/3 for moderate, 3/4 for steady)
-    # Higher number in range = less aggressive / more conservative sizing tier
-    my $initial_tier_range_str = "3/4"; # Default for "Steady"
-    if ($shape_descriptor eq "Very Peaky")
-    {
-        $initial_tier_range_str = "1/2";
-    }
-    elsif ($shape_descriptor eq "Moderately Peaky")
-    {
-        $initial_tier_range_str = "2/3";
-    }
-    
-    # Adjust tier if pressure is detected (moves to the more aggressive end of the range)
+    push @global_pressure_rationale_lines, sprintf("     - Pool Name               : %s", $pool_name_log);
+    push @global_pressure_rationale_lines, sprintf("     - Is Non-Default Pool     : %s", $is_non_default_pool_log_str);
+    push @global_pressure_rationale_lines, "";
+
+    my $overall_pressure_detected_for_csv_str = $overall_pressure_detected_for_csv ? "TRUE" : "FALSE";
+    my $pressure_detail_str = @pressure_points ? join(", ", @pressure_points) : "None";
+    push @global_pressure_rationale_lines, sprintf("  5. Overall Global Hint Pressure Flag (for CSV): %s", $overall_pressure_detected_for_csv_str);
+    push @global_pressure_rationale_lines, sprintf("  6. Final PressureDetail string for CSV     : \"%s\"", $pressure_detail_str);
+
+    my $global_pressure_rationale_text = "Section G: Global Sizing Hint Pressure Assessment (source: generate_sizing_hint)\n" .
+                                         join("\n", @global_pressure_rationale_lines);
+
+
+    # --- Tiering logic (remains unchanged) ---
+    my $initial_tier_range_str = "3/4";
+    if ($shape_descriptor eq "Very Peaky") { $initial_tier_range_str = "1/2"; }
+    elsif ($shape_descriptor eq "Moderately Peaky") { $initial_tier_range_str = "2/3"; }
     my $adjusted_tier_str = $initial_tier_range_str;
-    if ($overall_pressure_detected) # If any pressure, pick the lower (more aggressive) number in the range
+    if ($overall_pressure_detected_for_csv)
     {
-        if ($initial_tier_range_str eq "3/4") { $adjusted_tier_str = "3"; } # G3/O3/B3
-        elsif ($initial_tier_range_str eq "2/3") { $adjusted_tier_str = "2"; } # G2/O2/B2
-        elsif ($initial_tier_range_str eq "1/2") { $adjusted_tier_str = "1"; } # G1/O1/B1
+        if ($initial_tier_range_str eq "3/4") { $adjusted_tier_str = "3"; }
+        elsif ($initial_tier_range_str eq "2/3") { $adjusted_tier_str = "2"; }
+        elsif ($initial_tier_range_str eq "1/2") { $adjusted_tier_str = "1"; }
     }
-    
-    # Combine pattern and adjusted tier for final hint (e.g., G3, O1, B2)
     my $pattern_tier_string = $suggested_pattern . $adjusted_tier_str;
-    return ($pattern_tier_string, $shape_descriptor, $overall_pressure_detected, $pressure_detail_str);
+
+    return (
+        $pattern_tier_string,
+        $shape_descriptor,
+        $overall_pressure_detected_for_csv, # This is for the CSV Pressure column
+        $pressure_detail_str,
+        $global_pressure_rationale_text,
+        $p99w1_has_absolute_runq_pressure,    # NEW return value
+        $p99w1_has_normalized_runq_pressure   # NEW return value
+    );
 }
+# end of generate_sizing_hint
 
 # --- parse_percentile_list_for_header ---
 # This sub is used by the OLD global RunQ metric collection logic (which is now superseded
