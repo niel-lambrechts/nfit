@@ -1,7 +1,6 @@
 #!/usr/bin/env perl
 
 # NAME     : nfit-profile
-# VERSION  : 2.36.0.2 # Complete regeneration with all functions, --match-runq-perc-to-profile, robust percentile handling.
 # AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
 # PURPOSE  : Runs 'nfit' multiple times with user-defined profiles.
 #            Applies RunQ modifiers, generates hints, logs rationale, and aggregates to CSV.
@@ -25,7 +24,7 @@ my $PROFILE_SCRIPT_START_TIME_EPOCH = time();
 my $PROFILE_SCRIPT_START_TIME_STR = localtime($PROFILE_SCRIPT_START_TIME_EPOCH)->strftime("%Y-%m-%d %H:%M:%S %Z");
 
 # --- Version ---
-my $SCRIPT_VERSION = '2.36.0.2';
+my $SCRIPT_VERSION = '2.25.152.0';
 
 # --- Configuration ---
 my $DEFAULT_ROUND_INCREMENT = 0.05;
@@ -590,6 +589,8 @@ my %primary_runq_metrics_captured_for_vm; # Tracks if global P50/P90 RunQ metric
 my %source_profile_for_global_runq; # Which profile's output sourced the global RunQ P50/P90 for hints
 my %per_profile_runq_metrics; # Stores ALL RunQ metrics (e.g. AbsRunQ_P80, AbsRunQ_P98) from EACH profile's nfit run
                               # Structure: $per_profile_runq_metrics{vm_name}{profile_name}{runq_metric_key}
+my %parsed_growth_adj_values; # Stores GrowthAdj from nfit output
+my $FLOAT_EPSILON          = 1e-9;
 
 print STDERR "nfit-profile version $SCRIPT_VERSION\n";
 print STDERR "Starting nfit profile runs...\n";
@@ -812,6 +813,16 @@ foreach my $profile (@profiles) # Iterate through each profile defined in nfit.p
                     }
                 }
             }
+
+            # --- Extract GrowthAdj value for this VM and Profile ---
+            my $current_growth_adj_val_from_nfit = "0.0000"; 
+            if ($metrics_str =~ /GrowthAdj=([0-9.NA\/ -]+?)(?:\s+|$)/)
+            {
+                $current_growth_adj_val_from_nfit = $1;
+                $current_growth_adj_val_from_nfit =~ s/^\s+|\s+$//g; # Trim spaces
+            }
+            $parsed_growth_adj_values{$vm_name_from_nfit}{$profile_name} = $current_growth_adj_val_from_nfit;
+            # --- END NEW GrowthAdj Extraction ---
         }
         elsif ($line ne '') # Non-empty line that doesn't match VM: metrics format
         {
@@ -973,14 +984,24 @@ foreach my $vm_name (@vm_order)
             $debug_info_for_log->{FinalAdjustedPhysC} = $adjusted_value_str;
         }
         push @data_row_csv, $adjusted_value_str;
+        my $nfit_growth_adj_for_log = $parsed_growth_adj_values{$vm_name}{$profile_name_being_adjusted} // "0.0000 (not parsed)";
 
         if ($LOG_FH) {
             log_profile_rationale(
-                $LOG_FH, $vm_name, $profile_name_being_adjusted,
-                $raw_physc_profile_value_str, $profile_name_being_adjusted,
-                $abs_runq_p_value_to_use_for_calc, $this_profile_norm_p50, $this_profile_norm_p90,
-                $cfg_csv, $smt_used_for_vm_csv, $max_cpu_for_vm_csv,
-                $current_profile_runq_behavior, $debug_info_for_log, $adjusted_value_str
+                $LOG_FH, $vm_name,
+                $profile_name_being_adjusted,
+                $raw_physc_profile_value_str,
+                $profile_name_being_adjusted,
+                $abs_runq_p_value_to_use_for_calc,
+                $this_profile_norm_p50,
+                $this_profile_norm_p90,
+                $cfg_csv,
+                $smt_used_for_vm_csv,
+                $max_cpu_for_vm_csv,
+                $current_profile_runq_behavior,
+                $debug_info_for_log,
+                $adjusted_value_str,
+                $nfit_growth_adj_for_log
             );
         }
     } # End foreach profile_being_adjusted_ref
@@ -1343,9 +1364,10 @@ sub log_profile_rationale
         $normP50_for_this_calc, $normP90_for_this_calc,
         $vm_cfg_ref, $smt_val, $lpar_max_cpu_cfg_val_from_config,
         $profile_rq_behavior,
-        $calc_debug_info_ref, # Hash ref with detailed calculation steps, including AbsRunQKeyUsed
-                              # and new detailed fields for efficiency calculation.
-        $final_csv_value_for_profile
+        $calc_debug_info_ref,              # Hash ref with detailed calculation steps, including AbsRunQKeyUsed
+                                           # and new detailed fields for efficiency calculation.
+        $final_csv_value_for_profile,
+        $nfit_growth_adj_str               # GrowthAdj value from nfit
     ) = @_;
 
     return unless $fh; # Do nothing if log file handle is not valid
@@ -1362,7 +1384,30 @@ sub log_profile_rationale
 
     # --- Section A: Inputs for RunQ Adjustment (Remains as previously defined) ---
     print {$fh} "Section A: Inputs for RunQ Adjustment\n";
-    printf {$fh} "  1. Base PhysC for this Profile : %s cores (Value from nfit for profile '%s')\n", ($raw_physc_for_profile // $na), $profile_being_adjusted;
+
+    # --- Clarify nfit's Growth Adjustment on the input PhysC value ---
+    my $nfit_growth_adj_numeric = 0.0;
+    my $base_physc_from_nfit_before_its_growth = $raw_physc_for_profile; # Assume this is the nfit PXX output
+
+    if (defined $nfit_growth_adj_str && $nfit_growth_adj_str =~ /^-?[0-9.]+$/ && ($nfit_growth_adj_str + 0) > $FLOAT_EPSILON)
+    {
+        $nfit_growth_adj_numeric = $nfit_growth_adj_str + 0;
+        if (defined $raw_physc_for_profile && $raw_physc_for_profile ne $na && $raw_physc_for_profile =~ /^-?[0-9.]+$/)
+        {
+            # Calculate what nfit's value was *before* its own growth adjustment
+            my $calculated_nfit_pre_growth = ($raw_physc_for_profile + 0) - $nfit_growth_adj_numeric;
+            $base_physc_from_nfit_before_its_growth = sprintf("%.4f", $calculated_nfit_pre_growth);
+        }
+        printf {$fh} "  1. Base PhysC (from nfit's %s) : %s cores \t(INCLUDES GrowthAdj: +%.4f)\n", $profile_being_adjusted, ($raw_physc_for_profile // $na), $nfit_growth_adj_numeric;
+        printf {$fh} "     (Implied base value before growth: ~%s cores)\n", $base_physc_from_nfit_before_its_growth;
+    }
+    else
+    {
+        my $parsed_adj = (defined $nfit_growth_adj_str && $nfit_growth_adj_str =~ /^-?[0-9.]+$/) ? ($nfit_growth_adj_str+0) : 0.0;
+        printf {$fh} "  1. Base PhysC (from nfit's %s) : %s cores \t(nfit GrowthAdj was %.4f or N/A)\n", $profile_being_adjusted, ($raw_physc_for_profile // $na), $parsed_adj;
+    }
+    # --- END NEW Growth Info ---
+
     printf {$fh} "  2. RunQ Metrics for this Adjustment (sourced from this profile's ['%s'] nfit run):\n", $runq_metrics_source_profile_name_for_this_calc;
     printf {$fh} "     - AbsRunQ (%-13s) : %s threads\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
     printf {$fh} "     - NormRunQ P50            : %s\n", ($normP50_for_this_calc // $na);
@@ -1613,7 +1658,20 @@ sub log_profile_rationale
     printf {$fh} "  5. Is Capped by MaxCPU?       : %s\n\n", ($calc_debug_info_ref->{'CappedByMaxCPU'} // $na);
 
     print {$fh} "Section D: Final Result for Profile '$profile_being_adjusted'\n";
-    printf {$fh} "  - Final Adjusted Value      : %s cores\n", ($final_csv_value_for_profile // $na);
+    if ($nfit_growth_adj_numeric > $FLOAT_EPSILON)
+    {
+         printf {$fh} "  - Input from nfit (PXX value)            : %s cores (was ~%s + %.4f GrowthAdj from nfit)\n", 
+            ($raw_physc_for_profile // $na), 
+            $base_physc_from_nfit_before_its_growth, 
+            $nfit_growth_adj_numeric;
+    }
+    else
+    {
+         printf {$fh} "  - Input from nfit (PXX value)            : %s cores (nfit GrowthAdj was effectively zero)\n", ($raw_physc_for_profile // $na);
+    }
+
+    printf {$fh} "  - nfit-profile Internal Modifiers Reason : %s\n", ($calc_debug_info_ref->{EffFactorReason} // "Efficiency N/A") . "; Additive: " . ($calc_debug_info_ref->{FinalAdditive} // "0.0000");
+    printf {$fh} "  => Final Value Written to CSV by nfit-profile : %s cores\n", ($final_csv_value_for_profile // $na);
     print {$fh} "\n";
 }
 
