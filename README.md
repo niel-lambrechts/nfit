@@ -160,7 +160,9 @@ The underlying sizing methodology (primarily implemented in `nfit` and orchestra
 - **Tiering Concept:** The generated profiles are designed to map to different service tiers, allowing for differentiated sizing based on business criticality.
 - **Heuristics (in `nfit-profile`):** Suggests workload pattern (Online/Batch/General), CPU usage shape (Peaky/Steady), and potential CPU pressure (based on P-99W1 vs. maxCPU) to aid planners.
 
-*(For a more detailed explanation of the methodology, see `doc/nFit Suite - Features and Sizing Methodology Overview.md`)*
+For a more detailed explanation of the methodology, see `doc/nFit Suite - Features and Sizing Methodology Overview.md`.
+
+There is also a Python-based animation of the basic program principles available at `examples/animate-nfit.py`.
 
 ## Prerequisites
 
