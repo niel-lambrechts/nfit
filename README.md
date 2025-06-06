@@ -220,6 +220,8 @@ The underlying sizing methodology (primarily implemented in `nfit` and orchestra
 
 * **`nfit-profile` (Profile Runner & CSV Generator):**
     ```bash
+    # Recommended usage:
+    ./nfit-profile --match-runq-perc-to-profile --nfit-enable-windowed-decay -config vm_config.csv -pc physc.csv -rq runq.csv > /tmp/nfit-mgsysname.csv 
     # Using default config file locations (./etc/ or ./):
     ./nfit-profile -f <nmon_data.csv> > full_report.csv
     ./nfit-profile -f <nmon_data.csv> -config my_vm_inventory.csv -u > rounded_report.csv
