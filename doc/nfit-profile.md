@@ -4,7 +4,7 @@
 > **nFit Profile (`nfit-profile`)** is a high-level orchestration script that automates multiple runs of the `nfit` analyser and then applies its own sophisticated, Run-Queue (RunQ) driven sizing logic to refine the results. It uses predefined "profiles" to generate a comprehensive CSV report, provides heuristic hints about workload patterns and CPU pressure, and produces a detailed Rationale Log explaining every step of its calculations.
 
 ## Overview
-- **Description:** `nfit-profile` orchestrates the `nfit` script, running it for each profile defined in an external configuration file (`nfit.profiles.cfg`). After collecting the initial CPU and Run-Queue metrics from these `nfit` runs, `nfit-profile` applies its own multi-stage adjustment logic. This logic includes "CPU Downsizing" for efficiency, "CPU Upsizing" to handle pressure (featuring "Hot Thread Workload Dampening" and safety caps), and final "Maximum CPU Sizing Sanity Checks". The result is a single, unified CSV report containing the final, adjusted CPU recommendations for each profile, enriched with VM configuration data and sizing hints.
+- **Description:** `nfit-profile` orchestrates `nfit`, running it for each profile defined in an external configuration file (`nfit.profiles.cfg`). After collecting the initial CPU and Run-Queue metrics from these `nfit` runs, `nfit-profile` applies its own multi-stage adjustment logic. This logic includes "CPU Downsizing" for efficiency, "CPU Upsizing" to handle pressure (featuring "Hot Thread Workload Dampening" and safety caps), and final "Maximum CPU Sizing Sanity Checks". The result is a single, unified CSV report containing the final, adjusted CPU recommendations for each profile, enriched with VM configuration data and sizing hints.
 - **Language:** Perl
 - **Primary Input:**
     - NMON data CSV files for PhysC and RunQ (passed to underlying `nfit` calls).
@@ -45,9 +45,9 @@ Key functions include:
 - **Current - ENT:** Current entitlement from the optional VM configuration CSV.
 - **NFIT - ENT, NETT, NETT%:** Columns containing dynamic Excel formulas for use in a planning spreadsheet, facilitating comparison between current and recommended entitlements.
 
-Refer to the script's help output (`nfit-profile -h`) for detailed command-line options and configuration file locations.
+Refer to the program's help output (`nfit-profile -h`) for detailed command-line options and configuration file locations.
 
 ## Dependencies
 - Perl 5.x
 - Core Perl Modules: `Getopt::Long`, `Cwd`, `File::Basename`, `Time::Piece`, `List::Util`, `IO::File`, `version`.
-- The `nfit` script (must be executable and findable by path or via `--nfit-path`). A recent version of `nfit` (e.g., v2.29+) is recommended to support all advanced features like windowed decay and growth prediction.
+- The `nfit` program (must be executable and findable by path or via `--nfit-path`) at the corresponding version than `nfit-profile`.
