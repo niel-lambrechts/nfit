@@ -89,7 +89,7 @@ This script will run `nfit` multiple times based on your `etc/nfit.profiles.cfg`
 
 * **Command:**
     ```bash
-    ./nfit-profile -f /path/to/your/nmon_data.csv -config /path/to/your/config-all.csv > nfit_sizing_report.csv
+    ./nfit-profile --match-runq-perc-to-profile --nfit-enable-windowed-decay -f /path/to/your/nmon_data.csv -config /path/to/your/config-all.csv > nfit_sizing_report.csv
     ```
     *(Replace paths with your actual file locations. Add other options like `-s <startdate>`, `-r` or `-u` for rounding as needed.)*
 * **Output:** `nfit_sizing_report.csv` (or your chosen output file) will contain the aggregated metrics for each VM.
@@ -160,7 +160,7 @@ The underlying sizing methodology (primarily implemented in `nfit` and orchestra
 - **Tiering Concept:** The generated profiles are designed to map to different service tiers, allowing for differentiated sizing based on business criticality.
 - **Heuristics (in `nfit-profile`):** Suggests workload pattern (Online/Batch/General), CPU usage shape (Peaky/Steady), and potential CPU pressure (based on P-99W1 vs. maxCPU) to aid planners.
 
-*(For a more detailed explanation of the methodology, see `doc/nfit_methodology.md`)*
+*(For a more detailed explanation of the methodology, see `doc/nFit Suite - Features and Sizing Methodology Overview.md`)*
 
 ## Prerequisites
 
@@ -172,40 +172,6 @@ The underlying sizing methodology (primarily implemented in `nfit` and orchestra
     - `matplotlib` library (`pip install matplotlib`)
     - `numpy` library (`pip install numpy`)
     (These can be installed from the `requirements.txt` file: `pip install -r requirements.txt`)
-
-## Setup & Configuration
-
-1.  **Clone the Repository:**
-    `git clone <repository_url> nmon-fit`
-    `cd nmon-fit`
-
-2.  **Makes Executable:**
-    `chmod +x nfit nfit-profile nfit-plot`
-
-3.  **Configuration Files:**
-    The scripts look for configuration files by default in an `etc/` subdirectory relative to their location, and then in their own directory as a fallback. You can override these paths using command-line options.
-    It is recommended to copy the relevant `.example` files from the `examples/` directory to `etc/`, rename them (remove `.theme.example` or `.default`), and then customise them.
-
-    * **`etc/nfit.profiles.cfg` (for `nfit-profile`):** Defines the set of nFit runs.
-        * Format: INI style. Section name is the profile name/CSV column header. Key `nfit_flags` contains the flags for `nfit`.
-        * See `examples/nfit.profiles.cfg.*.example` for different templates (mission-critical, general, cost-sensitive).
-        * Copy an example: `cp examples/nfit.profiles.cfg.general_enterprise.example etc/nfit.profiles.cfg`
-    * **`etc/config-all.csv` (optional, for `nfit-profile`):** Your VM configuration inventory.
-        * Format: CSV with headers. Expected columns include `hostname`, `serial`, `systemtype`, `procpool_name`, `procpool_id`, `entitledcpu`, `maxcpu`.
-        * See `examples/config-all.csv.example`.
-        * Used via the `-config` option in `nfit-profile`.
-    * **`etc/nfit.mgsys.cfg` (for `nfit-plot`):** Defines frame infrastructure and DC name.
-        * Format: INI style. `[GLOBAL]` section for `dc_name`. Each frame is a section (e.g., `[Frame 1]`) with `name`, `total_cores`, `vio_allocation`.
-        * See `examples/nfit.mgsys.cfg.*.example`.
-        * Copy an example: `cp examples/nfit.mgsys.cfg.general_enterprise.example etc/nfit.mgsys.cfg`
-    * **`etc/nfit.scenarios.cfg` (for `nfit-plot`):** Defines LPAR entitlement scenarios.
-        * Format: INI style. Each scenario is a section with `name`, `lpar_entitlements_per_frame` (comma-separated, must match frame count), `filename_suffix`.
-        * See `examples/nfit.scenarios.cfg.*.example`.
-        * Copy an example: `cp examples/nfit.scenarios.cfg.general_enterprise.example etc/nfit.scenarios.cfg`
-
-4.  **Input NMON Data:**
-    * `nfit` (and by extension `nfit-profile`) expects a CSV file containing NMON `PhysC` data. The first column should be a timestamp (e.g., "YYYY-MM-DD HH:MM:SS"), and subsequent columns should be `"VMName PhysC"`.
-    * An example snippet is in `examples/nmon_data.csv.example`.
 
 ## Basic Usage
 
