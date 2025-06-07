@@ -886,14 +886,18 @@ foreach my $vm_name (@vm_order)
     my @data_row_csv; # Holds data for the current VM's CSV row
     my $cfg_csv = $vm_config_data{$vm_name}; # VM's config data from config-all.csv (if loaded)
     
+    # Determine if the current VM is a VIO Server for logic branching
+    my $is_vio_server = (
+        defined $cfg_csv &&
+        defined $cfg_csv->{'systemtype'} &&
+        $cfg_csv->{'systemtype'} =~ /VIO Server/i
+    );
+
     # Determine SMT and MaxCPU to use for this VM's calculations/reporting
     my $smt_used_for_vm_csv = (defined $cfg_csv && defined $cfg_csv->{smt}) ? $cfg_csv->{smt} : $default_smt_arg;
     my $max_cpu_for_vm_csv  = (defined $cfg_csv && defined $cfg_csv->{maxcpu} && $cfg_csv->{maxcpu} > 0) ? $cfg_csv->{maxcpu} : 0;
-    
-    # --- Generate Sizing Hint ---
-    my $hint_norm_runq_p90_str = $results_table{$vm_name}{'NormRunQ_P90'} // "N/A";
-    my $hint_abs_runq_p90_str  = $results_table{$vm_name}{'AbsRunQ_P90'}  // "N/A";
 
+    # --- Generate Sizing Hint and get ACTUAL pressure details for ALL servers ---
     my ($hint_type_tier_csv, $hint_pattern_shape_csv, $hint_pressure_bool_csv, $pressure_detail_str_csv, $global_pressure_log_details_str, $p99w1_vm_has_abs_runq_pressure, $p99w1_vm_has_norm_runq_pressure) =
         generate_sizing_hint(
             'results_ref'              => \%results_table, 
@@ -901,30 +905,24 @@ foreach my $vm_name (@vm_order)
             'config_ref'               => $cfg_csv,        
             'max_cpu_for_vm_numeric'        => $max_cpu_for_vm_csv,
             'smt_used_for_vm_numeric'       => $smt_used_for_vm_csv,
-            'per_profile_runq_metrics_ref'  => \%per_profile_runq_metrics # Pass the global hash
+            'per_profile_runq_metrics_ref'  => \%per_profile_runq_metrics
         );
     my $pressure_bool_str_csv = $hint_pressure_bool_csv ? "True" : "False";
 
-    # --- Log Global Pressure Assessment Details for Sizing Hint ---
     if ($LOG_FH)
     {
         print {$LOG_FH} "----------------------------------------------------------------------\n";
         print {$LOG_FH} "Global Sizing Hint Pressure Assessment (VM: $vm_name)\n";
-        # The $global_pressure_log_details_str already starts with "Section G..."
         print {$LOG_FH} $global_pressure_log_details_str . "\n";
-        # No need for an extra trailing line of dashes if the string itself is well-formed.
-        # The next major log section will be the per-profile ones.
     }
     
-    # Add VM, TIER, Hint, Pattern etc. columns to CSV row
-    # As per user feedback: TIER (column B) is user-populated/empty from script,
-    # Hint (column C) gets the $hint_type_tier_csv (e.g. "G3").
+    # --- Build the initial part of the CSV row ---
     push @data_row_csv, $vm_name,                   # VM (Column A)
-                        "",                         # TIER (Column B, empty from script as per user feedback)
-                        $hint_type_tier_csv,        # Hint (Column C, e.g., "G3")
-                        $hint_pattern_shape_csv,    # Pattern (Column D)
-                        $pressure_bool_str_csv,     # Pressure
-                        $pressure_detail_str_csv,   # PressureDetail
+                        "",                         # TIER (Column B, empty)
+                        $hint_type_tier_csv,        # Hint (e.g., "G3" or "P" for VIO)
+                        $hint_pattern_shape_csv,    # Pattern (e.g., "Steady" or "VIO Server")
+                        $pressure_bool_str_csv,     # ACTUAL calculated Pressure
+                        $pressure_detail_str_csv,   # ACTUAL calculated PressureDetail
                         $smt_used_for_vm_csv;       # SMT
 
     # Add VM config details
@@ -935,149 +933,112 @@ foreach my $vm_name (@vm_order)
     # Add Peak PhysC value
     push @data_row_csv, ($results_table{$vm_name}{$PEAK_PROFILE_NAME} // "");
     
-    # --- Calculate and Add RunQ-Modified PhysC value for each profile column ---
+    # --- Loop through profiles and populate values ---
     foreach my $profile_being_adjusted_ref (@profiles) 
     {
         my $profile_name_being_adjusted = $profile_being_adjusted_ref->{name};
         my $raw_physc_profile_value_str = $results_table{$vm_name}{$profile_name_being_adjusted};
-        my $adjusted_value_str = "N/A"; 
-        my $current_profile_runq_behavior = $profile_being_adjusted_ref->{runq_behavior} // 'default';
-        my $debug_info_for_log = { AbsRunQKeyUsed => 'AbsRunQ_P90 (default/key unknown)' };
-        my $abs_runq_p_value_to_use_for_calc = "N/A";
-        my $abs_runq_key_actually_used = "AbsRunQ_P90";
-        my $current_profile_physc_perc_val_num;
+        my $final_value_for_csv = $raw_physc_profile_value_str // "N/A";
 
-        if ($profile_being_adjusted_ref->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/) {
-            $current_profile_physc_perc_val_num = $1 + 0;
-        }
+        # *** This is the main VIO logic branch ***
+        if (!$is_vio_server)
+        {
+            # --- Standard (NON-VIO) Server: Apply modification logic ---
+            my $current_profile_runq_behavior = $profile_being_adjusted_ref->{runq_behavior} // 'default';
+            my $debug_info_for_log = { AbsRunQKeyUsed => 'AbsRunQ_P90 (default/key unknown)' };
+            my $abs_runq_p_value_to_use_for_calc = "N/A";
+            my $abs_runq_key_actually_used = "AbsRunQ_P90";
+            my $current_profile_physc_perc_val_num;
 
-        if ($match_runq_perc_to_profile && defined $current_profile_physc_perc_val_num) {
-            my $target_perc_label = sprintf("%.2f", $current_profile_physc_perc_val_num);
-            $target_perc_label =~ s/\.?0+$//;
-            $target_perc_label = "0" if $target_perc_label eq "" && abs($current_profile_physc_perc_val_num - 0) < 0.001;
-            my $potential_key = "AbsRunQ_P" . $target_perc_label;
+            if ($profile_being_adjusted_ref->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/) {
+                $current_profile_physc_perc_val_num = $1 + 0;
+            }
 
-            if (exists $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{$potential_key}) {
-                $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{$potential_key};
-                $abs_runq_key_actually_used = $potential_key;
-            } else {
-                if ($LOG_FH) {
-                    print {$LOG_FH} "WARNING VM '$vm_name', Profile '$profile_name_being_adjusted': Matched key '$potential_key' for AbsRunQ not found. Falling back to AbsRunQ_P90.\n";
-                }
-                if (exists $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{"AbsRunQ_P90"}) {
-                    $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{"AbsRunQ_P90"};
+            if ($match_runq_perc_to_profile && defined $current_profile_physc_perc_val_num) {
+                my $target_perc_label = sprintf("%.2f", $current_profile_physc_perc_val_num);
+                $target_perc_label =~ s/\.?0+$//;
+                $target_perc_label = "0" if $target_perc_label eq "" && abs($current_profile_physc_perc_val_num - 0) < 0.001;
+                my $potential_key = "AbsRunQ_P" . $target_perc_label;
+
+                if (exists $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{$potential_key}) {
+                    $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{$potential_key};
+                    $abs_runq_key_actually_used = $potential_key;
                 } else {
-                     if ($LOG_FH) {
-                         print {$LOG_FH} "WARNING VM '$vm_name', Profile '$profile_name_being_adjusted': Fallback AbsRunQ_P90 also not found.\n";
-                     }
+                    if ($LOG_FH) {
+                        print {$LOG_FH} "WARNING VM '$vm_name', Profile '$profile_name_being_adjusted': Matched key '$potential_key' for AbsRunQ not found. Falling back to AbsRunQ_P90.\n";
+                    }
+                    $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{"AbsRunQ_P90"} // "N/A";
+                }
+            } else {
+                $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{"AbsRunQ_P90"} // "N/A";
+            }
+            
+            my $this_profile_norm_p50 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P50'} // "N/A";
+            my $this_profile_norm_p90 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P90'} // "N/A";
+            my $this_profile_norm_p25 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P25'} // "N/A";
+            my $this_profile_norm_p75 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P75'} // "N/A";
+
+            if (defined $raw_physc_profile_value_str && $raw_physc_profile_value_str ne "N/A" && $raw_physc_profile_value_str =~ /^-?[0-9.]+$/) {
+                my $raw_physc_profile_value = $raw_physc_profile_value_str + 0;
+                
+                my ($runq_modified_physc_for_profile, $calc_debug_info_ref) = calculate_runq_modified_physc(
+                    $raw_physc_profile_value, $this_profile_norm_p25, $this_profile_norm_p50,
+                    $this_profile_norm_p75, $this_profile_norm_p90, $abs_runq_p_value_to_use_for_calc,
+                    $abs_runq_key_actually_used, $smt_used_for_vm_csv,
+                    (defined $cfg_csv ? $cfg_csv->{entitlement} : "0"), $max_cpu_for_vm_csv,
+                    ($is_vio_server ? 1 : 0), $current_profile_runq_behavior,
+                    $p99w1_vm_has_abs_runq_pressure, $p99w1_vm_has_norm_runq_pressure
+                );
+                
+                my $effective_nfit_flags_for_dp_calc = $rounding_flags_for_nfit . " " . $profile_being_adjusted_ref->{flags};
+                my $current_profile_output_dp = get_nfit_output_dp_from_flags($effective_nfit_flags_for_dp_calc);
+                my $current_sprintf_format = "%." . $current_profile_output_dp . "f";
+                $final_value_for_csv = sprintf($current_sprintf_format, $runq_modified_physc_for_profile);
+
+                my $nfit_growth_adj_for_log = $parsed_growth_adj_values{$vm_name}{$profile_name_being_adjusted} // "0.0000 (not parsed)";
+                my $nfit_growth_adj_abs_for_log = $parsed_growth_adj_abs_values{$vm_name}{$profile_name_being_adjusted} // "0.0000 (not parsed)";
+
+                if ($LOG_FH) {
+                    log_profile_rationale(
+                        $LOG_FH, $vm_name, $profile_name_being_adjusted, $raw_physc_profile_value_str,
+                        $profile_name_being_adjusted, $abs_runq_p_value_to_use_for_calc,
+                        $this_profile_norm_p50, $this_profile_norm_p90, $cfg_csv, $smt_used_for_vm_csv,
+                        $max_cpu_for_vm_csv, $current_profile_runq_behavior, $calc_debug_info_ref,
+                        $final_value_for_csv, $nfit_growth_adj_for_log, $nfit_growth_adj_abs_for_log
+                    );
                 }
             }
-        } else {
-            if (exists $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{"AbsRunQ_P90"}) {
-                $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{"AbsRunQ_P90"};
-            } else {
-                 if ($LOG_FH) {
-                     print {$LOG_FH} "INFO VM '$vm_name', Profile '$profile_name_being_adjusted': AbsRunQ_P90 not found (matching disabled or profile -p not determined).\n";
-                 }
-            }
         }
-        $debug_info_for_log->{AbsRunQKeyUsed} = $abs_runq_key_actually_used;
-        my $this_profile_norm_p50 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P50'} // "N/A";
-        my $this_profile_norm_p90 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P90'} // "N/A";
-        my $this_profile_norm_p25 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P25'} // "N/A";
-        my $this_profile_norm_p75 = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{'NormRunQ_P75'} // "N/A";
-
-        if (defined $raw_physc_profile_value_str && $raw_physc_profile_value_str ne "N/A" && $raw_physc_profile_value_str =~ /^-?[0-9.]+$/) {
-            my $raw_physc_profile_value = $raw_physc_profile_value_str + 0;
-            my $is_non_default_pool = (defined $cfg_csv && defined $cfg_csv->{pool_name} && lc($cfg_csv->{pool_name}) ne 'defaultpool' && $cfg_csv->{pool_name} ne '');
-            
-            my ($runq_modified_physc_for_profile, $calc_debug_info_ref) = calculate_runq_modified_physc(
-                $raw_physc_profile_value,
-                $this_profile_norm_p25,
-                $this_profile_norm_p50,
-                $this_profile_norm_p75,
-                $this_profile_norm_p90,
-                $abs_runq_p_value_to_use_for_calc,
-                $abs_runq_key_actually_used,
-                $smt_used_for_vm_csv,
-                (defined $cfg_csv ? $cfg_csv->{entitlement} : "0"),
-                $max_cpu_for_vm_csv,
-                $is_non_default_pool,
-                $current_profile_runq_behavior,
-                $p99w1_vm_has_abs_runq_pressure,
-                $p99w1_vm_has_norm_runq_pressure
-            );
-            %$debug_info_for_log = ( %$debug_info_for_log, %$calc_debug_info_ref );
-            $debug_info_for_log->{AbsRunQKeyUsed} = $abs_runq_key_actually_used;
-            my $effective_nfit_flags_for_dp_calc = $rounding_flags_for_nfit . " " . $profile_being_adjusted_ref->{flags};
-            my $current_profile_output_dp = get_nfit_output_dp_from_flags($effective_nfit_flags_for_dp_calc);
-            my $current_sprintf_format = "%." . $current_profile_output_dp . "f";
-            $adjusted_value_str = sprintf($current_sprintf_format, $runq_modified_physc_for_profile);
-        } else {
-            $adjusted_value_str = $raw_physc_profile_value_str // "N/A";
-            $debug_info_for_log->{ReasonForNoModification} = "Base PhysC for profile '$profile_name_being_adjusted' was N/A or not numeric.";
-            $debug_info_for_log->{FinalAdjustedPhysC} = $adjusted_value_str;
-        }
-        push @data_row_csv, $adjusted_value_str;
-        my $nfit_growth_adj_for_log = $parsed_growth_adj_values{$vm_name}{$profile_name_being_adjusted} // "0.0000 (not parsed)";
-        my $nfit_growth_adj_abs_for_log = $parsed_growth_adj_abs_values{$vm_name}{$profile_name_being_adjusted} // "0.0000 (not parsed)";
-
-        if ($LOG_FH) {
-            log_profile_rationale(
-                $LOG_FH,
-                $vm_name,
-                $profile_name_being_adjusted,
-                $raw_physc_profile_value_str,
-                $profile_name_being_adjusted,
-                $abs_runq_p_value_to_use_for_calc,
-                $this_profile_norm_p50,
-                $this_profile_norm_p90,
-                $cfg_csv,
-                $smt_used_for_vm_csv,
-                $max_cpu_for_vm_csv,
-                $current_profile_runq_behavior,
-                $debug_info_for_log,
-                $adjusted_value_str,
-                $nfit_growth_adj_for_log,
-                $nfit_growth_adj_abs_for_log
-            );
-        }
-    } # End foreach profile_being_adjusted_ref
+        # For VIO servers, we just use the raw value already in $final_value_for_csv
+        push @data_row_csv, $final_value_for_csv;
+    }
     
-    # Add current entitlement and formula placeholders to CSV row
+    # Add final columns (entitlement, formulas) to the CSV row
     my $current_ent_display_csv_out = (defined $cfg_csv && defined $cfg_csv->{entitlement}) ? $cfg_csv->{entitlement} : "";
     if ($current_ent_display_csv_out ne "" && $current_ent_display_csv_out =~ /^-?[0-9.]+$/) {
         $current_ent_display_csv_out = sprintf("%.2f", $current_ent_display_csv_out);
     }
 
-    # Generate the dynamic Excel formula
     my $nfit_ent_formula_str = generate_nfit_ent_formula($excel_row_num_counter, scalar(@profiles));
-
-    # 'Current_ENT' is the column after all profiles. Index = 12 + num_profiles + 1
-    # 'NFIT_ENT_UserFormula' is the column after 'Current_ENT'. Index = 12 + num_profiles + 2
+    
     my $idx_current_ent_col_this_row_actual = 12 + scalar(@profiles) + 1;
     my $idx_nfit_ent_formula_col_this_row_actual = 12 + scalar(@profiles) + 2;
-
+    
     my $cell_letter_current_ent_actual = get_excel_col_name($idx_current_ent_col_this_row_actual);
     my $cell_letter_nfit_ent_formula_actual = get_excel_col_name($idx_nfit_ent_formula_col_this_row_actual);
-
+    
     my $cell_ref_current_ent_actual = $cell_letter_current_ent_actual . $excel_row_num_counter;
     my $cell_ref_nfit_ent_formula_actual = $cell_letter_nfit_ent_formula_actual . $excel_row_num_counter;
-
-    # Formula for NETT_UserFormula: =(Current_ENT_cell - NFIT_ENT_UserFormula_cell)
+    
     my $nett_user_formula_str = sprintf("=(%s-%s)", $cell_ref_nfit_ent_formula_actual, $cell_ref_current_ent_actual);
-
-    # Formula for NETT_Perc_UserFormula: =IFERROR((NFIT_ENT_UserFormula_cell - Current_ENT_cell) / Current_ENT_cell, "")
-    # This shows change (NFIT - Current) as a percentage of Current.
-    # Using "" for errors (e.g., division by zero if Current_ENT is 0).
     my $nett_perc_user_formula_str = sprintf("=IFERROR((%s-%s)/%s,\"\")", $cell_ref_nfit_ent_formula_actual, $cell_ref_current_ent_actual, $cell_ref_current_ent_actual);
     
-    push @data_row_csv, $current_ent_display_csv_out, 
-                        $nfit_ent_formula_str,          # NFIT_Formula
-                        $nett_user_formula_str,         # NETT_UserFormula
-                        $nett_perc_user_formula_str;    # NETT_Perc_UserFormula
+    push @data_row_csv, $current_ent_display_csv_out,
+                        $nfit_ent_formula_str,
+                        $nett_user_formula_str,
+                        $nett_perc_user_formula_str;
     
-    print STDOUT join(",", map { quote_csv($_) } @data_row_csv) . "\n"; # Print the complete CSV row for the VM
+    print STDOUT join(",", map { quote_csv($_) } @data_row_csv) . "\n";
 } # End foreach vm_name
 
 # --- Collect unique serials that were part of the output ---
@@ -2796,16 +2757,13 @@ sub generate_sizing_hint
     push @global_pressure_rationale_lines, sprintf("  Input LPAR MaxCPU              : %.2f cores", $max_cpu_for_vm_numeric);
     push @global_pressure_rationale_lines, sprintf("  Input SMT for VM               : %d", $smt_used_for_vm_numeric);
 
-
     # --- VIO Server Check ---
+    my $is_vio_server = 0;
     if (defined $config_ref &&
         defined $config_ref->{'systemtype'} &&
         $config_ref->{'systemtype'} =~ /VIO Server/i)
     {
-        my $vio_rationale = join("\n", @global_pressure_rationale_lines);
-        $vio_rationale .= "\n  VM identified as VIO Server. Standard pressure checks skipped for hint.\n  Hint set to P / VIO Server.";
-        # Return dummy FALSE for P-99W1 specific RunQ pressures for VIOs
-        return ("P", "VIO Server", 0, "VIO Server - Manual/Peak Sizing", $vio_rationale, 0, 0);
+        $is_vio_server = 1;
     }
 
     # --- Profile Value Parsing (Pattern/Peakiness & P-99W1 PhysC) ---
@@ -2973,15 +2931,33 @@ sub generate_sizing_hint
     }
     my $pattern_tier_string = $suggested_pattern . $adjusted_tier_str;
 
-    return (
-        $pattern_tier_string,
-        $shape_descriptor,
-        $overall_pressure_detected_for_csv, # This is for the CSV Pressure column
-        $pressure_detail_str,
-        $global_pressure_rationale_text,
-        $p99w1_has_absolute_runq_pressure,    # NEW return value
-        $p99w1_has_normalized_runq_pressure   # NEW return value
-    );
+    if ($is_vio_server)
+    {
+        # For VIOs, we return the *actual* calculated pressure flags and details,
+        # but override the final tier/pattern hint for safety and clarity.
+        return (
+            "P",    # Override Hint to "P" for Peak/Manual
+            "shape_descriptor", # Override Pattern
+            $overall_pressure_detected_for_csv, # Return ACTUAL calculated pressure
+            $pressure_detail_str,               # Return ACTUAL pressure details
+            $global_pressure_rationale_text,
+            $p99w1_has_absolute_runq_pressure,
+            $p99w1_has_normalized_runq_pressure
+        );
+    }
+    else
+    {
+        # For non-VIOs, return the standard, calculated hint and pattern.
+        return (
+            $pattern_tier_string,
+            $shape_descriptor,
+            $overall_pressure_detected_for_csv,
+            $pressure_detail_str,
+            $global_pressure_rationale_text,
+            $p99w1_has_absolute_runq_pressure,
+            $p99w1_has_normalized_runq_pressure
+        );
+    }
 }
 # end of generate_sizing_hint
 
