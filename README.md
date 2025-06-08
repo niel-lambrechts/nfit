@@ -22,9 +22,7 @@ For more information on setting up this stack, refer to [njmon Intro and Update]
 
 The following example provides a basic animated visualisation of how nFit applies exponential moving average (EMA) smoothing and a final linear regression to a stream of NMON data. While not a comprehensive demonstration, it gives a clear sense of how the tool works in practice.
 
-Click the thumbnail below to watch the full animation:
-
-[![nFit Smoothing Thumbnail](./examples/nfit-smoothing.png)](./examples/nfit-smoothing.mp4)
+![nFit Smoothing Thumbnail](./examples/nfit-smoothing.gif)]
 
 ## 🚀 QuickStart
 
