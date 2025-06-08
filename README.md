@@ -18,6 +18,13 @@ For continuous, long-term monitoring and analysis, nFit integrates seamlessly wi
 
 For more information on setting up this stack, refer to [njmon Intro and Update](https://www.ibm.com/support/pages/njmon-intro-and-update). For a detailed installation guide, see [njmon + InfluxDB + Grafana Series 10: nimon Intro & Setup](https://www.youtube.com/watch?v=9_wG9H60AGg) by Nigel Griffiths.
 
+## 🎬 nFit Smoothing Visualisation
+
+The following example provides a basic animated visualisation of how nFit applies exponential moving average (EMA) smoothing and a final linear regression to a stream of NMON data. While not a comprehensive demonstration, it gives a clear sense of how the tool works in practice.
+
+Click the thumbnail below to watch the full animation:
+
+[![nFit Smoothing Thumbnail](./examples/nfit-smoothing.png)](./examples/nnfit-smoothing.mp4)
 
 ## 🚀 QuickStart
 

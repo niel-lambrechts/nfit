@@ -9,6 +9,17 @@ import re # Import regular expressions for parsing profile names
 # Apply a professional plot style
 plt.style.use("seaborn-v0_8-darkgrid")
 
+# --- Configuration: Save or Display Animation ---
+# Set SAVE_ANIMATION to True to save the animation to a file.
+# Set it to False to display the animation interactively instead.
+SAVE_ANIMATION = False
+
+# Define the output filename.
+# MP4 is recommended for GitHub for better quality and smaller file size.
+# Ensure you have the necessary writer installed (e.g., ffmpeg for .mp4).
+OUTPUT_FILENAME = "/tmp/nfit-smoothing.mp4" # or "nfit_visualisation.gif"
+
+
 # --- 0. Synthetic Data Generation ---
 np.random.seed(42)
 num_days = 90
@@ -53,7 +64,7 @@ for name in active_profile_names_ordered:
         alpha = USER_DEFINED_ALPHAS[name]
         profile_emas_data[name] = s_raw_cpu.ewm(alpha=alpha, adjust=False, ignore_na=True).mean()
     else:
-        profile_emas_data[name] = pd.Series(dtype=float) 
+        profile_emas_data[name] = pd.Series(dtype=float)
 
 profile_colors = ['limegreen', 'mediumorchid', 'orangered', 'darkorange', 'khaki']
 active_profile_emas = {name: data for name, data in profile_emas_data.items() if data is not None and not data.empty}
@@ -154,9 +165,9 @@ pxx_text_artist = None
 pxx_horizontal_line = None # Global artist for the Pxx horizontal line
 
 # --- Function to display Pxx for a profile ---
-def display_profile_pxx(profile_idx_to_show, current_ax, text_artist, horizontal_line_artist, 
+def display_profile_pxx(profile_idx_to_show, current_ax, text_artist, horizontal_line_artist,
                         current_active_profile_emas_dict, ordered_profile_names_list):
-    
+
     # Ensure artists are valid before proceeding
     if not text_artist or not horizontal_line_artist:
         return
@@ -181,8 +192,8 @@ def display_profile_pxx(profile_idx_to_show, current_ax, text_artist, horizontal
     w_span_for_smoothing = get_w_value_from_name(profile_name)
 
     pxx_text_content = f'{profile_name}\nP{percentile_val} (of W{w_span_for_smoothing} smoothed EMA): '
-    pxx_value_calculated = None 
-    
+    pxx_value_calculated = None
+
     if not original_ema_series.empty:
         smoothed_for_pxx = original_ema_series.ewm(span=w_span_for_smoothing, adjust=False, ignore_na=True).mean().dropna()
         if not smoothed_for_pxx.empty:
@@ -192,7 +203,7 @@ def display_profile_pxx(profile_idx_to_show, current_ax, text_artist, horizontal
             pxx_text_content += 'N/A (smoothing error)'
     else:
         pxx_text_content += 'N/A (no base EMA)'
-        
+
     text_artist.set_text(pxx_text_content)
     text_artist.set_visible(True)
     current_ax.set_title(f"{profile_name} (P{percentile_val} of W{w_span_for_smoothing} EMA shown). Pausing...")
@@ -211,7 +222,7 @@ def init_animation_multi():
     scatter_reg_points.set_offsets(np.empty((0, 2)))
     line_reg_plot.set_data([], [])
     ax.set_title("Visualising nFit (C) 2025 Niël Lambrechts ...") # As per user's v2
-    
+
     if pxx_text_artist is None:
         pxx_text_artist = ax.text(0.97, 0.97, '', ha='right', va='top',
                                  transform=ax.transAxes,
@@ -221,10 +232,10 @@ def init_animation_multi():
     else:
         pxx_text_artist.set_text('')
         pxx_text_artist.set_visible(False)
-    
+
     if pxx_horizontal_line is None:
         # Initialize with a default y that's likely off-screen or 0, and invisible
-        pxx_horizontal_line = ax.axhline(y=0, color='darkslateblue', linestyle='--', linewidth=1.3, 
+        pxx_horizontal_line = ax.axhline(y=0, color='darkslateblue', linestyle='--', linewidth=1.3,
                                          visible=False, zorder=6, alpha=0.7)
     else:
         pxx_horizontal_line.set_ydata([0,0]) # Reset to avoid showing old line briefly
@@ -238,11 +249,11 @@ def init_animation_multi():
 
 def update_animation_multi(frame_num):
     global pxx_text_artist, pxx_horizontal_line
-    
+
     if pxx_text_artist: pxx_text_artist.set_visible(False)
     if pxx_horizontal_line: pxx_horizontal_line.set_visible(False) # Hide Pxx line by default
-    
-    all_artists_to_return = [line_raw_plot] 
+
+    all_artists_to_return = [line_raw_plot]
     all_artists_to_return.extend(profile_lines_plots)
     all_artists_to_return.extend([scatter_reg_points, line_reg_plot])
     if pxx_text_artist: all_artists_to_return.append(pxx_text_artist)
@@ -272,7 +283,7 @@ def update_animation_multi(frame_num):
     current_phase_frame_counter += frames_delay_after_raw
 
     # --- Phase 2: Draw EMA Profile Lines Sequentially (with inter-EMA delays) ---
-    plotted_ema_idx = 0 
+    plotted_ema_idx = 0
     for profile_idx_ordered in range(len(active_profile_names_ordered)):
         profile_name_current_ordered = active_profile_names_ordered[profile_idx_ordered]
         if profile_name_current_ordered not in active_profile_emas:
@@ -315,7 +326,7 @@ def update_animation_multi(frame_num):
                 return all_artists_to_return
             current_phase_frame_counter += frames_delay_between_emas
         plotted_ema_idx += 1
-    
+
     # --- Delay 2: After all EMAs are drawn (and Pxx for the last EMA) ---
     if frame_num < current_phase_frame_counter + frames_delay_after_all_emas :
         line_raw_plot.set_alpha(0.2)
@@ -325,7 +336,7 @@ def update_animation_multi(frame_num):
                 profile_lines_plots[idx_for_plot_obj].set_data(time_days, active_profile_emas[name_ord])
                 profile_lines_plots[idx_for_plot_obj].set_alpha(0.5)
                 idx_for_plot_obj +=1
-        
+
         if num_active_profiles > 0:
             last_active_profile_original_idx = -1
             for i in range(len(active_profile_names_ordered) -1, -1, -1):
@@ -341,7 +352,7 @@ def update_animation_multi(frame_num):
                         if i_ord_check == last_active_profile_original_idx:
                             final_plot_obj_idx = temp_plotted_idx # This is the index in profile_lines_plots
                         temp_plotted_idx +=1
-                
+
                 if final_plot_obj_idx != -1 and final_plot_obj_idx < len(profile_lines_plots):
                      profile_lines_plots[final_plot_obj_idx].set_alpha(0.7) # Make it prominent for Pxx display
 
@@ -397,14 +408,14 @@ def update_animation_multi(frame_num):
         if frame_num == current_phase_frame_counter:
              ax.set_title(f"Animation Complete. Repeating in {pause_duration_before_repeat_ms/1000:.0f}s...")
         return all_artists_to_return
-    
+
     return all_artists_to_return
 
 # --- Create Animation ---
 ani_multi = None
 is_animation_paused = False
 def toggle_pause_resume(event):
-    global is_animation_paused, ani_multi, bpause 
+    global is_animation_paused, ani_multi, bpause
     if is_animation_paused:
         ani_multi.event_source.start()
         bpause.label.set_text('Pause')
@@ -419,10 +430,56 @@ ax_button_pause = plt.axes([0.40, 0.025, 0.1, 0.05])
 bpause = Button(ax_button_pause, 'Pause', color='lightgoldenrodyellow', hovercolor='0.975')
 bpause.on_clicked(toggle_pause_resume)
 ani_multi = animation.FuncAnimation(fig, update_animation_multi, frames=total_frames_for_animation,
-                                    init_func=init_animation_multi, blit=False, 
-                                    interval=animation_interval_ms, 
-                                    repeat=True, 
-                                    repeat_delay=0 
+                                    init_func=init_animation_multi, blit=False,
+                                    interval=animation_interval_ms,
+                                    repeat=True,
+                                    repeat_delay=0
                                     )
 plt.subplots_adjust(left=0.1, right=0.9, top=0.9, bottom=0.2)
-plt.show()
+
+
+# --- Save or Show Animation ---
+if SAVE_ANIMATION:
+    # The 'Pause' button is for interactive mode and not needed in the saved file.
+    bpause.ax.set_visible(False)
+    
+    # Calculate frames per second from the animation interval.
+    fps = 1000 / animation_interval_ms
+
+    print(f"Saving animation to '{OUTPUT_FILENAME}'...")
+    print(f"This will take approximately {total_frames_for_animation / fps / 60:.1f} minutes.")
+
+    # Define a progress callback function to show progress in the console.
+    def progress_callback(i, n):
+        print(f'Saving frame {i + 1} of {n}')
+
+    try:
+        if OUTPUT_FILENAME.lower().endswith('.mp4'):
+            # For MP4, the 'ffmpeg' writer is commonly used. Ensure ffmpeg is installed on your system.
+            # Example installation: sudo apt install ffmpeg (Linux) or brew install ffmpeg (macOS).
+            # The 'repeat=True' in FuncAnimation doesn't apply to saving, so it will save one full loop.
+            ani_multi.save(OUTPUT_FILENAME, writer='ffmpeg', fps=fps, dpi=200,
+                         progress_callback=progress_callback)
+        elif OUTPUT_FILENAME.lower().endswith('.gif'):
+            # For GIF, the 'pillow' writer is used. Ensure Pillow is installed (pip install Pillow).
+            from matplotlib.animation import PillowWriter
+            ani_multi.save(OUTPUT_FILENAME, writer=PillowWriter(fps=fps), dpi=120,
+                         progress_callback=progress_callback)
+        else:
+            print(f"Error: Unsupported output file format in '{OUTPUT_FILENAME}'.")
+            print("Please use a filename ending in '.mp4' or '.gif'.")
+
+        print(f"Animation saved successfully to '{OUTPUT_FILENAME}'.")
+
+    except FileNotFoundError:
+        print("\n--- ERROR ---")
+        if OUTPUT_FILENAME.lower().endswith('.mp4'):
+            print("The 'ffmpeg' writer was not found.")
+            print("Please install ffmpeg and ensure it's in your system's PATH.")
+        elif OUTPUT_FILENAME.lower().endswith('.gif'):
+             print("The 'pillow' writer failed. Please ensure Pillow is installed (`pip install Pillow`).")
+        print("-------------")
+
+else:
+    # Display the animation interactively.
+    plt.show()
