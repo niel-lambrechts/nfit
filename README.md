@@ -6,7 +6,18 @@ nFit is designed to assist with AIX and Linux on Power LPAR (Logical Partition) 
 
 This suite helps in optimising resource utilisation, ensuring critical workloads have the guaranteed CPU they need, while identifying potential savings by accurately sizing less critical workloads or standby systems.
 
-This program requires NMON with InfluxDB Time-Series DB and Grafana Graphing Engine. For more information, refer to [njmon Intro and Update](https://www.ibm.com/support/pages/njmon-intro-and-update). For installation, refer to [njmon + InfluxDB + Grafana Series 10: nimon Intro & Setup](https://www.youtube.com/watch?v=9_wG9H60AGg) by Nigel Griffiths.
+To provide maximum flexibility, nFit can process this performance data from two distinct sources:
+
+1. Direct NMON File Processing (Quick Start)
+
+For users who want to analyse existing NMON files without a complex setup, nFit can directly process a directory full of standard .nmon files. This is the fastest way to get started and is ideal for ad-hoc analysis, proof-of-concept projects, or analysing data from systems that are not part of a centralised monitoring solution. The only prerequisite is having a collection of NMON data files.
+
+2. Time-Series Database Integration (Enterprise Monitoring)
+
+For continuous, long-term monitoring and analysis, nFit integrates seamlessly with a time-series database stack. This method is recommended for environments where performance data is centrally collected and stored. It typically involves using njmon to feed performance data into an InfluxDB database, which can then be visualised with Grafana.
+
+For more information on setting up this stack, refer to [njmon Intro and Update](https://www.ibm.com/support/pages/njmon-intro-and-update). For a detailed installation guide, see [njmon + InfluxDB + Grafana Series 10: nimon Intro & Setup](https://www.youtube.com/watch?v=9_wG9H60AGg) by Nigel Griffiths.
+
 
 ## 🚀 QuickStart
 
