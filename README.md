@@ -24,7 +24,7 @@ The following example provides a basic animated visualisation of how nFit applie
 
 Click the thumbnail below to watch the full animation:
 
-[![nFit Smoothing Thumbnail](./examples/nfit-smoothing.png)](./examples/nnfit-smoothing.mp4)
+[![nFit Smoothing Thumbnail](./examples/nfit-smoothing.png)](./examples/nfit-smoothing.mp4)
 
 ## 🚀 QuickStart
 
