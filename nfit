@@ -1,7 +1,6 @@
 #!/usr/bin/env perl
 
 # NAME     : nfit
-# VERSION  : 2.30.1.0 # Restored user logic and comments, added nmondir.
 # AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
 # PURPOSE  : Analyse NMON PhysC and optionally RunQ data for AIX and Linux on Power
 #            VM right-sizing recommendations. Calculates rolling average (SMA or EMA)
@@ -26,9 +25,11 @@ use Time::Piece;
 use Time::Seconds;
 use version;
 use File::Spec;
+use File::Find;
+use List::MoreUtils qw(uniq);
 
 # --- Version ---
-my $VERSION = '2.25.159.0';
+my $VERSION = '3.25.166.0';
 
 # --- Configuration ---
 my $DEFAULT_AVG_METHOD     = 'ema';
@@ -111,6 +112,9 @@ my $enable_growth_prediction = 0;
 my $growth_projection_days = $DEFAULT_GROWTH_PROJECTION_DAYS;
 my $max_growth_inflation_percent = $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
 
+my $show_states_flag = 0;
+my $include_states_selector = 'all'; # Default value
+
 GetOptions(
     'physc-data|pc=s'     => \$physc_csv_file,
     'runq-data|rq=s'      => \$runq_csv_file,
@@ -146,6 +150,8 @@ GetOptions(
     'enable-growth-prediction'       => \$enable_growth_prediction,
     'growth-projection-days=i'       => \$growth_projection_days,
     'max-growth-inflation-percent=i' => \$max_growth_inflation_percent,
+    'show-states'               => \$show_states_flag,
+    'include-states=s'          => \$include_states_selector,
     # General Options
     'help|h'              => \$help,
     'verbose|v'           => \$verbose,
@@ -157,6 +163,21 @@ if ($show_version)
 {
     print STDERR "nfit version $VERSION\n";
     exit 0;
+}
+
+if ($show_states_flag)
+{
+    # The --include-states argument might be present with its default value.
+    # We only error if the user explicitly provided a different value.
+    if (defined $include_states_selector and lc($include_states_selector) ne 'all')
+    {
+        die "Error: --show-states and --include-states are mutually exclusive.\n";
+    }
+}
+
+if ( ($show_states_flag or (defined $include_states_selector and lc($include_states_selector) ne 'all')) and !$nmon_dir )
+{
+    die "Error: --show-states and --include-states can only be used with the --nmondir option.\n";
 }
 
 if ($help || (!$physc_csv_file && !$nmon_dir))
@@ -392,288 +413,405 @@ elsif (defined $start_time_str || defined $end_time_str)
     $ACTIVE_PHYSC_THRESHOLD = ($calculated_threshold < $MIN_ACTIVE_PHYSC_THRESHOLD) ? $MIN_ACTIVE_PHYSC_THRESHOLD : $calculated_threshold;
 }
 
-if ($nmon_dir)
-{
-    my ($temp_physc_fh, $temp_physc_filename) = tempfile(UNLINK => 1);
-    my ($temp_runq_fh, $temp_runq_filename) = tempfile(UNLINK => 1);
+## -- Main Block -- ##
 
-    process_nmon_directory($nmon_dir, $temp_physc_fh, $temp_runq_fh);
-
-    close($temp_physc_fh);
-    close($temp_runq_fh);
-
-    $physc_csv_file = $temp_physc_filename;
-    $runq_csv_file  = (-s $temp_runq_filename) ? $temp_runq_filename : undef;
-}
-
+my @processing_windows;
 my $script_start_time = time();
 print STDERR "nfit version $VERSION\n";
+print STDERR "-------------------------\n";
+
+# ==============================================================================
+# Main Execution Block
+# ==============================================================================
+
 if ($nmon_dir)
 {
-    print STDERR "Processing NMON data from directory: $nmon_dir\n";
-}
-else
-{
-    print STDERR "Processing PhysC data from: $physc_csv_file\n";
-}
+    # --- Phase 1: Discovery ---
+    print STDERR "Phase 1: Discovering Configuration States from '$nmon_dir'...\n";
+    my $all_states_ref = define_configuration_states($nmon_dir, $smt_value);
+    my %config_states_by_vm = %{$all_states_ref};
 
-if ($avg_method eq 'ema')
-{
-    print STDERR "Using EMA for PhysC rolling average (decay: $decay_level, alpha: $alpha_for_physc_ema).\n";
-    print STDERR "Conceptual window for PhysC EMA start trigger: $window_minutes minutes.\n";
+    # Handle the --show-states flag immediately after discovery
+    if ($show_states_flag) {
+        print_state_windows_report(\%config_states_by_vm);
+        exit 0;
+    }
+
+    # Filter the states based on the user's --include-states selector
+    my @all_selected_states;
+    my @vms_to_process = (defined $target_vm_name) ? ($target_vm_name) : (sort keys %config_states_by_vm);
+    foreach my $vm_name (@vms_to_process) {
+        my @available = @{$config_states_by_vm{$vm_name} || []};
+        my @selected_for_this_vm = parse_state_selector($include_states_selector, \@available);
+        push @all_selected_states, @selected_for_this_vm;
+    }
+
+    if (scalar(@all_selected_states) == 0) {
+        print STDERR " -> No matching states found for the specified selector '$include_states_selector'. No data to process.\n";
+        exit 0;
+    }
+    my $total_vms_with_states = scalar(grep { @{$config_states_by_vm{$_}} } keys %config_states_by_vm);
+    print STDERR " -> Found a total of " . scalar(@all_selected_states) . " matching configuration states across $total_vms_with_states VMs.\n\n";
+
+    # --- Phase 2: Staging ---
+    print STDERR "Phase 2: Staging NMON performance data for analysis...\n";
+    my ($temp_physc_fh, $temp_physc_filename) = tempfile(UNLINK => 1);
+    my ($temp_runq_fh, $temp_runq_filename)   = tempfile(UNLINK => 1);
+    process_nmon_directory_to_tempfiles($nmon_dir, $temp_physc_fh, $temp_runq_fh);
+    close($temp_physc_fh);
+    close($temp_runq_fh);
+    print STDERR " -> Data staging complete.\n\n";
+
+    my %vm_results_aggregator;
+
+    # --- Phase 3: Analysis ---
+    # Group selected states by VM name to enable cleaner, grouped output
+    my %selected_states_by_vm;
+    foreach my $state (@all_selected_states) {
+        push @{$selected_states_by_vm{$state->{vm_name}}}, $state;
+    }
+
+    print STDERR "Phase 3: Analysing Configuration States and Calculating Metrics...\n\n";
+
+    foreach my $vm_name (sort keys %selected_states_by_vm) {
+        my @states_for_this_vm = @{$selected_states_by_vm{$vm_name}};
+        print STDERR "  VM: $vm_name (" . @states_for_this_vm . " " . (@states_for_this_vm == 1 ? "State" : "States") . ")\n";
+
+        foreach my $state (@states_for_this_vm) {
+            my $start_str = $state->{start_time}->strftime('%Y-%m-%d');
+            my $end_str   = $state->{end_time}->strftime('%Y-%m-%d');
+            print STDERR "    - Analysing Configuration State " . $state->{state_id} . " ($start_str to $end_str)...";
+
+            my %filters = (
+                start_date_str => $start_date_str, end_date_str   => $end_date_str,
+                no_weekends    => $no_weekends,    time_filter_active => $time_filter_active,
+                time_filter_start => $time_filter_start, time_filter_end => $time_filter_end,
+                time_filter_overnight => $time_filter_overnight,
+            );
+            my @state_data_points = stream_data_for_state_from_temp($state, $temp_physc_filename, $temp_runq_filename, \%filters);
+
+            if (!$enable_windowed_decay_internal) {
+                my $metrics = calculate_metrics_for_period(\@state_data_points, $state->{metadata});
+                # Store results in an array under the 'states' key
+                push @{$vm_results_aggregator{$vm_name}{'states'}}, { metrics => $metrics, state_obj => $state };
+            } else {
+                my @time_windows = define_time_windows_for_state($state, $analysis_reference_date_str, $process_window_unit_str, $process_window_size_val);
+                foreach my $win (@time_windows) {
+                    my @data_in_window = grep { $_->{tp} >= $win->{start} && $_->{tp} <= $win->{end} } @state_data_points;
+                    next unless @data_in_window;
+                    my $win_metrics = calculate_metrics_for_period(\@data_in_window, $state->{metadata});
+                    push @{$vm_results_aggregator{$vm_name}{time_windows}}, { metrics => $win_metrics, date_obj => $win->{rep_date} };
+                }
+            }
+            print STDERR " Done.\n";
+        }
+        print STDERR "\n";
+    }
+
+    print STDERR generate_run_summary_string();
+    print STDERR "------------------------------------------------------------------\n";
+
+    # --- Final Output Generation ---
+
+    print STDOUT "\n------------------------------------------------------------------\n";
+    print STDOUT "Results\n";
+    print STDOUT "------------------------------------------------------------------\n";
+
+    my @output_header_cols = ("VM_Name", "State_ID", "Duration_Days", "Entitlement", "MaxCPU", "SMT", "Processor", "SerialNumber", "PoolID");
+    my @metric_keys_in_order = ("P" . clean_perc_label($percentile));
+    push @metric_keys_in_order, 'Peak' if $calculate_peak;
+    foreach my $p (@runq_norm_percentiles_to_calc) { push @metric_keys_in_order, "NormRunQ_P" . clean_perc_label($p); }
+    foreach my $p (@runq_abs_percentiles_to_calc) { push @metric_keys_in_order, "AbsRunQ_P" . clean_perc_label($p); }
+    if ($enable_windowed_decay_internal && $enable_growth_prediction) {
+        push @metric_keys_in_order, "GrowthAdj", "GrowthAdjAbs";
+    }
+    push @output_header_cols, @metric_keys_in_order;
+#    print STDOUT join(",", @output_header_cols) . "\n";
+
+	 if (!$enable_windowed_decay_internal) {
+# When decay is OFF, print one key=value pair line per state processed.
+		 foreach my $vm_name (sort keys %vm_results_aggregator) {
+
+			 next unless (exists $vm_results_aggregator{$vm_name}{'states'} && ref($vm_results_aggregator{$vm_name}{'states'}) eq 'ARRAY');
+
+			 my @states_for_this_vm = @{$vm_results_aggregator{$vm_name}{'states'}};
+			 my $total_states_for_vm = scalar(@states_for_this_vm);
+
+			 foreach my $result (@states_for_this_vm) {
+				 my $state_obj = $result->{state_obj};
+				 my $md        = $result->{state_obj}{metadata};
+
+# Build the descriptive state identifier prefix
+				 my $state_prefix = sprintf("%s:State-%d_of_%d (%s_to_%s)",
+						 $vm_name,
+						 $state_obj->{state_id},
+						 $total_states_for_vm,
+						 $state_obj->{start_time}->strftime('%Y-%m-%d'),
+						 $state_obj->{end_time}->strftime('%Y-%m-%d')
+						 );
+
+				 my @output_parts = ($state_prefix);
+
+# Push metadata key-value pairs
+				 push @output_parts, sprintf("Entitlement=%.2f", $md->{entitlement} // 0);
+				 push @output_parts, sprintf("MaxCPU=%.2f", $md->{max_cpu} // 0);
+				 push @output_parts, sprintf("SMT=%d", $md->{smt} // 0);
+				 push @output_parts, sprintf("Processor=%s", $md->{processor_state} // 'N/A');
+				 push @output_parts, sprintf("SerialNumber=%s", $md->{serial_number} // '');
+				 push @output_parts, sprintf("PoolID=%s", $md->{pool_id} // '');
+
+# Push metric key-value pairs
+				 my @metric_keys = sort keys %{$result->{metrics}};
+				 foreach my $key (@metric_keys) {
+					 my $val = $result->{metrics}{$key};
+					 my $val_str = defined($val) && looks_like_number($val) ? sprintf("%.${output_dp}f", apply_rounding($val, $round_increment, $rounding_method)) : "N/A";
+					 push @output_parts, "$key=$val_str";
+				 }
+
+# Final print statement, joined by spaces
+				 print STDOUT join(" ", @output_parts) . "\n";
+			 }
+		 }
+	 } else {
+        # When decay is ON, aggregate results and print one line per VM.
+        my $analysis_ref_obj;
+        if (defined $analysis_reference_date_str) {
+            eval { $analysis_ref_obj = Time::Piece->strptime($analysis_reference_date_str, "%Y-%m-%d"); };
+            die "Error: Invalid --analysis-reference-date: '$analysis_reference_date_str'. Parser error: $@" if ($@ || !$analysis_ref_obj);
+        } else {
+             my $latest_epoch = 0;
+             foreach my $state (@all_selected_states) { $latest_epoch = $state->{end_time}->epoch if $state->{end_time}->epoch > $latest_epoch; }
+             $analysis_ref_obj = Time::Piece->new($latest_epoch);
+        }
+        $analysis_ref_obj = $analysis_ref_obj->truncate(to => 'day');
+
+        foreach my $vm_name (sort keys %vm_results_aggregator) {
+            my %final_metrics; my %all_keys;
+            foreach my $win_result (@{$vm_results_aggregator{$vm_name}{time_windows}}) {
+                foreach my $key (keys %{$win_result->{metrics}}) { $all_keys{$key} = 1; }
+            }
+
+            # Aggregate metrics across all time windows for the VM
+            foreach my $metric_key (sort keys %all_keys) {
+                my @data_points;
+                foreach my $win_result (@{$vm_results_aggregator{$vm_name}{time_windows}}) {
+                    if (defined $win_result->{metrics}{$metric_key}) {
+                        push @data_points, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
+                    }
+                }
+                $final_metrics{$metric_key} = calculate_recency_weighted_average(\@data_points, $analysis_ref_obj, $decay_half_life_days_val);
+            }
+
+            # --- Growth Prediction logic for aggregated result ---
+            my $p_label_main = "P" . clean_perc_label($percentile);
+            my ($growth_adj_value, $growth_adj_abs_value) = (0.0, 0.0);
+
+            if ($enable_growth_prediction) {
+                my @timeseries_values; my @timeseries_points; my $time_idx = 0;
+                foreach my $win_result (@{$vm_results_aggregator{$vm_name}{time_windows}}) {
+                    my $metric_val = $win_result->{metrics}{$p_label_main};
+                    if (defined $metric_val && looks_like_number($metric_val)) {
+                        push @timeseries_values, $metric_val; push @timeseries_points, [$time_idx, $metric_val]; $time_idx++;
+                    }
+                }
+
+                my $num_hist_periods = scalar(@timeseries_points);
+                if ($num_hist_periods >= $GROWTH_MIN_HISTORICAL_PERIODS) {
+                    my ($mean_val, $stddev_val, $cv_val) = calculate_statistics_for_trend(\@timeseries_values);
+                    if (defined $cv_val && $cv_val < $GROWTH_MAX_CV_THRESHOLD) {
+                        my ($slope, $intercept) = calculate_manual_linear_regression(\@timeseries_points);
+                        if ($slope > $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD) {
+                            my $projected_val = $slope * ($num_hist_periods - 1 + $growth_projection_days) + $intercept;
+                            my $baseline_val = $final_metrics{$p_label_main} // 0;
+                            if ($baseline_val > $FLOAT_EPSILON) {
+                                my $inflation_perc = (($projected_val - $baseline_val) / $baseline_val) * 100;
+                                $inflation_perc = $max_growth_inflation_percent if $inflation_perc > $max_growth_inflation_percent;
+                                $growth_adj_value = ($baseline_val * $inflation_perc / 100);
+                                $growth_adj_abs_value = $growth_adj_value;
+                            }
+                        }
+                    }
+                }
+            }
+            $final_metrics{"GrowthAdj"} = $growth_adj_value;
+            $final_metrics{"GrowthAdjAbs"} = $growth_adj_abs_value;
+
+            if (defined $final_metrics{$p_label_main} && looks_like_number($final_metrics{$p_label_main})) {
+                $final_metrics{$p_label_main} += $growth_adj_value;
+            }
+
+            # --- Print the single aggregated output line ---
+            my $last_state_metadata = {};
+            if (exists $config_states_by_vm{$vm_name} && @{$config_states_by_vm{$vm_name}}) {
+                $last_state_metadata = $config_states_by_vm{$vm_name}[-1]->{metadata};
+            }
+
+            # --- Print the single aggregated output line ---
+            my $output_string = "$vm_name:";
+
+            $output_string .= sprintf(" Entitlement=%.2f", $last_state_metadata->{entitlement} // 0);
+            $output_string .= sprintf(" MaxCPU=%.2f", $last_state_metadata->{max_cpu} // 0);
+            $output_string .= sprintf(" SMT=%s", $last_state_metadata->{smt} // '');
+            $output_string .= sprintf(" Processor=%s", $last_state_metadata->{processor_state} // 'N/A');
+            $output_string .= sprintf(" SerialNumber=%s", $last_state_metadata->{serial_number} // '');
+            $output_string .= sprintf(" PoolID=%s", $last_state_metadata->{pool_id} // '');
+
+            my @keys_out = sort keys %final_metrics;
+             foreach my $key (@keys_out) {
+                my $val = $final_metrics{$key};
+                my $val_str = defined($val) && looks_like_number($val) ? sprintf("%.${output_dp}f", apply_rounding($val, $round_increment, $rounding_method)) : "N/A";
+                $output_string .= " $key=$val_str";
+            }
+            print STDOUT $output_string . "\n";
+        }
+    }
 }
 else
 {
-    print STDERR "Using SMA for PhysC rolling average with window: $window_minutes minutes.\n";
-}
-if (defined $runq_csv_file)
-{
-    if (-s $runq_csv_file)
+    # --- NON-NMONDIR (LEGACY) FILE-BASED PROCESSING ---
+    my %vm_data_by_window;
+    my $actual_overall_start_date_obj;
+    my $actual_overall_end_date_obj;
+    my $actual_analysis_ref_date_obj;
+    my @vm_names_from_physc_header;
+    my $target_vm_index_in_physc = undef;
+    my %current_window_vm_data_buffer;
+    my %temp_files_for_physc_rolling_avgs_overall;
+    my %collected_runq_overall;
+    my $line_count = 0;
+    my $data_lines_processed = 0;
+    my %runq_data_store;
+    my $vm_physc_max_peak_scalar_overall;
+    my @vm_physc_max_peaks_list_overall;
+
+    if ($enable_windowed_decay_internal)
     {
-        print STDERR "Processing RunQ data from: $runq_csv_file (using SMT: $smt_value for normalisation)\n";
-        if ($runq_avg_method_str ne 'none')
+        ($actual_overall_start_date_obj, $actual_overall_end_date_obj) = get_nmon_overall_date_range($physc_csv_file, $start_date_str, $end_date_str);
+        unless (defined $actual_overall_start_date_obj && $actual_overall_start_date_obj->isa('Time::Piece') && defined $actual_overall_end_date_obj && $actual_overall_end_date_obj->isa('Time::Piece'))
         {
-            my $runq_specific_decay_info = "";
-            if ($runq_avg_method_str eq 'ema')
+            die "Error: Could not determine actual data processing range from NMON file '$physc_csv_file' after applying global date filters. Windowed decay cannot proceed.\n";
+        }
+        if (defined $analysis_reference_date_str)
+        {
+            eval { $actual_analysis_ref_date_obj = Time::Piece->strptime($analysis_reference_date_str, "%Y-%m-%d"); };
+            unless (defined $actual_analysis_ref_date_obj && $actual_analysis_ref_date_obj->isa('Time::Piece'))
             {
-                $runq_specific_decay_info = " (RunQ decay: $runq_decay_source_for_log, alpha: $alpha_for_runq_ema)";
+                die "Error: Invalid --analysis-reference-date: '$analysis_reference_date_str'. Ensure format YYYY-MM-DD. Parser error: $@\n";
             }
-            print STDERR "Applying " . uc($runq_avg_method_str) . " (using global -w $window_minutes" . $runq_specific_decay_info . ") to RunQ data before percentile calculation.\n";
         }
         else
         {
-            print STDERR "Calculating RunQ percentiles from raw RunQ values.\n";
+            $actual_analysis_ref_date_obj = $actual_overall_end_date_obj;
         }
-        if (@runq_norm_percentiles_to_calc)
+        $actual_analysis_ref_date_obj = $actual_analysis_ref_date_obj->truncate(to => 'day');
+        @processing_windows = generate_processing_time_windows($actual_overall_start_date_obj, $actual_overall_end_date_obj, $process_window_unit_str, $process_window_size_val);
+        if (scalar @processing_windows == 0)
         {
-            print STDERR "Calculating Normalised RunQ Percentiles: " . join(", ", map { "P$_" } @runq_norm_percentiles_to_calc) . "\n";
+            die "Error: No processing windows generated. Check NMON data range and window parameters.\n";
         }
-        if (@runq_abs_percentiles_to_calc)
+        print STDERR "Generated " . scalar(@processing_windows) . " processing windows for internal aggregation.\n";
+    }
+
+    if (defined $runq_csv_file && (-s $runq_csv_file))
+    {
+        print STDERR "Pre-loading RunQ data...\n";
+        open my $runq_fh, '<:encoding(utf8)', $runq_csv_file or die "Error: Cannot open RunQ CSV file '$runq_csv_file': $!\n";
+        my $runq_line_count = 0;
+        my @runq_vm_names_header;
+        while (my $line = <$runq_fh>)
         {
-            print STDERR "Calculating Absolute RunQ Percentiles: " . join(", ", map { "P$_" } @runq_abs_percentiles_to_calc) . "\n";
+            chomp $line;
+            $line =~ s/\r$//;
+            $runq_line_count++;
+            next if ($line =~ /^\s*$/o);
+            $line =~ s/^\x{FEFF}// if $runq_line_count == 1;
+            my @fields = split ',', $line, -1;
+            if ($runq_line_count == 1)
+            {
+                shift @fields;
+                @runq_vm_names_header = map { my ($name) = split / /; $name =~ s/^"|"$//g; $name; } @fields;
+                if (defined $target_vm_name && !grep { $_ eq $target_vm_name } @runq_vm_names_header)
+                {
+                    print STDERR "Warning: Target VM '$target_vm_name' not found in RunQ CSV header. RunQ metrics for it will be N/A.\n";
+                }
+                next;
+            }
+            my $timestamp_str_local = $fields[0];
+            shift @fields;
+            for (my $i = 0; $i <= $#fields; $i++)
+            {
+                my $vm_name_local = $runq_vm_names_header[$i];
+                next unless (defined $vm_name_local && $vm_name_local ne '');
+                if (!defined $target_vm_name || $vm_name_local eq $target_vm_name)
+                {
+                    if (defined $fields[$i] && $fields[$i] =~ /^[0-9.]+$/)
+                    {
+                        $runq_data_store{$vm_name_local}{$timestamp_str_local} = $fields[$i];
+                    }
+                }
+            }
         }
+        close $runq_fh;
+        print STDERR "Finished pre-loading RunQ data for " . scalar(keys %runq_data_store) . " VMs from $runq_line_count lines.\n";
     }
-    else
-    {
-        # If the RunQ file is empty (which can happen with the temp file), nullify it.
-        undef $runq_csv_file;
-        print STDERR "No RunQ data found to process.\n";
-    }
-}
 
-my $p_label_display_main = sprintf("P%.2f", $percentile); # Use a distinct variable for main percentile label
-$p_label_display_main =~ s/\.?0+$//;
-$p_label_display_main = "0" if $p_label_display_main eq "" && abs($percentile-0) < 0.001;
-print STDERR "Calculating PhysC percentile: $p_label_display_main\n";
-print STDERR "Calculating Absolute PhysC peak: " . ($calculate_peak ? "Yes" : "No") . "\n";
-if (defined $start_date_str)
-{
-    print STDERR "Ignoring data before global start date: $start_date_str\n";
-}
-if (defined $end_date_str)
-{
-    print STDERR "Ignoring data after global end date: $end_date_str\n";
-}
-if ($no_weekends)
-{
-    print STDERR "Applying filter: Excluding Weekends (Sat/Sun)\n";
-}
-if ($time_filter_active)
-{
-    print STDERR "Applying time filter: $time_filter_desc\n";
-}
-if (defined $filter_above_perc_value)
-{
-    my $filter_p_label = sprintf("P%.2f", $filter_above_perc_value);
-    $filter_p_label =~ s/\.?0+$//;
-    $filter_p_label = "0" if $filter_p_label eq "" && abs($filter_above_perc_value - 0) < 0.001;
-    print STDERR "Filtering PhysC: >= $filter_p_label of rolling averages\n";
-}
-if (defined $target_vm_name)
-{
-    print STDERR "Filtering for VM/LPAR: $target_vm_name\n";
-}
+    print STDERR "Processing PhysC data and calculating metrics...\n";
+    open my $physc_csv_fh, '<:encoding(utf8)', $physc_csv_file or die "Error: Cannot open PhysC CSV file '$physc_csv_file': $!\n";
+    my $current_window_idx = 0;
+    my $current_processing_window_end_obj = ($enable_windowed_decay_internal && @processing_windows) ? $processing_windows[0][1] : undef;
 
-if ($enable_windowed_decay_internal)
-{
-    my $process_window_unit_str_final = ($process_window_size_val != 1) ? 'weeks' : 'week';
-    print STDERR "Internal Windowed Decay Processing ENABLED.\n";
-    print STDERR "  Window Size     : $process_window_size_val $process_window_unit_str_final\n";
-    print STDERR "  Decay Half-Life : $decay_half_life_days_val days\n";
-    if (defined $analysis_reference_date_str)
-    {
-        print STDERR "  Analysis Reference Date: $analysis_reference_date_str\n";
-    }
-    if ($enable_growth_prediction) # New summary line for growth (check if still true after validation)
-    {
-        print STDERR "Growth Prediction ENABLED.\n";
-        print STDERR "  Projection Horizon: $growth_projection_days days\n";
-        print STDERR "  Max Inflation Cap : $max_growth_inflation_percent%\n";
-    }
-}
-
-# These variables are declared here to ensure they have the correct scope.
-my %vm_data_by_window;
-my @processing_windows;
-my $actual_overall_start_date_obj;
-my $actual_overall_end_date_obj;
-my $actual_analysis_ref_date_obj;
-
-my @vm_names_from_physc_header;
-my $target_vm_index_in_physc = undef;
-my %current_window_vm_data_buffer;
-my %temp_files_for_physc_rolling_avgs_overall;
-my %collected_runq_overall;
-my $line_count = 0;
-my $data_lines_processed = 0;
-my %runq_data_store;
-my $vm_physc_max_peak_scalar_overall;
-my @vm_physc_max_peaks_list_overall;
-
-if ($enable_windowed_decay_internal)
-{
-    ($actual_overall_start_date_obj, $actual_overall_end_date_obj) = get_nmon_overall_date_range($physc_csv_file, $start_date_str, $end_date_str);
-    unless (defined $actual_overall_start_date_obj && $actual_overall_start_date_obj->isa('Time::Piece') && defined $actual_overall_end_date_obj && $actual_overall_end_date_obj->isa('Time::Piece'))
-    {
-        die "Error: Could not determine actual data processing range from NMON file '$physc_csv_file' after applying global date filters. Windowed decay cannot proceed.\n";
-    }
-    if (defined $analysis_reference_date_str)
-    {
-        eval { $actual_analysis_ref_date_obj = Time::Piece->strptime($analysis_reference_date_str, "%Y-%m-%d"); };
-        unless (defined $actual_analysis_ref_date_obj && $actual_analysis_ref_date_obj->isa('Time::Piece'))
-        {
-            die "Error: Invalid --analysis-reference-date: '$analysis_reference_date_str'. Ensure format YYYY-MM-DD. Parser error: $@\n";
-        }
-    }
-    else
-    {
-        $actual_analysis_ref_date_obj = $actual_overall_end_date_obj;
-    }
-    $actual_analysis_ref_date_obj = $actual_analysis_ref_date_obj->truncate(to => 'day');
-    @processing_windows = generate_processing_time_windows($actual_overall_start_date_obj, $actual_overall_end_date_obj, $process_window_unit_str, $process_window_size_val);
-    if (scalar @processing_windows == 0)
-    {
-        die "Error: No processing windows generated. Check NMON data range and window parameters.\n";
-    }
-    print STDERR "Generated " . scalar(@processing_windows) . " processing windows for internal aggregation.\n";
-}
-
-if (defined $runq_csv_file && (-s $runq_csv_file))
-{
-    print STDERR "Pre-loading RunQ data...\n";
-    open my $runq_fh, '<:encoding(utf8)', $runq_csv_file or die "Error: Cannot open RunQ CSV file '$runq_csv_file': $!\n";
-    my $runq_line_count = 0;
-    my @runq_vm_names_header;
-    while (my $line = <$runq_fh>)
+    while (my $line = <$physc_csv_fh>)
     {
         chomp $line;
         $line =~ s/\r$//;
-        $runq_line_count++;
+        $line_count++;
         next if ($line =~ /^\s*$/o);
-        $line =~ s/^\x{FEFF}// if $runq_line_count == 1;
+        $line =~ s/^\x{FEFF}// if $line_count == 1;
         my @fields = split /,/, $line, -1;
-        if ($runq_line_count == 1)
+
+        if ($line_count == 1)
         {
             shift @fields;
-            @runq_vm_names_header = map
+            my $num_vms_found = 0;
+            my $current_idx_header = 0;
+            foreach my $header_field (@fields)
             {
-                my ($name) = split / /;
-                $name =~ s/^"|"$//g;
-                $name;
-            } @fields;
-            if (defined $target_vm_name && !grep { $_ eq $target_vm_name } @runq_vm_names_header)
-            {
-                print STDERR "Warning: Target VM '$target_vm_name' not found in RunQ CSV header. RunQ metrics for it will be N/A.\n";
-            }
-            next;
-        }
-        my $timestamp_str_local = $fields[0];
-        shift @fields;
-        for (my $i = 0; $i <= $#fields; $i++)
-        {
-            my $vm_name_local = $runq_vm_names_header[$i];
-            next unless (defined $vm_name_local && $vm_name_local ne '');
-            if (!defined $target_vm_name || $vm_name_local eq $target_vm_name)
-            {
-                if (defined $fields[$i] && $fields[$i] =~ /^[0-9.]+$/)
+                $header_field =~ s/^\s+|\s+$//g;
+                $header_field =~ s/^"|"$//g;
+                my ($vm_name_local) = split / /, $header_field, 2;
+                if (defined $vm_name_local && $vm_name_local ne '')
                 {
-                    $runq_data_store{$vm_name_local}{$timestamp_str_local} = $fields[$i];
+                    push @vm_names_from_physc_header, $vm_name_local;
+                    if (defined $target_vm_name && $vm_name_local eq $target_vm_name)
+                    {
+                        $target_vm_index_in_physc = $current_idx_header;
+                    }
+                    $num_vms_found++;
                 }
-            }
-        }
-    }
-    close $runq_fh;
-    print STDERR "Finished pre-loading RunQ data for " . scalar(keys %runq_data_store) . " VMs from $runq_line_count lines.\n";
-}
-
-print STDERR "Processing PhysC data and calculating metrics...\n";
-open my $physc_csv_fh, '<:encoding(utf8)', $physc_csv_file or die "Error: Cannot open PhysC CSV file '$physc_csv_file': $!\n";
-my $current_window_idx = 0;
-my $current_processing_window_end_obj = ($enable_windowed_decay_internal && @processing_windows) ? $processing_windows[0][1] : undef;
-
-while (my $line = <$physc_csv_fh>)
-{
-    chomp $line;
-    $line =~ s/\r$//;
-    $line_count++;
-    next if ($line =~ /^\s*$/o);
-    $line =~ s/^\x{FEFF}// if $line_count == 1;
-    my @fields = split /,/, $line, -1;
-
-    if ($line_count == 1)
-    {
-        shift @fields;
-        my $num_vms_found = 0;
-        my $current_idx_header = 0;
-        foreach my $header_field (@fields)
-        {
-            $header_field =~ s/^\s+|\s+$//g;
-            $header_field =~ s/^"|"$//g;
-            my ($vm_name_local) = split / /, $header_field, 2;
-            if (defined $vm_name_local && $vm_name_local ne '')
-            {
-                push @vm_names_from_physc_header, $vm_name_local;
-                if (defined $target_vm_name && $vm_name_local eq $target_vm_name)
+                else
                 {
-                    $target_vm_index_in_physc = $current_idx_header;
+                    print STDERR "Warning: Could not extract VM name from PhysC header index $current_idx_header: '$header_field'\n";
+                    push @vm_names_from_physc_header, "UNKNOWN_VM_PHYSC_$current_idx_header";
                 }
-                $num_vms_found++;
+                $current_idx_header++;
             }
-            else
+            my $num_vms = scalar(@vm_names_from_physc_header);
+            if ($num_vms == 0)
             {
-                print STDERR "Warning: Could not extract VM name from PhysC header index $current_idx_header: '$header_field'\n";
-                push @vm_names_from_physc_header, "UNKNOWN_VM_PHYSC_$current_idx_header";
+                die "Error: No valid VM columns found in PhysC header.\n";
             }
-            $current_idx_header++;
-        }
-        my $num_vms = scalar(@vm_names_from_physc_header);
-        if ($num_vms == 0)
-        {
-            die "Error: No valid VM columns found in PhysC header.\n";
-        }
-        print STDERR "Found $num_vms VMs in PhysC header.\n";
-        if (defined $target_vm_name && !defined $target_vm_index_in_physc)
-        {
-            my $avail_vms = join(", ", @vm_names_from_physc_header);
-            $avail_vms = substr($avail_vms, 0, 200) . "..." if length($avail_vms) > 200;
-            die "Error: Target VM '$target_vm_name' not found in PhysC CSV header.\nAvailable VMs: $avail_vms\n";
-        }
-        unless ($enable_windowed_decay_internal)
-        {
-            if (defined $target_vm_index_in_physc)
+            print STDERR "Found $num_vms VMs in PhysC header.\n";
+            if (defined $target_vm_name && !defined $target_vm_index_in_physc)
             {
-                my $vm_name_local = $target_vm_name; # Use local var
-                my ($fh, $fname) = tempfile(UNLINK => 0);
-                unless ($fh)
+                my $avail_vms = join(", ", @vm_names_from_physc_header);
+                $avail_vms = substr($avail_vms, 0, 200) . "..." if length($avail_vms) > 200;
+                die "Error: Target VM '$target_vm_name' not found in PhysC CSV header.\nAvailable VMs: $avail_vms\n";
+            }
+            unless ($enable_windowed_decay_internal)
+            {
+                if (defined $target_vm_index_in_physc)
                 {
-                    die "Error: Could not create PhysC temp file for $vm_name_local: $!\n";
-                }
-                $temp_files_for_physc_rolling_avgs_overall{$vm_name_local} = { fh => $fh, filename => $fname };
-            }
-            else
-            {
-                foreach my $vm_name_local (@vm_names_from_physc_header) # Use local var
-                {
+                    my $vm_name_local = $target_vm_name; # Use local var
                     my ($fh, $fname) = tempfile(UNLINK => 0);
                     unless ($fh)
                     {
@@ -681,528 +819,538 @@ while (my $line = <$physc_csv_fh>)
                     }
                     $temp_files_for_physc_rolling_avgs_overall{$vm_name_local} = { fh => $fh, filename => $fname };
                 }
+                else
+                {
+                    foreach my $vm_name_local (@vm_names_from_physc_header) # Use local var
+                    {
+                        my ($fh, $fname) = tempfile(UNLINK => 0);
+                        unless ($fh)
+                        {
+                            die "Error: Could not create PhysC temp file for $vm_name_local: $!\n";
+                        }
+                        $temp_files_for_physc_rolling_avgs_overall{$vm_name_local} = { fh => $fh, filename => $fname };
+                    }
+                }
             }
+            next;
         }
-        next;
-    }
-    my $timestamp_str_loop = $fields[0]; # Use local var
-    my $tp;
-    eval { $tp = Time::Piece->strptime($timestamp_str_loop, "%Y-%m-%d %H:%M:%S"); };
-    if ($@ || !defined $tp || !$tp->isa('Time::Piece'))
-    {
-        print STDERR "Warning: Could not parse timestamp '$timestamp_str_loop' line $line_count. Skipping.\n";
-        next;
-    }
-
-    if (defined $start_date_str && $tp->ymd('-') lt $start_date_str) { next; }
-    if (defined $end_date_str   && $tp->ymd('-') gt $end_date_str)   { next; }
-    if ($no_weekends)
-    {
-        my $day_of_week = $tp->day_of_week;
-        if ($day_of_week == 1 || $day_of_week == 7) { next; }
-    }
-    if ($time_filter_active)
-    {
-        my $line_time = substr($tp->hms(':'), 0, 5);
-        my $include_line = 0;
-        if ($time_filter_overnight)
+        my $timestamp_str_loop = $fields[0]; # Use local var
+        my $tp;
+        eval { $tp = Time::Piece->strptime($timestamp_str_loop, "%Y-%m-%d %H:%M:%S"); };
+        if ($@ || !defined $tp || !$tp->isa('Time::Piece'))
         {
-            if ($line_time ge $time_filter_start || $line_time lt $time_filter_end) { $include_line = 1; }
+            print STDERR "Warning: Could not parse timestamp '$timestamp_str_loop' line $line_count. Skipping.\n";
+            next;
+        }
+
+        if (defined $start_date_str && $tp->ymd('-') lt $start_date_str) { next; }
+        if (defined $end_date_str   && $tp->ymd('-') gt $end_date_str)   { next; }
+        if ($no_weekends)
+        {
+            my $day_of_week = $tp->day_of_week;
+            if ($day_of_week == 1 || $day_of_week == 7) { next; }
+        }
+        if ($time_filter_active)
+        {
+            my $line_time = substr($tp->hms(':'), 0, 5);
+            my $include_line = 0;
+            if ($time_filter_overnight)
+            {
+                if ($line_time ge $time_filter_start || $line_time lt $time_filter_end) { $include_line = 1; }
+            }
+            else
+            {
+                if ($line_time ge $time_filter_start && $line_time lt $time_filter_end) { $include_line = 1; }
+            }
+            unless ($include_line) { next; }
+        }
+
+        $data_lines_processed++;
+        shift @fields;
+
+        my $current_window_key_loop; # Use local var
+        if ($enable_windowed_decay_internal)
+        {
+            my $current_timestamp_day_obj = $tp->truncate(to => 'day');
+            while (defined $current_processing_window_end_obj && $current_timestamp_day_obj > $current_processing_window_end_obj)
+            {
+                process_and_store_window_results(
+                    $processing_windows[$current_window_idx], \%current_window_vm_data_buffer, \%vm_data_by_window,
+                    \@vm_names_from_physc_header, $target_vm_index_in_physc, $target_vm_name,
+                    $percentile, $calculate_peak, $runq_csv_file, \@runq_norm_percentiles_to_calc, \@runq_abs_percentiles_to_calc,
+                    $runq_avg_method_str, $window_minutes, $alpha_for_physc_ema
+                );
+                %current_window_vm_data_buffer = ();
+                $current_window_idx++;
+                if ($current_window_idx < @processing_windows)
+                {
+                    $current_processing_window_end_obj = $processing_windows[$current_window_idx][1];
+                }
+                else
+                {
+                    $current_processing_window_end_obj = undef;
+                    last;
+                }
+            }
+            $current_window_key_loop = get_window_key_for_timestamp($tp, \@processing_windows, $current_window_idx);
+            unless (defined $current_window_key_loop) { next; }
+        }
+
+        my @vms_to_iterate_this_line;
+        if (defined $target_vm_index_in_physc)
+        {
+            push @vms_to_iterate_this_line, { index => $target_vm_index_in_physc, name => $target_vm_name };
         }
         else
         {
-            if ($line_time ge $time_filter_start && $line_time lt $time_filter_end) { $include_line = 1; }
+            for (my $i=0; $i < @vm_names_from_physc_header; $i++)
+            {
+                push @vms_to_iterate_this_line, { index => $i, name => $vm_names_from_physc_header[$i] };
+            }
         }
-        unless ($include_line) { next; }
+
+        foreach my $vm_info (@vms_to_iterate_this_line)
+        {
+            my $vm_idx = $vm_info->{index};
+            my $current_vm_name_loop = $vm_info->{name}; # Use local var
+            my $physc_value_str_local = defined $fields[$vm_idx] ? $fields[$vm_idx] : ''; # Use local var
+            my $physc_value_loop; # Use local var
+            if (defined $physc_value_str_local && $physc_value_str_local =~ /^-?[0-9.]+$/) { $physc_value_loop = $physc_value_str_local + 0; }
+            else { $physc_value_loop = undef; }
+
+            my $runq_value_for_this_ts_loop = undef; # Use local var
+            if (defined $runq_csv_file && exists $runq_data_store{$current_vm_name_loop}{$timestamp_str_loop})
+            {
+                if ($runq_data_store{$current_vm_name_loop}{$timestamp_str_loop} =~ /^-?[0-9.]+$/)
+                {
+                    $runq_value_for_this_ts_loop = $runq_data_store{$current_vm_name_loop}{$timestamp_str_loop} + 0;
+                }
+            }
+
+            if ($enable_windowed_decay_internal)
+            {
+                unless (exists $current_window_vm_data_buffer{$current_vm_name_loop}{$current_window_key_loop})
+                {
+                    $current_window_vm_data_buffer{$current_vm_name_loop}{$current_window_key_loop} = {
+                        physc_sma_queue => [], physc_prev_ema => undef, physc_ema_point_counter => [],
+                        raw_physc_for_peak => [], rolling_physc_avgs => [],
+                        abs_rq_values_for_perc => [], norm_rq_values_for_perc => [],
+                        runq_abs_sma_queue => [], runq_abs_prev_ema => undef, runq_abs_ema_point_counter => [],
+                        runq_norm_sma_queue => [], runq_norm_prev_ema => undef, runq_norm_ema_point_counter => [],
+                    };
+                }
+                my $vm_win_buf = $current_window_vm_data_buffer{$current_vm_name_loop}{$current_window_key_loop};
+
+                if (defined $physc_value_loop) { push @{$vm_win_buf->{raw_physc_for_peak}}, $physc_value_loop; }
+                my $current_physc_avg_output_win;
+                if ($avg_method eq 'sma')
+                {
+                    if(defined $physc_value_loop) { push @{$vm_win_buf->{physc_sma_queue}}, $physc_value_loop; }
+                    else { push @{$vm_win_buf->{physc_sma_queue}}, undef; }
+                    shift @{$vm_win_buf->{physc_sma_queue}} while scalar @{$vm_win_buf->{physc_sma_queue}} > $window_minutes;
+                    if (scalar @{$vm_win_buf->{physc_sma_queue}} == $window_minutes) { $current_physc_avg_output_win = calculate_average(@{$vm_win_buf->{physc_sma_queue}}); }
+                }
+                else # EMA for PhysC (windowed)
+                {
+                    if (defined $physc_value_loop) {
+                        if (!defined $vm_win_buf->{physc_prev_ema}) { $vm_win_buf->{physc_prev_ema} = $physc_value_loop; }
+                        else { $vm_win_buf->{physc_prev_ema} = ($physc_value_loop * $alpha_for_physc_ema) + ($vm_win_buf->{physc_prev_ema} * (1 - $alpha_for_physc_ema)); }
+                    }
+                    push @{$vm_win_buf->{physc_ema_point_counter}}, $physc_value_loop;
+                    shift @{$vm_win_buf->{physc_ema_point_counter}} while scalar @{$vm_win_buf->{physc_ema_point_counter}} > $window_minutes;
+                    if (scalar @{$vm_win_buf->{physc_ema_point_counter}} == $window_minutes) { $current_physc_avg_output_win = $vm_win_buf->{physc_prev_ema}; }
+                }
+                push @{$vm_win_buf->{rolling_physc_avgs}}, $current_physc_avg_output_win if defined $current_physc_avg_output_win;
+
+                if (defined $runq_value_for_this_ts_loop)
+                {
+                    if ($runq_avg_method_str eq 'none') { push @{$vm_win_buf->{abs_rq_values_for_perc}}, $runq_value_for_this_ts_loop; }
+                    else
+                    {
+                        my $smoothed_abs_rq;
+                        if ($runq_avg_method_str eq 'sma') {
+                            push @{$vm_win_buf->{runq_abs_sma_queue}}, $runq_value_for_this_ts_loop;
+                            shift @{$vm_win_buf->{runq_abs_sma_queue}} while scalar @{$vm_win_buf->{runq_abs_sma_queue}} > $window_minutes;
+                            if (scalar @{$vm_win_buf->{runq_abs_sma_queue}} == $window_minutes) { $smoothed_abs_rq = calculate_average(@{$vm_win_buf->{runq_abs_sma_queue}}); }
+                        } elsif ($runq_avg_method_str eq 'ema') {
+                            if (!defined $vm_win_buf->{runq_abs_prev_ema}) { $vm_win_buf->{runq_abs_prev_ema} = $runq_value_for_this_ts_loop; }
+                            else { $vm_win_buf->{runq_abs_prev_ema} = ($runq_value_for_this_ts_loop * $alpha_for_runq_ema) + ($vm_win_buf->{runq_abs_prev_ema} * (1-$alpha_for_runq_ema)); }
+                            push @{$vm_win_buf->{runq_abs_ema_point_counter}}, $runq_value_for_this_ts_loop;
+                            shift @{$vm_win_buf->{runq_abs_ema_point_counter}} while scalar @{$vm_win_buf->{runq_abs_ema_point_counter}} > $window_minutes;
+                            if (scalar @{$vm_win_buf->{runq_abs_ema_point_counter}} == $window_minutes) { $smoothed_abs_rq = $vm_win_buf->{runq_abs_prev_ema}; }
+                        }
+                        push @{$vm_win_buf->{abs_rq_values_for_perc}}, $smoothed_abs_rq if defined $smoothed_abs_rq;
+                    }
+                    if (defined $physc_value_loop && $physc_value_loop >= $ACTIVE_PHYSC_THRESHOLD)
+                    {
+                        my $effective_lcpus = $physc_value_loop * $smt_value;
+                        if ($effective_lcpus > $FLOAT_EPSILON) {
+                            my $norm_runq_raw_val = $runq_value_for_this_ts_loop / $effective_lcpus;
+                            if ($runq_avg_method_str eq 'none') { push @{$vm_win_buf->{norm_rq_values_for_perc}}, $norm_runq_raw_val; }
+                            else {
+                                my $smoothed_norm_rq;
+                                if ($runq_avg_method_str eq 'sma') {
+                                    push @{$vm_win_buf->{runq_norm_sma_queue}}, $norm_runq_raw_val;
+                                    shift @{$vm_win_buf->{runq_norm_sma_queue}} while scalar @{$vm_win_buf->{runq_norm_sma_queue}} > $window_minutes;
+                                    if (scalar @{$vm_win_buf->{runq_norm_sma_queue}} == $window_minutes) { $smoothed_norm_rq = calculate_average(@{$vm_win_buf->{runq_norm_sma_queue}}); }
+                                } elsif ($runq_avg_method_str eq 'ema') {
+                                    if (!defined $vm_win_buf->{runq_norm_prev_ema}) { $vm_win_buf->{runq_norm_prev_ema} = $norm_runq_raw_val; }
+                                    else { $vm_win_buf->{runq_norm_prev_ema} = ($norm_runq_raw_val * $alpha_for_runq_ema) + ($vm_win_buf->{runq_norm_prev_ema} * (1-$alpha_for_runq_ema)); }
+                                    push @{$vm_win_buf->{runq_norm_ema_point_counter}}, $norm_runq_raw_val;
+                                    shift @{$vm_win_buf->{runq_norm_ema_point_counter}} while scalar @{$vm_win_buf->{runq_norm_ema_point_counter}} > $window_minutes;
+                                    if (scalar @{$vm_win_buf->{runq_norm_ema_point_counter}} == $window_minutes) { $smoothed_norm_rq = $vm_win_buf->{runq_norm_prev_ema}; }
+                                }
+                                push @{$vm_win_buf->{norm_rq_values_for_perc}}, $smoothed_norm_rq if defined $smoothed_norm_rq;
+                            }
+                        }
+                    }
+                }
+            }
+            else # Standard Non-Windowed Processing
+            {
+                my $vm_overall_peak_ref_local = defined($target_vm_name) ? \$vm_physc_max_peak_scalar_overall : \$vm_physc_max_peaks_list_overall[$vm_idx];
+                if ($calculate_peak && defined $physc_value_loop)
+                {
+                    if (!defined(${$vm_overall_peak_ref_local}) || $physc_value_loop > ${$vm_overall_peak_ref_local})
+                    {
+                        ${$vm_overall_peak_ref_local} = $physc_value_loop;
+                    }
+                }
+                my $current_avg_output_value_overall;
+                my $temp_fh_overall;
+                my $prev_ema_ref_overall;
+                my $sma_queue_ref_overall;
+                my $buffer_key = "_overall_vm_$current_vm_name_loop";
+
+                $temp_fh_overall = $temp_files_for_physc_rolling_avgs_overall{$current_vm_name_loop}{fh};
+
+                unless (exists $current_window_vm_data_buffer{$buffer_key})
+                {
+                     $current_window_vm_data_buffer{$buffer_key} = { 'physc_prev_ema' => undef, 'physc_sma_queue' => [] };
+                }
+
+                $prev_ema_ref_overall = \$current_window_vm_data_buffer{$buffer_key}{'physc_prev_ema'};
+                $sma_queue_ref_overall = \@{$current_window_vm_data_buffer{$buffer_key}{'physc_sma_queue'}};
+
+                if ($avg_method eq 'sma') {
+                    if(defined $physc_value_loop) { push @{$sma_queue_ref_overall}, $physc_value_loop; }
+                    else { push @{$sma_queue_ref_overall}, undef; }
+                    shift @{$sma_queue_ref_overall} while scalar @{$sma_queue_ref_overall} > $window_minutes;
+                    if (scalar @{$sma_queue_ref_overall} == $window_minutes) { $current_avg_output_value_overall = calculate_average(@{$sma_queue_ref_overall}); }
+                } else { # EMA for PhysC (non-windowed)
+                    if (defined $physc_value_loop) {
+                        if (!defined ${$prev_ema_ref_overall}) { ${$prev_ema_ref_overall} = $physc_value_loop; }
+                        else { ${$prev_ema_ref_overall} = ($physc_value_loop * $alpha_for_physc_ema) + (${$prev_ema_ref_overall} * (1 - $alpha_for_physc_ema)); }
+                    }
+                    push @{$sma_queue_ref_overall}, $physc_value_loop;
+                    shift @{$sma_queue_ref_overall} while scalar @{$sma_queue_ref_overall} > $window_minutes;
+                    if (scalar @{$sma_queue_ref_overall} == $window_minutes) { $current_avg_output_value_overall = ${$prev_ema_ref_overall}; }
+                }
+                if (defined $current_avg_output_value_overall && defined $temp_fh_overall) {
+                    print {$temp_fh_overall} "$current_avg_output_value_overall\n" or die "Error writing PhysC temp file for $current_vm_name_loop: $!";
+                }
+
+                if (defined $runq_csv_file && defined $runq_value_for_this_ts_loop && $runq_value_for_this_ts_loop =~ /^-?[0-9.]+$/) {
+                     my $current_raw_abs_rq_overall = $runq_value_for_this_ts_loop + 0;
+                     push @{$collected_runq_overall{$current_vm_name_loop}{abs_raw}}, $current_raw_abs_rq_overall;
+                     if (defined $physc_value_loop && $physc_value_loop >= $ACTIVE_PHYSC_THRESHOLD) {
+                         my $effective_lcpus = $physc_value_loop * $smt_value;
+                         if ($effective_lcpus > $FLOAT_EPSILON) {
+                             push @{$collected_runq_overall{$current_vm_name_loop}{norm_raw}}, ($current_raw_abs_rq_overall / $effective_lcpus);
+                         }
+                     }
+                }
+            }
+        }
+        if ($data_lines_processed > 0 && $data_lines_processed % 10000 == 0)
+        {
+            print STDERR "Processed $data_lines_processed NMON data lines (matching filters).\n";
+        }
     }
+    close $physc_csv_fh;
 
-    $data_lines_processed++;
-    shift @fields;
-
-    my $current_window_key_loop; # Use local var
     if ($enable_windowed_decay_internal)
     {
-        my $current_timestamp_day_obj = $tp->truncate(to => 'day');
-        while (defined $current_processing_window_end_obj && $current_timestamp_day_obj > $current_processing_window_end_obj)
+        if ($current_window_idx < @processing_windows && %current_window_vm_data_buffer)
         {
-            process_and_store_window_results(
+             process_and_store_window_results(
                 $processing_windows[$current_window_idx], \%current_window_vm_data_buffer, \%vm_data_by_window,
                 \@vm_names_from_physc_header, $target_vm_index_in_physc, $target_vm_name,
                 $percentile, $calculate_peak, $runq_csv_file, \@runq_norm_percentiles_to_calc, \@runq_abs_percentiles_to_calc,
                 $runq_avg_method_str, $window_minutes, $alpha_for_physc_ema
             );
-            %current_window_vm_data_buffer = ();
-            $current_window_idx++;
-            if ($current_window_idx < @processing_windows)
-            {
-                $current_processing_window_end_obj = $processing_windows[$current_window_idx][1];
-            }
-            else
-            {
-                $current_processing_window_end_obj = undef;
-                last;
-            }
         }
-        $current_window_key_loop = get_window_key_for_timestamp($tp, \@processing_windows, $current_window_idx);
-        unless (defined $current_window_key_loop) { next; }
-    }
-
-    my @vms_to_iterate_this_line;
-    if (defined $target_vm_index_in_physc)
-    {
-        push @vms_to_iterate_this_line, { index => $target_vm_index_in_physc, name => $target_vm_name };
     }
     else
     {
-        for (my $i=0; $i < @vm_names_from_physc_header; $i++)
+        foreach my $vm_name_local (keys %temp_files_for_physc_rolling_avgs_overall) # Use local var
         {
-            push @vms_to_iterate_this_line, { index => $i, name => $vm_names_from_physc_header[$i] };
-        }
-    }
-
-    foreach my $vm_info (@vms_to_iterate_this_line)
-    {
-        my $vm_idx = $vm_info->{index};
-        my $current_vm_name_loop = $vm_info->{name}; # Use local var
-        my $physc_value_str_local = defined $fields[$vm_idx] ? $fields[$vm_idx] : ''; # Use local var
-        my $physc_value_loop; # Use local var
-        if (defined $physc_value_str_local && $physc_value_str_local =~ /^-?[0-9.]+$/) { $physc_value_loop = $physc_value_str_local + 0; }
-        else { $physc_value_loop = undef; }
-
-        my $runq_value_for_this_ts_loop = undef; # Use local var
-        if (defined $runq_csv_file && exists $runq_data_store{$current_vm_name_loop}{$timestamp_str_loop})
-        {
-            if ($runq_data_store{$current_vm_name_loop}{$timestamp_str_loop} =~ /^-?[0-9.]+$/)
+            if (defined $temp_files_for_physc_rolling_avgs_overall{$vm_name_local}{fh})
             {
-                $runq_value_for_this_ts_loop = $runq_data_store{$current_vm_name_loop}{$timestamp_str_loop} + 0;
+                close $temp_files_for_physc_rolling_avgs_overall{$vm_name_local}{fh} or warn "Could not close temp file for $vm_name_local: $!";
             }
         }
+        if (defined $runq_csv_file && $runq_avg_method_str ne 'none')
+        {
+            print STDERR "Calculating overall smoothed RunQ values for non-windowed mode...\n";
+            foreach my $vm_name_local (keys %collected_runq_overall) # Use local var
+            {
+                if (exists $collected_runq_overall{$vm_name_local}{abs_raw} && @{$collected_runq_overall{$vm_name_local}{abs_raw}})
+                {
+                    my $smoothed_series_ref = calculate_rolling_average_series(
+                        \@{$collected_runq_overall{$vm_name_local}{abs_raw}}, $runq_avg_method_str, $window_minutes, $alpha_for_runq_ema
+                    );
+                    $collected_runq_overall{$vm_name_local}{abs_smoothed} = $smoothed_series_ref;
+                }
+                if (exists $collected_runq_overall{$vm_name_local}{norm_raw} && @{$collected_runq_overall{$vm_name_local}{norm_raw}})
+                {
+                    my $smoothed_series_ref = calculate_rolling_average_series(
+                        \@{$collected_runq_overall{$vm_name_local}{norm_raw}}, $runq_avg_method_str, $window_minutes, $alpha_for_runq_ema
+                    );
+                    $collected_runq_overall{$vm_name_local}{norm_smoothed} = $smoothed_series_ref;
+                }
+            }
+        }
+    }
+    print STDERR "Finished reading NMON data ($data_lines_processed lines matching filters).\n";
+
+    my @results_data_output;
+    my @vms_for_final_output_loop = defined($target_vm_name) ? ($target_vm_name) : @vm_names_from_physc_header;
+
+    foreach my $vm_name_loop (@vms_for_final_output_loop)
+    {
+        my $output_line_for_vm = "$vm_name_loop:";
+        my %final_metrics_for_vm;
 
         if ($enable_windowed_decay_internal)
         {
-            unless (exists $current_window_vm_data_buffer{$current_vm_name_loop}{$current_window_key_loop})
-            {
-                $current_window_vm_data_buffer{$current_vm_name_loop}{$current_window_key_loop} = {
-                    physc_sma_queue => [], physc_prev_ema => undef, physc_ema_point_counter => [],
-                    raw_physc_for_peak => [], rolling_physc_avgs => [],
-                    abs_rq_values_for_perc => [], norm_rq_values_for_perc => [],
-                    runq_abs_sma_queue => [], runq_abs_prev_ema => undef, runq_abs_ema_point_counter => [],
-                    runq_norm_sma_queue => [], runq_norm_prev_ema => undef, runq_norm_ema_point_counter => [],
-                };
-            }
-            my $vm_win_buf = $current_window_vm_data_buffer{$current_vm_name_loop}{$current_window_key_loop};
+            my $p_label_main_decay = sprintf("P%.2f", $percentile);
+            $p_label_main_decay =~ s/\.?0+$//;
+            $p_label_main_decay = "0" if $p_label_main_decay eq "" && abs($percentile-0)<0.001;
+            $p_label_main_decay = "P$p_label_main_decay" unless $p_label_main_decay =~ /^P/;
 
-            if (defined $physc_value_loop) { push @{$vm_win_buf->{raw_physc_for_peak}}, $physc_value_loop; }
-            my $current_physc_avg_output_win;
-            if ($avg_method eq 'sma')
-            {
-                if(defined $physc_value_loop) { push @{$vm_win_buf->{physc_sma_queue}}, $physc_value_loop; }
-                else { push @{$vm_win_buf->{physc_sma_queue}}, undef; }
-                shift @{$vm_win_buf->{physc_sma_queue}} while scalar @{$vm_win_buf->{physc_sma_queue}} > $window_minutes;
-                if (scalar @{$vm_win_buf->{physc_sma_queue}} == $window_minutes) { $current_physc_avg_output_win = calculate_average(@{$vm_win_buf->{physc_sma_queue}}); }
-            }
-            else # EMA for PhysC (windowed)
-            {
-                if (defined $physc_value_loop) {
-                    if (!defined $vm_win_buf->{physc_prev_ema}) { $vm_win_buf->{physc_prev_ema} = $physc_value_loop; }
-                    else { $vm_win_buf->{physc_prev_ema} = ($physc_value_loop * $alpha_for_physc_ema) + ($vm_win_buf->{physc_prev_ema} * (1 - $alpha_for_physc_ema)); }
-                }
-                push @{$vm_win_buf->{physc_ema_point_counter}}, $physc_value_loop;
-                shift @{$vm_win_buf->{physc_ema_point_counter}} while scalar @{$vm_win_buf->{physc_ema_point_counter}} > $window_minutes;
-                if (scalar @{$vm_win_buf->{physc_ema_point_counter}} == $window_minutes) { $current_physc_avg_output_win = $vm_win_buf->{physc_prev_ema}; }
-            }
-            push @{$vm_win_buf->{rolling_physc_avgs}}, $current_physc_avg_output_win if defined $current_physc_avg_output_win;
+            my $baseline_weighted_metric_val_str = get_weighted_metric_for_vm(
+                \%vm_data_by_window, $vm_name_loop, $p_label_main_decay,
+                \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val
+            );
+            $final_metrics_for_vm{$p_label_main_decay} = $baseline_weighted_metric_val_str;
 
-            if (defined $runq_value_for_this_ts_loop)
+            my $growth_adj_value_for_output = 0.0;
+
+            if ($enable_growth_prediction)
             {
-                if ($runq_avg_method_str eq 'none') { push @{$vm_win_buf->{abs_rq_values_for_perc}}, $runq_value_for_this_ts_loop; }
-                else
+                print STDERR "INFO [$vm_name_loop]: Performing Growth Prediction processing ($p_label_main_decay)...\n" if ($verbose);
+                my $baseline_for_growth_str = $final_metrics_for_vm{$p_label_main_decay};
+                my $growth_skipped_reason = "";
+                $final_metrics_for_vm{"GrowthAdjAbs"} = "0.0000";
+
+                if (defined $baseline_for_growth_str && $baseline_for_growth_str ne "N/A" && $baseline_for_growth_str =~ /^-?[0-9.]+$/)
                 {
-                    my $smoothed_abs_rq;
-                    if ($runq_avg_method_str eq 'sma') {
-                        push @{$vm_win_buf->{runq_abs_sma_queue}}, $runq_value_for_this_ts_loop;
-                        shift @{$vm_win_buf->{runq_abs_sma_queue}} while scalar @{$vm_win_buf->{runq_abs_sma_queue}} > $window_minutes;
-                        if (scalar @{$vm_win_buf->{runq_abs_sma_queue}} == $window_minutes) { $smoothed_abs_rq = calculate_average(@{$vm_win_buf->{runq_abs_sma_queue}}); }
-                    } elsif ($runq_avg_method_str eq 'ema') {
-                        if (!defined $vm_win_buf->{runq_abs_prev_ema}) { $vm_win_buf->{runq_abs_prev_ema} = $runq_value_for_this_ts_loop; }
-                        else { $vm_win_buf->{runq_abs_prev_ema} = ($runq_value_for_this_ts_loop * $alpha_for_runq_ema) + ($vm_win_buf->{runq_abs_prev_ema} * (1-$alpha_for_runq_ema)); }
-                        push @{$vm_win_buf->{runq_abs_ema_point_counter}}, $runq_value_for_this_ts_loop;
-                        shift @{$vm_win_buf->{runq_abs_ema_point_counter}} while scalar @{$vm_win_buf->{runq_abs_ema_point_counter}} > $window_minutes;
-                        if (scalar @{$vm_win_buf->{runq_abs_ema_point_counter}} == $window_minutes) { $smoothed_abs_rq = $vm_win_buf->{runq_abs_prev_ema}; }
-                    }
-                    push @{$vm_win_buf->{abs_rq_values_for_perc}}, $smoothed_abs_rq if defined $smoothed_abs_rq;
-                }
-                if (defined $physc_value_loop && $physc_value_loop >= $ACTIVE_PHYSC_THRESHOLD)
-                {
-                    my $effective_lcpus = $physc_value_loop * $smt_value;
-                    if ($effective_lcpus > $FLOAT_EPSILON) {
-                        my $norm_runq_raw_val = $runq_value_for_this_ts_loop / $effective_lcpus;
-                        if ($runq_avg_method_str eq 'none') { push @{$vm_win_buf->{norm_rq_values_for_perc}}, $norm_runq_raw_val; }
-                        else {
-                            my $smoothed_norm_rq;
-                            if ($runq_avg_method_str eq 'sma') {
-                                push @{$vm_win_buf->{runq_norm_sma_queue}}, $norm_runq_raw_val;
-                                shift @{$vm_win_buf->{runq_norm_sma_queue}} while scalar @{$vm_win_buf->{runq_norm_sma_queue}} > $window_minutes;
-                                if (scalar @{$vm_win_buf->{runq_norm_sma_queue}} == $window_minutes) { $smoothed_norm_rq = calculate_average(@{$vm_win_buf->{runq_norm_sma_queue}}); }
-                            } elsif ($runq_avg_method_str eq 'ema') {
-                                if (!defined $vm_win_buf->{runq_norm_prev_ema}) { $vm_win_buf->{runq_norm_prev_ema} = $norm_runq_raw_val; }
-                                else { $vm_win_buf->{runq_norm_prev_ema} = ($norm_runq_raw_val * $alpha_for_runq_ema) + ($vm_win_buf->{runq_norm_prev_ema} * (1-$alpha_for_runq_ema)); }
-                                push @{$vm_win_buf->{runq_norm_ema_point_counter}}, $norm_runq_raw_val;
-                                shift @{$vm_win_buf->{runq_norm_ema_point_counter}} while scalar @{$vm_win_buf->{runq_norm_ema_point_counter}} > $window_minutes;
-                                if (scalar @{$vm_win_buf->{runq_norm_ema_point_counter}} == $window_minutes) { $smoothed_norm_rq = $vm_win_buf->{runq_norm_prev_ema}; }
-                            }
-                            push @{$vm_win_buf->{norm_rq_values_for_perc}}, $smoothed_norm_rq if defined $smoothed_norm_rq;
-                        }
-                    }
-                }
-            }
-        }
-        else # Standard Non-Windowed Processing
-        {
-            my $vm_overall_peak_ref_local = defined($target_vm_name) ? \$vm_physc_max_peak_scalar_overall : \$vm_physc_max_peaks_list_overall[$vm_idx];
-            if ($calculate_peak && defined $physc_value_loop)
-            {
-                if (!defined(${$vm_overall_peak_ref_local}) || $physc_value_loop > ${$vm_overall_peak_ref_local})
-                {
-                    ${$vm_overall_peak_ref_local} = $physc_value_loop;
-                }
-            }
-            my $current_avg_output_value_overall;
-            my $temp_fh_overall;
-            my $prev_ema_ref_overall;
-            my $sma_queue_ref_overall;
-            my $buffer_key = "_overall_vm_$current_vm_name_loop";
+                    my $current_baseline_entitlement_for_growth = $baseline_for_growth_str + 0;
+                    my @metric_time_series_points;
+                    my @metric_time_series_values;
 
-            $temp_fh_overall = $temp_files_for_physc_rolling_avgs_overall{$current_vm_name_loop}{fh};
-
-            unless (exists $current_window_vm_data_buffer{$buffer_key})
-            {
-                 $current_window_vm_data_buffer{$buffer_key} = { 'physc_prev_ema' => undef, 'physc_sma_queue' => [] };
-            }
-
-            $prev_ema_ref_overall = \$current_window_vm_data_buffer{$buffer_key}{'physc_prev_ema'};
-            $sma_queue_ref_overall = \@{$current_window_vm_data_buffer{$buffer_key}{'physc_sma_queue'}};
-
-            if ($avg_method eq 'sma') {
-                if(defined $physc_value_loop) { push @{$sma_queue_ref_overall}, $physc_value_loop; }
-                else { push @{$sma_queue_ref_overall}, undef; }
-                shift @{$sma_queue_ref_overall} while scalar @{$sma_queue_ref_overall} > $window_minutes;
-                if (scalar @{$sma_queue_ref_overall} == $window_minutes) { $current_avg_output_value_overall = calculate_average(@{$sma_queue_ref_overall}); }
-            } else { # EMA for PhysC (non-windowed)
-                if (defined $physc_value_loop) {
-                    if (!defined ${$prev_ema_ref_overall}) { ${$prev_ema_ref_overall} = $physc_value_loop; }
-                    else { ${$prev_ema_ref_overall} = ($physc_value_loop * $alpha_for_physc_ema) + (${$prev_ema_ref_overall} * (1 - $alpha_for_physc_ema)); }
-                }
-                push @{$sma_queue_ref_overall}, $physc_value_loop;
-                shift @{$sma_queue_ref_overall} while scalar @{$sma_queue_ref_overall} > $window_minutes;
-                if (scalar @{$sma_queue_ref_overall} == $window_minutes) { $current_avg_output_value_overall = ${$prev_ema_ref_overall}; }
-            }
-            if (defined $current_avg_output_value_overall && defined $temp_fh_overall) {
-                print {$temp_fh_overall} "$current_avg_output_value_overall\n" or die "Error writing PhysC temp file for $current_vm_name_loop: $!";
-            }
-
-            if (defined $runq_csv_file && defined $runq_value_for_this_ts_loop && $runq_value_for_this_ts_loop =~ /^-?[0-9.]+$/) {
-                 my $current_raw_abs_rq_overall = $runq_value_for_this_ts_loop + 0;
-                 push @{$collected_runq_overall{$current_vm_name_loop}{abs_raw}}, $current_raw_abs_rq_overall;
-                 if (defined $physc_value_loop && $physc_value_loop >= $ACTIVE_PHYSC_THRESHOLD) {
-                     my $effective_lcpus = $physc_value_loop * $smt_value;
-                     if ($effective_lcpus > $FLOAT_EPSILON) {
-                         push @{$collected_runq_overall{$current_vm_name_loop}{norm_raw}}, ($current_raw_abs_rq_overall / $effective_lcpus);
-                     }
-                 }
-            }
-        }
-    }
-    if ($data_lines_processed > 0 && $data_lines_processed % 10000 == 0)
-    {
-        print STDERR "Processed $data_lines_processed NMON data lines (matching filters).\n";
-    }
-}
-close $physc_csv_fh;
-
-if ($enable_windowed_decay_internal)
-{
-    if ($current_window_idx < @processing_windows && %current_window_vm_data_buffer)
-    {
-         process_and_store_window_results(
-            $processing_windows[$current_window_idx], \%current_window_vm_data_buffer, \%vm_data_by_window,
-            \@vm_names_from_physc_header, $target_vm_index_in_physc, $target_vm_name,
-            $percentile, $calculate_peak, $runq_csv_file, \@runq_norm_percentiles_to_calc, \@runq_abs_percentiles_to_calc,
-            $runq_avg_method_str, $window_minutes, $alpha_for_physc_ema
-        );
-    }
-}
-else
-{
-    foreach my $vm_name_local (keys %temp_files_for_physc_rolling_avgs_overall) # Use local var
-    {
-        if (defined $temp_files_for_physc_rolling_avgs_overall{$vm_name_local}{fh})
-        {
-            close $temp_files_for_physc_rolling_avgs_overall{$vm_name_local}{fh} or warn "Could not close temp file for $vm_name_local: $!";
-        }
-    }
-    if (defined $runq_csv_file && $runq_avg_method_str ne 'none')
-    {
-        print STDERR "Calculating overall smoothed RunQ values for non-windowed mode...\n";
-        foreach my $vm_name_local (keys %collected_runq_overall) # Use local var
-        {
-            if (exists $collected_runq_overall{$vm_name_local}{abs_raw} && @{$collected_runq_overall{$vm_name_local}{abs_raw}})
-            {
-                my $smoothed_series_ref = calculate_rolling_average_series(
-                    \@{$collected_runq_overall{$vm_name_local}{abs_raw}}, $runq_avg_method_str, $window_minutes, $alpha_for_runq_ema
-                );
-                $collected_runq_overall{$vm_name_local}{abs_smoothed} = $smoothed_series_ref;
-            }
-            if (exists $collected_runq_overall{$vm_name_local}{norm_raw} && @{$collected_runq_overall{$vm_name_local}{norm_raw}})
-            {
-                my $smoothed_series_ref = calculate_rolling_average_series(
-                    \@{$collected_runq_overall{$vm_name_local}{norm_raw}}, $runq_avg_method_str, $window_minutes, $alpha_for_runq_ema
-                );
-                $collected_runq_overall{$vm_name_local}{norm_smoothed} = $smoothed_series_ref;
-            }
-        }
-    }
-}
-print STDERR "Finished reading NMON data. Processed $data_lines_processed data lines matching filters.\n";
-
-# --- Final Result Assembly and Output ---
-my @results_data_output;
-print STDERR "Calculating final results...\n";
-my @vms_for_final_output_loop = defined($target_vm_name) ? ($target_vm_name) : @vm_names_from_physc_header;
-
-foreach my $vm_name_loop (@vms_for_final_output_loop)
-{
-    my $output_line_for_vm = "$vm_name_loop:";
-    my %final_metrics_for_vm;
-
-    if ($enable_windowed_decay_internal)
-    {
-        my $p_label_main_decay = sprintf("P%.2f", $percentile);
-        $p_label_main_decay =~ s/\.?0+$//;
-        $p_label_main_decay = "0" if $p_label_main_decay eq "" && abs($percentile-0)<0.001;
-        $p_label_main_decay = "P$p_label_main_decay" unless $p_label_main_decay =~ /^P/;
-
-        my $baseline_weighted_metric_val_str = get_weighted_metric_for_vm(
-            \%vm_data_by_window, $vm_name_loop, $p_label_main_decay,
-            \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val
-        );
-        $final_metrics_for_vm{$p_label_main_decay} = $baseline_weighted_metric_val_str;
-
-        # --- START: Growth Prediction Logic (NEW) ---
-        my $growth_adj_value_for_output = 0.0;
-
-        if ($enable_growth_prediction)
-        {
-            print STDERR "INFO [$vm_name_loop]: Performing Growth Prediction processing ($p_label_main_decay)...\n" if ($verbose);
-            my $baseline_for_growth_str = $final_metrics_for_vm{$p_label_main_decay};
-            my $growth_skipped_reason = "";
-            $final_metrics_for_vm{"GrowthAdjAbs"} = "0.0000";
-
-            if (defined $baseline_for_growth_str && $baseline_for_growth_str ne "N/A" && $baseline_for_growth_str =~ /^-?[0-9.]+$/)
-            {
-                my $current_baseline_entitlement_for_growth = $baseline_for_growth_str + 0;
-                my @metric_time_series_points;
-                my @metric_time_series_values;
-
-                if (exists $vm_data_by_window{$vm_name_loop})
-                {
-                    my $time_idx = 0;
-                    foreach my $win_key (sort {
-                                            my ($ad, $ai) = ($a =~ /^(\d{8})_(\d+)$/);
-                                            my ($bd, $bi) = ($b =~ /^(\d{8})_(\d+)$/);
-                                            return ($ad cmp $bd) || ($ai <=> $bi);
-                                         } keys %{$vm_data_by_window{$vm_name_loop}})
+                    if (exists $vm_data_by_window{$vm_name_loop})
                     {
-                        if (exists $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} &&
-                            defined $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} &&
-                            $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} ne "N/A" &&
-                            $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} =~ /^-?[0-9.]+$/)
+                        my $time_idx = 0;
+                        foreach my $win_key (sort {
+                                                my ($ad, $ai) = ($a =~ /^(\d{8})_(\d+)$/);
+                                                my ($bd, $bi) = ($b =~ /^(\d{8})_(\d+)$/);
+                                                return ($ad cmp $bd) || ($ai <=> $bi);
+                                             } keys %{$vm_data_by_window{$vm_name_loop}})
                         {
-                            my $metric_val = $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} + 0;
-                            push @metric_time_series_points, [$time_idx, $metric_val];
-                            push @metric_time_series_values, $metric_val;
-                            $time_idx++;
+                            if (exists $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} &&
+                                defined $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} &&
+                                $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} ne "N/A" &&
+                                $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} =~ /^-?[0-9.]+$/)
+                            {
+                                my $metric_val = $vm_data_by_window{$vm_name_loop}{$win_key}{$p_label_main_decay} + 0;
+                                push @metric_time_series_points, [$time_idx, $metric_val];
+                                push @metric_time_series_values, $metric_val;
+                                $time_idx++;
+                            }
                         }
                     }
-                }
 
-                my $num_hist_periods_for_trend = scalar @metric_time_series_points;
-                print STDERR "INFO [$vm_name_loop]: Found $num_hist_periods_for_trend historical periods for $p_label_main_decay trend analysis.\n" if ($verbose);
+                    my $num_hist_periods_for_trend = scalar @metric_time_series_points;
+                    print STDERR "INFO [$vm_name_loop]: Found $num_hist_periods_for_trend historical periods for $p_label_main_decay trend analysis.\n" if ($verbose);
 
-                if ($num_hist_periods_for_trend < $GROWTH_MIN_HISTORICAL_PERIODS)
-                {
-                    $growth_skipped_reason = "Insufficient historical periods ($num_hist_periods_for_trend < $GROWTH_MIN_HISTORICAL_PERIODS)";
-                }
-                else
-                {
-                    my $stats_for_trend = calculate_statistics_for_trend(\@metric_time_series_values);
-                    my $cv_for_trend = (defined $stats_for_trend && defined $stats_for_trend->{cv}) ? $stats_for_trend->{cv} : undef;
-                    print STDERR "INFO [$vm_name_loop]: Trend data stats - Mean: " . (defined $stats_for_trend ? sprintf("%.4f", $stats_for_trend->{mean}) : "N/A") .
-                                 ", StdDev: " . (defined $stats_for_trend ? sprintf("%.4f", $stats_for_trend->{stddev}) : "N/A") .
-                                 ", CV: " . (defined $cv_for_trend ? sprintf("%.4f", $cv_for_trend) : "N/A") . ".\n" if ($verbose);
-
-                    if (defined $cv_for_trend && abs($cv_for_trend) > $GROWTH_MAX_CV_THRESHOLD)
+                    if ($num_hist_periods_for_trend < $GROWTH_MIN_HISTORICAL_PERIODS)
                     {
-                        $growth_skipped_reason = sprintf("High volatility (CV %.2f > threshold %.2f)", $cv_for_trend, $GROWTH_MAX_CV_THRESHOLD);
+                        $growth_skipped_reason = "Insufficient historical periods ($num_hist_periods_for_trend < $GROWTH_MIN_HISTORICAL_PERIODS)";
                     }
                     else
                     {
-                        my $regression_results = calculate_manual_linear_regression(\@metric_time_series_points);
-                        if (defined $regression_results && defined $regression_results->{slope})
+                        my $stats_for_trend = calculate_statistics_for_trend(\@metric_time_series_values);
+                        my $cv_for_trend = (defined $stats_for_trend && defined $stats_for_trend->{cv}) ? $stats_for_trend->{cv} : undef;
+                        print STDERR "INFO [$vm_name_loop]: Trend data stats - Mean: " . (defined $stats_for_trend ? sprintf("%.4f", $stats_for_trend->{mean}) : "N/A") .
+                                     ", StdDev: " . (defined $stats_for_trend ? sprintf("%.4f", $stats_for_trend->{stddev}) : "N/A") .
+                                     ", CV: " . (defined $cv_for_trend ? sprintf("%.4f", $cv_for_trend) : "N/A") . ".\n" if ($verbose);
+
+                        if (defined $cv_for_trend && abs($cv_for_trend) > $GROWTH_MAX_CV_THRESHOLD)
                         {
-                            my $slope     = $regression_results->{slope};
-                            my $r_squared = $regression_results->{r_squared};
-                            print STDERR "INFO [$vm_name_loop]: Linear regression - Slope: " . sprintf("%.4f units/%s", $slope, $process_window_unit_str) .
-                                         (defined $r_squared ? sprintf(" (R²: %.4f)", $r_squared) : "") . ".\n" if ($verbose);
-
-                            if ($slope <= 0 || ($slope > 0 && $slope < $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD) )
-                            {
-                                $growth_skipped_reason = sprintf("Slope (%.4f) not sufficiently positive (min threshold for inflation: %.4f) or is non-positive", $slope, $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD);
-                            }
-                            else
-                            {
-                                my $days_per_hist_window = ($process_window_unit_str eq "weeks" ? 7 : 1);
-                                my $total_hist_duration_days_for_trend = $num_hist_periods_for_trend * $days_per_hist_window;
-
-                                if ($total_hist_duration_days_for_trend > 0 && ($growth_projection_days / $total_hist_duration_days_for_trend) > $GROWTH_MAX_PROJECTION_HISTORY_RATIO)
-                                {
-                                    $growth_skipped_reason = sprintf("Projection horizon (%d days) too long for available history (%.1f days, ratio limit %.1f)",
-                                                                     $growth_projection_days, $total_hist_duration_days_for_trend, $GROWTH_MAX_PROJECTION_HISTORY_RATIO);
-                                }
-                                else
-                                {
-                                    my $num_effective_projection_periods = $growth_projection_days / $days_per_hist_window;
-                                    my $projected_absolute_increase = $slope * $num_effective_projection_periods;
-                                    print STDERR "INFO [$vm_name_loop]: Growth Prediction: Raw projected increase over $growth_projection_days days: " . sprintf("%.4f", $projected_absolute_increase) . ".\n" if ($verbose);
-
-                                    # This ensures GrowthAdjAbs always reflects the uncapped prediction if one was made.
-                                    $final_metrics_for_vm{"GrowthAdjAbs"} = sprintf("%.4f", ($projected_absolute_increase < 0 ? 0 : $projected_absolute_increase) );
-
-                                    my $max_allowed_increase_by_cap = $current_baseline_entitlement_for_growth * ($max_growth_inflation_percent / 100.0);
-                                    print STDERR "INFO [$vm_name_loop]: Growth Prediction: Max allowed inflation ($max_growth_inflation_percent% of baseline " . sprintf("%.4f", $current_baseline_entitlement_for_growth) . "): " . sprintf("%.4f", $max_allowed_increase_by_cap) . ".\n" if ($verbose);
-
-                                    my $final_capped_increase = $projected_absolute_increase;
-                                    if ($final_capped_increase > $max_allowed_increase_by_cap)
-                                    {
-                                        $final_capped_increase = $max_allowed_increase_by_cap;
-                                        print STDERR "INFO [$vm_name_loop]: Growth capped: projected +" . sprintf("%.4f", $projected_absolute_increase) .
-                                                     " cores → +" . sprintf("%.4f", $final_capped_increase) .
-                                                     " cores (" . $max_growth_inflation_percent . "% max).\n";
-
-                                    }
-                                    $final_capped_increase = 0 if $final_capped_increase < 0;
-
-                                    $growth_adj_value_for_output = $final_capped_increase;
-                                    my $inflated_recommendation = $current_baseline_entitlement_for_growth + $growth_adj_value_for_output;
-
-                                    print STDERR "INFO [$vm_name_loop]: Growth Prediction: Inflated $p_label_main_decay: " . sprintf("%.4f", $inflated_recommendation) . " (+" . sprintf("%.4f", $growth_adj_value_for_output) . ").\n";
-                                    $final_metrics_for_vm{$p_label_main_decay} = sprintf("%.4f", $inflated_recommendation);
-                                }
-                            }
+                            $growth_skipped_reason = sprintf("High volatility (CV %.2f > threshold %.2f)", $cv_for_trend, $GROWTH_MAX_CV_THRESHOLD);
                         }
                         else
                         {
-                            $growth_skipped_reason = "Linear regression failed (e.g., could not calculate slope)";
+                            my $regression_results = calculate_manual_linear_regression(\@metric_time_series_points);
+                            if (defined $regression_results && defined $regression_results->{slope})
+                            {
+                                my $slope     = $regression_results->{slope};
+                                my $r_squared = $regression_results->{r_squared};
+                                print STDERR "INFO [$vm_name_loop]: Linear regression - Slope: " . sprintf("%.4f units/%s", $slope, $process_window_unit_str) .
+                                             (defined $r_squared ? sprintf(" (R²: %.4f)", $r_squared) : "") . ".\n" if ($verbose);
+
+                                if ($slope <= 0 || ($slope > 0 && $slope < $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD) )
+                                {
+                                    $growth_skipped_reason = sprintf("Slope (%.4f) not sufficiently positive (min threshold for inflation: %.4f) or is non-positive", $slope, $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD);
+                                }
+                                else
+                                {
+                                    my $days_per_hist_window = ($process_window_unit_str eq "weeks" ? 7 : 1);
+                                    my $total_hist_duration_days_for_trend = $num_hist_periods_for_trend * $days_per_hist_window;
+
+                                    if ($total_hist_duration_days_for_trend > 0 && ($growth_projection_days / $total_hist_duration_days_for_trend) > $GROWTH_MAX_PROJECTION_HISTORY_RATIO)
+                                    {
+                                        $growth_skipped_reason = sprintf("Projection horizon (%d days) too long for available history (%.1f days, ratio limit %.1f)",
+                                                                         $growth_projection_days, $total_hist_duration_days_for_trend, $GROWTH_MAX_PROJECTION_HISTORY_RATIO);
+                                    }
+                                    else
+                                    {
+                                        my $num_effective_projection_periods = $growth_projection_days / $days_per_hist_window;
+                                        my $projected_absolute_increase = $slope * $num_effective_projection_periods;
+                                        print STDERR "INFO [$vm_name_loop]: Growth Prediction: Raw projected increase over $growth_projection_days days: " . sprintf("%.4f", $projected_absolute_increase) . ".\n" if ($verbose);
+
+                                        $final_metrics_for_vm{"GrowthAdjAbs"} = sprintf("%.4f", ($projected_absolute_increase < 0 ? 0 : $projected_absolute_increase) );
+
+                                        my $max_allowed_increase_by_cap = $current_baseline_entitlement_for_growth * ($max_growth_inflation_percent / 100.0);
+                                        print STDERR "INFO [$vm_name_loop]: Growth Prediction: Max allowed inflation ($max_growth_inflation_percent% of baseline " . sprintf("%.4f", $current_baseline_entitlement_for_growth) . "): " . sprintf("%.4f", $max_allowed_increase_by_cap) . ".\n" if ($verbose);
+
+                                        my $final_capped_increase = $projected_absolute_increase;
+                                        if ($final_capped_increase > $max_allowed_increase_by_cap)
+                                        {
+                                            $final_capped_increase = $max_allowed_increase_by_cap;
+                                            print STDERR "INFO [$vm_name_loop]: Growth capped: projected +" . sprintf("%.4f", $projected_absolute_increase) .
+                                                         " cores → +" . sprintf("%.4f", $final_capped_increase) .
+                                                         " cores (" . $max_growth_inflation_percent . "% max).\n";
+
+                                        }
+                                        $final_capped_increase = 0 if $final_capped_increase < 0;
+
+                                        $growth_adj_value_for_output = $final_capped_increase;
+                                        my $inflated_recommendation = $current_baseline_entitlement_for_growth + $growth_adj_value_for_output;
+
+                                        print STDERR "INFO [$vm_name_loop]: Growth Prediction: Inflated $p_label_main_decay: " . sprintf("%.4f", $inflated_recommendation) . " (+" . sprintf("%.4f", $growth_adj_value_for_output) . ").\n";
+                                        $final_metrics_for_vm{$p_label_main_decay} = sprintf("%.4f", $inflated_recommendation);
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                $growth_skipped_reason = "Linear regression failed (e.g., could not calculate slope)";
+                            }
                         }
                     }
                 }
+                else
+                {
+                    $growth_skipped_reason = "Baseline metric for growth ($p_label_main_decay = $baseline_for_growth_str) is N/A or not numeric";
+                }
+
+                if ($growth_skipped_reason ne "" && $verbose)
+                {
+                    print STDERR "WARN [$vm_name_loop]: Growth projection for $p_label_main_decay skipped: $growth_skipped_reason.\n";
+                }
+                $final_metrics_for_vm{"GrowthAdj"} = sprintf("%.4f", $growth_adj_value_for_output);
+                print STDERR "INFO [$vm_name_loop]: Growth prediction processing for $p_label_main_decay finished.\n" if ($verbose);
             }
             else
             {
-                $growth_skipped_reason = "Baseline metric for growth ($p_label_main_decay = $baseline_for_growth_str) is N/A or not numeric";
+                 $final_metrics_for_vm{"GrowthAdj"} = "0.0000";
             }
-
-            if ($growth_skipped_reason ne "" && $verbose)
+            if ($calculate_peak)
             {
-                print STDERR "WARN [$vm_name_loop]: Growth projection for $p_label_main_decay skipped: $growth_skipped_reason.\n";
+                $final_metrics_for_vm{'Peak'} = get_weighted_metric_for_vm(\%vm_data_by_window, $vm_name_loop, 'Peak', \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val);
             }
-            $final_metrics_for_vm{"GrowthAdj"} = sprintf("%.4f", $growth_adj_value_for_output);
-            print STDERR "INFO [$vm_name_loop]: Growth prediction processing for $p_label_main_decay finished.\n" if ($verbose);
+            if (defined $runq_csv_file)
+            {
+                foreach my $p_val (@runq_norm_percentiles_to_calc)
+                {
+                    my $p_lbl_base = sprintf("%.2f",$p_val); $p_lbl_base=~s/\.?0+$//; $p_lbl_base="0" if $p_lbl_base eq ""&&abs($p_val-0)<0.001;
+                    my $mk="NormRunQ_P$p_lbl_base";
+                    $final_metrics_for_vm{$mk} = get_weighted_metric_for_vm(\%vm_data_by_window, $vm_name_loop, $mk, \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val, "%.2f");
+                }
+                foreach my $p_val (@runq_abs_percentiles_to_calc)
+                {
+                    my $p_lbl_base = sprintf("%.2f",$p_val); $p_lbl_base=~s/\.?0+$//; $p_lbl_base="0" if $p_lbl_base eq ""&&abs($p_val-0)<0.001;
+                    my $mk="AbsRunQ_P$p_lbl_base";
+                    $final_metrics_for_vm{$mk} = get_weighted_metric_for_vm(\%vm_data_by_window, $vm_name_loop, $mk, \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val, "%.2f");
+                }
+            }
         }
         else
         {
-             $final_metrics_for_vm{"GrowthAdj"} = "0.0000";
-        }
-        # --- END: Growth Prediction Logic ---
+            my $temp_file_path_val = $temp_files_for_physc_rolling_avgs_overall{$vm_name_loop}{filename};
+            my @physc_avg_values_from_file;
+            my $percentile_val_raw_overall = undef;
+            my $vm_idx_overall = (defined($target_vm_name) && $target_vm_name eq $vm_name_loop) ? $target_vm_index_in_physc : get_vm_index_by_name($vm_name_loop, \@vm_names_from_physc_header);
+            my $peak_val_raw_overall = defined($target_vm_name) ? $vm_physc_max_peak_scalar_overall : ( (defined $vm_idx_overall && $vm_idx_overall <= $#vm_physc_max_peaks_list_overall && defined $vm_physc_max_peaks_list_overall[$vm_idx_overall]) ? $vm_physc_max_peaks_list_overall[$vm_idx_overall] : undef);
 
-        if ($calculate_peak)
-        {
-            $final_metrics_for_vm{'Peak'} = get_weighted_metric_for_vm(\%vm_data_by_window, $vm_name_loop, 'Peak', \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val);
-        }
-        if (defined $runq_csv_file)
-        {
-            foreach my $p_val (@runq_norm_percentiles_to_calc)
-            {
-                my $p_lbl_base = sprintf("%.2f",$p_val); $p_lbl_base=~s/\.?0+$//; $p_lbl_base="0" if $p_lbl_base eq ""&&abs($p_val-0)<0.001;
-                my $mk="NormRunQ_P$p_lbl_base";
-                $final_metrics_for_vm{$mk} = get_weighted_metric_for_vm(\%vm_data_by_window, $vm_name_loop, $mk, \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val, "%.2f");
+            if (defined $temp_file_path_val && -f $temp_file_path_val && -s $temp_file_path_val) {
+                open my $in_fh, '<', $temp_file_path_val or print STDERR "Warning: Could not open temp file $temp_file_path_val for $vm_name_loop: $!\n";
+                if ($in_fh) {
+                    while (my $num = <$in_fh>) { chomp $num; if ($num =~ /^-?[0-9]+(?:\.[0-9]+)?$/) { push @physc_avg_values_from_file, $num; } }
+                    close $in_fh;
+                }
             }
-            foreach my $p_val (@runq_abs_percentiles_to_calc)
-            {
-                my $p_lbl_base = sprintf("%.2f",$p_val); $p_lbl_base=~s/\.?0+$//; $p_lbl_base="0" if $p_lbl_base eq ""&&abs($p_val-0)<0.001;
-                my $mk="AbsRunQ_P$p_lbl_base";
-                $final_metrics_for_vm{$mk} = get_weighted_metric_for_vm(\%vm_data_by_window, $vm_name_loop, $mk, \@processing_windows, $actual_analysis_ref_date_obj, $decay_half_life_days_val, "%.2f");
+            unlink $temp_file_path_val or warn "Could not delete temporary file '$temp_file_path_val': $!" if defined $temp_file_path_val && -f $temp_file_path_val;
+
+            if (@physc_avg_values_from_file && defined $filter_above_perc_value) {
+                 my @sff = sort { $a <=> $b } @physc_avg_values_from_file;
+                 my $ft = calculate_percentile(\@sff, $filter_above_perc_value);
+                 if (defined $ft) {
+                     my @fa = grep { defined($_) && $_ >= ($ft - $FLOAT_EPSILON) } @physc_avg_values_from_file;
+                     if (@fa) { my @sf = sort { $a <=> $b } @fa; $percentile_val_raw_overall = calculate_percentile(\@sf, $percentile); }
+                     else { $percentile_val_raw_overall = undef; }
+                 } else {
+                     if (@physc_avg_values_from_file) { my @sa = sort { $a <=> $b } @physc_avg_values_from_file; $percentile_val_raw_overall = calculate_percentile(\@sa, $percentile); }
+                 }
+            } elsif (@physc_avg_values_from_file) {
+                my @sa = sort { $a <=> $b } @physc_avg_values_from_file;
+                $percentile_val_raw_overall = calculate_percentile(\@sa, $percentile);
             }
-        }
-    }
-    else
-    {
-        my $temp_file_path_val = $temp_files_for_physc_rolling_avgs_overall{$vm_name_loop}{filename};
-        my @physc_avg_values_from_file;
-        my $percentile_val_raw_overall = undef;
-        my $vm_idx_overall = (defined($target_vm_name) && $target_vm_name eq $vm_name_loop) ? $target_vm_index_in_physc : get_vm_index_by_name($vm_name_loop, \@vm_names_from_physc_header);
-        my $peak_val_raw_overall = defined($target_vm_name) ? $vm_physc_max_peak_scalar_overall : ( (defined $vm_idx_overall && $vm_idx_overall <= $#vm_physc_max_peaks_list_overall && defined $vm_physc_max_peaks_list_overall[$vm_idx_overall]) ? $vm_physc_max_peaks_list_overall[$vm_idx_overall] : undef);
 
+            my $p_label_main_overall = sprintf("P%.2f", $percentile);
+            $p_label_main_overall =~ s/\.?0+$//;
+            $p_label_main_overall = "0" if $p_label_main_overall eq "" && abs($percentile-0)<0.001;
+            $p_label_main_overall = "P$p_label_main_overall" unless $p_label_main_overall =~ /^P/;
+            $final_metrics_for_vm{$p_label_main_overall} = defined($percentile_val_raw_overall) ? $percentile_val_raw_overall : "N/A";
 
-        if (defined $temp_file_path_val && -f $temp_file_path_val && -s $temp_file_path_val) {
-            open my $in_fh, '<', $temp_file_path_val or print STDERR "Warning: Could not open temp file $temp_file_path_val for $vm_name_loop: $!\n";
-            if ($in_fh) {
-                while (my $num = <$in_fh>) { chomp $num; if ($num =~ /^-?[0-9]+(?:\.[0-9]+)?$/) { push @physc_avg_values_from_file, $num; } }
-                close $in_fh;
+            if ($calculate_peak) {
+                $final_metrics_for_vm{'Peak'} = defined($peak_val_raw_overall) ? $peak_val_raw_overall : "N/A";
             }
-        }
-        unlink $temp_file_path_val or warn "Could not delete temporary file '$temp_file_path_val': $!" if defined $temp_file_path_val && -f $temp_file_path_val;
 
-        if (@physc_avg_values_from_file && defined $filter_above_perc_value) {
-             my @sff = sort { $a <=> $b } @physc_avg_values_from_file;
-             my $ft = calculate_percentile(\@sff, $filter_above_perc_value);
-             if (defined $ft) {
-                 my @fa = grep { defined($_) && $_ >= ($ft - $FLOAT_EPSILON) } @physc_avg_values_from_file;
-                 if (@fa) { my @sf = sort { $a <=> $b } @fa; $percentile_val_raw_overall = calculate_percentile(\@sf, $percentile); }
-                 else { $percentile_val_raw_overall = undef; }
-             } else {
-                 if (@physc_avg_values_from_file) { my @sa = sort { $a <=> $b } @physc_avg_values_from_file; $percentile_val_raw_overall = calculate_percentile(\@sa, $percentile); }
-             }
-        } elsif (@physc_avg_values_from_file) {
-            my @sa = sort { $a <=> $b } @physc_avg_values_from_file;
-            $percentile_val_raw_overall = calculate_percentile(\@sa, $percentile);
-        }
+            if (defined $runq_csv_file && exists $collected_runq_overall{$vm_name_loop}) {
+                my $norm_data_source_ref = ($runq_avg_method_str ne 'none' && exists $collected_runq_overall{$vm_name_loop}{norm_smoothed})
+                                         ? $collected_runq_overall{$vm_name_loop}{norm_smoothed}
+                                         : (exists $collected_runq_overall{$vm_name_loop}{norm_raw} ? \@{$collected_runq_overall{$vm_name_loop}{norm_raw}} : undef );
+                my $abs_data_source_ref  = ($runq_avg_method_str ne 'none' && exists $collected_runq_overall{$vm_name_loop}{abs_smoothed})
+                                         ? $collected_runq_overall{$vm_name_loop}{abs_smoothed}
+                                         : (exists $collected_runq_overall{$vm_name_loop}{abs_raw} ? \@{$collected_runq_overall{$vm_name_loop}{abs_raw}} : undef );
 
-        my $p_label_main_overall = sprintf("P%.2f", $percentile);
-        $p_label_main_overall =~ s/\.?0+$//;
-        $p_label_main_overall = "0" if $p_label_main_overall eq "" && abs($percentile-0)<0.001;
-        $p_label_main_overall = "P$p_label_main_overall" unless $p_label_main_overall =~ /^P/;
-        $final_metrics_for_vm{$p_label_main_overall} = defined($percentile_val_raw_overall) ? $percentile_val_raw_overall : "N/A";
-
-        if ($calculate_peak) {
-            $final_metrics_for_vm{'Peak'} = defined($peak_val_raw_overall) ? $peak_val_raw_overall : "N/A";
-        }
-
-        if (defined $runq_csv_file && exists $collected_runq_overall{$vm_name_loop}) {
-            my $norm_data_source_ref = ($runq_avg_method_str ne 'none' && exists $collected_runq_overall{$vm_name_loop}{norm_smoothed})
-                                     ? $collected_runq_overall{$vm_name_loop}{norm_smoothed}
-                                     : (exists $collected_runq_overall{$vm_name_loop}{norm_raw} ? \@{$collected_runq_overall{$vm_name_loop}{norm_raw}} : undef );
-            my $abs_data_source_ref  = ($runq_avg_method_str ne 'none' && exists $collected_runq_overall{$vm_name_loop}{abs_smoothed})
-                                     ? $collected_runq_overall{$vm_name_loop}{abs_smoothed}
-                                     : (exists $collected_runq_overall{$vm_name_loop}{abs_raw} ? \@{$collected_runq_overall{$vm_name_loop}{abs_raw}} : undef );
-
-            if (defined $norm_data_source_ref && @{$norm_data_source_ref}) {
-                my @sorted_norm = sort {$a <=> $b} grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$norm_data_source_ref};
-                if (@sorted_norm) {
-                    foreach my $p_val (@runq_norm_percentiles_to_calc) {
-                        my $val = calculate_percentile(\@sorted_norm, $p_val);
-                        my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
-                        $final_metrics_for_vm{"NormRunQ_P$p_num_for_key"} = defined($val)?sprintf("%.2f",$val):"N/A";
+                if (defined $norm_data_source_ref && @{$norm_data_source_ref}) {
+                    my @sorted_norm = sort {$a <=> $b} grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$norm_data_source_ref};
+                    if (@sorted_norm) {
+                        foreach my $p_val (@runq_norm_percentiles_to_calc) {
+                            my $val = calculate_percentile(\@sorted_norm, $p_val);
+                            my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
+                            $final_metrics_for_vm{"NormRunQ_P$p_num_for_key"} = defined($val)?sprintf("%.2f",$val):"N/A";
+                        }
+                    } else {
+                         foreach my $p_val (@runq_norm_percentiles_to_calc) {
+                             my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
+                             $final_metrics_for_vm{"NormRunQ_P$p_num_for_key"} = "N/A";
+                         }
                     }
                 } else {
                      foreach my $p_val (@runq_norm_percentiles_to_calc) {
@@ -1210,19 +1358,19 @@ foreach my $vm_name_loop (@vms_for_final_output_loop)
                          $final_metrics_for_vm{"NormRunQ_P$p_num_for_key"} = "N/A";
                      }
                 }
-            } else {
-                 foreach my $p_val (@runq_norm_percentiles_to_calc) {
-                     my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
-                     $final_metrics_for_vm{"NormRunQ_P$p_num_for_key"} = "N/A";
-                 }
-            }
-            if (defined $abs_data_source_ref && @{$abs_data_source_ref}) {
-                my @sorted_abs = sort {$a <=> $b} grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$abs_data_source_ref};
-                if (@sorted_abs) {
-                    foreach my $p_val (@runq_abs_percentiles_to_calc) {
-                        my $val = calculate_percentile(\@sorted_abs, $p_val);
-                        my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
-                        $final_metrics_for_vm{"AbsRunQ_P$p_num_for_key"} = defined($val)?sprintf("%.2f",$val):"N/A";
+                if (defined $abs_data_source_ref && @{$abs_data_source_ref}) {
+                    my @sorted_abs = sort {$a <=> $b} grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$abs_data_source_ref};
+                    if (@sorted_abs) {
+                        foreach my $p_val (@runq_abs_percentiles_to_calc) {
+                            my $val = calculate_percentile(\@sorted_abs, $p_val);
+                            my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
+                            $final_metrics_for_vm{"AbsRunQ_P$p_num_for_key"} = defined($val)?sprintf("%.2f",$val):"N/A";
+                        }
+                    } else {
+                        foreach my $p_val (@runq_abs_percentiles_to_calc) {
+                            my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
+                            $final_metrics_for_vm{"AbsRunQ_P$p_num_for_key"} = "N/A";
+                        }
                     }
                 } else {
                     foreach my $p_val (@runq_abs_percentiles_to_calc) {
@@ -1230,158 +1378,489 @@ foreach my $vm_name_loop (@vms_for_final_output_loop)
                         $final_metrics_for_vm{"AbsRunQ_P$p_num_for_key"} = "N/A";
                     }
                 }
-            } else {
-                foreach my $p_val (@runq_abs_percentiles_to_calc) {
-                    my $p_num_for_key = sprintf("%.2f",$p_val); $p_num_for_key =~ s/\.?0+$//; $p_num_for_key = "0" if $p_num_for_key eq "" && abs($p_val-0)<0.001;
-                    $final_metrics_for_vm{"AbsRunQ_P$p_num_for_key"} = "N/A";
-                }
+            }
+            if ($enable_growth_prediction)
+            {
+                $final_metrics_for_vm{"GrowthAdj"} = "0.0000";
             }
         }
+
+        my $p_label_out_final = sprintf("P%.2f", $percentile);
+        $p_label_out_final =~ s/\.?0+$//;
+        $p_label_out_final = "0" if $p_label_out_final eq "" && abs($percentile-0)<0.001;
+        $p_label_out_final = "P$p_label_out_final" unless $p_label_out_final =~ /^P/;
+        my $physc_p_val_to_print = $final_metrics_for_vm{$p_label_out_final} // "N/A";
+
+        if ($physc_p_val_to_print ne "N/A" && $physc_p_val_to_print =~ /^-?[0-9.]+$/)
+        {
+            my $r_val = apply_rounding($physc_p_val_to_print, $round_increment, $rounding_method);
+            $output_line_for_vm .= " $p_label_out_final=" . sprintf("%.${output_dp}f", $r_val);
+        }
+        else
+        {
+            $output_line_for_vm .= " $p_label_out_final=N/A";
+        }
+
+        if ($calculate_peak)
+        {
+            my $peak_val_to_print = $final_metrics_for_vm{'Peak'} // "N/A";
+            if ($peak_val_to_print ne "N/A" && $peak_val_to_print =~ /^-?[0-9.]+$/)
+            {
+                my $r_val = apply_rounding($peak_val_to_print, $round_increment, $rounding_method);
+                $output_line_for_vm .= " Peak=" . sprintf("%.${output_dp}f", $r_val);
+            }
+            else
+            {
+                $output_line_for_vm .= " Peak=N/A";
+            }
+        }
+
+        my @runq_metric_keys_ordered_for_output;
+        if (defined $runq_csv_file)
+        {
+            foreach my $p_val (@runq_norm_percentiles_to_calc)
+            {
+                my $p_num_label = sprintf("%.2f", $p_val); $p_num_label =~ s/\.?0+$//; $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
+                push @runq_metric_keys_ordered_for_output, "NormRunQ_P$p_num_label";
+            }
+            foreach my $p_val (@runq_abs_percentiles_to_calc)
+            {
+                my $p_num_label = sprintf("%.2f", $p_val); $p_num_label =~ s/\.?0+$//; $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
+                push @runq_metric_keys_ordered_for_output, "AbsRunQ_P$p_num_label";
+            }
+        }
+        foreach my $key (@runq_metric_keys_ordered_for_output)
+        {
+            $output_line_for_vm .= " $key=" . ($final_metrics_for_vm{$key} // "N/A");
+        }
+
         if ($enable_growth_prediction)
         {
-            $final_metrics_for_vm{"GrowthAdj"} = "0.0000";
+            my $growth_adj_display_val = $final_metrics_for_vm{"GrowthAdj"} // "0.0000";
+            if ($growth_adj_display_val =~ /^-?[0-9.]+$/)
+            {
+                $output_line_for_vm .= sprintf(" GrowthAdj=%.4f", $growth_adj_display_val + 0);
+            }
+            else
+            {
+                 $output_line_for_vm .= " GrowthAdj=$growth_adj_display_val";
+            }
+            my $growth_adj_abs_display_val = $final_metrics_for_vm{"GrowthAdjAbs"} // "0.0000";
+            if ($growth_adj_abs_display_val =~ /^-?[0-9.]+$/)
+            {
+                $output_line_for_vm .= sprintf(" GrowthAdjAbs=%.4f", $growth_adj_abs_display_val + 0);
+            }
+            else
+            {
+                 $output_line_for_vm .= " GrowthAdjAbs=$growth_adj_abs_display_val";
+            }
         }
+
+        push @results_data_output, { line => $output_line_for_vm };
     }
 
-    my $p_label_out_final = sprintf("P%.2f", $percentile);
-    $p_label_out_final =~ s/\.?0+$//;
-    $p_label_out_final = "0" if $p_label_out_final eq "" && abs($percentile-0)<0.001;
-    $p_label_out_final = "P$p_label_out_final" unless $p_label_out_final =~ /^P/;
-    my $physc_p_val_to_print = $final_metrics_for_vm{$p_label_out_final} // "N/A";
+    my @output_header_cols = ("VM_Name", "State", "Duration_Days", "Entitlement", "MaxCPU", "SMT", "Processor", "SerialNumber", "PoolID");
+    my @metric_keys_in_order = ("P" . clean_perc_label($percentile));
+    push @metric_keys_in_order, 'Peak' if $calculate_peak;
+    foreach my $p (@runq_norm_percentiles_to_calc) { push @metric_keys_in_order, "NormRunQ_P" . clean_perc_label($p); }
+    foreach my $p (@runq_abs_percentiles_to_calc) { push @metric_keys_in_order, "AbsRunQ_P" . clean_perc_label($p); }
+    if ($enable_growth_prediction) {
+        push @metric_keys_in_order, "GrowthAdj", "GrowthAdjAbs";
+    }
+    push @output_header_cols, @metric_keys_in_order;
+#    print STDOUT join(",", @output_header_cols) . "\n";
 
-    if ($physc_p_val_to_print ne "N/A" && $physc_p_val_to_print =~ /^-?[0-9.]+$/)
+    # Print the new standardized summary if there are results.
+    if (@results_data_output)
     {
-        my $r_val = apply_rounding($physc_p_val_to_print, $round_increment, $rounding_method);
-        $output_line_for_vm .= " $p_label_out_final=" . sprintf("%.${output_dp}f", $r_val);
+        print STDERR generate_run_summary_string();
+
+        print STDOUT "\n------------------------------------------------------------------\n";
+        print STDOUT "Results\n";
+        print STDOUT "------------------------------------------------------------------\n";
+
+# This loop now simply prints the pre-formatted key=value string for each VM.
+        foreach my $res (@results_data_output)
+        {
+            print STDOUT $res->{line} . "\n";
+        }
     }
     else
     {
-        $output_line_for_vm .= " $p_label_out_final=N/A";
+        print STDERR "\n--- No results generated for this run (check filters/data) ---\n";
     }
-
-    if ($calculate_peak)
-    {
-        my $peak_val_to_print = $final_metrics_for_vm{'Peak'} // "N/A";
-        if ($peak_val_to_print ne "N/A" && $peak_val_to_print =~ /^-?[0-9.]+$/)
-        {
-            my $r_val = apply_rounding($peak_val_to_print, $round_increment, $rounding_method);
-            $output_line_for_vm .= " Peak=" . sprintf("%.${output_dp}f", $r_val);
-        }
-        else
-        {
-            $output_line_for_vm .= " Peak=N/A";
-        }
-    }
-
-    my @runq_metric_keys_ordered_for_output;
-    if (defined $runq_csv_file)
-    {
-        foreach my $p_val (@runq_norm_percentiles_to_calc)
-        {
-            my $p_num_label = sprintf("%.2f", $p_val); $p_num_label =~ s/\.?0+$//; $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
-            push @runq_metric_keys_ordered_for_output, "NormRunQ_P$p_num_label";
-        }
-        foreach my $p_val (@runq_abs_percentiles_to_calc)
-        {
-            my $p_num_label = sprintf("%.2f", $p_val); $p_num_label =~ s/\.?0+$//; $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
-            push @runq_metric_keys_ordered_for_output, "AbsRunQ_P$p_num_label";
-        }
-    }
-    foreach my $key (@runq_metric_keys_ordered_for_output)
-    {
-        $output_line_for_vm .= " $key=" . ($final_metrics_for_vm{$key} // "N/A");
-    }
-
-    # Append GrowthAdj to output line if Growth Prediction feature was enabled
-    if ($enable_growth_prediction)
-    {
-        my $growth_adj_display_val = $final_metrics_for_vm{"GrowthAdj"} // "0.0000"; # Default to 0 if not calculated
-        if ($growth_adj_display_val =~ /^-?[0-9.]+$/)
-        {
-            $output_line_for_vm .= sprintf(" GrowthAdj=%.4f", $growth_adj_display_val + 0);
-        }
-        else
-        {
-             $output_line_for_vm .= " GrowthAdj=$growth_adj_display_val";
-        }
-
-        # This ensures GrowthAdjAbs always reflects the uncapped prediction if one was made.
-        my $growth_adj_abs_display_val = $final_metrics_for_vm{"GrowthAdjAbs"} // "0.0000"; # Default to 0 if not calculated
-        if ($growth_adj_abs_display_val =~ /^-?[0-9.]+$/)
-        {
-            $output_line_for_vm .= sprintf(" GrowthAdjAbs=%.4f", $growth_adj_abs_display_val + 0);
-        }
-        else
-        {
-             $output_line_for_vm .= " GrowthAdjAbs=$growth_adj_abs_display_val";
-        }
-    }
-
-    push @results_data_output, { line => $output_line_for_vm };
 }
 
-# --- Construct Run Summary Note (add growth prediction info) ---
-my $growth_prediction_note_out_str = "";
-if ($enable_growth_prediction) # Check if it was enabled and *remained* enabled
-{
-    $growth_prediction_note_out_str = sprintf(" (GrowthPred: ON, ProjDays=%d, MaxInflPerc=%d%%)",
-                                          $growth_projection_days, $max_growth_inflation_percent);
-}
-
-my $peak_note_out_final = $calculate_peak ? " (Peak Calc: Yes)" : "";
-my $runq_note_out_final = defined($runq_csv_file) ? " (RunQ SMT: $smt_value, NormPercs: $runq_norm_perc_str, AbsPercs: $runq_abs_perc_str, RunQAvgMethod: $runq_avg_method_str)" : "";
-if (defined $runq_csv_file && defined $runq_decay_level_arg && $runq_avg_method_str eq 'ema') {
-    $runq_note_out_final =~ s/\)$/, RunQDecay: $runq_decay_level_to_use\)/;
-}
-my $rounding_note_out_final = ($rounding_method ne 'none') ? " (Rounded $rounding_method to $round_increment)" : "";
-my $filter_note_out_final = $time_filter_active ? " (Time Filter: $time_filter_desc)" : "";
-my $weekend_note_out_final = $no_weekends ? " (Weekends Excluded)" : "";
-my $perc_filter_note_val_out_display = defined($filter_above_perc_value) ? sprintf("P%.2f", $filter_above_perc_value) : "";
-if ($perc_filter_note_val_out_display ne "") {
-    $perc_filter_note_val_out_display =~ s/\.?0+$//;
-    $perc_filter_note_val_out_display = "0" if $perc_filter_note_val_out_display eq "" && abs($filter_above_perc_value - 0) < 0.001;
-}
-my $perc_filter_note_out_final = defined($filter_above_perc_value) ? " (PhysC Perc Filter >= $perc_filter_note_val_out_display)" : "";
-my $date_filter_note_out_final_str = "";
-if (defined $start_date_str || defined $end_date_str) {
-    $date_filter_note_out_final_str = " (Global Date Filter:";
-    if (defined $start_date_str) { $date_filter_note_out_final_str .= " Start=$start_date_str"; }
-    if (defined $end_date_str) { $date_filter_note_out_final_str .= (defined($start_date_str) ? "," : "") . " End=$end_date_str"; }
-    $date_filter_note_out_final_str .= ")";
-}
-my $window_decay_note_out_final = $enable_windowed_decay_internal ? " (Windowed Decay: ON, Unit=$process_window_unit_str, Size=$process_window_size_val, HalfLife=${decay_half_life_days_val}d)" : "";
-my $header_run_params_label_out_final_str = sprintf("P%.2f", $percentile);
-$header_run_params_label_out_final_str =~ s/\.?0+$//;
-$header_run_params_label_out_final_str = "0" if $header_run_params_label_out_final_str eq "" && abs($percentile-0)<0.001;
-$header_run_params_label_out_final_str = "P$header_run_params_label_out_final_str" unless $header_run_params_label_out_final_str =~ /^P/;
-$header_run_params_label_out_final_str .= ", W=$window_minutes (" . uc($avg_method);
-if ($avg_method eq 'ema') { $header_run_params_label_out_final_str .= ", PhysCDecay=$decay_level"; }
-$header_run_params_label_out_final_str .= ")";
-
-if (@results_data_output)
-{
-    print STDERR "\n--- Run Summary ($header_run_params_label_out_final_str)$peak_note_out_final$runq_note_out_final$rounding_note_out_final$filter_note_out_final$weekend_note_out_final$perc_filter_note_out_final$date_filter_note_out_final_str$window_decay_note_out_final$growth_prediction_note_out_str ---\n";
-}
-else
-{
-    print STDERR "\n--- No results generated for this run (check filters/data) ---\n";
-}
-foreach my $res (@results_data_output)
-{
-    print STDOUT $res->{line} . "\n";
-}
-my $script_end_time_final_run_local = time();
-my $duration_final_run_local = $script_end_time_final_run_local - $script_start_time;
-print STDERR "\nProcessing completed in $duration_final_run_local seconds.\n\n";
+my $script_end_time = time();
+my $duration = $script_end_time - $script_start_time;
+print STDERR "\nCompleted in $duration second(s).\n\n";
 exit 0;
 
 # ==============================================================================
 # Subroutines
 # ==============================================================================
+
+# --- clean_perc_label ---
+# Helper to format a percentile number into a clean string for metric keys.
+sub clean_perc_label {
+    my ($p) = @_;
+    my $label = sprintf("%.2f", $p);
+    $label =~ s/\.?0+$//;
+    $label = "0" if $label eq "" && abs($p-0)<0.001;
+    return $label;
+}
+
+# --- calculate_rolling_average ---
+# Generic sub to calculate a single rolling average point (SMA or EMA).
+sub calculate_rolling_average {
+    my ($value, $method, $sma_queue_aref, $prev_ema_sref, $window, $alpha) = @_;
+
+    my $avg_to_return;
+    if ($method eq 'sma') {
+        push @$sma_queue_aref, $value;
+        shift @$sma_queue_aref while @$sma_queue_aref > $window;
+        if (@$sma_queue_aref == $window) {
+            $avg_to_return = calculate_average(@$sma_queue_aref);
+        }
+    } else { # ema
+        if (defined $value) {
+            if (!defined $$prev_ema_sref) { $$prev_ema_sref = $value; }
+            else { $$prev_ema_sref = ($value * $alpha) + ($$prev_ema_sref * (1 - $alpha)); }
+        }
+        push @$sma_queue_aref, $value; # Use sma_queue as a simple counter
+        shift @$sma_queue_aref while @$sma_queue_aref > $window;
+        if (@$sma_queue_aref == $window) {
+            $avg_to_return = $$prev_ema_sref;
+        }
+    }
+    return $avg_to_return;
+}
+
+# --- define_configuration_states ---
+# Performs the first pass over all .nmon files in a directory to detect
+# changes in key configuration metadata (SMT, Entitlement, vCPU, etc.).
+# It builds a timeline of these changes and consolidates them into discrete
+# "state windows" where the configuration for a VM was static.
+#
+# Args:
+#   1. $dir (string): The path to the directory containing .nmon files.
+#
+# Returns:
+#   - A hash reference where keys are VM names. Each VM name maps to an array
+#     of state window hashes. Each state window hash contains:
+#     {
+#       vm_name      => string,
+#       state_id     => int,
+#       start_time   => Time::Piece object,
+#       end_time     => Time::Piece object,
+#       duration_days => float,
+#       metadata     => {
+#         smt          => int,
+#         entitlement  => float,
+#         virtual_cpus => int,
+#         pool_cpu     => int,
+#         capped       => int (0 or 1),
+#         max_cpu      => float,
+#         proc_type    => string,
+#         proc_version => string,
+#         proc_clock   => string,
+#         processor_state => string
+#       }
+#     }
+# ==============================================================================
+# Subroutines for v3 State Management
+# ==============================================================================
+
+# --- define_configuration_states ---
+# Performs the first pass over all .nmon files in a directory to detect
+# changes in key configuration metadata (SMT, Entitlement, vCPU, etc.).
+# It builds a timeline of these changes and consolidates them into discrete
+# "state windows" where the configuration for a VM was static.
+#
+# Args:
+#   1. $dir (string): The path to the directory containing .nmon files.
+#
+# Returns:
+#   - A hash reference where keys are VM names. Each VM name maps to an array
+#     of state window hashes.
+#
+sub define_configuration_states
+{
+    my ($dir, $default_smt) = @_;
+
+    my @nmon_files;
+    find( sub { push @nmon_files, $File::Find::name if -f && /\.nmon$/i; }, $dir );
+
+    unless (@nmon_files)
+    {
+        die "Error: No .nmon files found in directory '$dir'.\n";
+    }
+
+    @nmon_files = sort @nmon_files;
+    print STDERR "  Found " . scalar(@nmon_files) . " NMON files to scan for metadata.\n";
+
+    my %config_events_by_vm;
+    my %file_boundaries;
+
+    # --- Pass 1.1: Scan each file to gather all raw metadata events ---
+    foreach my $file_path (@nmon_files)
+    {
+        open my $fh, '<:encoding(utf8)', $file_path or do {
+            warn "Warning: Could not open '$file_path': $!. Skipping.";
+            next;
+        };
+
+        my $current_vm;
+        my %zzzz_map;
+        my %file_static_config;
+
+        while (my $line = <$fh>)
+        {
+            chomp $line; $line =~ s/\r$//;
+            my @fields = split ',', $line;
+            my $key = $fields[0];
+
+            if ($key eq 'AAA' && $fields[1] eq 'host') {
+               $current_vm = $fields[2];
+            }
+            elsif ($key eq 'AAA' && $fields[1] eq 'SerialNumber') {
+                $file_static_config{serial_number} = $fields[2];
+            }
+            elsif ($key eq 'ZZZZ') {
+                my ($t_num, $time, $date_str) = @fields[1..3];
+                my $tp_date;
+                eval { $tp_date = Time::Piece->strptime($date_str, "%d-%b-%Y"); };
+                if ($@ || !$tp_date) { eval { $tp_date = Time::Piece->strptime($date_str, "%d-%B-%Y"); }; }
+                next if ($@ || !$tp_date);
+                my $timestamp = $tp_date->ymd . " " . $time;
+                $zzzz_map{$t_num} = $timestamp;
+                $file_boundaries{$current_vm}{$timestamp} = 1;
+            }
+            elsif ($key eq 'BBBL') {
+                my ($id, $bkey, $bval) = @fields[1..3];
+                if    ($id eq '04') { $file_static_config{virtual_cpus} = $bval + 0 if looks_like_number($bval); }
+                elsif ($id eq '06') { $file_static_config{smt}          = $bval + 0 if looks_like_number($bval); }
+                elsif ($id eq '07') { $file_static_config{capped}       = ($bval =~ /true|1/i ? 1 : 0); }
+                elsif ($id eq '18') { $file_static_config{pool_cpu}      = $bval + 0 if looks_like_number($bval); }
+            }
+            elsif ($key eq 'BBBP') {
+                my $bval = $fields[3] // "";
+                if    ($bval =~ /"Processor Type:\s*(.+?)"?$/)    { $file_static_config{proc_type} = $1; }
+                elsif ($bval =~ /"Processor Version:\s*(.+?)"?$/) { $file_static_config{proc_version} = $1; }
+                elsif ($bval =~ /"Processor Clock Speed:\s*(\d+)/){ $file_static_config{proc_clock} = $1; }
+                elsif ($bval =~ /Shared Pool ID\s*:\s*(\d+)/) { $file_static_config{pool_id} = $1; }
+            }
+            elsif ($key eq 'LPAR') {
+                my $t_num = $fields[1];
+                if (defined $zzzz_map{$t_num}) {
+                    my $ts_obj = Time::Piece->strptime($zzzz_map{$t_num}, "%Y-%m-%d %H:%M:%S");
+                    my $ent_val = $fields[6]; # Entitled is 5th field after Txxxx
+                    if (defined $ent_val && looks_like_number($ent_val)) {
+                        push @{$config_events_by_vm{$current_vm}}, { ts => $ts_obj->epoch, key => 'entitlement', value => $ent_val + 0 };
+                    }
+                }
+            }
+        }
+        close $fh;
+
+        if (defined $current_vm && %file_static_config) {
+            my @file_ts_epochs = map { Time::Piece->strptime($_, "%Y-%m-%d %H:%M:%S")->epoch } values %zzzz_map;
+            next unless @file_ts_epochs;
+            my $file_start_ts = (sort {$a <=> $b} @file_ts_epochs)[0];
+            foreach my $key (keys %file_static_config) {
+                push @{$config_events_by_vm{$current_vm}}, { ts => $file_start_ts, key => $key, value => $file_static_config{$key} };
+            }
+        }
+    }
+
+    # --- Pass 1.2: Process events grouped by timestamp to define state windows ---
+    my %all_vm_states;
+    foreach my $vm_name (sort keys %config_events_by_vm) {
+        # Group all events by their exact timestamp to treat changes at one moment as atomic.
+        my %events_by_ts;
+        foreach my $event (@{$config_events_by_vm{$vm_name}}) {
+            $events_by_ts{$event->{ts}}{$event->{key}} = $event->{value};
+        }
+
+        my @sorted_timestamps = sort {$a <=> $b} keys %events_by_ts;
+        next unless @sorted_timestamps;
+
+        my %last_known_metadata;
+        my $last_fingerprint = "";
+        my $current_state_start_epoch;
+
+        # Iterate through the unique timestamps where configuration changes occurred.
+        for (my $i = 0; $i < @sorted_timestamps; $i++) {
+            my $ts = $sorted_timestamps[$i];
+
+            # Create a snapshot of the current state BEFORE applying the new events
+            my %metadata_before_change = %last_known_metadata;
+
+            # Apply all events for this timestamp to a temporary hash to create the new state
+            my %snapshot_metadata = %last_known_metadata;
+            foreach my $key (keys %{$events_by_ts{$ts}}) {
+                $snapshot_metadata{$key} = $events_by_ts{$ts}{$key};
+            }
+
+            my $current_fingerprint = join "|", map { $snapshot_metadata{$_} // 'U' }
+                                      sort qw(entitlement smt virtual_cpus pool_cpu capped proc_type proc_version proc_clock);
+
+            if ($i == 0) {
+                # This is the very first event for the VM. Initialize the first state.
+                $last_fingerprint = $current_fingerprint;
+                $current_state_start_epoch = $ts;
+            } elsif ($current_fingerprint ne $last_fingerprint) {
+                # A change was detected. Finalize the PREVIOUS state using the metadata from before the change.
+                push @{$all_vm_states{$vm_name}}, {
+                    start_epoch => $current_state_start_epoch,
+                    end_epoch   => $ts - 1, # End time is 1 second before the change.
+                    metadata    => { %metadata_before_change } # CRITICAL: Use the state BEFORE the change.
+                };
+
+                # Start the new state.
+                $current_state_start_epoch = $ts;
+                $last_fingerprint = $current_fingerprint;
+            }
+
+            # Persist the fully updated state for the next iteration.
+            %last_known_metadata = %snapshot_metadata;
+        }
+
+        # After the loop, finalize the very last state for the VM.
+        my $vm_timestamps = [sort {$a <=> $b} map {Time::Piece->strptime($_, "%Y-%m-%d %H:%M:%S")->epoch} keys %{$file_boundaries{$vm_name}}];
+        my $final_end_epoch = @$vm_timestamps ? $vm_timestamps->[-1] : $current_state_start_epoch;
+
+        if (defined $current_state_start_epoch) {
+            push @{$all_vm_states{$vm_name}}, {
+                start_epoch => $current_state_start_epoch,
+                end_epoch   => $final_end_epoch,
+                metadata    => \%last_known_metadata
+            };
+        }
+
+        # Post-process: Add IDs, duration, and calculated fields
+        for (my $i=0; $i < @{$all_vm_states{$vm_name} || []}; $i++) {
+            my $state = $all_vm_states{$vm_name}[$i];
+            $state->{state_id} = $i + 1;
+            $state->{start_time} = Time::Piece->new($state->{start_epoch});
+            $state->{end_time} = Time::Piece->new($state->{end_epoch});
+            $state->{duration_days} = ($state->{end_epoch} - $state->{start_epoch}) / (60*60*24);
+            $state->{vm_name} = $vm_name;
+
+            my $md = $state->{metadata};
+            $md->{smt} //= $default_smt;
+            my $ent = $md->{entitlement} // 0;
+            my $vcpu = $md->{virtual_cpus} // 0;
+            my $poolcpu = $md->{pool_cpu} // 0;
+            my $is_capped = $md->{capped} // 0;
+            $md->{lpar_state} = "capped=$is_capped";
+
+            my $max_cpu_calc = $is_capped ? $ent : ($poolcpu > 0 && $vcpu > 0 ? min($vcpu, $poolcpu) : $vcpu);
+            $md->{max_cpu} = $max_cpu_calc > 0 ? $max_cpu_calc : ($vcpu > 0 ? $vcpu : 0);
+
+            my $p_type = $md->{proc_type} // 'UNK'; $p_type =~ s/PowerPC_//;
+            my $p_ver = $md->{proc_version} // 'UNK';
+            my $p_clk = $md->{proc_clock} // 'UNK';
+
+            $md->{processor_state} = join("_", $p_type, $p_ver, $p_clk);
+            $md->{processor_state} =~ s/\s+/-/g;
+            $md->{duration_days} = $state->{duration_days};
+        }
+    }
+
+    print STDERR "Phase 1 finished. Found states for " . scalar(keys %all_vm_states) . " VMs.\n";
+    return \%all_vm_states;
+}
+
+# --- print_state_windows_report ---
+# Takes the data structure returned by define_configuration_states and
+# prints a formatted, compact report to STDOUT.
+#
+# Args:
+#   1. $states_href (hash ref): The state windows data structure.
+#
+sub print_state_windows_report
+{
+    my ($states_href) = @_;
+
+    my $header_format = "%-20s %-10s %-20s %-20s %-10s %-45s %s\n";
+    my $row_format    = "%-20s %-10s %-20s %-20s %-10.2f %-45s %s\n";
+
+    printf $header_format, "VM_Name", "State_ID", "Start_Time", "End_Time", "Duration", "Config_Summary", "Processor";
+
+    my $separator = ("-" x 20) . " " . ("-" x 10) . " " . ("-" x 20) . " " . ("-" x 20) . " " . ("-" x 10) . " " . ("-" x 45) . " " . ("-" x 30) . "\n";
+    print STDOUT $separator;
+
+    foreach my $vm_name (sort keys %$states_href)
+    {
+        my @vm_states = @{$states_href->{$vm_name}};
+        my $total_states = scalar(@vm_states);
+        foreach my $state (@vm_states)
+        {
+            my $md = $state->{metadata};
+
+            # Build the compact configuration summary string
+            my $capped_str = ($md->{capped} // 0) ? "Capped" : "Uncapped";
+            my $config_summary = sprintf("Ent:%.2f vCPU:%d PoolCPU:%d SMT:%d %s",
+                $md->{entitlement} // 0,
+                $md->{virtual_cpus} // 0,
+                $md->{pool_cpu} // 0,
+                $md->{smt} // 0,
+                $capped_str
+            );
+
+            printf $row_format,
+                $state->{vm_name},
+                $state->{state_id} . "/" . $total_states,
+                $state->{start_time}->strftime('%Y-%m-%d %H:%M'),
+                $state->{end_time}->strftime('%Y-%m-%d %H:%M'),
+                $state->{duration_days},
+                $config_summary,
+                $md->{processor_state};
+        }
+    }
+}
+
+# --- parse_state_selector ---
+# Parses the user's state selection string (e.g., "1,3,5-7,-1") and returns
+# an array of the actual state window objects that match the selection.
+#
+# Args:
+#   1. $selector_str (string): The raw string from the --include-states flag.
+#   2. $available_states_aref (array ref): An array of all state window hashes for a VM.
+#
+# Returns:
+#   - An array containing the state window hashes that were selected.
+#
+sub parse_state_selector
+{
+    my ($selector_str, $available_states_aref) = @_;
+    my @selected_states;
+    return @$available_states_aref if (lc($selector_str) eq 'all');
+    return () if (scalar(@$available_states_aref) == 0);
+    my %selected_ids;
+    my $total_states = scalar(@$available_states_aref);
+    my @parts = split ',', $selector_str;
+    foreach my $part (@parts) {
+        $part =~ s/\s+//g;
+        if ($part =~ /^(\d+)-(\d+)$/) {
+            for my $id ($1 .. $2) { $selected_ids{$id} = 1; }
+        } elsif ($part =~ /^-(\d+)$/) {
+            my $offset = $1;
+            if ($total_states - $offset >= 0) { $selected_ids{ $total_states - ($offset - 1) } = 1; }
+        } elsif ($part =~ /^\d+$/) {
+            $selected_ids{$part} = 1;
+        }
+    }
+    foreach my $state (@$available_states_aref) {
+        push @selected_states, $state if exists $selected_ids{$state->{state_id}};
+    }
+    return @selected_states;
+}
+
 sub process_nmon_directory
 {
     my ($dir, $physc_out_fh, $runq_out_fh) = @_;
-    print STDERR "Scanning directory '$dir' for .nmon files...\n";
 
     opendir(my $dh, $dir) or die "Error: Cannot open directory '$dir': $!";
     my @nmon_files = grep { /\.nmon$/ && -f File::Spec->catfile($dir, $_) } readdir($dh);
@@ -1391,8 +1870,6 @@ sub process_nmon_directory
     {
         die "Error: No .nmon files found in directory '$dir'.\n";
     }
-
-    print STDERR "Found " . scalar(@nmon_files) . " NMON files to process.\n";
 
     my %data; # {timestamp} -> {vm_name} -> {physc => val, runq => val}
     my %vm_names;
@@ -1491,7 +1968,6 @@ sub process_nmon_directory
         print $runq_out_fh join(",", @runq_row) . "\n";
     }
 }
-# --- START: New Subroutines for Growth Prediction ---
 
 # Calculate basic statistics (mean, stddev, CV) for a list of values
 # Input: reference to an array of numeric values
@@ -1558,7 +2034,7 @@ sub calculate_manual_linear_regression
     foreach my $point (@{$points_aref})
     {
         my ($x_val, $y_val) = @{$point};
-        
+
         # Assuming $x_val and $y_val are already numeric based on upstream processing.
         # If strict validation is needed here, it can be added, but the input
         # preparation logic should ensure numeric data.
@@ -1629,6 +2105,120 @@ sub calculate_manual_linear_regression
         n_points  => $n,
     };
 }
+
+sub process_and_store_window_results
+{
+    my ($window_def_ref, $current_vm_win_buf_href, $vm_overall_win_data_href,
+        $all_vm_names_aref, $target_vm_idx_nullable, $target_vm_name_nullable,
+        $main_physc_percentile_arg, $calc_peak_arg, $has_runq_data_arg,
+        $runq_norm_p_aref_arg, $runq_abs_p_aref_arg,
+        $current_runq_avg_method_arg, $current_win_minutes_arg, $current_alpha_for_ema_arg_unused
+    ) = @_;
+
+    my ($win_start, $win_end, $win_rep_date) = @{$window_def_ref};
+    my $win_idx = -1;
+    for (my $i=0; $i < @processing_windows; $i++)
+    {
+        if ($processing_windows[$i][2]->epoch == $win_rep_date->epoch)
+        {
+            $win_idx = $i;
+            last;
+        }
+    }
+    return unless $win_idx != -1;
+    my $window_key = $win_rep_date->ymd('') . "_" . $win_idx;
+
+    my @vms_to_process_this_window_list;
+    if (defined $target_vm_idx_nullable)
+    {
+        push @vms_to_process_this_window_list, $target_vm_name_nullable;
+    }
+    else
+    {
+        @vms_to_process_this_window_list = @{$all_vm_names_aref};
+    }
+
+    foreach my $vm_name_local (@vms_to_process_this_window_list) # Use local var
+    {
+        next unless (exists $current_vm_win_buf_href->{$vm_name_local} && exists $current_vm_win_buf_href->{$vm_name_local}{$window_key});
+        my $vm_win_data = $current_vm_win_buf_href->{$vm_name_local}{$window_key};
+
+        my $p_label_main = sprintf("P%.2f", $main_physc_percentile_arg);
+        $p_label_main =~ s/\.?0+$//;
+        $p_label_main = "0" if $p_label_main eq "" && abs($main_physc_percentile_arg-0)<0.001;
+
+        if (exists $vm_win_data->{rolling_physc_avgs} && @{$vm_win_data->{rolling_physc_avgs}})
+        {
+            my @sorted_physc_avgs = sort {$a <=> $b} grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{rolling_physc_avgs}};
+            if (@sorted_physc_avgs)
+            {
+                my $physc_perc_val = calculate_percentile(\@sorted_physc_avgs, $main_physc_percentile_arg);
+                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$p_label_main} = defined($physc_perc_val) ? $physc_perc_val : "N/A";
+            }
+            else
+            {
+                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$p_label_main} = "N/A";
+            }
+        }
+        else
+        {
+            $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$p_label_main} = "N/A";
+        }
+
+        if ($calc_peak_arg)
+        {
+            if (exists $vm_win_data->{raw_physc_for_peak} && @{$vm_win_data->{raw_physc_for_peak}})
+            {
+                my @defined_peaks = grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{raw_physc_for_peak}};
+                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{'Peak'} = @defined_peaks ? max(@defined_peaks) : "N/A";
+            }
+            else
+            {
+                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{'Peak'} = "N/A";
+            }
+        }
+        if ($has_runq_data_arg)
+        {
+            my @abs_rq_for_perc_cleaned = grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{abs_rq_values_for_perc}};
+            foreach my $p_val (@{$runq_abs_p_aref_arg})
+            {
+                my $p_num_label = sprintf("%.2f", $p_val);
+                $p_num_label =~ s/\.?0+$//;
+                $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
+                my $metric_key = "AbsRunQ_P$p_num_label";
+                if (@abs_rq_for_perc_cleaned)
+                {
+                    my @sorted_vals = sort {$a <=> $b} @abs_rq_for_perc_cleaned;
+                    my $val = calculate_percentile(\@sorted_vals, $p_val);
+                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = defined($val) ? sprintf("%.2f", $val) : "N/A";
+                }
+                else
+                {
+                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = "N/A";
+                }
+            }
+            my @norm_rq_for_perc_cleaned = grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{norm_rq_values_for_perc}};
+            foreach my $p_val (@{$runq_norm_p_aref_arg})
+            {
+                my $p_num_label = sprintf("%.2f", $p_val);
+                $p_num_label =~ s/\.?0+$//;
+                $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
+                my $metric_key = "NormRunQ_P$p_num_label";
+                if (@norm_rq_for_perc_cleaned)
+                {
+                    my @sorted_vals = sort {$a <=> $b} @norm_rq_for_perc_cleaned;
+                    my $val = calculate_percentile(\@sorted_vals, $p_val);
+                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = defined($val) ? sprintf("%.2f", $val) : "N/A";
+                }
+                else
+                {
+                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = "N/A";
+                }
+            }
+        }
+    }
+}
+
 
 # --- Existing Subroutines from Original Script ---
 sub parse_percentile_list
@@ -1795,120 +2385,6 @@ sub get_window_key_for_timestamp
     return undef;
 }
 
-sub process_and_store_window_results
-{
-    my ($window_def_ref, $current_vm_win_buf_href, $vm_overall_win_data_href,
-        $all_vm_names_aref, $target_vm_idx_nullable, $target_vm_name_nullable,
-        $main_physc_percentile_arg, $calc_peak_arg, $has_runq_data_arg,
-        $runq_norm_p_aref_arg, $runq_abs_p_aref_arg,
-        $current_runq_avg_method_arg, $current_win_minutes_arg, $current_alpha_for_ema_arg_unused
-    ) = @_;
-
-    my ($win_start, $win_end, $win_rep_date) = @{$window_def_ref};
-    my $win_idx = -1;
-    for (my $i=0; $i < @processing_windows; $i++)
-    {
-        if ($processing_windows[$i][2]->epoch == $win_rep_date->epoch)
-        {
-            $win_idx = $i;
-            last;
-        }
-    }
-    return unless $win_idx != -1;
-    my $window_key = $win_rep_date->ymd('') . "_" . $win_idx;
-
-    my @vms_to_process_this_window_list;
-    if (defined $target_vm_idx_nullable)
-    {
-        push @vms_to_process_this_window_list, $target_vm_name_nullable;
-    }
-    else
-    {
-        @vms_to_process_this_window_list = @{$all_vm_names_aref};
-    }
-
-    foreach my $vm_name_local (@vms_to_process_this_window_list) # Use local var
-    {
-        next unless (exists $current_vm_win_buf_href->{$vm_name_local} && exists $current_vm_win_buf_href->{$vm_name_local}{$window_key});
-        my $vm_win_data = $current_vm_win_buf_href->{$vm_name_local}{$window_key};
-
-        my $p_label_main = sprintf("P%.2f", $main_physc_percentile_arg);
-        $p_label_main =~ s/\.?0+$//;
-        $p_label_main = "0" if $p_label_main eq "" && abs($main_physc_percentile_arg-0)<0.001;
-        $p_label_main = "P$p_label_main" unless $p_label_main =~ /^P/;
-
-        if (exists $vm_win_data->{rolling_physc_avgs} && @{$vm_win_data->{rolling_physc_avgs}})
-        {
-            my @sorted_physc_avgs = sort {$a <=> $b} grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{rolling_physc_avgs}};
-            if (@sorted_physc_avgs)
-            {
-                my $physc_perc_val = calculate_percentile(\@sorted_physc_avgs, $main_physc_percentile_arg);
-                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$p_label_main} = defined($physc_perc_val) ? $physc_perc_val : "N/A";
-            }
-            else
-            {
-                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$p_label_main} = "N/A";
-            }
-        }
-        else
-        {
-            $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$p_label_main} = "N/A";
-        }
-
-        if ($calc_peak_arg)
-        {
-            if (exists $vm_win_data->{raw_physc_for_peak} && @{$vm_win_data->{raw_physc_for_peak}})
-            {
-                my @defined_peaks = grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{raw_physc_for_peak}};
-                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{'Peak'} = @defined_peaks ? max(@defined_peaks) : "N/A";
-            }
-            else
-            {
-                $vm_overall_win_data_href->{$vm_name_local}{$window_key}{'Peak'} = "N/A";
-            }
-        }
-        if ($has_runq_data_arg)
-        {
-            my @abs_rq_for_perc_cleaned = grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{abs_rq_values_for_perc}};
-            foreach my $p_val (@{$runq_abs_p_aref_arg})
-            {
-                my $p_num_label = sprintf("%.2f", $p_val);
-                $p_num_label =~ s/\.?0+$//;
-                $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
-                my $metric_key = "AbsRunQ_P$p_num_label";
-                if (@abs_rq_for_perc_cleaned)
-                {
-                    my @sorted_vals = sort {$a <=> $b} @abs_rq_for_perc_cleaned;
-                    my $val = calculate_percentile(\@sorted_vals, $p_val);
-                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = defined($val) ? sprintf("%.2f", $val) : "N/A";
-                }
-                else
-                {
-                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = "N/A";
-                }
-            }
-            my @norm_rq_for_perc_cleaned = grep {defined $_ && $_ =~ /^-?[0-9.]+$/} @{$vm_win_data->{norm_rq_values_for_perc}};
-            foreach my $p_val (@{$runq_norm_p_aref_arg})
-            {
-                my $p_num_label = sprintf("%.2f", $p_val);
-                $p_num_label =~ s/\.?0+$//;
-                $p_num_label = "0" if $p_num_label eq "" && abs($p_val-0)<0.001;
-                my $metric_key = "NormRunQ_P$p_num_label";
-                if (@norm_rq_for_perc_cleaned)
-                {
-                    my @sorted_vals = sort {$a <=> $b} @norm_rq_for_perc_cleaned;
-                    my $val = calculate_percentile(\@sorted_vals, $p_val);
-                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = defined($val) ? sprintf("%.2f", $val) : "N/A";
-                }
-                else
-                {
-                    $vm_overall_win_data_href->{$vm_name_local}{$window_key}{$metric_key} = "N/A";
-                }
-            }
-        }
-    }
-}
-
 sub get_weighted_metric_for_vm
 {
     my ($vm_data_by_window_href, $vm_name_local, $metric_key, # Use local var
@@ -2018,15 +2494,10 @@ sub get_vm_index_by_name
 
 sub calculate_average
 {
-    my @values = @_;
-    my @defined_values = grep
-    {
-        defined($_) && $_ ne '' && $_ =~ /^-?[0-9.]+$/;
-    } @values;
-    my $count = scalar @defined_values;
-    return undef if $count == 0;
-    my $sum = sum0(@defined_values);
-    return $sum / $count;
+    my (@data) = @_;
+    my @numbers = grep { defined $_ && looks_like_number($_) } @data;
+    return 0 if !@numbers;
+    return sum0(@numbers) / scalar(@numbers);
 }
 
 sub calculate_percentile
@@ -2155,6 +2626,308 @@ sub get_decimal_places
     }
 }
 
+# --- define_time_windows_for_state ---
+# Subdivides a configuration state window into smaller, regular time-based
+# windows for decay and growth analysis.
+#
+sub define_time_windows_for_state {
+    my ($state_obj, $ref_date_str, $unit, $size) = @_;
+    my @windows;
+    my $start = $state_obj->{start_time};
+    my $end   = $state_obj->{end_time};
+
+    my $current_win_start = $start->truncate(to => 'day');
+
+    while ($current_win_start < $end) {
+        my $current_win_end;
+        if ($unit eq 'days') {
+            $current_win_end = $current_win_start + ($size * ONE_DAY()) - 1;
+        } else { # weeks
+            $current_win_end = $current_win_start + ($size * ONE_WEEK()) - 1;
+        }
+
+        $current_win_end = $end if $current_win_end > $end;
+
+        push @windows, {
+            start => $current_win_start,
+            end   => $current_win_end,
+            rep_date => $current_win_end, # Representative date for weighting is the end of the window
+        };
+
+        $current_win_start = $current_win_end->truncate(to => 'day') + ONE_DAY();
+    }
+    return @windows;
+}
+
+# --- calculate_metrics_for_period ---
+# A generic routine to calculate all relevant metrics (PhysC, RunQ, Peak)
+# for a given set of data points and a specific configuration state.
+#
+sub calculate_metrics_for_period {
+    my ($data_points_aref, $state_metadata_href) = @_;
+
+    my %metrics;
+    return \%metrics unless @$data_points_aref;
+
+    my $smt_for_period = $state_metadata_href->{smt} // $DEFAULT_SMT;
+
+    # Calculate rolling averages for PhysC
+    my @physc_avgs;
+    my $physc_sma_q = []; my $physc_ema_s = undef;
+    foreach my $dp (@$data_points_aref) {
+        my $avg = calculate_rolling_average($dp->{physc}, $avg_method, $physc_sma_q, \$physc_ema_s, $window_minutes, $alpha_for_physc_ema);
+        push @physc_avgs, $avg if defined $avg;
+    }
+
+    # Filter and calculate PhysC percentile
+    my @filtered_physc = @physc_avgs;
+    if (defined $filter_above_perc_value && @physc_avgs) {
+        my @sff = sort {$a <=> $b} @physc_avgs;
+        my $ft = calculate_percentile(\@sff, $filter_above_perc_value);
+        if(defined $ft) { @filtered_physc = grep { $_ >= ($ft - $FLOAT_EPSILON) } @physc_avgs; }
+    }
+    my @sorted_final_physc = sort {$a <=> $b} @filtered_physc;
+    my $p_val_physc = @sorted_final_physc ? calculate_percentile(\@sorted_final_physc, $percentile) : undef;
+    $metrics{"P".clean_perc_label($percentile)} = $p_val_physc;
+
+    # Calculate Peak PhysC
+    if ($calculate_peak) {
+        my $peak = 0;
+        foreach my $dp (@$data_points_aref) {
+            $peak = $dp->{physc} if (defined $dp->{physc} && $dp->{physc} > $peak);
+        }
+        $metrics{'Peak'} = $peak > 0 ? $peak : undef;
+    }
+
+    # Calculate RunQ metrics
+    my @norm_runq_raw; my @abs_runq_raw;
+    foreach my $dp (@$data_points_aref) {
+        if (defined $dp->{runq} && defined $dp->{physc} && $dp->{physc} >= $ACTIVE_PHYSC_THRESHOLD) {
+            push @abs_runq_raw, $dp->{runq};
+            my $eff_lcpus = $dp->{physc} * $smt_for_period;
+            if ($eff_lcpus > $FLOAT_EPSILON) {
+                push @norm_runq_raw, ($dp->{runq} / $eff_lcpus);
+            }
+        }
+    }
+
+    my $norm_data_ref = \@norm_runq_raw;
+    my $abs_data_ref = \@abs_runq_raw;
+    if ($runq_avg_method_str ne 'none') {
+        $norm_data_ref = calculate_rolling_average_series($norm_data_ref, $runq_avg_method_str, $window_minutes, $alpha_for_runq_ema);
+        $abs_data_ref = calculate_rolling_average_series($abs_data_ref, $runq_avg_method_str, $window_minutes, $alpha_for_runq_ema);
+    }
+    my @sorted_norm = sort {$a <=> $b} @$norm_data_ref;
+    my @sorted_abs = sort {$a <=> $b} @$abs_data_ref;
+    foreach my $p (@runq_norm_percentiles_to_calc) { $metrics{"NormRunQ_P".clean_perc_label($p)} = @sorted_norm ? calculate_percentile(\@sorted_norm, $p) : undef; }
+    foreach my $p (@runq_abs_percentiles_to_calc) { $metrics{"AbsRunQ_P".clean_perc_label($p)} = @sorted_abs ? calculate_percentile(\@sorted_abs, $p) : undef; }
+
+    return \%metrics;
+}
+
+# --- stream_data_for_state_from_temp ---
+#   - This function implements the efficient streaming part of the design.
+#   - It reads from the consolidated temporary files ONCE per state, instead
+#     of re-scanning all original NMON files. It handles "long" CSV format from temp files.
+sub stream_data_for_state_from_temp
+{
+    my ($state_obj, $physc_temp_file, $runq_temp_file, $filters_ref) = @_;
+
+    my @data_points;
+    my $vm_to_find = $state_obj->{vm_name};
+
+    # Pre-load all relevant RunQ data for the target VM into a hash for quick lookup.
+    # This is efficient as it avoids re-scanning the RunQ file for every PhysC point.
+    my %runq_data_for_vm;
+    if (defined $runq_temp_file && -s $runq_temp_file) {
+        open my $rq_fh, '<:encoding(utf8)', $runq_temp_file or die "Could not open temp RunQ file $runq_temp_file: $!";
+        my $ln = 0;
+        while(my $line = <$rq_fh>) {
+            chomp $line; $ln++;
+            next if $ln == 1; # Skip header line
+
+            my ($ts_str, $vm_name, $runq_val) = split ',', $line, 3;
+            next unless (defined $vm_name && $vm_name eq $vm_to_find);
+
+            $runq_data_for_vm{$ts_str} = (defined $runq_val && looks_like_number($runq_val)) ? $runq_val+0 : undef;
+        }
+        close $rq_fh;
+    }
+
+    # Stream the PhysC file and build the final data points array for the state.
+    open my $pc_fh, '<:encoding(utf8)', $physc_temp_file or die "Could not open temp PhysC file $physc_temp_file: $!";
+    my $ln = 0;
+    while(my $line = <$pc_fh>) {
+        chomp $line; $ln++;
+        next if $ln == 1; # Skip header line
+
+        my ($ts_str, $vm_name, $physc_val) = split ',', $line, 3;
+
+        # We only care about lines for the VM of the current state object.
+        next unless (defined $vm_name && $vm_name eq $vm_to_find);
+
+        my $tp;
+        eval { $tp = Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S"); };
+        next if ($@ || !$tp);
+
+        # --- Filtering Logic ---
+        # 1. State Window Filter (the primary filter)
+        next unless ($tp >= $state_obj->{start_time} && $tp <= $state_obj->{end_time});
+
+        # 2. Global Date Filters (--startdate, --enddate)
+        if (defined $filters_ref->{start_date_str} && $tp->ymd('-') lt $filters_ref->{start_date_str}) { next; }
+        if (defined $filters_ref->{end_date_str}   && $tp->ymd('-') gt $filters_ref->{end_date_str})   { next; }
+
+        # 3. Weekend Filter (--no-weekends)
+        if ($filters_ref->{no_weekends}) {
+            my $day_of_week = $tp->day_of_week;
+            next if ($day_of_week == 1 || $day_of_week == 7); # Skip Sunday (1) and Saturday (7)
+        }
+
+        # 4. Time-of-Day Filter (--online, --batch, --startt/--endt)
+        if ($filters_ref->{time_filter_active}) {
+            my $line_time = substr($tp->hms(':'), 0, 5);
+            my $include_line = 0;
+            if ($filters_ref->{time_filter_overnight}) {
+                $include_line = 1 if ($line_time ge $filters_ref->{time_filter_start} || $line_time lt $filters_ref->{time_filter_end});
+            } else {
+                $include_line = 1 if ($line_time ge $filters_ref->{time_filter_start} && $line_time lt $filters_ref->{time_filter_end});
+            }
+            next unless ($include_line);
+        }
+
+        # If the data point passed all filters, add it to the list for this state.
+        my $p_val = (defined $physc_val && looks_like_number($physc_val)) ? $physc_val+0 : undef;
+        my $r_val = $runq_data_for_vm{$ts_str} // undef; # Look up corresponding RunQ value
+
+        push @data_points, { ts => $ts_str, physc => $p_val, runq => $r_val, tp => $tp };
+    }
+    close $pc_fh;
+
+    return @data_points;
+}
+
+sub process_nmon_directory_to_tempfiles
+{
+    my ($dir, $physc_out_fh, $runq_out_fh) = @_;
+
+    my @nmon_files;
+    find(sub { push @nmon_files, $File::Find::name if -f && /\.nmon$/i; }, $dir);
+    die "Error: No .nmon files found in directory '$dir'.\n" unless @nmon_files;
+
+    # Write headers for the new "long" CSV format
+    print $physc_out_fh "Timestamp,VMName,PhysC\n";
+    print $runq_out_fh "Timestamp,VMName,RunQ\n";
+
+    foreach my $file_path (sort @nmon_files)
+    {
+        open my $fh, '<:encoding(utf8)', $file_path or do {
+            warn "Warning: Could not open '$file_path' for temp file creation: $!. Skipping.";
+            next;
+        };
+
+        my $vm_name;
+        my %zzzz_map;
+
+        while (my $line = <$fh>)
+        {
+            chomp $line; $line =~ s/\r$//;
+            my @fields = split ',', $line;
+            my $key = $fields[0];
+
+            if ($key eq 'AAA' && $fields[1] eq 'host') {
+                $vm_name = $fields[2];
+            }
+            elsif ($key eq 'ZZZZ') {
+                my ($t_num, $time, $date_str) = @fields[1..3];
+                my $tp_date;
+                eval { $tp_date = Time::Piece->strptime($date_str, "%d-%b-%Y"); };
+                if ($@ || !$tp_date) { eval { $tp_date = Time::Piece->strptime($date_str, "%d-%B-%Y"); }; }
+                next if ($@ || !$tp_date);
+                # Use the snapshot ID with the "T" prefix as the key
+                $zzzz_map{$t_num} = $tp_date->ymd . " " . $time;
+            }
+            elsif ($key eq 'LPAR') {
+                my $t_num = $fields[1]; # Do NOT strip the "T"
+                if (defined $zzzz_map{$t_num} && defined $vm_name) {
+                    my $physc_val = $fields[2];
+                    # Add your check here to ensure only numeric data is written
+                    if (defined $physc_val && looks_like_number($physc_val)) {
+                        print $physc_out_fh join(",", $zzzz_map{$t_num}, $vm_name, $physc_val) . "\n";
+                    }
+                }
+            }
+            elsif ($key eq 'CPU_ALL') {
+                my $t_num = $fields[1]; # Do NOT strip the "T"
+                if (defined $zzzz_map{$t_num} && defined $vm_name) {
+                    my $runq_val = $fields[6];
+                    # Add your check here to ensure only numeric data is written
+                    if (defined $runq_val && looks_like_number($runq_val)) {
+                        print $runq_out_fh join(",", $zzzz_map{$t_num}, $vm_name, $runq_val) . "\n";
+                    }
+                }
+            }
+        }
+        close $fh;
+    }
+}
+
+sub generate_run_summary_string {
+    my @summary_lines;
+    my $label_width = 25;
+
+    push @summary_lines, "\n------------------------------------------------------------------";
+    push @summary_lines, "Run Summary";
+    push @summary_lines, "------------------------------------------------------------------";
+
+    # Input Method
+    my $input_method = defined($nmon_dir) ? "--nmondir ($nmon_dir)" : "--physc-data ($physc_csv_file)";
+    push @summary_lines, sprintf("%-".$label_width."s: %s", "Input Method", $input_method);
+
+    # Primary Metric
+    my $p_label = sprintf("P%.2f", $percentile);
+    $p_label =~ s/\.?0+$//;
+    my $primary_metric = sprintf("%s (Percentile: %.2f)", $p_label, $percentile);
+    push @summary_lines, sprintf("%-".$label_width."s: %s", "Primary Metric", $primary_metric);
+
+    # Averaging
+    my $avg_details = uc($avg_method);
+    $avg_details .= sprintf(" (Window: %d min, PhysC Decay: %s)", $window_minutes, $decay_level) if $avg_method eq 'ema';
+    $avg_details .= sprintf(" (Window: %d min)", $window_minutes) if $avg_method eq 'sma';
+    push @summary_lines, sprintf("%-".$label_width."s: %s", "Averaging Method", $avg_details);
+
+    # RunQ
+    if (defined($runq_csv_file) || defined($nmon_dir)) {
+        my $runq_decay_str = ($runq_avg_method_str eq 'ema') ? ", Decay: $runq_decay_level_to_use" : "";
+        my $runq_details = sprintf("Enabled (SMT: %d, Avg Method: %s%s)", $smt_value, $runq_avg_method_str, $runq_decay_str);
+        push @summary_lines, sprintf("%-".$label_width."s: %s", "RunQ Analysis", $runq_details);
+
+        my $norm_perc_str = $runq_norm_perc_str eq '' ? 'none' : $runq_norm_perc_str;
+        my $abs_perc_str = $runq_abs_perc_str eq '' ? 'none' : $runq_abs_perc_str;
+        push @summary_lines, sprintf("%-".$label_width."s: Norm(%s), Abs(%s)", "RunQ Percentiles", $norm_perc_str, $abs_perc_str);
+    }
+
+    # Filters
+    my @filters;
+    push @filters, "Time ($time_filter_desc)" if $time_filter_active;
+    push @filters, "Weekends Excluded" if $no_weekends;
+    if (defined $filter_above_perc_value) {
+        my $perc_filter_label = sprintf("P%.2f", $filter_above_perc_value);
+        $perc_filter_label =~ s/\.?0+$//;
+        push @filters, "PhysC Perc (>= $perc_filter_label)";
+    }
+    push @summary_lines, sprintf("%-".$label_width."s: %s", "Filters Applied", join(', ', @filters)) if @filters;
+
+    # Decay / Growth
+    my $decay_status = $enable_windowed_decay_internal ? "Windowed Decay ON" : "Windowed Decay OFF";
+    my $growth_status = $enable_growth_prediction ? "Growth Prediction ON" : "Growth Prediction OFF";
+    push @summary_lines, sprintf("%-".$label_width."s: %s, %s", "Decay / Growth", $decay_status, $growth_status);
+
+#    push @summary_lines, "------------------------------------------------------------------";
+
+    return join("\n", @summary_lines) . "\n";
+}
+
 sub usage
 {
     my $script_name = $0;
@@ -2172,6 +2945,14 @@ Input Method (mutually exclusive):
   --physc-data, -pc <file> : Path to input CSV file with PhysC data.
   --runq-data, -rq <file>  : Path to input CSV file with RunQ data.
   --nmondir <directory>    : Path to a directory of .nmon files to process.
+
+NMON Directory State Management (NEW for v3, requires --nmondir):
+  --show-states            : Scans NMON files, prints a report of all detected configuration
+                             state windows for each VM, and exits.
+  --include-states <sel>   : Specifies which state windows to analyze. <sel> is a comma-
+                             separated list of state IDs or ranges (e.g., 'all', '1,3',
+                             '2-4', '-1' for the most recent). (Default: all)
+                             (--show-states and --include-states are mutually exclusive).
 
 Averaging Method (used within each window if decay enabled):
   --avg-method <method>    : Averaging method for PhysC: 'sma' or 'ema'. (Default: $DEFAULT_AVG_METHOD)
