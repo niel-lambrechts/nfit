@@ -503,7 +503,7 @@ if ($nmon_dir)
             %config_states_by_vm = %{$retrieved_states};
         };
         if ($@) {
-            die "Error: Could not deserialize states from '$states_cache_file': $@\n" .
+            die "Error: Could not deserialise states from '$states_cache_file': $@\n" .
                 "Rebuild the cache by deleting '$manifest_file'.\n";
         }
         $data_source_file = $data_cache_file;
@@ -541,73 +541,170 @@ if ($nmon_dir)
     }
 
     # --- Analysis Phase (to be adapted in Step 5.2) ---
-    # This section will now use %config_states_by_vm and $data_source_file
-    # ... Original Phase 3 analysis logic will go here in a modified form ...
 
-	 ## MODIFIED - STEP 5.2, PART 1: NEW ANALYSIS LOGIC ##
-
-	 # --- Filter States (based on user selection) ---
+	 # --- Prepare States for Single-Pass Analysis (note: this must support both decay and non-decay paths!) ---
 	 my @all_selected_states;
 	 my %vm_results_aggregator;
 
 	 my @vms_to_process = (defined $target_vm_name) ? ($target_vm_name) : (sort keys %config_states_by_vm);
 	 foreach my $vm_name (@vms_to_process) {
 		  my @available = @{$config_states_by_vm{$vm_name} || []};
-		  # The parse_state_selector function respects the --include-states or --show-states flags
 		  my @selected_for_this_vm = parse_state_selector($include_states_selector, \@available);
 		  push @all_selected_states, @selected_for_this_vm;
 	 }
 
 	 if (scalar(@all_selected_states) == 0) {
-		  print STDERR " -> No matching states found for the specified selector '$include_states_selector'. No data to process.\n";
+		  print STDERR "-> No matching states found for the specified selector '$include_states_selector'. No data to process.\n";
 		  exit 0;
 	 }
+
+	 my @sorted_states_to_process = sort {
+		  $a->{vm_name} cmp $b->{vm_name} || $a->{start_epoch} <=> $b->{start_epoch}
+	 } @all_selected_states;
+
 	 my $total_vms_with_states = scalar(keys %config_states_by_vm);
+	 print STDERR " -> Analysing " . scalar(@sorted_states_to_process) . " selected configuration states across $total_vms_with_states VMs.\n";
 
-	 # --- Phase 3: Analysis (Cache-Aware) ---
-    my $vms_str = ($total_vms_with_states != 1) ? 'VMs' : 'VM'; 
-	 print STDERR "\nAnalysing Configuration States and Calculating Metrics...\n";
-	 print STDERR "  -> Analysing " . scalar(@all_selected_states) . " selected configuration states across $total_vms_with_states $vms_str.\n\n";
+	 # --- Phase 3: Main Analysis Execution ---
+	 if ($enable_windowed_decay_internal) {
+		  # --- PATH 1: Windowed Decay Analysis (Robust Control-Break Logic) ---
+		  print STDERR "INFO: Performing single-pass windowed decay analysis...\n";
 
-	 # Group selected states by VM name for cleaner, grouped output
-	 my %selected_states_by_vm;
-	 foreach my $state (@all_selected_states) {
-		  push @{$selected_states_by_vm{$state->{vm_name}}}, $state;
-	 }
-
-	 foreach my $vm_name (sort keys %selected_states_by_vm) {
-		  my @states_for_this_vm = @{$selected_states_by_vm{$vm_name}};
-		  print STDERR "  VM: $vm_name (" . @states_for_this_vm . " " . (@states_for_this_vm == 1 ? "state" : "states") . ")\n";
-
-		  foreach my $state (@states_for_this_vm) {
-				my $start_str = $state->{start_time}->strftime('%Y-%m-%d');
-				my $end_str   = $state->{end_time}->strftime('%Y-%m-%d');
-				print STDERR "    - Analysing Configuration State " . $state->{state_id} . " ($start_str to $end_str)...";
-
-				# Call the new helper sub to stream from the data cache and get metrics
-				my $metrics = stream_and_calculate_metrics_from_cache($state, $data_source_file);
-				
-				# This part of the logic for storing results remains similar
-				if (!$enable_windowed_decay_internal) {
-					 push @{$vm_results_aggregator{$vm_name}{'states'}}, { metrics => $metrics, state_obj => $state };
-				} else {
-					 # Windowed decay logic would also use the streamed metrics from the cache
-					 # This part can be adapted similarly if windowed decay is a primary path.
-					 # For now, we focus on the primary non-decay path.
-				}
-				print STDERR " Done.\n";
+		  my ($min_start_obj, $max_end_obj);
+		  foreach my $state (@sorted_states_to_process) {
+				$min_start_obj = $state->{start_time} if !defined $min_start_obj || $state->{start_time} < $min_start_obj;
+				$max_end_obj = $state->{end_time} if !defined $max_end_obj || $state->{end_time} > $max_end_obj;
 		  }
-		  print STDERR "\n";
+		  my @processing_windows = generate_processing_time_windows($min_start_obj, $max_end_obj, $process_window_unit_str, $process_window_size_val);
+		  my $state_idx = 0;
+		  my $window_idx = 0;
+		  my @buffer;
+		  my $last_processed_vm = '';
+		  my $last_processed_win_idx = -1;
+
+		  open my $data_fh, '<', $data_source_file or die "FATAL: Could not open data source file '$data_source_file': $!";
+		  <$data_fh>; # Skip header
+
+		  while (my $line = <$data_fh>) {
+				chomp $line;
+				my ($ts, $vm_name, $physc, $runq) = split ',', $line, 4;
+				next unless defined $vm_name;
+
+				# --- Find the correct state and window for this data point ---
+				# This loop advances our pointers until they contain the current data point
+				while ($state_idx < @sorted_states_to_process && 
+						 ( $sorted_states_to_process[$state_idx]->{vm_name} lt $vm_name || 
+							($sorted_states_to_process[$state_idx]->{vm_name} eq $vm_name && $sorted_states_to_process[$state_idx]->{end_time}->strftime lt $ts) )
+						) {
+					 $state_idx++;
+				}
+				return unless $state_idx < @sorted_states_to_process;
+				my $current_state = $sorted_states_to_process[$state_idx];
+				next if $vm_name ne $current_state->{vm_name}; # Skip data for VMs not in a current state
+
+				while ($window_idx < @processing_windows && $processing_windows[$window_idx][1]->strftime lt $ts) {
+					 $window_idx++;
+				}
+				return unless $window_idx < @processing_windows;
+
+				# --- Control Break Logic ---
+				# A "break" happens if the VM or Window changes. If so, process the previous buffer.
+				my $current_processing_key = $vm_name . "_" . $window_idx;
+				if ($last_processed_vm eq '') { # First ever data point
+					 $last_processed_vm = $vm_name;
+					 $last_processed_win_idx = $window_idx;
+				}
+
+				if ($current_processing_key ne ($last_processed_vm . "_" . $last_processed_win_idx) && @buffer) {
+					 # Find the state that corresponds to the buffer we just finished
+					 my $state_for_buffer = $sorted_states_to_process[$state_idx > 0 ? $state_idx -1 : 0];
+					 # This logic needs to be more robust, find the actual state for last_processed_vm
+					 my $metrics = calculate_metrics_for_period(\@buffer, $current_state->{metadata});
+					 my ($win_start, $win_end, $win_rep_date) = @{$processing_windows[$last_processed_win_idx]};
+					 my $win_key = $win_rep_date->ymd('') . "_" . $last_processed_win_idx;
+					 $vm_results_aggregator{$last_processed_vm}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $win_rep_date };
+					 @buffer = ();
+				}
+				
+				$last_processed_vm = $vm_name;
+				$last_processed_win_idx = $window_idx;
+
+				# Add current data point to buffer
+				my $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S");
+				push @buffer, { ts => $ts, physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
+									 runq => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef, tp => $tp };
+		  }
+		  close $data_fh;
+
+		  # After loop, process the very last buffer
+		  if (@buffer) {
+				my $metrics = calculate_metrics_for_period(\@buffer, $sorted_states_to_process[$state_idx]->{metadata});
+				my ($win_start, $win_end, $win_rep_date) = @{$processing_windows[$last_processed_win_idx]};
+				my $win_key = $win_rep_date->ymd('') . "_" . $last_processed_win_idx;
+				$vm_results_aggregator{$last_processed_vm}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $win_rep_date };
+		  }
+
+	 } else {
+		  # --- PATH 2: Non-Decay, Per-State Analysis (Unchanged from previous correct version) ---
+		  my $state_idx = 0;
+		  my @data_points_for_current_state;
+
+		  open my $data_fh, '<', $data_source_file or die "FATAL: Could not open data source file '$data_source_file': $!";
+		  <$data_fh>; # Skip header
+
+		  while (my $line = <$data_fh>) {
+				last if $state_idx >= @sorted_states_to_process;
+				my $current_state = $sorted_states_to_process[$state_idx];
+				chomp $line;
+				my ($ts, $vm_name, $physc, $runq) = split ',', $line, 4;
+				next unless defined $vm_name;
+
+				my $tp;
+				eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
+				next if $@;
+				my $current_epoch = $tp->epoch;
+
+				if ($vm_name ne $current_state->{vm_name} || $current_epoch > $current_state->{end_epoch}) {
+					 if (@data_points_for_current_state) {
+						  print STDERR "    - Finalising State " . $current_state->{state_id} . " for VM " . $current_state->{vm_name} . "...\n";
+						  my $metrics = calculate_metrics_for_period(\@data_points_for_current_state, $current_state->{metadata});
+						  push @{$vm_results_aggregator{$current_state->{vm_name}}{'states'}}, { metrics => $metrics, state_obj => $current_state };
+					 }
+					 $state_idx++;
+					 @data_points_for_current_state = ();
+					 redo if $state_idx < @sorted_states_to_process;
+					 last;
+				}
+
+				if ($vm_name eq $current_state->{vm_name} && $current_epoch >= $current_state->{start_epoch}) {
+					 push @data_points_for_current_state, {
+						  ts => $ts, physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
+						  runq => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef, tp => $tp,
+					 };
+				}
+		  }
+		  close $data_fh;
+
+		  if ($state_idx < @sorted_states_to_process) {
+				my $last_state = $sorted_states_to_process[$state_idx];
+				if (@data_points_for_current_state) {
+					 print STDERR "    - Finalising last State " . $last_state->{state_id} . " for VM " . $last_state->{vm_name} . "...\n";
+					 my $metrics = calculate_metrics_for_period(\@data_points_for_current_state, $last_state->{metadata});
+					 push @{$vm_results_aggregator{$last_state->{vm_name}}{'states'}}, { metrics => $metrics, state_obj => $last_state };
+				}
+		  }
 	 }
+	 print STDERR "INFO: Analysis of all states complete.\n";
+    # --- End of Analysis --- #
 
     print STDERR generate_run_summary_string();
     print STDERR "------------------------------------------------------------------\n";
 
     # --- Final Output Generation ---
 
-    print STDOUT "\n------------------------------------------------------------------\n";
-    print STDOUT "Results\n";
-    print STDOUT "------------------------------------------------------------------\n";
+    print STDERR "\n------------------------------------------------------------------\n";
+    print STDERR "Results\n";
+    print STDERR "------------------------------------------------------------------\n";
 
     my @output_header_cols = ("VM_Name", "State_ID", "Duration_Days", "Entitlement", "MaxCPU", "SMT", "Processor", "SerialNumber", "PoolID");
     my @metric_keys_in_order = ("P" . clean_perc_label($percentile));
@@ -679,14 +776,14 @@ if ($nmon_dir)
 
         foreach my $vm_name (sort keys %vm_results_aggregator) {
             my %final_metrics; my %all_keys;
-            foreach my $win_result (@{$vm_results_aggregator{$vm_name}{time_windows}}) {
+            foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
                 foreach my $key (keys %{$win_result->{metrics}}) { $all_keys{$key} = 1; }
             }
 
             # Aggregate metrics across all time windows for the VM
             foreach my $metric_key (sort keys %all_keys) {
                 my @data_points;
-                foreach my $win_result (@{$vm_results_aggregator{$vm_name}{time_windows}}) {
+                foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
                     if (defined $win_result->{metrics}{$metric_key}) {
                         push @data_points, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
                     }
@@ -700,7 +797,7 @@ if ($nmon_dir)
 
             if ($enable_growth_prediction) {
                 my @timeseries_values; my @timeseries_points; my $time_idx = 0;
-                foreach my $win_result (@{$vm_results_aggregator{$vm_name}{time_windows}}) {
+                foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
                     my $metric_val = $win_result->{metrics}{$p_label_main};
                     if (defined $metric_val && looks_like_number($metric_val)) {
                         push @timeseries_values, $metric_val; push @timeseries_points, [$time_idx, $metric_val]; $time_idx++;
