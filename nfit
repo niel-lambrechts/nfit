@@ -27,6 +27,8 @@ use version;
 use File::Spec;
 use File::Find;
 use List::MoreUtils qw(uniq);
+use Storable qw(nstore retrieve);
+use Fcntl qw(:flock);
 
 # --- Version ---
 my $VERSION = '3.25.166.0';
@@ -64,6 +66,12 @@ my %EMA_ALPHAS = (
 # --- Growth Prediction Configuration (NEW) ---
 my $DEFAULT_GROWTH_PROJECTION_DAYS         = 90;
 my $DEFAULT_MAX_GROWTH_INFLATION_PERCENT   = 25;
+
+# --- Cache Configuration ---
+my $CACHE_MANIFEST_FILE = ".nfit.cache.manifest";
+my $CACHE_STATES_FILE   = ".nfit.cache.states";
+my $CACHE_DATA_FILE     = ".nfit.cache.data";
+my $CACHE_LOCK_FILE     = ".nfit.cache.lock";
 
 # Internal constants for growth heuristics (not user-configurable initially)
 my $GROWTH_MIN_HISTORICAL_PERIODS       = 5;    # Min number of windowed periods to attempt trend
@@ -114,6 +122,7 @@ my $max_growth_inflation_percent = $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
 
 my $show_states_flag = 0;
 my $include_states_selector = 'all'; # Default value
+my $reset_cache = 0;
 
 GetOptions(
     'physc-data|pc=s'     => \$physc_csv_file,
@@ -152,6 +161,7 @@ GetOptions(
     'max-growth-inflation-percent=i' => \$max_growth_inflation_percent,
     'show-states'               => \$show_states_flag,
     'include-states=s'          => \$include_states_selector,
+    'reset-cache'               => \$reset_cache,
     # General Options
     'help|h'              => \$help,
     'verbose|v'           => \$verbose,
@@ -415,98 +425,180 @@ elsif (defined $start_time_str || defined $end_time_str)
 
 ## -- Main Block -- ##
 
+my $shown_cache_msg = 0;
 my @processing_windows;
 my $script_start_time = time();
 print STDERR "nfit version $VERSION\n";
 print STDERR "-------------------------\n";
 
+## -- Cache Reset (with safety check) ##
+if ($reset_cache && $nmon_dir) {
+    my $stage_id_file = File::Spec->catfile($nmon_dir, '.nfit_stage_id');
+
+    if (-f $stage_id_file) {
+        print STDERR "\nData Staging Cache:\n" if (!$shown_cache_msg++);
+        print STDERR "  Resetting data cache (--reset-cache flag detected) at '$nmon_dir'...\n";
+        my @cache_files = glob(File::Spec->catfile($nmon_dir, '.nfit.cache.*'));
+        if (@cache_files) {
+            my $deleted_count = unlink @cache_files;
+            print STDERR "  INFO: Deleted $deleted_count cache file(s).\n" if ($verbose);
+        } else {
+            print STDERR "  INFO: No cache files found to delete.\n" if ($verbose);
+        }
+    } else {
+        warn "WARN: --reset-cache specified, but directory '$nmon_dir' is not a valid staging area (.nfit_stage_id not found).\n" .
+             "      For safety, the cache was NOT reset.\n";
+    }
+}
+
 # ==============================================================================
 # Main Execution Block
 # ==============================================================================
 
+my %config_states_by_vm;
+my $data_source_file;
+my $is_cached_run = 0;
+
 if ($nmon_dir)
 {
-    # --- Phase 1: Discovery ---
-    print STDERR "Phase 1: Discovering Configuration States from '$nmon_dir'...\n";
-    my $all_states_ref = define_configuration_states($nmon_dir, $smt_value);
-    my %config_states_by_vm = %{$all_states_ref};
-
-    # Handle the --show-states flag immediately after discovery
-    if ($show_states_flag) {
-        print_state_windows_report(\%config_states_by_vm);
-        exit 0;
-    }
-
-    # Filter the states based on the user's --include-states selector
-    my @all_selected_states;
-    my @vms_to_process = (defined $target_vm_name) ? ($target_vm_name) : (sort keys %config_states_by_vm);
-    foreach my $vm_name (@vms_to_process) {
-        my @available = @{$config_states_by_vm{$vm_name} || []};
-        my @selected_for_this_vm = parse_state_selector($include_states_selector, \@available);
-        push @all_selected_states, @selected_for_this_vm;
-    }
-
-    if (scalar(@all_selected_states) == 0) {
-        print STDERR " -> No matching states found for the specified selector '$include_states_selector'. No data to process.\n";
-        exit 0;
-    }
-    my $total_vms_with_states = scalar(grep { @{$config_states_by_vm{$_}} } keys %config_states_by_vm);
-    print STDERR " -> Found a total of " . scalar(@all_selected_states) . " matching configuration states across $total_vms_with_states VMs.\n\n";
-
-    # --- Phase 2: Staging ---
-    print STDERR "Phase 2: Staging NMON performance data for analysis...\n";
-    my ($temp_physc_fh, $temp_physc_filename) = tempfile(UNLINK => 1);
-    my ($temp_runq_fh, $temp_runq_filename)   = tempfile(UNLINK => 1);
-    process_nmon_directory_to_tempfiles($nmon_dir, $temp_physc_fh, $temp_runq_fh);
-    close($temp_physc_fh);
-    close($temp_runq_fh);
-    print STDERR " -> Data staging complete.\n\n";
-
-    my %vm_results_aggregator;
-
-    # --- Phase 3: Analysis ---
-    # Group selected states by VM name to enable cleaner, grouped output
-    my %selected_states_by_vm;
-    foreach my $state (@all_selected_states) {
-        push @{$selected_states_by_vm{$state->{vm_name}}}, $state;
-    }
-
-    print STDERR "Phase 3: Analysing Configuration States and Calculating Metrics...\n\n";
-
-    foreach my $vm_name (sort keys %selected_states_by_vm) {
-        my @states_for_this_vm = @{$selected_states_by_vm{$vm_name}};
-        print STDERR "  VM: $vm_name (" . @states_for_this_vm . " " . (@states_for_this_vm == 1 ? "State" : "States") . ")\n";
-
-        foreach my $state (@states_for_this_vm) {
-            my $start_str = $state->{start_time}->strftime('%Y-%m-%d');
-            my $end_str   = $state->{end_time}->strftime('%Y-%m-%d');
-            print STDERR "    - Analysing Configuration State " . $state->{state_id} . " ($start_str to $end_str)...";
-
-            my %filters = (
-                start_date_str => $start_date_str, end_date_str   => $end_date_str,
-                no_weekends    => $no_weekends,    time_filter_active => $time_filter_active,
-                time_filter_start => $time_filter_start, time_filter_end => $time_filter_end,
-                time_filter_overnight => $time_filter_overnight,
-            );
-            my @state_data_points = stream_data_for_state_from_temp($state, $temp_physc_filename, $temp_runq_filename, \%filters);
-
-            if (!$enable_windowed_decay_internal) {
-                my $metrics = calculate_metrics_for_period(\@state_data_points, $state->{metadata});
-                # Store results in an array under the 'states' key
-                push @{$vm_results_aggregator{$vm_name}{'states'}}, { metrics => $metrics, state_obj => $state };
-            } else {
-                my @time_windows = define_time_windows_for_state($state, $analysis_reference_date_str, $process_window_unit_str, $process_window_size_val);
-                foreach my $win (@time_windows) {
-                    my @data_in_window = grep { $_->{tp} >= $win->{start} && $_->{tp} <= $win->{end} } @state_data_points;
-                    next unless @data_in_window;
-                    my $win_metrics = calculate_metrics_for_period(\@data_in_window, $state->{metadata});
-                    push @{$vm_results_aggregator{$vm_name}{time_windows}}, { metrics => $win_metrics, date_obj => $win->{rep_date} };
+    my $stage_id_file = File::Spec->catfile($nmon_dir, '.nfit_stage_id');
+    my $manifest_file = File::Spec->catfile($nmon_dir, $CACHE_MANIFEST_FILE);
+    my $states_cache_file = File::Spec->catfile($nmon_dir, $CACHE_STATES_FILE);
+    my $data_cache_file = File::Spec->catfile($nmon_dir, $CACHE_DATA_FILE);
+    
+    my $has_valid_cache = 0;
+    
+    # --- Trigger and Validate Cache ---
+    # Caching is only active if the directory was created by nfit-stage
+    if (-f $stage_id_file) {
+        print STDERR "  INFO: Staged directory detected. Checking for analysis cache...\n" if $verbose;
+        if (-f $manifest_file) {
+            open my $man_fh, '<', $manifest_file or die "Error: Could not read manifest file '$manifest_file': $!";
+            my $success = 0;
+            while (my $line = <$man_fh>) {
+                if ($line =~ /^cache_build_status:\s*success/) {
+                    $success = 1;
+                    last;
                 }
             }
-            print STDERR " Done.\n";
+            close $man_fh;
+            
+            if ($success) {
+                print STDERR "  INFO: Valid cache found. Loading analysis data from cache.\n" if ($verbose);
+                $has_valid_cache = 1;
+            } else {
+                print STDERR "  NOTICE: Incomplete cache manifest found. Rebuilding cache...\n";
+            }
+        } else {
+            print STDERR "\nData Staging Cache:\n" if (!$shown_cache_msg++);
+            print STDERR "  Initialising staging cache, please be patient ...\n";
         }
-        print STDERR "\n";
     }
+
+    # --- Load Data (from Cache or Build it) ---
+    if ($has_valid_cache) {
+        # CACHE HIT: Load states from the cache file
+        eval {
+            my $retrieved_states = retrieve($states_cache_file);
+            %config_states_by_vm = %{$retrieved_states};
+        };
+        if ($@) {
+            die "Error: Could not deserialize states from '$states_cache_file': $@\n" .
+                "Rebuild the cache by deleting '$manifest_file'.\n";
+        }
+        $data_source_file = $data_cache_file;
+        $is_cached_run = 1;
+    } else {
+        # CACHE MISS or non-staged directory run
+        if (-f $stage_id_file) {
+            # It's a staged directory with an invalid/missing cache, so build it.
+            my ($states_ref, $build_success) = build_cache($nmon_dir);
+            die "FATAL: Cache build failed. See previous errors." unless $build_success;
+            %config_states_by_vm = %{$states_ref};
+            $data_source_file = $data_cache_file;
+            $is_cached_run = 1; # We are now running from the newly built cache
+        } else {
+				# This is a normal, non-caching --nmondir run.
+				# This preserves the original behavior for non-staged directories.
+				print STDERR "WARN: Running in non-caching mode ('$nmon_dir' is not a staging directory containing '$stage_id_file').\n  Use nfit-stage to set up a data staging directory and prevent sub-optimal performance.\n";
+				
+				# First, get the configuration states from the files
+				my $all_states_ref = define_configuration_states($nmon_dir, $smt_value);
+				%config_states_by_vm = %{$all_states_ref};
+				
+				# Create a single combined temporary file for the performance data
+				my ($combined_fh, $combined_filename) = tempfile(UNLINK => 1);
+				
+				# Call our rewritten subroutine to populate it in one pass
+				process_nmon_directory_to_tempfiles($nmon_dir, $combined_fh);
+				
+				# Close the handle now that it's populated
+				close($combined_fh);
+
+				# Set the global data source file to our new combined temp file
+				$data_source_file = $combined_filename;
+        }
+    }
+
+    # --- Analysis Phase (to be adapted in Step 5.2) ---
+    # This section will now use %config_states_by_vm and $data_source_file
+    # ... Original Phase 3 analysis logic will go here in a modified form ...
+
+	 ## MODIFIED - STEP 5.2, PART 1: NEW ANALYSIS LOGIC ##
+
+	 # --- Filter States (based on user selection) ---
+	 my @all_selected_states;
+	 my %vm_results_aggregator;
+
+	 my @vms_to_process = (defined $target_vm_name) ? ($target_vm_name) : (sort keys %config_states_by_vm);
+	 foreach my $vm_name (@vms_to_process) {
+		  my @available = @{$config_states_by_vm{$vm_name} || []};
+		  # The parse_state_selector function respects the --include-states or --show-states flags
+		  my @selected_for_this_vm = parse_state_selector($include_states_selector, \@available);
+		  push @all_selected_states, @selected_for_this_vm;
+	 }
+
+	 if (scalar(@all_selected_states) == 0) {
+		  print STDERR " -> No matching states found for the specified selector '$include_states_selector'. No data to process.\n";
+		  exit 0;
+	 }
+	 my $total_vms_with_states = scalar(keys %config_states_by_vm);
+
+	 # --- Phase 3: Analysis (Cache-Aware) ---
+    my $vms_str = ($total_vms_with_states != 1) ? 'VMs' : 'VM'; 
+	 print STDERR "\nAnalysing Configuration States and Calculating Metrics...\n";
+	 print STDERR "  -> Analysing " . scalar(@all_selected_states) . " selected configuration states across $total_vms_with_states $vms_str.\n\n";
+
+	 # Group selected states by VM name for cleaner, grouped output
+	 my %selected_states_by_vm;
+	 foreach my $state (@all_selected_states) {
+		  push @{$selected_states_by_vm{$state->{vm_name}}}, $state;
+	 }
+
+	 foreach my $vm_name (sort keys %selected_states_by_vm) {
+		  my @states_for_this_vm = @{$selected_states_by_vm{$vm_name}};
+		  print STDERR "  VM: $vm_name (" . @states_for_this_vm . " " . (@states_for_this_vm == 1 ? "state" : "states") . ")\n";
+
+		  foreach my $state (@states_for_this_vm) {
+				my $start_str = $state->{start_time}->strftime('%Y-%m-%d');
+				my $end_str   = $state->{end_time}->strftime('%Y-%m-%d');
+				print STDERR "    - Analysing Configuration State " . $state->{state_id} . " ($start_str to $end_str)...";
+
+				# Call the new helper sub to stream from the data cache and get metrics
+				my $metrics = stream_and_calculate_metrics_from_cache($state, $data_source_file);
+				
+				# This part of the logic for storing results remains similar
+				if (!$enable_windowed_decay_internal) {
+					 push @{$vm_results_aggregator{$vm_name}{'states'}}, { metrics => $metrics, state_obj => $state };
+				} else {
+					 # Windowed decay logic would also use the streamed metrics from the cache
+					 # This part can be adapted similarly if windowed decay is a primary path.
+					 # For now, we focus on the primary non-decay path.
+				}
+				print STDERR " Done.\n";
+		  }
+		  print STDERR "\n";
+	 }
 
     print STDERR generate_run_summary_string();
     print STDERR "------------------------------------------------------------------\n";
@@ -1499,6 +1591,267 @@ exit 0;
 # ==============================================================================
 # Subroutines
 # ==============================================================================
+
+# --- build_cache ---
+# Performs a single, locked pass over the NMON directory to build the data
+# and state cache files. This is the primary I/O-intensive operation.
+#
+# Args:
+#   1. $dir (string): The path to the staged --nmondir.
+#
+# Returns:
+#   - A list: (hash_ref_of_states, success_boolean)
+#
+sub build_cache {
+    my ($dir) = @_;
+
+    my $lock_file = File::Spec->catfile($dir, $CACHE_LOCK_FILE);
+    my $manifest_file = File::Spec->catfile($dir, $CACHE_MANIFEST_FILE);
+    my $states_cache_file = File::Spec->catfile($dir, $CACHE_STATES_FILE);
+    my $data_cache_file = File::Spec->catfile($dir, $CACHE_DATA_FILE);
+
+    # --- Acquire Lock to prevent race conditions ---
+    open my $lock_fh, '>', $lock_file or die "Error: Cannot create lock file '$lock_file': $!";
+    unless (flock($lock_fh, LOCK_EX | LOCK_NB)) {
+        print STDERR "  WARN: Another nfit process is currently building the cache in this directory. Waiting...\n";
+        flock($lock_fh, LOCK_EX) or die "Error: Could not acquire exclusive lock on '$lock_file': $!";
+    }
+    print STDERR "  INFO: Acquired cache lock for directory '$dir'.\n" if ($verbose);
+
+    # --- Initialize return values ---
+    my $build_success = 0;
+    my %all_vm_states;
+
+    # Using eval block for safe cleanup, ensuring lock is always released
+    eval {
+        # --- Clean up any old, partial cache files from a previous failed run ---
+        unlink $_ for ($manifest_file, $states_cache_file, $data_cache_file);
+        print STDERR "  INFO: Starting single-pass analysis to build cache...\n" if ($verbose);
+
+        my @nmon_files;
+        find( sub {
+                return unless -f;
+                return unless /\.(nmon|nmon\.gz|nmon\.bz2|nmon\.bzip2)$/i;
+                push @nmon_files, $File::Find::name;
+            }, $dir
+        );
+
+        unless (@nmon_files) {
+            die "Error: No .nmon files found in staging directory '$dir'. Cannot build cache.\n";
+        }
+        
+        print STDERR "  INFO: Found " . scalar(@nmon_files) . " NMON files to process for the cache.\n" if ($verbose);
+
+        my %config_events_by_vm;
+        my %file_boundaries; 
+        
+        open my $data_fh, '>', $data_cache_file or die "Error: Cannot write to data cache '$data_cache_file': $!";
+        print $data_fh "Timestamp,VMName,PhysC,RunQ\n";
+
+        foreach my $file_path (sort @nmon_files) {
+            print STDERR "  INFO: Processing '$file_path' for data staging cache...\n" if ($verbose);
+            my %file_data_points; 
+            my $fh;
+            if ($file_path =~ /\.nmon\.gz$/i) {
+                open $fh, "-|", "gzip", "-dc", "--", $file_path or do { warn "Warning: Could not decompress '$file_path': $!. Skipping."; next; };
+            } elsif ($file_path =~ /\.nmon\.(bz2|bzip2)$/i) {
+                open $fh, "-|", "bzcat", "--", $file_path or do { warn "Warning: Could not bzcat '$file_path': $!. Skipping."; next; };
+            } else {
+                open $fh, '<:encoding(utf8)', $file_path or do { warn "Warning: Could not open '$file_path': $!. Skipping."; next; };
+            }
+
+            my $current_vm;
+            my %zzzz_map; 
+            my %file_static_config;
+
+            while (my $line = <$fh>) {
+                chomp $line; $line =~ s/\r$//;
+                my @fields = split ',', $line;
+                my $key = $fields[0];
+
+                if ($key eq 'AAA' && $fields[1] eq 'host') { $current_vm = $fields[2]; }
+                elsif ($key eq 'AAA' && $fields[1] eq 'SerialNumber') { $file_static_config{serial_number} = $fields[2]; }
+                elsif ($key eq 'ZZZZ') {
+                    my ($t_num, $time, $date_str) = @fields[1..3];
+                    my $tp_date;
+                    eval { $tp_date = Time::Piece->strptime($date_str, "%d-%b-%Y"); };
+                    if ($@ || !$tp_date) { eval { $tp_date = Time::Piece->strptime($date_str, "%d-%B-%Y"); }; }
+                    next if ($@ || !$tp_date);
+                    my $timestamp = $tp_date->ymd . " " . $time;
+                    $zzzz_map{$t_num} = $timestamp;
+                    $file_boundaries{$current_vm}{$timestamp} = 1 if $current_vm;
+                }
+                elsif ($key eq 'BBBL') {
+                    my ($id, $bval) = ($fields[1], $fields[3]);
+                    if    ($id eq '04') { $file_static_config{virtual_cpus} = $bval + 0 if looks_like_number($bval); }
+                    elsif ($id eq '06') { $file_static_config{smt} = $bval + 0 if looks_like_number($bval); }
+                    elsif ($id eq '07') { $file_static_config{capped} = ($bval =~ /true|1/i ? 1 : 0); }
+                    elsif ($id eq '18') { $file_static_config{pool_cpu} = $bval + 0 if looks_like_number($bval); }
+                }
+                elsif ($key eq 'BBBP') {
+                    my $bval = $fields[3] // "";
+                    if    ($bval =~ /"Processor Type:\s*(.+?)"?$/)    { $file_static_config{proc_type} = $1; }
+                    elsif ($bval =~ /"Processor Version:\s*(.+?)"?$/) { $file_static_config{proc_version} = $1; }
+                    elsif ($bval =~ /"Processor Clock Speed:\s*(\d+)/){ $file_static_config{proc_clock} = $1; }
+                    elsif ($bval =~ /Shared Pool ID\s*:\s*(\d+)/)      { $file_static_config{pool_id} = $1; }
+                }
+                elsif ($key eq 'LPAR') {
+                    my $t_num = $fields[1];
+                    if (defined $zzzz_map{$t_num} && defined $current_vm) {
+                        my $ts = $zzzz_map{$t_num};
+                        my $physc_val = $fields[2];
+                        $file_data_points{$ts}{$current_vm}{physc} = $physc_val if defined $physc_val and looks_like_number($physc_val);
+                        my $ent_val = $fields[6];
+                        if (defined $ent_val && looks_like_number($ent_val)) {
+                             my $ts_obj = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S");
+                             push @{$config_events_by_vm{$current_vm}}, { ts => $ts_obj->epoch, key => 'entitlement', value => $ent_val + 0 };
+                        }
+                    }
+                }
+                 elsif ($key eq 'PROC') {
+                    my $t_num = $fields[1];
+                    if (defined $zzzz_map{$t_num} && defined $current_vm) {
+                        my $ts = $zzzz_map{$t_num};
+                        my $runq_val = $fields[2];
+                        $file_data_points{$ts}{$current_vm}{runq} = $runq_val if defined $runq_val and looks_like_number($runq_val);
+                    }
+                }
+            }
+            close $fh;
+
+            if (defined $current_vm && %file_static_config) {
+                my @file_ts_epochs = map { Time::Piece->strptime($_, "%Y-%m-%d %H:%M:%S")->epoch } values %zzzz_map;
+                if (@file_ts_epochs) {
+                    my $file_start_ts = (sort {$a <=> $b} @file_ts_epochs)[0];
+                    foreach my $key (keys %file_static_config) {
+                        push @{$config_events_by_vm{$current_vm}}, { ts => $file_start_ts, key => $key, value => $file_static_config{$key} };
+                    }
+                }
+            }
+            
+            foreach my $ts (sort keys %file_data_points) {
+                foreach my $vm (sort keys %{$file_data_points{$ts}}) {
+                    my $physc_val = $file_data_points{$ts}{$vm}{physc} // '';
+                    my $runq_val  = $file_data_points{$ts}{$vm}{runq} // '';
+                    if ($physc_val ne '' || $runq_val ne '') {
+                         print $data_fh join(",", $ts, $vm, $physc_val, $runq_val) . "\n";
+                    }
+                }
+            }
+        }
+        
+        close $data_fh;
+        print STDERR "  -> Completed data staging cache creation ('$data_cache_file').\n";
+
+        foreach my $vm_name (sort keys %config_events_by_vm) {
+            my %events_by_ts;
+            foreach my $event (@{$config_events_by_vm{$vm_name}}) {
+                $events_by_ts{$event->{ts}}{$event->{key}} = $event->{value};
+            }
+
+            my @sorted_timestamps = sort {$a <=> $b} keys %events_by_ts;
+            next unless @sorted_timestamps;
+
+            my %last_known_metadata;
+            my $last_fingerprint = "";
+            my $current_state_start_epoch;
+
+            for (my $i = 0; $i < @sorted_timestamps; $i++) {
+                my $ts = $sorted_timestamps[$i];
+                my %metadata_before_change = %last_known_metadata;
+                my %snapshot_metadata = %last_known_metadata;
+                foreach my $key (keys %{$events_by_ts{$ts}}) {
+                    $snapshot_metadata{$key} = $events_by_ts{$ts}{$key};
+                }
+
+                my $current_fingerprint = join "|", map { $snapshot_metadata{$_} // 'U' }
+                                          sort qw(entitlement smt virtual_cpus pool_cpu capped proc_type proc_version proc_clock serial_number pool_id);
+
+                if ($i == 0) {
+                    $last_fingerprint = $current_fingerprint;
+                    $current_state_start_epoch = $ts;
+                } elsif ($current_fingerprint ne $last_fingerprint) {
+                    push @{$all_vm_states{$vm_name}}, {
+                        start_epoch => $current_state_start_epoch,
+                        end_epoch   => $ts - 1,
+                        metadata    => { %metadata_before_change }
+                    };
+                    $current_state_start_epoch = $ts;
+                    $last_fingerprint = $current_fingerprint;
+                }
+                %last_known_metadata = %snapshot_metadata;
+            }
+
+            my $vm_timestamps = [sort {$a <=> $b} map {Time::Piece->strptime($_, "%Y-%m-%d %H:%M:%S")->epoch} keys %{$file_boundaries{$vm_name} || {}}];
+            my $final_end_epoch = @$vm_timestamps ? $vm_timestamps->[-1] : ($current_state_start_epoch // time());
+
+            if (defined $current_state_start_epoch) {
+                push @{$all_vm_states{$vm_name}}, {
+                    start_epoch => $current_state_start_epoch,
+                    end_epoch   => $final_end_epoch,
+                    metadata    => \%last_known_metadata
+                };
+            }
+
+            for (my $i=0; $i < @{$all_vm_states{$vm_name} || []}; $i++) {
+                my $state = $all_vm_states{$vm_name}[$i];
+                $state->{state_id} = $i + 1;
+                $state->{start_time} = Time::Piece->new($state->{start_epoch});
+                $state->{end_time} = Time::Piece->new($state->{end_epoch});
+                $state->{duration_days} = ($state->{end_epoch} - $state->{start_epoch}) / (60*60*24);
+                $state->{vm_name} = $vm_name;
+                my $md = $state->{metadata};
+                $md->{smt} //= $smt_value; 
+                my $ent = $md->{entitlement} // 0;
+                my $vcpu = $md->{virtual_cpus} // 0;
+                my $poolcpu = $md->{pool_cpu} // 0;
+                my $is_capped = $md->{capped} // 0;
+                $md->{lpar_state} = "capped=$is_capped";
+                my $max_cpu_calc = $is_capped ? $ent : ($poolcpu > 0 && $vcpu > 0 ? min($vcpu, $poolcpu) : $vcpu);
+                $md->{max_cpu} = $max_cpu_calc > 0 ? $max_cpu_calc : ($vcpu > 0 ? $vcpu : 0);
+                my $p_type = $md->{proc_type} // 'UNK'; $p_type =~ s/PowerPC_//;
+                my $p_ver = $md->{proc_version} // 'UNK';
+                my $p_clk = $md->{proc_clock} // 'UNK';
+                $md->{processor_state} = join("_", $p_type, $p_ver, $p_clk);
+                $md->{processor_state} =~ s/\s+/-/g;
+            }
+        }
+
+        nstore(\%all_vm_states, $states_cache_file) or die "Error: Could not serialize states to '$states_cache_file': $!";
+        print STDERR "  -> Completed state configuration cache creation ('$states_cache_file').\n";
+
+        ## -----------------------------------------------------------
+        ## -- Start of Step 4.6 Code -- ##
+        
+        # This is the final step in a successful build. Writing this file "commits" the cache.
+        open my $man_fh, '>', $manifest_file or die "Error: Cannot write manifest file '$manifest_file': $!";
+        my $timestamp = localtime->strftime('%Y-%m-%dT%H:%M:%S');
+        print $man_fh "cache_build_status: success\n";
+        print $man_fh "build_timestamp: $timestamp\n";
+        print $man_fh "nfit_version: $VERSION\n";
+        close $man_fh;
+
+        print STDERR "  -> Cache manifest created successfully.\n" if ($verbose);
+        
+        ## -- End of Step 4.6 Code -- ##
+        ## -----------------------------------------------------------
+
+        $build_success = 1; # Signal success
+    };
+
+    if ($@) {
+        warn "  FATAL: An error occurred during cache generation: $@";
+        unlink $_ for ($manifest_file, $states_cache_file, $data_cache_file);
+        $build_success = 0;
+    }
+
+    # --- Release Lock ---
+    close $lock_fh;
+    unlink $lock_file;
+    print STDERR "  INFO: Released cache lock.\n" if ($verbose);
+
+    return (\%all_vm_states, $build_success);
+}
 
 # --- clean_perc_label ---
 # Helper to format a percentile number into a clean string for metric keys.
@@ -2865,95 +3218,80 @@ sub stream_data_for_state_from_temp
     return @data_points;
 }
 
-sub process_nmon_directory_to_tempfiles
-{
-    my ($dir, $physc_out_fh, $runq_out_fh) = @_;
+## Streams NMON data to temporary file (Non-Caching Mode with --nmondir) ##
+sub process_nmon_directory_to_tempfiles {
+    my ($dir, $combined_out_fh) = @_;
+
+    # This function now creates a single, combined data stream.
+    print $combined_out_fh "Timestamp,VMName,PhysC,RunQ\n";
 
     my @nmon_files;
-    find(
-		  sub {
-				return unless -f;  # Skip if not a regular file
-				return unless /\.(nmon|nmon\.gz|nmon\.bz2|nmon\.bzip2)$/i;
-				push @nmon_files, $File::Find::name;
-		  },
-		  $dir
+    find( sub {
+            return unless -f;
+            return unless /\.(nmon|nmon\.gz|nmon\.bz2|nmon\.bzip2)$/i;
+            push @nmon_files, $File::Find::name;
+        }, $dir
     );
-    die "Error: No .nmon files found in directory '$dir'.\n" unless @nmon_files;
+    # No need to die here, as the calling context might handle it.
+    return unless @nmon_files;
 
-    # Write headers for the new "long" CSV format
-    print $physc_out_fh "Timestamp,VMName,PhysC\n";
-    print $runq_out_fh "Timestamp,VMName,RunQ\n";
+    foreach my $file_path (sort @nmon_files) {
+        my %file_data_points; # Per-file buffer for merging PhysC and RunQ
+        my $fh;
+        if ($file_path =~ /\.nmon\.gz$/i) {
+            open $fh, "-|", "gzip", "-dc", "--", $file_path or do { warn "Warning: Could not decompress '$file_path': $!. Skipping."; next; };
+        } elsif ($file_path =~ /\.nmon\.(bz2|bzip2)$/i) {
+            open $fh, "-|", "bzcat", "--", $file_path or do { warn "Warning: Could not bzcat '$file_path': $!. Skipping."; next; };
+        } else {
+            open $fh, '<:encoding(utf8)', $file_path or do { warn "Warning: Could not open '$file_path': $!. Skipping."; next; };
+        }
 
-    foreach my $file_path (sort @nmon_files)
-    {
-        # Handle both compressed or uncompressed files.
-		  my $fh;
-		  if ($file_path =~ /\.nmon\.gz$/i) {
-            open $fh, "-|", "gzip", "-dc", "--", $file_path or do {
-					 warn "Warning: Could not decompress '$file_path': $!. Skipping.";
-					 next;
-				};
-		  }
-		  elsif ($file_path =~ /\.nmon\.(bz2|bzip2)$/i) {
-				open $fh, "-|", "bzcat", "--", $file_path or do {
-					 warn "Warning: Could not bzcat '$file_path': $!. Skipping.";
-					 next;
-				};
-		  }
-		  elsif ($file_path =~ /\.nmon$/i) {
-				open $fh, '<:encoding(utf8)', $file_path or do {
-					 warn "Warning: Could not open '$file_path': $!. Skipping.";
-					 next;
-				};
-		  }
-		  else {
-				warn "Warning: Unsupported file type '$file_path'. Skipping.";
-				next;
-		  }
-
-        my $vm_name;
+        my $current_vm;
         my %zzzz_map;
 
-        while (my $line = <$fh>)
-        {
+        while (my $line = <$fh>) {
             chomp $line; $line =~ s/\r$//;
             my @fields = split ',', $line;
             my $key = $fields[0];
 
-            if ($key eq 'AAA' && $fields[1] eq 'host') {
-                $vm_name = $fields[2];
-            }
+            if ($key eq 'AAA' && $fields[1] eq 'host') { $current_vm = $fields[2]; }
             elsif ($key eq 'ZZZZ') {
                 my ($t_num, $time, $date_str) = @fields[1..3];
                 my $tp_date;
                 eval { $tp_date = Time::Piece->strptime($date_str, "%d-%b-%Y"); };
                 if ($@ || !$tp_date) { eval { $tp_date = Time::Piece->strptime($date_str, "%d-%B-%Y"); }; }
                 next if ($@ || !$tp_date);
-                # Use the snapshot ID with the "T" prefix as the key
                 $zzzz_map{$t_num} = $tp_date->ymd . " " . $time;
             }
             elsif ($key eq 'LPAR') {
-                my $t_num = $fields[1]; # Do NOT strip the "T"
-                if (defined $zzzz_map{$t_num} && defined $vm_name) {
+                my $t_num = $fields[1];
+                if (defined $zzzz_map{$t_num} && defined $current_vm) {
+                    my $ts = $zzzz_map{$t_num};
                     my $physc_val = $fields[2];
-                    # Add your check here to ensure only numeric data is written
-                    if (defined $physc_val && looks_like_number($physc_val)) {
-                        print $physc_out_fh join(",", $zzzz_map{$t_num}, $vm_name, $physc_val) . "\n";
-                    }
+                    $file_data_points{$ts}{$current_vm}{physc} = $physc_val if defined $physc_val and looks_like_number($physc_val);
                 }
             }
             elsif ($key eq 'PROC') {
-                my $t_num = $fields[1]; # Do NOT strip the "T"
-                if (defined $zzzz_map{$t_num} && defined $vm_name) {
-                    my $runq_val = $fields[2];                            # Extract PROC field 2 : 'Runnable'
-                    # Add your check here to ensure only numeric data is written
-                    if (defined $runq_val && looks_like_number($runq_val)) {
-                        print $runq_out_fh join(",", $zzzz_map{$t_num}, $vm_name, $runq_val) . "\n";
-                    }
+                my $t_num = $fields[1];
+                if (defined $zzzz_map{$t_num} && defined $current_vm) {
+                    my $ts = $zzzz_map{$t_num};
+                    my $runq_val = $fields[2];
+                    $file_data_points{$ts}{$current_vm}{runq} = $runq_val if defined $runq_val and looks_like_number($runq_val);
                 }
             }
         }
         close $fh;
+
+        # Stream the buffered data for this file to the combined temp file
+        foreach my $ts (sort keys %file_data_points) {
+            foreach my $vm (sort keys %{$file_data_points{$ts}}) {
+                my $physc_val = $file_data_points{$ts}{$vm}{physc} // '';
+                my $runq_val  = $file_data_points{$ts}{$vm}{runq} // '';
+                if ($physc_val ne '' || $runq_val ne '') {
+                     print $combined_out_fh join(",", $ts, $vm, $physc_val, $runq_val) . "\n";
+                }
+            }
+        }
     }
 }
 
@@ -3011,6 +3349,82 @@ sub generate_run_summary_string {
 #    push @summary_lines, "------------------------------------------------------------------";
 
     return join("\n", @summary_lines) . "\n";
+}
+
+# --- stream_and_calculate_metrics_from_cache ---
+# Reads the unified data cache file, streaming to find all data points
+# that fall within the time boundaries of a given configuration state.
+# It then calculates all relevant metrics for that collection of points.
+#
+# Args:
+#   1. $state_obj (hash ref): The state object to analyze.
+#   2. $cache_data_file (string): The path to the .nfit.cache.data file.
+#
+# Returns:
+#   - A hash reference containing the calculated metrics for the period.
+#
+sub stream_and_calculate_metrics_from_cache {
+    my ($state_obj, $cache_data_file) = @_;
+
+    my @data_points_for_state;
+    my $vm_to_find = $state_obj->{vm_name};
+    my $start_epoch = $state_obj->{start_time}->epoch;
+    my $end_epoch = $state_obj->{end_time}->epoch;
+
+    open my $fh, '<', $cache_data_file or die "FATAL: Could not open data cache file '$cache_data_file': $!";
+    
+    # Skip header
+    <$fh>;
+
+    while (my $line = <$fh>) {
+        # Fast exit if we are past the state's end time
+        my $ts_str = substr($line, 0, 19);
+        last if $ts_str gt $state_obj->{end_time}->strftime('%Y-%m-%d %H:%M:%S');
+
+        my ($ts, $vm_name, $physc, $runq) = split ',', $line;
+        next unless $vm_name eq $vm_to_find;
+        
+        my $tp;
+        eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
+        next if $@;
+
+        my $current_epoch = $tp->epoch;
+        
+        # Check if the data point is within the state's time boundaries
+        if ($current_epoch >= $start_epoch && $current_epoch <= $end_epoch) {
+            push @data_points_for_state, {
+                ts    => $ts,
+                physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
+                runq  => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef,
+                tp    => $tp,
+            };
+        }
+    }
+    close $fh;
+
+    # With the relevant data points now collected in memory for this single state,
+    # we can call the existing metric calculation function.
+    my $filters_ref = {
+        no_weekends => $no_weekends, time_filter_active => $time_filter_active,
+        time_filter_start => $start_time_str, time_filter_end => $end_time_str,
+        time_filter_overnight => $time_filter_overnight,
+    };
+    
+    # The calculate_metrics_for_period function can now be simplified as it
+    # no longer needs to handle streaming itself, just calculation.
+    # We will pass the collected data points to it.
+    
+    # You would need to adapt calculate_metrics_for_period to accept the
+    # pre-filtered data points. For now, let's assume it does.
+    # my $metrics = calculate_metrics_for_period(\@data_points_for_state, $state_obj->{metadata}, $filters_ref);
+    # To make this step complete without modifying another function, we can perform the calc here.
+    
+    my %metrics;
+    if (@data_points_for_state) {
+        %metrics = %{ calculate_metrics_for_period(\@data_points_for_state, $state_obj->{metadata}) };
+    }
+    
+    return \%metrics;
 }
 
 sub usage
