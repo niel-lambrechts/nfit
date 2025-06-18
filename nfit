@@ -540,8 +540,7 @@ if ($nmon_dir)
         }
     }
 
-    # --- Analysis Phase (to be adapted in Step 5.2) ---
-
+    # --- Analysis Phase ---
 	 # --- Prepare States for Single-Pass Analysis (note: this must support both decay and non-decay paths!) ---
 	 my @all_selected_states;
 	 my %vm_results_aggregator;
@@ -567,20 +566,21 @@ if ($nmon_dir)
 
 	 # --- Phase 3: Main Analysis Execution ---
 	 if ($enable_windowed_decay_internal) {
-		  # --- PATH 1: Windowed Decay Analysis (Robust Control-Break Logic) ---
+		  # --- PATH 1: Windowed Decay Analysis (Final Robust Logic) ---
 		  print STDERR "INFO: Performing single-pass windowed decay analysis...\n";
 
 		  my ($min_start_obj, $max_end_obj);
 		  foreach my $state (@sorted_states_to_process) {
-				$min_start_obj = $state->{start_time} if !defined $min_start_obj || $state->{start_time} < $min_start_obj;
-				$max_end_obj = $state->{end_time} if !defined $max_end_obj || $state->{end_time} > $max_end_obj;
+				$min_start_obj = $state->{start_time} if !defined $min_start_obj || $state->{start_time}->epoch < $min_start_obj->epoch;
+				$max_end_obj = $state->{end_time} if !defined $max_end_obj || $state->{end_time}->epoch > $max_end_obj->epoch;
 		  }
 		  my @processing_windows = generate_processing_time_windows($min_start_obj, $max_end_obj, $process_window_unit_str, $process_window_size_val);
-		  my $state_idx = 0;
-		  my $window_idx = 0;
+
 		  my @buffer;
-		  my $last_processed_vm = '';
-		  my $last_processed_win_idx = -1;
+		  my $processing_key = '';
+		  my $buffer_metadata = undef;
+		  my $buffer_rep_date = undef;
+		  my $buffer_win_idx = -1;
 
 		  open my $data_fh, '<', $data_source_file or die "FATAL: Could not open data source file '$data_source_file': $!";
 		  <$data_fh>; # Skip header
@@ -590,62 +590,67 @@ if ($nmon_dir)
 				my ($ts, $vm_name, $physc, $runq) = split ',', $line, 4;
 				next unless defined $vm_name;
 
-				# --- Find the correct state and window for this data point ---
-				# This loop advances our pointers until they contain the current data point
-				while ($state_idx < @sorted_states_to_process && 
-						 ( $sorted_states_to_process[$state_idx]->{vm_name} lt $vm_name || 
-							($sorted_states_to_process[$state_idx]->{vm_name} eq $vm_name && $sorted_states_to_process[$state_idx]->{end_time}->strftime lt $ts) )
-						) {
-					 $state_idx++;
-				}
-				return unless $state_idx < @sorted_states_to_process;
-				my $current_state = $sorted_states_to_process[$state_idx];
-				next if $vm_name ne $current_state->{vm_name}; # Skip data for VMs not in a current state
+				my $tp;
+				eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
+				next if $@;
 
-				while ($window_idx < @processing_windows && $processing_windows[$window_idx][1]->strftime lt $ts) {
-					 $window_idx++;
-				}
-				return unless $window_idx < @processing_windows;
+				my $current_win_idx = get_window_index_for_timestamp($tp, \@processing_windows);
+				next unless defined $current_win_idx;
 
-				# --- Control Break Logic ---
-				# A "break" happens if the VM or Window changes. If so, process the previous buffer.
-				my $current_processing_key = $vm_name . "_" . $window_idx;
-				if ($last_processed_vm eq '') { # First ever data point
-					 $last_processed_vm = $vm_name;
-					 $last_processed_win_idx = $window_idx;
+				my ($current_state) = grep { $_->{vm_name} eq $vm_name && $tp->epoch >= $_->{start_epoch} && $tp->epoch <= $_->{end_epoch} } @sorted_states_to_process;
+				next unless $current_state;
+
+				my $new_key = $vm_name . "_" . $current_win_idx;
+
+				if ($processing_key eq '') {
+					 $processing_key = $new_key;
+					 $buffer_metadata = $current_state->{metadata};
+					 $buffer_rep_date = $processing_windows[$current_win_idx][2];
+					 $buffer_win_idx = $current_win_idx;
 				}
 
-				if ($current_processing_key ne ($last_processed_vm . "_" . $last_processed_win_idx) && @buffer) {
-					 # Find the state that corresponds to the buffer we just finished
-					 my $state_for_buffer = $sorted_states_to_process[$state_idx > 0 ? $state_idx -1 : 0];
-					 # This logic needs to be more robust, find the actual state for last_processed_vm
-					 my $metrics = calculate_metrics_for_period(\@buffer, $current_state->{metadata});
-					 my ($win_start, $win_end, $win_rep_date) = @{$processing_windows[$last_processed_win_idx]};
-					 my $win_key = $win_rep_date->ymd('') . "_" . $last_processed_win_idx;
-					 $vm_results_aggregator{$last_processed_vm}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $win_rep_date };
+				if ($new_key ne $processing_key && @buffer) {
+					 my $metrics = calculate_metrics_for_period(\@buffer, $buffer_metadata);
+					 my $win_key = $buffer_rep_date->ymd('') . "_" . $buffer_win_idx;
+					 $vm_results_aggregator{$buffer_metadata->{vm_name}}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $buffer_rep_date };
 					 @buffer = ();
 				}
 				
-				$last_processed_vm = $vm_name;
-				$last_processed_win_idx = $window_idx;
+				$processing_key = $new_key;
+				$buffer_metadata = $current_state->{metadata};
+				$buffer_rep_date = $processing_windows[$current_win_idx][2];
+				$buffer_win_idx = $current_win_idx;
 
-				# Add current data point to buffer
-				my $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S");
+				# --- TIME FILTER LOGIC (CORRECT PLACEMENT) ---
+				if ($no_weekends) {
+					 my $day_of_week = $tp->day_of_week;
+					 next if ($day_of_week == 1 || $day_of_week == 7);
+				}
+				if ($time_filter_active) {
+					 my $line_time = substr($tp->hms(':'), 0, 5);
+					 my $include_line = 0;
+					 if ($time_filter_overnight) {
+						  $include_line = 1 if ($line_time ge $time_filter_start || $line_time lt $time_filter_end);
+					 } else {
+						  $include_line = 1 if ($line_time ge $time_filter_start && $line_time lt $time_filter_end);
+					 }
+					 next unless $include_line;
+				}
+				# --- END TIME FILTER LOGIC ---
+
 				push @buffer, { ts => $ts, physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
 									 runq => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef, tp => $tp };
 		  }
 		  close $data_fh;
 
-		  # After loop, process the very last buffer
-		  if (@buffer) {
-				my $metrics = calculate_metrics_for_period(\@buffer, $sorted_states_to_process[$state_idx]->{metadata});
-				my ($win_start, $win_end, $win_rep_date) = @{$processing_windows[$last_processed_win_idx]};
-				my $win_key = $win_rep_date->ymd('') . "_" . $last_processed_win_idx;
-				$vm_results_aggregator{$last_processed_vm}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $win_rep_date };
+		  if (@buffer && defined $buffer_metadata) {
+				my $metrics = calculate_metrics_for_period(\@buffer, $buffer_metadata);
+				my $win_key = $buffer_rep_date->ymd('') . "_" . $buffer_win_idx;
+				$vm_results_aggregator{$buffer_metadata->{vm_name}}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $buffer_rep_date };
 		  }
 
 	 } else {
-		  # --- PATH 2: Non-Decay, Per-State Analysis (Unchanged from previous correct version) ---
+		  # --- PATH 2: Non-Decay, Per-State Analysis ---
 		  my $state_idx = 0;
 		  my @data_points_for_current_state;
 
@@ -677,6 +682,23 @@ if ($nmon_dir)
 				}
 
 				if ($vm_name eq $current_state->{vm_name} && $current_epoch >= $current_state->{start_epoch}) {
+					 # --- RE-INSTATED TIME FILTER LOGIC ---
+					 if ($no_weekends) {
+						  my $day_of_week = $tp->day_of_week;
+						  next if ($day_of_week == 1 || $day_of_week == 7);
+					 }
+					 if ($time_filter_active) {
+						  my $line_time = substr($tp->hms(':'), 0, 5);
+						  my $include_line = 0;
+						  if ($time_filter_overnight) {
+								$include_line = 1 if ($line_time ge $time_filter_start || $line_time lt $time_filter_end);
+						  } else {
+								$include_line = 1 if ($line_time ge $time_filter_start && $line_time lt $time_filter_end);
+						  }
+						  next unless $include_line;
+					 }
+					 # --- END TIME FILTER LOGIC ---
+
 					 push @data_points_for_current_state, {
 						  ts => $ts, physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
 						  runq => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef, tp => $tp,
@@ -775,20 +797,29 @@ if ($nmon_dir)
         $analysis_ref_obj = $analysis_ref_obj->truncate(to => 'day');
 
         foreach my $vm_name (sort keys %vm_results_aggregator) {
+
             my %final_metrics; my %all_keys;
             foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
                 foreach my $key (keys %{$win_result->{metrics}}) { $all_keys{$key} = 1; }
             }
 
-            # Aggregate metrics across all time windows for the VM
+            # Aggregate metrics across all time windows for the VM using recency weighting
             foreach my $metric_key (sort keys %all_keys) {
-                my @data_points;
+                my @metric_values_across_windows;
                 foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
                     if (defined $win_result->{metrics}{$metric_key}) {
-                        push @data_points, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
+                        push @metric_values_across_windows, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
                     }
                 }
-                $final_metrics{$metric_key} = calculate_recency_weighted_average(\@data_points, $analysis_ref_obj, $decay_half_life_days_val);
+
+                # For all other (non-peak) metrics, apply the recency weighted average
+                if ($metric_key ne 'Peak') {
+						  $final_metrics{$metric_key} = calculate_recency_weighted_average(\@metric_values_across_windows, $analysis_ref_obj, $decay_half_life_days_val);
+                } else {
+                    # Peak is an absolute max, do not apply decay
+						  my @values = map { $_->{value} } grep { defined $_->{value} && looks_like_number($_->{value}) } @metric_values_across_windows;
+						  $final_metrics{$metric_key} = @values ? max(@values) : "N/A";
+                }
             }
 
             # --- Growth Prediction logic for aggregated result ---
@@ -830,6 +861,12 @@ if ($nmon_dir)
             }
 
             # --- Print the single aggregated output line ---
+				my ($last_state_obj) = grep { $_->{vm_name} eq $vm_name } reverse @sorted_states_to_process;
+
+				unless ($last_state_obj) {
+					 print STDERR "WARN: Could not find a valid state object for VM '$vm_name' to print metadata. Skipping.\n";
+					 next;
+				}
             my $last_state_metadata = {};
             if (exists $config_states_by_vm{$vm_name} && @{$config_states_by_vm{$vm_name}}) {
                 $last_state_metadata = $config_states_by_vm{$vm_name}[-1]->{metadata};
@@ -1897,6 +1934,7 @@ sub build_cache {
                 $state->{end_time} = Time::Piece->new($state->{end_epoch});
                 $state->{duration_days} = ($state->{end_epoch} - $state->{start_epoch}) / (60*60*24);
                 $state->{vm_name} = $vm_name;
+                $state->{metadata}{vm_name} = $vm_name;
                 my $md = $state->{metadata};
                 $md->{smt} //= $smt_value; 
                 my $ent = $md->{entitlement} // 0;
@@ -3522,6 +3560,16 @@ sub stream_and_calculate_metrics_from_cache {
     }
     
     return \%metrics;
+}
+
+sub get_window_index_for_timestamp {
+    my ($timestamp_obj, $windows_aref) = @_;
+    my $ts_epoch = $timestamp_obj->epoch;
+    for (my $i=0; $i < @{$windows_aref}; $i++) {
+        my ($win_start, $win_end) = @{$windows_aref->[$i]};
+        return $i if ($ts_epoch >= $win_start->epoch && $ts_epoch <= $win_end->epoch);
+    }
+    return undef;
 }
 
 sub usage
