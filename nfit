@@ -438,14 +438,19 @@ my $script_start_time = time();
 print STDERR "nfit version $VERSION\n";
 print STDERR "-------------------------\n";
 
-## -- Cache Reset (with safety check) ##
+## -- L1/L2 Cache Reset (with safety check) ##
 if ($reset_cache && $nmon_dir) {
     my $stage_id_file = File::Spec->catfile($nmon_dir, '.nfit_stage_id');
 
     if (-f $stage_id_file) {
         print STDERR "\nData Staging Cache:\n" if (!$shown_cache_msg++);
         print STDERR "  Resetting data cache (--reset-cache flag detected) at '$nmon_dir'...\n";
+
+        # Add the L2 Results cache file to the list of files to be deleted.
         my @cache_files = glob(File::Spec->catfile($nmon_dir, '.nfit.cache.*'));
+        my $results_cache_file = File::Spec->catfile($nmon_dir, '.nfit.cache.results');
+        push @cache_files, $results_cache_file if -f $results_cache_file;
+
         if (@cache_files) {
             my $deleted_count = unlink @cache_files;
             print STDERR "  INFO: Deleted $deleted_count cache file(s).\n" if ($verbose);
@@ -462,10 +467,47 @@ if ($reset_cache && $nmon_dir) {
 # Main Execution Block
 # ==============================================================================
 
+# --- L2 Cache Variables ---
+my $L2_RESULTS_CACHE_FILE = ".nfit.cache.results";
+my @final_output_lines; # Buffer for all STDOUT to enable caching the result.
+
 my %config_states_by_vm;
 my $data_source_file;
 my $is_cached_run = 0;
 my $cachedir = (defined $nmon_dir) ? $nmon_dir : $physc_csv_dirname;
+
+# --- L2 Results Cache Lookup ---
+# This block attempts to find a pre-calculated result to avoid all further processing.
+my $canonical_key = generate_canonical_key();
+my $stage_id_file_for_l2 = File::Spec->catfile($cachedir, '.nfit_stage_id');
+
+if (-f $stage_id_file_for_l2)
+{
+    my $results_cache_path = File::Spec->catfile($cachedir, $L2_RESULTS_CACHE_FILE);
+    my $l2_lock_file_path  = File::Spec->catfile($cachedir, $CACHE_LOCK_FILE);
+
+    # Check if the L1 cache manifest is newer than the L2 results cache.
+    # If so, the L2 cache is stale and should not be used.
+    my $manifest_path = File::Spec->catfile($cachedir, $CACHE_MANIFEST_FILE);
+    my $results_cache_is_stale = 0;
+    if (-f $manifest_path and -f $results_cache_path) {
+        if ((stat($manifest_path))[9] > (stat($results_cache_path))[9]) {
+            $results_cache_is_stale = 1;
+            print STDERR "  NOTICE: L2 Results cache is older than L1 Data cache. Ignoring L2 cache.\n" if $verbose;
+        }
+    }
+
+    unless ($results_cache_is_stale)
+    {
+        my $cached_result = lookup_cached_result($canonical_key, $results_cache_path);
+        if (defined $cached_result)
+        {
+            print STDERR "  L2 Cache HIT. Returning cached result.\n" if $verbose;
+            print STDOUT $cached_result . "\n";
+            exit 0;
+        }
+    }
+}
 
 # --- Trigger and Validate Cache ---
 my $stage_id_file = File::Spec->catfile($cachedir, '.nfit_stage_id');
@@ -501,6 +543,7 @@ if (-f $stage_id_file) {
 
 # --- Load Data (from Cache or Build it) ---
 if ($has_valid_cache) {
+				print STDERR "\nData Staging Cache:\n" if (!$shown_cache_msg++);
 				# CACHE HIT: Load states from the cache file
 				eval {
 								my $retrieved_states = retrieve($states_cache_file);
@@ -510,6 +553,7 @@ if ($has_valid_cache) {
 								die "Error: Could not deserialise states from '$states_cache_file': $@\n" .
 												"Rebuild the cache by deleting '$manifest_file'.\n";
 				}
+				printf STDERR "  Loaded %d cached configuration states.\n", scalar keys %config_states_by_vm;
 				$data_source_file = $data_cache_file;
 				$is_cached_run = 1;
 } else {
@@ -801,7 +845,7 @@ if ($physc_csv_file) {
 																my $state_obj = $result->{state_obj};
 																my $md        = $result->{state_obj}{metadata};
 
-# Build the descriptive state identifier prefix
+																# Build the descriptive state identifier prefix
 																my $state_prefix = sprintf("%s:State-%d_of_%d (%s_to_%s)",
 																								$vm_name,
 																								$state_obj->{state_id},
@@ -812,7 +856,7 @@ if ($physc_csv_file) {
 
 																my @output_parts = ($state_prefix);
 
-# Push metadata key-value pairs
+																# Push metadata key-value pairs
 																push @output_parts, sprintf("Entitlement=%.2f", $md->{entitlement} // 0);
 																push @output_parts, sprintf("MaxCPU=%.2f", $md->{max_cpu} // 0);
 																push @output_parts, sprintf("SMT=%d", $md->{smt} // 0);
@@ -820,7 +864,7 @@ if ($physc_csv_file) {
 																push @output_parts, sprintf("SerialNumber=%s", $md->{serial_number} // '');
 																push @output_parts, sprintf("PoolID=%s", $md->{pool_id} // '');
 
-# Push metric key-value pairs
+																# Push metric key-value pairs
 																my @metric_keys = sort keys %{$result->{metrics}};
 																foreach my $key (@metric_keys) {
 																				my $val = $result->{metrics}{$key};
@@ -828,8 +872,9 @@ if ($physc_csv_file) {
 																				push @output_parts, "$key=$val_str";
 																}
 
-# Final print statement, joined by spaces
-																print STDOUT join(" ", @output_parts) . "\n";
+																# Final print statement, joined by spaces (buffered, for results cache)
+																push @final_output_lines, join(" ", @output_parts);
+
 												}
 								}
 				} else {
@@ -909,7 +954,7 @@ if ($physc_csv_file) {
 																$final_metrics{$p_label_main} += $growth_adj_value;
 												}
 
-# --- Print the single aggregated output line ---
+												# --- Print the single aggregated output line ---
 												my ($last_state_obj) = grep { $_->{vm_name} eq $vm_name } reverse @sorted_states_to_process;
 
 												unless ($last_state_obj) {
@@ -921,7 +966,7 @@ if ($physc_csv_file) {
 																$last_state_metadata = $config_states_by_vm{$vm_name}[-1]->{metadata};
 												}
 
-# --- Print the single aggregated output line ---
+												# --- Print the single aggregated output line ---
 												my $output_string = "$vm_name:";
 
 												$output_string .= sprintf(" Entitlement=%.2f", $last_state_metadata->{entitlement} // 0);
@@ -937,9 +982,28 @@ if ($physc_csv_file) {
 																my $val_str = defined($val) && looks_like_number($val) ? sprintf("%.${output_dp}f", apply_rounding($val, $round_increment, $rounding_method)) : "N/A";
 																$output_string .= " $key=$val_str";
 												}
-												print STDOUT $output_string . "\n";
+            # buffered for results cache
+												push @final_output_lines, $output_string;
 								}
 				}
+}
+
+# --- L2 Cache Save and Final Output ---
+if (@final_output_lines)
+{
+    my $final_output_string = join("\n", @final_output_lines);
+
+    # If we are in a cacheable context (a staged directory), save the result.
+    if (-f $stage_id_file_for_l2)
+    {
+        my $results_cache_path = File::Spec->catfile($cachedir, $L2_RESULTS_CACHE_FILE);
+        my $l2_lock_file_path  = File::Spec->catfile($cachedir, $CACHE_LOCK_FILE);
+        print STDERR "  L2 Cache MISS. Caching new result.\n" if $verbose;
+        save_result_to_cache($canonical_key, $final_output_string, $results_cache_path, $l2_lock_file_path);
+    }
+
+    # Print the final, complete output to STDOUT.
+    print STDOUT $final_output_string . "\n";
 }
 
 my $script_end_time = time();
@@ -3171,8 +3235,6 @@ sub parse_csv_line {
     return @fields;
 }
 
-# --- Add this new subroutine to the Subroutines section ---
-
 # --- process_vm_buffer ---
 # Analyses the fully buffered data for a single VM, calculating metrics
 # for each time window in which the VM has data.
@@ -3213,6 +3275,155 @@ sub process_vm_buffer {
         my $win_key = $rep_date->ymd('') . "_" . $win_idx;
         $results_agg_href->{$vm_name}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $rep_date };
     }
+}
+
+## --- BEGIN L2 RESULTS CACHE MODIFICATION (NEW SUBROUTINES) --- ##
+
+# ==============================================================================
+# Subroutine to generate a canonical key from script arguments for caching.
+# ==============================================================================
+sub generate_canonical_key
+{
+    my @key_parts;
+
+    # This subroutine should be called AFTER GetOptions has populated the variables.
+    # It systematically checks all options that affect the output.
+
+    # Input Method
+    push @key_parts, "--nmondir $nmon_dir" if defined $nmon_dir;
+    push @key_parts, "--physc-data $physc_csv_file" if defined $physc_csv_file;
+    push @key_parts, "--runq-data $runq_csv_file" if defined $runq_csv_file;
+    push @key_parts, "--config $vm_config_file" if defined $vm_config_file;
+
+    # State Management
+    push @key_parts, "--include-states $include_states_selector" if (defined $include_states_selector and lc($include_states_selector) ne 'all');
+
+    # Averaging and Decay
+    push @key_parts, "--avg-method $avg_method" if defined $avg_method;
+    push @key_parts, "--decay $decay_level" if defined $decay_level;
+    push @key_parts, "--runq-decay $runq_decay_level_arg" if defined $runq_decay_level_arg;
+    push @key_parts, "--window $window_minutes" if defined $window_minutes;
+
+    # RunQ Options
+    push @key_parts, "--smt $smt_value" if defined $smt_value;
+    push @key_parts, "--runq-norm-perc '$runq_norm_perc_str'" if defined $runq_norm_perc_str;
+    push @key_parts, "--runq-abs-perc '$runq_abs_perc_str'" if defined $runq_abs_perc_str;
+    push @key_parts, "--runq-avg-method $runq_avg_method_str" if defined $runq_avg_method_str;
+
+    # Filtering
+    push @key_parts, "--startdate $start_date_str" if defined $start_date_str;
+    push @key_parts, "--enddate $end_date_str" if defined $end_date_str;
+    push @key_parts, "--startt $start_time_str" if defined $start_time_str;
+    push @key_parts, "--endt $end_time_str" if defined $end_time_str;
+    push @key_parts, "--online" if $online_flag;
+    push @key_parts, "--batch" if $batch_flag;
+    push @key_parts, "--no-weekends" if $no_weekends;
+    push @key_parts, "--vm $target_vm_name" if defined $target_vm_name;
+
+    # PhysC Calculation
+    push @key_parts, "--percentile $percentile" if defined $percentile;
+    push @key_parts, "--peak" if $calculate_peak;
+    push @key_parts, "--filter-above-perc $filter_above_perc_value" if defined $filter_above_perc_value;
+
+    # Windowed Recency Decay
+    if ($enable_windowed_decay_internal)
+    {
+        push @key_parts, "--enable-windowed-decay";
+        push @key_parts, "--process-window-unit $process_window_unit_str";
+        push @key_parts, "--process-window-size $process_window_size_val";
+        push @key_parts, "--decay-half-life-days $decay_half_life_days_val";
+        push @key_parts, "--analysis-reference-date $analysis_reference_date_str" if defined $analysis_reference_date_str;
+    }
+
+    # Growth Prediction
+    if ($enable_growth_prediction)
+    {
+        push @key_parts, "--enable-growth-prediction";
+        push @key_parts, "--growth-projection-days $growth_projection_days";
+        push @key_parts, "--max-growth-inflation-percent $max_growth_inflation_percent";
+    }
+
+    # Rounding
+    push @key_parts, "-r" . (defined $round_arg && length $round_arg ? "=$round_arg" : "") if defined $round_arg;
+    push @key_parts, "-u" . (defined $roundup_arg && length $roundup_arg ? "=$roundup_arg" : "") if defined $roundup_arg;
+
+    # Normalise by sorting and joining.
+    my $canonical_key = join(" ", sort @key_parts);
+    return $canonical_key;
+}
+
+# ==============================================================================
+# Subroutine to look up a result from the L2 cache file.
+# Returns: The cached result as a single string, or undef if not found.
+# ==============================================================================
+sub lookup_cached_result
+{
+    my ($key, $cache_file) = @_;
+
+    return undef unless (-f $cache_file && -s $cache_file);
+
+    open my $fh, '<:encoding(utf8)', $cache_file
+        or warn "Warning: Could not open results cache '$cache_file' for reading: $!" and return undef;
+
+    my $in_target_block = 0;
+    my @result_lines;
+
+    while (my $line = <$fh>)
+    {
+        chomp $line;
+        if ($in_target_block)
+        {
+            if ($line eq '--END--')
+            {
+                # Found the end of our block, return the collected result.
+                close $fh;
+                return join("\n", @result_lines);
+            }
+            push @result_lines, $line;
+        }
+        elsif ($line eq "[$key]")
+        {
+            # Found the start of our target block.
+            $in_target_block = 1;
+        }
+    }
+
+    close $fh;
+    return undef; # Reached end of file without finding the block or its end.
+}
+
+# ==============================================================================
+# Subroutine to save a result to the L2 cache file under an exclusive lock.
+# ==============================================================================
+sub save_result_to_cache
+{
+    my ($key, $result_string, $cache_file, $lock_file) = @_;
+
+    # Acquire an exclusive lock to prevent race conditions when writing.
+    open my $lock_fh, '>', $lock_file or do {
+        warn "Warning: Could not create lock file '$lock_file' for writing cache: $!. Skipping cache write.";
+        return;
+    };
+    flock($lock_fh, LOCK_EX) or do {
+        warn "Warning: Could not acquire exclusive lock on '$lock_file': $!. Skipping cache write.";
+        close $lock_fh;
+        return;
+    };
+
+    # Open the results cache in append mode.
+    open my $fh, '>>:encoding(utf8)', $cache_file or do {
+        warn "Warning: Could not open results cache '$cache_file' for appending: $!. Skipping cache write.";
+        close $lock_fh; # Release lock
+        return;
+    };
+
+    # Write the canonical key, the result, and the delimiter.
+    print {$fh} "[$key]\n";
+    print {$fh} $result_string . "\n"; # result_string already has newlines from the buffer
+    print {$fh} "--END--\n";
+
+    close $fh;
+    close $lock_fh; # Releases the lock automatically on close.
 }
 
 sub usage
