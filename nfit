@@ -1234,107 +1234,341 @@ sub build_cache_from_csv {
     open my $data_fh, '>', $data_cache_path or die "Cannot write to data cache '$data_cache_path': $!";
     print $data_fh "Timestamp,VMName,PhysC,RunQ\n";
 
-    # 1. Load config-all.csv if it exists
+    # Precompiled regex for efficiency (OPTION 1 OPTIMIZATION)
+    my $quote_strip_re = qr/^['"]|['"]$/;
+    my $whitespace_re = qr/\s+/;
+    my $empty_line_re = qr/^\s*$/;
+    my $carriage_return_re = qr/\r$/;
+
+    # 1. Load config-all.csv if it exists (OPTION 1 OPTIMIZED VERSION)
     if (defined $config_file && -f $config_file) {
         open my $cfg_fh, '<:encoding(utf8)', $config_file or die "Error opening config file '$config_file': $!";
         my $header_line = <$cfg_fh>;
-        chomp $header_line; $header_line =~ s/\r$//;
+        chomp $header_line;
+        $header_line =~ s/$carriage_return_re//;
+
         my @headers = parse_csv_line($header_line);
         my %hmap;
-        for my $i (0 .. $#headers) { my $col = $headers[$i]; $col =~ s/^['"]|['"]$//g; $hmap{lc($col)} = $i; }
+        for my $i (0 .. $#headers) {
+            my $col = $headers[$i];
+            $col =~ s/$quote_strip_re//g;
+            $hmap{lc($col)} = $i;
+        }
+
+        # Pre-check which columns exist to avoid hash lookups in the loop (OPTION 1)
+        my $has_smt = exists $hmap{'smt'};
+        my $has_maxcpu = exists $hmap{'maxcpu'};
+        my $has_entitledcpu = exists $hmap{'entitledcpu'};
+        my $has_procpool_id = exists $hmap{'procpool_id'};
+        my $has_serial = exists $hmap{'serial'};
+        my $has_proctype = exists $hmap{'proctype'};
+        my $has_procversion = exists $hmap{'procversion'};
+        my $has_procclock = exists $hmap{'procclock'};
+
         while (my $line = <$cfg_fh>) {
-            chomp $line; $line =~ s/\r$//; next if $line =~ /^\s*$/;
+            chomp $line;
+            $line =~ s/$carriage_return_re//;
+            next if $line =~ /$empty_line_re/;
+
             my @vals = parse_csv_line($line);
             my $vm_name = $vals[$hmap{'hostname'}];
-            next unless defined $vm_name && $vm_name ne '';
-            $vm_config_data{$vm_name}{smt} = $vals[$hmap{'smt'}] if exists $hmap{'smt'};
-            $vm_config_data{$vm_name}{maxcpu} = $vals[$hmap{'maxcpu'}] if exists $hmap{'maxcpu'};
-            $vm_config_data{$vm_name}{entitlement} = $vals[$hmap{'entitledcpu'}] if exists $hmap{'entitledcpu'};
-            $vm_config_data{$vm_name}{pool_id} = $vals[$hmap{'procpool_id'}] if exists $hmap{'procpool_id'};
-            $vm_config_data{$vm_name}{serial_number} = $vals[$hmap{'serial'}] if exists $hmap{'serial'};
-            $vm_config_data{$vm_name}{proc_type} = $vals[$hmap{'proctype'}] if exists $hmap{'proctype'};
-            $vm_config_data{$vm_name}{proc_version} = $vals[$hmap{'procversion'}] if exists $hmap{'procversion'};
-            $vm_config_data{$vm_name}{proc_clock} = $vals[$hmap{'procclock'}] if exists $hmap{'procclock'};
+            next unless defined $vm_name && length($vm_name);
+
+            # Direct assignment without repeated hash lookups (OPTION 1)
+            my $vm_ref = $vm_config_data{$vm_name} = {};
+            $vm_ref->{smt} = $vals[$hmap{'smt'}] if $has_smt;
+            $vm_ref->{maxcpu} = $vals[$hmap{'maxcpu'}] if $has_maxcpu;
+            $vm_ref->{entitlement} = $vals[$hmap{'entitledcpu'}] if $has_entitledcpu;
+            $vm_ref->{pool_id} = $vals[$hmap{'procpool_id'}] if $has_procpool_id;
+            $vm_ref->{serial_number} = $vals[$hmap{'serial'}] if $has_serial;
+            $vm_ref->{proc_type} = $vals[$hmap{'proctype'}] if $has_proctype;
+            $vm_ref->{proc_version} = $vals[$hmap{'procversion'}] if $has_procversion;
+            $vm_ref->{proc_clock} = $vals[$hmap{'procclock'}] if $has_procclock;
         }
         close $cfg_fh;
     }
 
-    # 2. Pre-load RunQ data into memory
-    my %runq_data_store;
+    # 2. STREAMING MERGE: Open both files simultaneously (OPTION 2 APPROACH)
+    open my $pc_fh, '<:encoding(utf8)', $physc_file or die "Error: Cannot open PhysC file '$physc_file': $!";
+
+    my $rq_fh;
+    my $has_runq = 0;
     if (defined $runq_file && -s $runq_file) {
-        open my $rq_fh, '<:encoding(utf8)', $runq_file or die "Error: Cannot open RunQ file '$runq_file': $!";
-        my $rq_line_count = 0; my @runq_vm_names_header;
-        while (my $line = <$rq_fh>) {
-            chomp $line; $rq_line_count++; next if $line =~ /^\s*$/;
-            my @fields = split ',', $line, -1;
-            if ($rq_line_count == 1) { shift @fields; @runq_vm_names_header = map { s/^"|"$//g; my ($name) = split / /; $name; } @fields; next; }
-            my $ts = $fields[0]; shift @fields;
-            for (my $i=0; $i<@fields; $i++) {
-                my $vm = $runq_vm_names_header[$i];
-                if (defined $fields[$i] && looks_like_number($fields[$i])) { $runq_data_store{$ts}{$vm} = $fields[$i]; }
-            }
-        }
-        close $rq_fh;
+        open $rq_fh, '<:encoding(utf8)', $runq_file or die "Error: Cannot open RunQ file '$runq_file': $!";
+        $has_runq = 1;
     }
 
-    # 3. Stream PhysC file, merge, and write to data cache
-    open my $pc_fh, '<:encoding(utf8)', $physc_file or die "Error: Cannot open PhysC file '$physc_file': $!";
-    my $pc_line_count = 0; my @physc_vm_names_header;
+    # Read headers from both files with OPTION 1 optimizations
+    my $pc_header = <$pc_fh>;
+    chomp $pc_header;
+    $pc_header =~ s/$carriage_return_re//;
+    my @pc_fields = split ',', $pc_header, -1;
+    shift @pc_fields; # Remove timestamp column
+
+    # OPTION 1 OPTIMIZATION: More efficient VM name extraction
+    my @physc_vm_names = map {
+        my $val = $_;
+        $val =~ s/$quote_strip_re//g;
+        my ($name) = split / /, $val;
+        $name;
+    } @pc_fields;
+
+    # OPTION 1 OPTIMIZATION: Create hash for O(1) lookups instead of linear search
+    my %physc_vm_index;
+    for my $i (0 .. $#physc_vm_names) {
+        $physc_vm_index{$physc_vm_names[$i]} = $i if defined $physc_vm_names[$i] && length($physc_vm_names[$i]);
+    }
+
+    my (@runq_vm_names, %runq_vm_index);
+    if ($has_runq) {
+        my $rq_header = <$rq_fh>;
+        chomp $rq_header;
+        $rq_header =~ s/$carriage_return_re//;
+        my @rq_fields = split ',', $rq_header, -1;
+        shift @rq_fields; # Remove timestamp column
+
+        # OPTION 1 OPTIMIZATION: More efficient VM name extraction
+        @runq_vm_names = map {
+            s/$quote_strip_re//g;
+            my ($name) = split / /;
+            $name;
+        } @rq_fields;
+
+        # OPTION 1 OPTIMIZATION: Create index mapping for O(1) lookup
+        for my $i (0 .. $#runq_vm_names) {
+            $runq_vm_index{$runq_vm_names[$i]} = $i if defined $runq_vm_names[$i] && length($runq_vm_names[$i]);
+        }
+    }
+
+    # Variables for streaming merge
+    my ($pc_line, $rq_line, $pc_timestamp, $rq_timestamp);
+    my (@pc_data, @rq_data);
+    my $pc_has_data = 0;
+    my $rq_has_data = 0;
     my ($min_epoch, $max_epoch);
     my %all_vms_in_file;
-    while (my $line = <$pc_fh>) {
-        chomp $line; $pc_line_count++; next if ($line =~ /^\s*$/o);
-        my @fields = split ',', $line, -1;
-        if ($pc_line_count == 1) { shift @fields; @physc_vm_names_header = map { my $val = $_; $val =~ s/^"|"$//g; my ($name) = split / /, $val; $name; } @fields; next; }
-        my $ts = $fields[0]; shift @fields;
-        my $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S");
+
+    # OPTION 1 OPTIMIZATION: Larger output buffer for better I/O performance
+    my $output_buffer = '';
+    my $buffer_size = 0;
+    my $max_buffer_size = 16384; # 16KB buffer (increased from 8KB)
+
+    # Helper function to read next PhysC line
+    my $read_pc_line = sub {
+        while (my $line = <$pc_fh>) {
+            chomp $line;
+            next if $line =~ /$empty_line_re/;
+            $line =~ s/$carriage_return_re//;
+
+            my @fields = split ',', $line, -1;
+
+            # Validate field count against the header
+            # The -1 accounts for the timestamp column that will be shifted off.
+            if (scalar(@fields) - 1 != scalar(@physc_vm_names)) {
+                my $ts_for_error = (split ',', $line, 2)[0] // '[unknown timestamp]';
+                print STDERR "WARN: Mismatched field count in physc data at $ts_for_error. Header has ",
+                             scalar(@physc_vm_names), " VMs, but line has ", scalar(@fields) - 1, " data points. Skipping line.\n";
+                next; # Skip this malformed line and read the next one
+            }
+
+            $pc_timestamp = shift @fields;
+            @pc_data = @fields;
+            return 1;
+        }
+        return 0;
+    };
+
+    # Helper function to read next RunQ line
+    my $read_rq_line = sub {
+        return 0 unless $has_runq;
+        while (my $line = <$rq_fh>) {
+            chomp $line;
+            next if $line =~ /$empty_line_re/;
+            $line =~ s/$carriage_return_re//;
+
+            my @fields = split ',', $line, -1;
+
+            # Validate field count against the header ---
+            if (scalar(@fields) - 1 != scalar(@runq_vm_names)) {
+                my $ts_for_error = (split ',', $line, 2)[0] // '[unknown timestamp]';
+                print STDERR "WARN: Mismatched field count in runq data at $ts_for_error. Header has ",
+                             scalar(@runq_vm_names), " VMs, but line has ", scalar(@fields) - 1, " data points. Skipping line.\n";
+                next; # Skip this malformed line and read the next one
+            }
+
+            $rq_timestamp = shift @fields;
+            @rq_data = @fields;
+            return 1;
+        }
+        return 0;
+    };
+
+    # Initialize with first data lines
+    $pc_has_data = $read_pc_line->();
+    $rq_has_data = $read_rq_line->() if $has_runq;
+
+    # STREAMING MERGE LOOP with OPTION 1 optimizations
+    # This loop uses a robust three-way comparison to correctly merge the two
+    # time-sorted files, handling all cases to prevent the data loss seen in
+    # the previous implementation. It preserves all of your optimisations.
+    while ($pc_has_data || $rq_has_data) {
+        # This block contains the complete and corrected logic for the streaming merge loop.
+        # It correctly sets flags, validates the timestamp, processes data, and advances the file streams.
+
+        my $current_timestamp;
+        my $use_pc_data = 0;
+        my $use_rq_data = 0;
+
+        # --- Stage 1: Determine which timestamp to process and set flags ---
+        if ($pc_has_data && $rq_has_data) {
+            if ($pc_timestamp eq $rq_timestamp) {
+                $current_timestamp = $pc_timestamp;
+                $use_pc_data = 1;
+                $use_rq_data = 1;
+            } elsif ($pc_timestamp lt $rq_timestamp) {
+                $current_timestamp = $pc_timestamp;
+                $use_pc_data = 1;
+            } else { # $pc_timestamp gt $rq_timestamp
+                $current_timestamp = $rq_timestamp;
+                $use_rq_data = 1;
+            }
+        } elsif ($pc_has_data) {
+            $current_timestamp = $pc_timestamp;
+            $use_pc_data = 1;
+        } elsif ($rq_has_data) {
+            $current_timestamp = $rq_timestamp;
+            $use_rq_data = 1;
+        }
+
+        # --- Stage 2: Validate the timestamp before proceeding (FIX 1) ---
+        my $tp;
+        eval { $tp = Time::Piece->strptime($current_timestamp, "%Y-%m-%d %H:%M:%S"); };
+        if ($@ || !defined($tp)) {
+            print STDERR "WARN: Malformed timestamp '$current_timestamp' found. Skipping line.\n";
+            # Use the flags we just set to advance past the bad line(s) and prevent an infinite loop.
+            $pc_has_data = $read_pc_line->() if $use_pc_data;
+            $rq_has_data = $read_rq_line->() if $use_rq_data;
+            next; # Continue to the next iteration of the while loop
+        }
+        
+        # --- Stage 3: Process the data for the now-validated timestamp ---
         my $epoch = $tp->epoch;
         $min_epoch = $epoch if !defined $min_epoch || $epoch < $min_epoch;
         $max_epoch = $epoch if !defined $max_epoch || $epoch > $max_epoch;
-        for (my $i=0; $i<@fields; $i++) {
-            my $vm = $physc_vm_names_header[$i];
-            next unless defined $vm && $vm ne '';
-            $all_vms_in_file{$vm} = 1;
-            my $physc = (defined $fields[$i] && looks_like_number($fields[$i])) ? $fields[$i] : '';
-            my $runq = $runq_data_store{$ts}{$vm} // '';
-            if ($physc ne '' || $runq ne '') { print $data_fh join(",", $ts, $vm, $physc, $runq) . "\n"; }
+
+        my $ts_vm_prefix = "$current_timestamp,";
+        my %processed_vms;
+
+        if ($use_pc_data) {
+            # --- Field count validation (FIX 2) is inside the helper sub $read_pc_line->()
+            for my $i (0 .. $#physc_vm_names) {
+                my $vm = $physc_vm_names[$i];
+                next unless defined $vm && length($vm);
+                $all_vms_in_file{$vm} = 1;
+                $processed_vms{$vm} = 1;
+                my $physc = (defined $pc_data[$i] && looks_like_number($pc_data[$i])) ? $pc_data[$i] : '';
+                my $runq = '';
+                if ($use_rq_data && exists $runq_vm_index{$vm}) {
+                    my $rq_idx = $runq_vm_index{$vm};
+                    $runq = (defined $rq_data[$rq_idx] && looks_like_number($rq_data[$rq_idx])) ? $rq_data[$rq_idx] : '';
+                }
+                if (length($physc) || length($runq)) {
+                    my $line = $ts_vm_prefix . $vm . ',' . $physc . ',' . $runq . "\n";
+                    $output_buffer .= $line;
+                    $buffer_size += length($line);
+                }
+            }
+        }
+
+        if ($use_rq_data) {
+            # --- Field count validation (FIX 2) is inside the helper sub $read_rq_line->()
+            for my $i (0 .. $#runq_vm_names) {
+                my $vm = $runq_vm_names[$i];
+                next unless defined $vm && length($vm);
+                next if $processed_vms{$vm};
+                $all_vms_in_file{$vm} = 1;
+                my $runq = (defined $rq_data[$i] && looks_like_number($rq_data[$i])) ? $rq_data[$i] : '';
+                if (length($runq)) {
+                    my $line = $ts_vm_prefix . $vm . ',,' . $runq . "\n";
+                    $output_buffer .= $line;
+                    $buffer_size += length($line);
+                }
+            }
+        }
+
+        if ($buffer_size >= $max_buffer_size) {
+            print $data_fh $output_buffer;
+            $output_buffer = '';
+            $buffer_size = 0;
+        }
+
+        # --- Stage 4: Advance file handles for the next iteration on success ---
+        if ($use_pc_data) {
+            $pc_has_data = $read_pc_line->();
+        }
+        if ($use_rq_data) {
+            $rq_has_data = $read_rq_line->();
         }
     }
-    close $pc_fh;
-    close $data_fh; # Close the data cache file handle
 
-    # 4. Create a single, static state for each VM found
+    # Flush any remaining buffer
+    if ($buffer_size > 0) {
+        print $data_fh $output_buffer;
+    }
+
+    close $pc_fh;
+    close $rq_fh if $has_runq;
+    close $data_fh;
+
+    # 4. Create a single, static state for each VM found (OPTION 1 OPTIMIZED)
     foreach my $vm_name (keys %all_vms_in_file) {
+        # OPTION 1 OPTIMIZATION: Single hash lookup with fallback reference
+        my $vm_config = $vm_config_data{$vm_name} || {};
+
         my %metadata = (
-            vm_name => $vm_name, smt => $vm_config_data{$vm_name}{smt} // $DEFAULT_SMT,
-            max_cpu => $vm_config_data{$vm_name}{maxcpu} // 0,
-            entitlement => $vm_config_data{$vm_name}{entitlement} // 0,
-            pool_id => $vm_config_data{$vm_name}{pool_id} // 0,
-            serial_number => $vm_config_data{$vm_name}{serial_number} // '',
+            vm_name => $vm_name,
+            smt => $vm_config->{smt} // $DEFAULT_SMT,
+            max_cpu => $vm_config->{maxcpu} // 0,
+            entitlement => $vm_config->{entitlement} // 0,
+            pool_id => $vm_config->{pool_id} // 0,
+            serial_number => $vm_config->{serial_number} // '',
             capped => 0,
         );
-        my $p_type = $vm_config_data{$vm_name}{proc_type} // 'UNK'; $p_type =~ s/PowerPC_//;
-        my $p_ver = $vm_config_data{$vm_name}{proc_version} // 'UNK';
-        my $p_clk = $vm_config_data{$vm_name}{proc_clock} // 'UNK';
+
+        my $p_type = $vm_config->{proc_type} // 'UNK';
+        $p_type =~ s/PowerPC_//;
+        my $p_ver = $vm_config->{proc_version} // 'UNK';
+        my $p_clk = $vm_config->{proc_clock} // 'UNK';
+
         $metadata{processor_state} = join("_", $p_type, $p_ver, $p_clk);
-        $metadata{processor_state} =~ s/\s+/-/g;
-        my $state_obj = { vm_name => $vm_name, state_id => 1, start_epoch => $min_epoch, end_epoch => $max_epoch, start_time => Time::Piece->new($min_epoch), end_time => Time::Piece->new($max_epoch), metadata => \%metadata, };
+        $metadata{processor_state} =~ s/$whitespace_re/-/g;
+
+        my $state_obj = {
+            vm_name => $vm_name,
+            state_id => 1,
+            start_epoch => $min_epoch,
+            end_epoch => $max_epoch,
+            start_time => Time::Piece->new($min_epoch),
+            end_time => Time::Piece->new($max_epoch),
+            metadata => \%metadata,
+        };
+
         push @{$all_vm_states{$vm_name}}, $state_obj;
     }
-    
+
     # 5. Write the states file
     nstore(\%all_vm_states, $states_cache_file) or die "Error: Could not serialize states to '$states_cache_file': $!";
     print STDERR "  -> Completed state configuration cache creation ('$states_cache_file').\n";
 
-				# This is the final step in a successful build. Writing this file "commits" the cache.
-				open my $man_fh, '>', $manifest_file or die "Error: Cannot write manifest file '$manifest_file': $!";
-				my $timestamp = localtime->strftime('%Y-%m-%dT%H:%M:%S');
-				print $man_fh "cache_build_status: success\n";
-				print $man_fh "build_timestamp: $timestamp\n";
-				print $man_fh "nfit_version: $VERSION\n";
-				close $man_fh;
+    # This is the final step in a successful build. Writing this file "commits" the cache.
+    open my $man_fh, '>', $manifest_file or die "Error: Cannot write manifest file '$manifest_file': $!";
+    my $timestamp = localtime->strftime('%Y-%m-%dT%H:%M:%S');
+    print $man_fh "cache_build_status: success\n";
+    print $man_fh "build_timestamp: $timestamp\n";
+    print $man_fh "nfit_version: $VERSION\n";
+    close $man_fh;
 
-				print STDERR "  -> Cache manifest created successfully.\n" if ($verbose);
+    print STDERR "  -> Cache manifest created successfully.\n" if ($verbose);
 
     # --- Release Lock ---
     close $lock_fh;
