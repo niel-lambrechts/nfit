@@ -1,10 +1,25 @@
-# nFit: AIX and Linux on Power VM Right-Sizing Toolkit
+# nFit: AIX & Linux on Power Right-Sizing Toolkit
 
+<div align="center">
+
+*A modern, data-driven toolkit for accurately right-sizing IBM Power Systems LPARs, to deliver statistically sound CPU entitlement recommendations.*
+
+</div>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/license-AGPL--3.0-blue.svg" alt="License: AGPL v3.0">
+  <img src="https://img.shields.io/badge/author-Niël_Lambrechts-orange" alt="Author">
+  <img src="https://img.shields.io/badge/platform-AIX_|_Linux_on_Power-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/badge/perl-v5.x-blue" alt="Perl Version">
+  <img src="https://img.shields.io/badge/python-v3.x-blue" alt="Python Version">
+</p>
+
+---
 ## Overview
 
-nFit is designed to assist with AIX and Linux on Power LPAR (Logical Partition) CPU right-sizing on IBM Power systems. It leverages historical performance data from NMON (`PhysC` - Physical CPU consumed) to provide data-driven, statistically sound entitlement recommendations. The suite aims to move beyond subjective "eye-balling" of performance graphs, offering a consistent, automatable, and configurable approach to capacity planning.
+**nFit** is a sophisticated analysis suite designed to assist with AIX and Linux on Power LPAR CPU right-sizing. It leverages historical performance data from NMON (`PhysC` - Physical CPU consumed) and Run-Queue (`RunQ`) to provide data-driven, statistically sound entitlement recommendations. The suite moves beyond subjective "eye-balling" of performance graphs by offering a consistent, automatable, and deeply configurable approach to capacity planning.
 
-This suite helps in optimising resource utilisation, ensuring critical workloads have the guaranteed CPU they need, while identifying potential savings by accurately sizing less critical workloads or standby systems.
+At its core, nFit helps you optimise resource utilisation by ensuring critical workloads have the guaranteed CPU they need while identifying potential savings by accurately sizing less critical systems. With its v4 architecture, it can process vast NMON archives with incredible speed, making it suitable for both ad-hoc analysis and large-scale, continuous capacity management.
 
 To provide maximum flexibility, nFit can process this performance data from two distinct sources:
 
@@ -30,7 +45,7 @@ This guide will help you get the `nFit Suite` up and running quickly.
 
 **1. Installation / Setup**
 
-* **Clone the Repository:**
+* **Clone the repository:**
     ```bash
     git clone <your_github_repository_url_here> nmon-fit
     cd nmon-fit
@@ -91,6 +106,7 @@ The scripts use configuration files to define profiles, frame setups, and VM ent
 
 **4. Obtain Managed System Data**
 
+** NJMON/NIMON:**
 - Open Grafana NJMON
 - Open Whole Server by Serial Number
 - Navigate to the graph Physical Consumed CPU - SERIAL
@@ -99,15 +115,25 @@ The scripts use configuration files to define profiles, frame setups, and VM ent
 - Click on Data options, and under Show data frame select Series joined by time
 - Download the CSV file
 
+**NMON Data-files:**
+- Make sure the directory containing your 90-day (recommended: 1-3 months) is accessible to nFit.
+
 **5. Run `nfit-profile` to Generate Sizing Data**
 
 This script will run `nfit` multiple times based on your `etc/nfit.profiles.cfg` and produce a comprehensive CSV output.
 
-* **Command:**
+* **Command - NMON data-files:**
+    ```bash
+    ./nfit-profile --match-runq-perc-to-profile --nfit-enable-windowed-decay --nmondir /path/to/your/vm.nmon.gz -config /path/to/your/config-all.csv > nfit_sizing_report.csv
+    ```
+    *(Replace paths with your actual file locations. Add other options like `-s <startdate>`, `-r` or `-u` for rounding as needed.)*
+
+* **Command - NIMON:**
     ```bash
     ./nfit-profile --match-runq-perc-to-profile --nfit-enable-windowed-decay -f /path/to/your/nmon_data.csv -config /path/to/your/config-all.csv > nfit_sizing_report.csv
     ```
     *(Replace paths with your actual file locations. Add other options like `-s <startdate>`, `-r` or `-u` for rounding as needed.)*
+
 * **Output:** `nfit_sizing_report.csv` (or your chosen output file) will contain the aggregated metrics for each VM.
 
 **6. Utilise Data in Your Sizing Spreadsheet**
@@ -137,23 +163,26 @@ By following these steps, you can integrate the `nFit Suite` into your capacity 
 The nFit Suite currently consists of three main components:
 
 1.  **`nfit` (Perl):**
-    * The core analysis engine.
+    * The core analysis engine that processes data from a staged NMON data-file directory or legacy CSV exports.
     * Parses NMON `PhysC` data (exported to CSV).
+    * Features a multi-level caching system for near-instant re-analysis.
     * Calculates rolling average CPU utilisation and specified percentiles of these averages.
+    * Automatically detects historical changes in VM configuration (CPU, SMT) using **Configuration State Windowing**.
     * Can identify absolute peak CPU consumption.
-    * Offers extensive filtering options: by date range, time-of-day (including "online" and "batch" presets), specific VMs, and exclusion of weekends.
+    * Offers extensive filtering options for time-of-day (including "online" and "batch" presets), weekends and statistical thresholds.
     * Includes an advanced filter (`--filter-above-perc`) to focus percentile calculations on periods of higher sustained load.
     * Provides options for rounding results to align with hardware entitlement increments.
     * Outputs results per VM to STDOUT, status/errors to STDERR.
 
 2.  **`nfit-profile` (Perl):**
-    * A wrapper script that automates multiple runs of `nfit`.
+    * An orchestration tool that automates multiple runs of `nfit`.
     * Reads a set of predefined "profiles" from an INI configuration file (`nfit.profiles.cfg`). Each profile defines a specific combination of `nfit` flags (percentile, window, time filters, etc.).
     * Runs `nfit` for each defined profile.
     * Always runs `nfit` with the `-k` flag to capture absolute peak usage.
+    * Performs Run-Queue analysis to assess for CPU pressure and identifies constrained "Hot Thread" workloads.
     * Optionally merges static VM configuration data (e.g., serial number, system type, current entitlement, max CPU) from another CSV file (`config-all.csv` by default).
     * Generates heuristic "Hint", "Pattern", and "Pressure" columns based on the collected metrics and VM configuration to provide quick insights.
-    * Aggregates all results into a single, comprehensive CSV output to STDOUT, suitable for import into spreadsheets for further analysis and decision-making.
+    * Aggregates all results into a single, comprehensive CSV output with heuristic "Hint" and "Pattern" columns to guide planners.
 
 3.  **`nfit-plot` (Python):**
     * A visualisation tool to generate capacity charts.
@@ -164,15 +193,22 @@ The nFit Suite currently consists of three main components:
         * Per-Frame Detail Charts: Visualising capacity, allocation, headroom for each individual frame, and its contribution target for frame evacuation.
     * Outputs charts as PNG files to `/tmp/`.
 
+4. **`nfit-stage` (Perl):**
+    * The preparatory utility that scans a source directory of NMON files.
+    * Selects a subset based on a date range (--days or --startd/--endd) and an optional VM whitelist.
+    * Creates an optimised "staging directory" containing symbolic links to the target files, which enables nfit's high-performance caching engine.
+
 ## Core Methodology
 
 The underlying sizing methodology (primarily implemented in `nfit` and orchestrated by `nfit-profile`) is based on:
 
-- **Data Source:** 90 days of 1-minute interval AIX `PhysC` data from NMON.
+- **Data Source:** Typically 90 days of 1-minute interval AIX `PhysC` and `RunQ` data from NMON.
 - **Primary Metrics:**
     - **Absolute Peak:** For highest-tier systems.
     - **Percentiles of Rolling Averages:** For various tiers of sustained load, using different window sizes (W) and percentile targets (P). Common profiles include P99W5, P98W10, P95W15, P90W15.
+    - **Run-Queue Saturation**: To identify CPU queuing and constraint.
 - **Filtering:** Includes date, time-of-day (with `-online`/`-batch` presets and `-no-weekends` option), and a statistical filter (`--filter-above-perc`) to focus on relevant busy periods.
+- **Contextual Analysis**: The engine understands a VM's configuration history and weights recent data more heavily to produce relevant recommendations.
 - **Tiering Concept:** The generated profiles are designed to map to different service tiers, allowing for differentiated sizing based on business criticality.
 - **Heuristics (in `nfit-profile`):** Suggests workload pattern (Online/Batch/General), CPU usage shape (Peaky/Steady), and potential CPU pressure (based on P-99W1 vs. maxCPU) to aid planners.
 
@@ -182,9 +218,10 @@ There is also a Python-based animation of the basic program principles available
 
 ## Prerequisites
 
-- **For `nfit` and `nfit-profile` (Perl):**
+- **For `nfit`, `nfit-profile` and `nfit-stage` (Perl):**
     - Perl 5.x
     - Core Perl Modules: `Getopt::Long`, `File::Temp`, `List::Util`, `POSIX` (for `ceil`), `Time::Piece`. These are generally standard.
+    - Non-Core Modules: Storable (`cpan install Storable`)
 - **For `nfit-plot` (Python):**
     - Python 3.x
     - `matplotlib` library (`pip install matplotlib`)
@@ -194,6 +231,13 @@ There is also a Python-based animation of the basic program principles available
 ## Basic Usage
 
 **(Ensure scripts are executable and configuration files are in place or paths specified)**
+
+
+* **`nfit-stage` (Staging Tool):**
+    ```bash
+    # Create a staging directory with the last 90 days of data
+    ./nfit-stage --srcdir /archive/nmon --stagedir /nfit/run_q2 --days 90 --cleanup
+    ```
 
 * **`nfit` (Core Analyser):**
     ```bash
