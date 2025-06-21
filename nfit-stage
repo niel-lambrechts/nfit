@@ -1,0 +1,400 @@
+#!/usr/bin/env perl
+
+# NAME     : nfit-stage
+# AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
+# PURPOSE  : Traverses a source directory of NMON files, selects a recent
+#            subset based on date and an optional VM whitelist, and prepares
+#            an optimized staging directory for faster analysis by the nfit suite.
+# REQUIRES : Perl, Time::Piece, Time::Seconds, Getopt::Long, File::Find,
+#            File::Path, File::Spec, File::Basename, Cwd, File::Copy
+
+use strict;
+use warnings;
+use Getopt::Long qw(GetOptions);
+use File::Find qw(find);
+use File::Path qw(make_path remove_tree);
+use File::Spec;
+use File::Basename qw(basename);
+use Cwd qw(abs_path);
+use Time::Piece;
+use Time::Seconds;
+use File::Copy qw(copy);
+
+# --- Version ---
+my $VERSION = '1.1.0';
+
+# --- Constants ---
+my $IDENTIFIER_FILE = '.nfit_stage_id';
+
+# --- Argument Parsing ---
+my $src_dir;
+my $stage_dir;
+my $days;
+my $startd;
+my $endd;
+my $mode = 'link';
+my $vm_list_file;
+my $vms_string;
+my $cleanup    = 0;
+my $verbose    = 0;
+my $help       = 0;
+my $show_version = 0;
+
+GetOptions(
+    'srcdir=s'       => \$src_dir,
+    'stagedir=s'     => \$stage_dir,
+    'days|n=i'       => \$days,
+    'startd=s'       => \$startd,
+    'endd=s'         => \$endd,
+    'mode|m=s'       => \$mode,
+    'vm-list|l=s'    => \$vm_list_file,
+    'vms=s'          => \$vms_string,
+    'cleanup'        => \$cleanup,
+    'verbose|v'      => \$verbose,
+    'help|h'         => \$help,
+    'version'        => \$show_version,
+) or die usage();
+
+# --- Initial Checks & Validation ---
+if ($show_version) {
+    print "nfit-stage version $VERSION\n";
+    exit 0;
+}
+
+if ($help || !$src_dir || !$stage_dir) {
+    print usage();
+    exit 0;
+}
+
+# Check for a valid time/date selection method.
+if (!defined($days) && !defined($startd) && !defined($endd)) {
+    warn "Error: You must specify a time window using either --days or --startd/--endd.\n\n";
+    print usage();
+    exit 0;
+}
+
+# Check for mutual exclusivity.
+if (defined($days) && (defined($startd) || defined($endd))) {
+    die "Error: --days cannot be used at the same time as --startd or --endd.\n";
+}
+
+unless (-d $src_dir) {
+    die "Error: Source directory (--srcdir) '$src_dir' not found or is not a directory.\n";
+}
+
+if (defined($days) && $days <= 0) {
+    die "Error: Number of days (--days) must be a positive integer.\n";
+}
+
+# Validate date formats if they are provided.
+my ($startd_obj, $endd_obj);
+if (defined $startd) {
+    unless ($startd =~ /^\d{4}-\d{2}-\d{2}$/) {
+        die "Error: Start date (--startd) format is invalid. Use YYYY-MM-DD.\n";
+    }
+    eval { $startd_obj = Time::Piece->strptime($startd, "%Y-%m-%d"); };
+    if ($@) { die "Error: Could not parse start date '$startd': $@"; }
+}
+if (defined $endd) {
+    unless ($endd =~ /^\d{4}-\d{2}-\d{2}$/) {
+        die "Error: End date (--endd) format is invalid. Use YYYY-MM-DD.\n";
+    }
+    eval { $endd_obj = Time::Piece->strptime($endd, "%Y-%m-%d"); };
+    if ($@) { die "Error: Could not parse end date '$endd': $@"; }
+}
+
+if (defined($startd_obj) && defined($endd_obj) && $startd_obj > $endd_obj) {
+    die "Error: --startd cannot be after --endd.\n";
+}
+
+$mode = lc($mode);
+unless ($mode eq 'link' || $mode eq 'copy') {
+    die "Error: Mode (--mode) must be either 'link' or 'copy'.\n";
+}
+
+# --- Combine VM Lists ---
+my %vms_to_process;
+my $vm_filter_active = 0;
+
+if ($vms_string) {
+    my @vms_from_cmd = split /,/, $vms_string;
+    foreach my $vm (@vms_from_cmd) {
+        $vm =~ s/^\s+|\s+$//g; # Trim whitespace
+        $vms_to_process{$vm} = 1 if $vm;
+    }
+}
+
+if ($vm_list_file) {
+    unless (-f $vm_list_file && -r $vm_list_file) {
+        die "Error: VM list file (--vm-list) '$vm_list_file' not found or not readable.\n";
+    }
+    open my $fh, '<', $vm_list_file or die "Error: Could not open VM list file '$vm_list_file': $!\n";
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+|\s+$//g; # Trim whitespace
+        $line =~ s/#.*//;       # Remove comments
+        $vms_to_process{$line} = 1 if $line;
+    }
+    close $fh;
+}
+
+if (%vms_to_process) {
+    $vm_filter_active = 1;
+    print "Staging will be restricted to " . scalar(keys %vms_to_process) . " specified VM(s).\n";
+}
+
+# --- Handle Staging Directory ---
+if (-e $stage_dir) {
+    unless (-d $stage_dir) {
+        die "Error: Staging path (--stagedir) '$stage_dir' exists but is not a directory.\n";
+    }
+    if ($cleanup) {
+        my $id_file = File::Spec->catfile($stage_dir, $IDENTIFIER_FILE);
+        unless (-f $id_file) {
+            die "Error: --cleanup specified, but '$stage_dir' does not appear to be a valid nfit staging directory.\n" .
+                "Safety check failed: Identifier file '$IDENTIFIER_FILE' not found. Aborting.\n";
+        }
+        print "Cleanup flag set. Removing existing staging directory: '$stage_dir'\n";
+        remove_tree($stage_dir) or die "Error: Could not remove directory '$stage_dir': $!\n";
+    } else {
+        die "Error: Staging directory '$stage_dir' already exists. Use --cleanup to overwrite it.\n";
+    }
+}
+
+print "Creating new staging directory: '$stage_dir'\n";
+make_path($stage_dir) or die "Error: Could not create directory '$stage_dir': $!\n";
+
+# --- Create Identifier File ---
+my $id_file_path = File::Spec->catfile($stage_dir, $IDENTIFIER_FILE);
+open my $id_fh, '>', $id_file_path or die "Error: Could not create identifier file in staging directory: $!\n";
+my $timestamp = localtime->strftime('%Y-%m-%dT%H:%M:%S');
+print {$id_fh} "# This directory was created by nfit-stage.pl.\n";
+print {$id_fh} "# The --cleanup flag requires this file for safe operation.\n";
+print {$id_fh} "creation_timestamp: $timestamp\n";
+print {$id_fh} "source_directory: " . abs_path($src_dir) . "\n";
+print {$id_fh} "mode: $mode\n";
+print {$id_fh} "days: $days\n";
+close $id_fh;
+
+# --- Main Processing ---
+my ($start_epoch_filter, $end_epoch_filter);
+my $scan_message;
+
+if (defined $days) {
+    # Relative day-based filtering
+    $start_epoch_filter = time() - ($days * ONE_DAY);
+    $scan_message = "Scanning '$src_dir' for NMON files modified in the last $days day(s)...\n";
+} else {
+    # Absolute date-range filtering
+    if (defined $startd_obj) {
+        # Start of the day
+        $start_epoch_filter = $startd_obj->truncate(to => 'day')->epoch;
+    }
+    if (defined $endd_obj) {
+        # End of the day (23:59:59)
+        $end_epoch_filter = $endd_obj->truncate(to => 'day')->epoch + ONE_DAY - 1;
+    }
+    my $start_msg = defined($startd) ? "from $startd" : "from beginning of time";
+    my $end_msg = defined($endd) ? "until $endd" : "until now";
+    $scan_message = "Scanning '$src_dir' for NMON files modified $start_msg $end_msg...\n";
+}
+
+my %counters = (
+    scanned   => 0,
+    matched   => 0,
+    staged    => 0,
+    skipped   => 0,
+    conflict  => 0,
+);
+
+print $scan_message;
+
+find({ wanted => \&wanted, no_chdir => 1 }, $src_dir);
+
+sub wanted {
+    $counters{scanned}++;
+
+    # Filter 1: Must be a file matching NMON pattern
+    return unless -f $_;
+    return unless /\.(nmon|nmon\.(gz|bz2|bzip2))$/i;
+
+    # Filter 2: Must be recent enough
+    my $mtime = (stat($_))[9];
+    if (defined $start_epoch_filter) {
+        return unless $mtime >= $start_epoch_filter;
+    }
+    if (defined $end_epoch_filter) {
+        return unless $mtime <= $end_epoch_filter;
+    }
+
+    # Filter 3: Must match VM list (if provided)
+    my $basename = basename($_);
+    # Heuristic to get VM name from filename. Assumes format like 'hostname_...'
+    # This can be adjusted if other conventions are more common.
+    my ($vm_name_from_file) = $basename =~ /^([a-zA-Z0-9._-]+?)_/;
+    unless (defined $vm_name_from_file) {
+        # Fallback for filenames without underscores, e.g. 'hostname.nmon'
+        ($vm_name_from_file) = $basename =~ /^([a-zA-Z0-9._-]+?)\./;
+    }
+
+    if ($vm_filter_active) {
+        unless (defined $vm_name_from_file && exists $vms_to_process{$vm_name_from_file}) {
+            $counters{skipped}++;
+            return;
+        }
+    }
+    
+    $counters{matched}++;
+
+    # --- Staging Action ---
+    my $dest_subdir_name = Time::Piece->new($mtime)->strftime('%Y-%m');
+    my $dest_subdir_path = File::Spec->catfile($stage_dir, $dest_subdir_name);
+    make_path($dest_subdir_path) unless -d $dest_subdir_path;
+
+	if ($mode eq 'link') {
+		 my $abs_source_path = abs_path($_);  # resolve full real path of the source file
+		 my $dest_link_path  = File::Spec->catfile($dest_subdir_path, $basename);
+
+		 if (-l $dest_link_path) {
+			  my $existing_target = readlink($dest_link_path);
+			  if ($existing_target eq $abs_source_path) {
+					print "  Skipping existing link: $basename\n" if $verbose;
+					$counters{skipped}++;
+					next;
+			  } else {
+					unlink $dest_link_path or warn "Warning: Could not remove outdated symlink '$dest_link_path': $!\n";
+			  }
+		 } elsif (-e $dest_link_path) {
+			  warn "Warning: File exists and is not a symlink: '$dest_link_path'. Skipping.\n";
+			  $counters{conflict}++;
+			  next;
+		 }
+
+		 if (symlink($abs_source_path, $dest_link_path)) {
+			  print "  Linking: $basename\n" if $verbose;
+			  $counters{staged}++;
+		 } else {
+			  warn "Warning: Could not create symlink for '$basename': $!\n";
+		 }
+	}
+    elsif ($mode eq 'copy') {
+        my $dest_basename = $basename;
+        $dest_basename =~ s/\.(gz|bz2|bzip2)$//i; # Remove compression extension
+        my $dest_file_path = File::Spec->catfile($dest_subdir_path, $dest_basename);
+        
+        print "  Copying: $basename -> $dest_basename\n" if $verbose;
+        
+        my $success = 0;
+        if ($basename =~ /\.gz$/i) {
+            $success = decompress_to_file("gzip", "-dc", $_, $dest_file_path);
+        } elsif ($basename =~ /\.b(z|zip)2$/i) {
+            $success = decompress_to_file("bzcat", "", $_, $dest_file_path);
+        } else { # Uncompressed
+             if (copy($_, $dest_file_path)) {
+                 $success = 1;
+             } else {
+                 warn "Warning: Could not copy '$basename': $!\n";
+             }
+        }
+        
+        $counters{staged}++ if $success;
+    }
+}
+
+# Helper sub to decompress using safe open pipe
+sub decompress_to_file {
+    my ($command, $options, $source_file, $dest_file) = @_;
+    
+    # Build command array, filtering empty options
+    my @cmd_array = grep { $_ ne '' } ($command, $options, "--", $source_file);
+
+    # Open a pipe FROM the decompression command
+    open my $in_fh, "-|", @cmd_array or do {
+        warn "Warning: Could not execute command '@cmd_array': $!\n";
+        return 0;
+    };
+    binmode $in_fh;
+
+    # Open the destination file for writing
+    open my $out_fh, '>', $dest_file or do {
+        warn "Warning: Could not open destination file '$dest_file' for writing: $!\n";
+        close $in_fh;
+        return 0;
+    };
+    binmode $out_fh;
+    
+    # Copy data in chunks
+    my $buffer;
+    while (read($in_fh, $buffer, 8192)) {
+        print $out_fh $buffer;
+    }
+    
+    close $in_fh;
+    close $out_fh;
+    
+    # Check if the process exited cleanly
+    return ($? == 0);
+}
+
+# --- Final Summary ---
+print "\n--- Staging Complete ---\n";
+print "Mode: $mode\n";
+print "Files Scanned: $counters{scanned}\n";
+print "Files Matched Date/VM Criteria: $counters{matched}\n";
+if ($vm_filter_active) {
+    print "Files Skipped (VM mismatch): $counters{skipped}\n";
+}
+print "Files Successfully Staged: $counters{staged}\n";
+print "------------------------\n\n";
+print "You can now run your analysis:\n";
+print "nfit-profile.pl --nmondir $stage_dir [other options]\n\n";
+
+exit 0;
+
+# ==============================================================================
+# Subroutine to display usage information
+# ==============================================================================
+sub usage {
+    my $script_name = basename($0);
+    return <<END_USAGE;
+Usage: $script_name --srcdir <dir> --stagedir <dir> --days <N> [options]
+   or: $script_name --srcdir <dir> --stagedir <dir> --startd <date> [--endd <date>] [options]
+
+Prepares a subset of NMON data for fast analysis by the nfit suite.
+
+Required Arguments:
+  --srcdir <dir>       The top-level source directory to search recursively for NMON files.
+  --stagedir <dir>     The destination staging directory to create.
+
+Date/Time Selection (select one method):
+  --days, -n <N>       Select files modified in the last N days.
+  --startd <date>      Select files modified on or after this date (YYYY-MM-DD).
+  --endd <date>        Select files modified on or before this date (YYYY-MM-DD).
+                       (--days is mutually exclusive with --startd/--endd).
+
+Staging Mode:
+  --mode, -m <type>    The operational mode. Default is 'link'.
+                       'link': Create symbolic links to original files. (Fast, space-efficient).
+                       'copy': Copy and decompress files. (Slower, requires more disk space).
+
+Filtering Options:
+  --vm-list, -l <file> Path to a text file with one VM hostname per line. Can be combined with --vms.
+  --vms <list>         A comma-separated list of VM hostnames to include (e.g., "vm1,vm2").
+
+Other Options:
+  --cleanup            Authorize the script to delete and recreate the --stagedir if it already
+                       exists. This only works if the directory contains an '.nfit_stage_id'
+                       identifier file from a previous run.
+  --verbose, -v        Enable verbose output to see each file being staged.
+  --help, -h           Display this help message and exit.
+  --version            Display the script version and exit.
+
+Examples:
+  # Create a lightweight view of the last 90 days of data using symbolic links (default mode).
+  $script_name --srcdir /nmon/archive --stagedir /nfit/run01 --days 90 --cleanup
+
+  # Copy and decompress data for a specific date range for two specific VMs.
+  $script_name --srcdir /nmon/archive --stagedir /nfit/run02 --mode copy --startd 2025-05-01 --endd 2025-05-31 --vms "prod-db-01,prod-app-02" --cleanup
+
+END_USAGE
+}
