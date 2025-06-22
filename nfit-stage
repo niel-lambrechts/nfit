@@ -6,7 +6,7 @@
 #            subset based on date and an optional VM whitelist, and prepares
 #            an optimized staging directory for faster analysis by the nfit suite.
 # REQUIRES : Perl, Time::Piece, Time::Seconds, Getopt::Long, File::Find,
-#            File::Path, File::Spec, File::Basename, Cwd, File::Copy
+#            File::Path, File::Spec, File::Basename, Cwd, File::Copy, Fcntl
 
 use strict;
 use warnings;
@@ -19,12 +19,16 @@ use Cwd qw(abs_path);
 use Time::Piece;
 use Time::Seconds;
 use File::Copy qw(copy);
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL); # For creating a secure lock file.
 
 # --- Version ---
-my $VERSION = '4.25.172.0';
+my $VERSION = '4.25.173.0';
 
 # --- Constants ---
 my $IDENTIFIER_FILE = '.nfit_stage_id';
+my $CACHE_FILE      = '.nfit_scan_cache';
+my $LOCK_FILE       = '.nfit_scan_cache.lock';
+my $LOCK_TIMEOUT_S  = 60; # Maximum time (in seconds) to wait for a lock.
 
 # --- Argument Parsing ---
 my $src_dir;
@@ -81,6 +85,7 @@ if (defined($days) && (defined($startd) || defined($endd))) {
 unless (-d $src_dir) {
     die "Error: Source directory (--srcdir) '$src_dir' not found or is not a directory.\n";
 }
+$src_dir = abs_path($src_dir); # Resolve full path early.
 
 if (defined($days) && $days <= 0) {
     die "Error: Number of days (--days) must be a positive integer.\n";
@@ -157,90 +162,152 @@ if (-e $stage_dir) {
         print "Cleanup flag set. Removing existing staging directory: '$stage_dir'\n";
         remove_tree($stage_dir) or die "Error: Could not remove directory '$stage_dir': $!\n";
     } else {
-        die "Error: Staging directory '$stage_dir' already exists. Use --cleanup to overwrite it.\n";
+        # With the new cache, it's safe to re-run in an existing directory.
+        # This error is now only triggered if --cleanup is not used and the dir exists.
+        # We will check for the cache later. For now, we only error if it's a file.
     }
 }
 
-print "Creating new staging directory: '$stage_dir'\n";
-make_path($stage_dir) or die "Error: Could not create directory '$stage_dir': $!\n";
+unless (-d $stage_dir) {
+    print "Creating new staging directory: '$stage_dir'\n";
+    make_path($stage_dir) or die "Error: Could not create directory '$stage_dir': $!\n";
+}
+$stage_dir = abs_path($stage_dir);
 
-# --- Create Identifier File ---
+# --- Create Identifier File (if it doesn't exist) ---
 my $id_file_path = File::Spec->catfile($stage_dir, $IDENTIFIER_FILE);
-open my $id_fh, '>', $id_file_path or die "Error: Could not create identifier file in staging directory: $!\n";
-my $timestamp = localtime->strftime('%Y-%m-%dT%H:%M:%S');
-print {$id_fh} "# This directory was created by nfit-stage.pl.\n";
-print {$id_fh} "# The --cleanup flag requires this file for safe operation.\n";
-print {$id_fh} "creation_timestamp: $timestamp\n";
-print {$id_fh} "source_directory: " . abs_path($src_dir) . "\n";
-print {$id_fh} "mode: $mode\n";
-print {$id_fh} "days: $days\n";
-close $id_fh;
+unless (-e $id_file_path) {
+    open my $id_fh, '>', $id_file_path or die "Error: Could not create identifier file in staging directory: $!\n";
+    my $timestamp = localtime->strftime('%Y-%m-%dT%H:%M:%S');
+    print {$id_fh} "# This directory was created by nfit-stage.pl.\n";
+    print {$id_fh} "# The --cleanup flag requires this file for safe operation.\n";
+    print {$id_fh} "creation_timestamp: $timestamp\n";
+    print {$id_fh} "source_directory: " . abs_path($src_dir) . "\n";
+    # Store initial settings in the ID file for reference
+    print {$id_fh} "initial_mode: $mode\n";
+    my $days_val = defined($days) ? $days : 'N/A';
+    print {$id_fh} "initial_days: $days_val\n";
+    close $id_fh;
+}
 
-# --- Main Processing ---
+# --- Main Processing Logic ---
 my ($start_epoch_filter, $end_epoch_filter);
 my $scan_message;
 
 if (defined $days) {
-    # Relative day-based filtering
     $start_epoch_filter = time() - ($days * ONE_DAY);
-    $scan_message = "Scanning '$src_dir' for NMON files modified in the last $days day(s)...\n";
+    $scan_message = "Filtering for NMON files modified in the last $days day(s)...";
 } else {
-    # Absolute date-range filtering
     if (defined $startd_obj) {
-        # Start of the day
         $start_epoch_filter = $startd_obj->truncate(to => 'day')->epoch;
     }
     if (defined $endd_obj) {
-        # End of the day (23:59:59)
         $end_epoch_filter = $endd_obj->truncate(to => 'day')->epoch + ONE_DAY - 1;
     }
     my $start_msg = defined($startd) ? "from $startd" : "from beginning of time";
     my $end_msg = defined($endd) ? "until $endd" : "until now";
-    $scan_message = "Scanning '$src_dir' for NMON files modified $start_msg $end_msg...\n";
+    $scan_message = "Filtering for NMON files modified $start_msg $end_msg...";
+}
+print "$scan_message\n";
+
+
+# --- Cache and Scan Logic ---
+my $cache_file_path = File::Spec->catfile($stage_dir, $CACHE_FILE);
+my $lock_file_path  = File::Spec->catfile($stage_dir, $LOCK_FILE);
+my @source_files; # This will hold {path => '/path/to/file', mtime => 12345}
+
+if (-f $cache_file_path) {
+    print "Found existing scan cache. Using it to accelerate processing.\n";
+    open my $cfh, '<', $cache_file_path or die "Error: Could not read cache file '$cache_file_path': $!\n";
+    while (my $line = <$cfh>) {
+        chomp $line;
+        my ($path, $mtime) = split /\t/, $line, 2;
+        push @source_files, { path => $path, mtime => $mtime } if $path && $mtime;
+    }
+    close $cfh;
+} else {
+    # No cache exists, so we must scan. First, we handle locking.
+    my $lock_fh;
+    my $wait_start_time = time();
+    while (-e $lock_file_path) {
+        if (time() - $wait_start_time > $LOCK_TIMEOUT_S) {
+            die "Error: Timed out after $LOCK_TIMEOUT_S seconds waiting for lock file '$lock_file_path'.\n" .
+                "If you are sure no other nfit-stage process is running, remove this file manually.\n";
+        }
+        print "Another scan appears to be in progress. Waiting for lock to be released...\n";
+        sleep 2;
+    }
+
+    # Atomically create the lock file.
+    unless (sysopen $lock_fh, $lock_file_path, O_WRONLY | O_CREAT | O_EXCL) {
+        die "Error: Could not create lock file '$lock_file_path': $!. Another process may have just started.\n";
+    }
+
+    print "No cache found. Performing full scan of '$src_dir'. This may take a while...\n";
+    my @found_during_scan;
+    my $scan_sub = sub {
+        # We only want NMON files.
+        return unless -f $_ && /\.(nmon|nmon\.(gz|bz2|bzip2))$/i;
+        # Get absolute path and modification time.
+        push @found_during_scan, { path => abs_path($_), mtime => (stat($_))[9] };
+    };
+
+    find({ wanted => $scan_sub, no_chdir => 1 }, $src_dir);
+    @source_files = @found_during_scan;
+
+    # Now, write the results to the cache file for next time.
+    print "Scan complete. Writing " . scalar(@source_files) . " entries to cache file...\n";
+    open my $cfh, '>', $cache_file_path or die "Error: Could not open cache file '$cache_file_path' for writing: $!\n";
+    for my $file_ref (@source_files) {
+        print {$cfh} "$file_ref->{path}\t$file_ref->{mtime}\n";
+    }
+    close $cfh;
+
+    # Release the lock.
+    close $lock_fh;
+    unlink $lock_file_path or warn "Warning: Could not remove lock file '$lock_file_path': $!\n";
 }
 
+
+# --- Staging from File List ---
 my %counters = (
-    scanned   => 0,
+    scanned   => scalar(@source_files),
     matched   => 0,
     staged    => 0,
-    skipped   => 0,
+    skipped_vm => 0, # Renamed for clarity
+    skipped_date => 0,
     conflict  => 0,
 );
 
-print $scan_message;
+for my $file_ref (@source_files) {
+    my $source_path = $file_ref->{path};
+    my $mtime = $file_ref->{mtime};
 
-find({ wanted => \&wanted, no_chdir => 1 }, $src_dir);
-
-sub wanted {
-    $counters{scanned}++;
-
-    # Filter 1: Must be a file matching NMON pattern
-    return unless -f $_;
-    return unless /\.(nmon|nmon\.(gz|bz2|bzip2))$/i;
-
-    # Filter 2: Must be recent enough
-    my $mtime = (stat($_))[9];
+    # Filter 1: Must be recent enough (based on mtime from cache)
     if (defined $start_epoch_filter) {
-        return unless $mtime >= $start_epoch_filter;
+        unless ($mtime >= $start_epoch_filter) {
+            $counters{skipped_date}++;
+            next;
+        }
     }
     if (defined $end_epoch_filter) {
-        return unless $mtime <= $end_epoch_filter;
+        unless ($mtime <= $end_epoch_filter) {
+            $counters{skipped_date}++;
+            next;
+        }
     }
 
-    # Filter 3: Must match VM list (if provided)
-    my $basename = basename($_);
-    # Heuristic to get VM name from filename. Assumes format like 'hostname_...'
-    # This can be adjusted if other conventions are more common.
+    # Filter 2: Must match VM list (if provided)
+    my $basename = basename($source_path);
     my ($vm_name_from_file) = $basename =~ /^([a-zA-Z0-9._-]+?)_/;
     unless (defined $vm_name_from_file) {
-        # Fallback for filenames without underscores, e.g. 'hostname.nmon'
         ($vm_name_from_file) = $basename =~ /^([a-zA-Z0-9._-]+?)\./;
     }
 
     if ($vm_filter_active) {
         unless (defined $vm_name_from_file && exists $vms_to_process{$vm_name_from_file}) {
-            $counters{skipped}++;
-            return;
+            $counters{skipped_vm}++;
+            next;
         }
     }
     
@@ -251,46 +318,54 @@ sub wanted {
     my $dest_subdir_path = File::Spec->catfile($stage_dir, $dest_subdir_name);
     make_path($dest_subdir_path) unless -d $dest_subdir_path;
 
-	if ($mode eq 'link') {
-		 my $abs_source_path = abs_path($_);  # resolve full real path of the source file
-		 my $dest_link_path  = File::Spec->catfile($dest_subdir_path, $basename);
+    if ($mode eq 'link') {
+         my $dest_link_path  = File::Spec->catfile($dest_subdir_path, $basename);
 
-		 if (-l $dest_link_path) {
-			  my $existing_target = readlink($dest_link_path);
-			  if ($existing_target eq $abs_source_path) {
-					print "  Skipping existing link: $basename\n" if $verbose;
-					$counters{skipped}++;
-					next;
-			  } else {
-					unlink $dest_link_path or warn "Warning: Could not remove outdated symlink '$dest_link_path': $!\n";
-			  }
-		 } elsif (-e $dest_link_path) {
-			  warn "Warning: File exists and is not a symlink: '$dest_link_path'. Skipping.\n";
-			  $counters{conflict}++;
-			  next;
-		 }
+         if (-l $dest_link_path) {
+              my $existing_target = readlink($dest_link_path);
+              if ($existing_target eq $source_path) {
+                    # This is verbose, so only show if requested.
+                    print "  Skipping existing, correct link: $basename\n" if $verbose;
+                    next; # Don't increment any counters, it's already done.
+              } else {
+                    # This could happen if the source archive was reorganised.
+                    unlink $dest_link_path or warn "Warning: Could not remove outdated symlink '$dest_link_path': $!\n";
+              }
+         } elsif (-e $dest_link_path) {
+              warn "Warning: File exists and is not a symlink: '$dest_link_path'. Skipping.\n";
+              $counters{conflict}++;
+              next;
+         }
 
-		 if (symlink($abs_source_path, $dest_link_path)) {
-			  print "  Linking: $basename\n" if $verbose;
-			  $counters{staged}++;
-		 } else {
-			  warn "Warning: Could not create symlink for '$basename': $!\n";
-		 }
-	}
+         if (symlink($source_path, $dest_link_path)) {
+              print "  Linking: $basename\n" if $verbose;
+              $counters{staged}++;
+         } else {
+              warn "Warning: Could not create symlink for '$basename' pointing to '$source_path': $!\n";
+         }
+    }
     elsif ($mode eq 'copy') {
         my $dest_basename = $basename;
-        $dest_basename =~ s/\.(gz|bz2|bzip2)$//i; # Remove compression extension
+        # Remove compression extension for the destination file name.
+        $dest_basename =~ s/\.(gz|bz2|bzip2)$//i;
         my $dest_file_path = File::Spec->catfile($dest_subdir_path, $dest_basename);
         
+        # Avoid re-copying if the file already exists.
+        if (-e $dest_file_path) {
+            print "  Skipping existing copied file: $dest_basename\n" if $verbose;
+            next;
+        }
+
         print "  Copying: $basename -> $dest_basename\n" if $verbose;
         
         my $success = 0;
         if ($basename =~ /\.gz$/i) {
-            $success = decompress_to_file("gzip", "-dc", $_, $dest_file_path);
+            $success = decompress_to_file("gzip", "-dc", $source_path, $dest_file_path);
         } elsif ($basename =~ /\.b(z|zip)2$/i) {
-            $success = decompress_to_file("bzcat", "", $_, $dest_file_path);
+            # bzcat is often a symlink to bzip2 -d -c
+            $success = decompress_to_file("bzip2", "-dc", $source_path, $dest_file_path);
         } else { # Uncompressed
-             if (copy($_, $dest_file_path)) {
+             if (copy($source_path, $dest_file_path)) {
                  $success = 1;
              } else {
                  warn "Warning: Could not copy '$basename': $!\n";
@@ -338,15 +413,18 @@ sub decompress_to_file {
 
 # --- Final Summary ---
 print "\n--- Staging Complete ---\n";
-print "Mode: $mode\n";
-print "Files Scanned: $counters{scanned}\n";
-print "Files Matched Date/VM Criteria: $counters{matched}\n";
+print "Mode Used: $mode\n";
+print "Files Found in Source (from cache or scan): $counters{scanned}\n";
+print "Files Matching Date/VM Criteria: $counters{matched}\n";
 if ($vm_filter_active) {
-    print "Files Skipped (VM mismatch): $counters{skipped}\n";
+    print "Files Skipped (VM mismatch): $counters{skipped_vm}\n";
 }
-print "Files Successfully Staged: $counters{staged}\n";
-print "------------------------\n\n";
-print "You can now run your analysis:\n";
+print "Files Newly Staged in This Run: $counters{staged}\n";
+if ($counters{conflict} > 0) {
+    print "Path Conflicts (skipped): $counters{conflict}\n";
+}
+print "--------------------------------------------\n\n";
+print "You can now run your analysis, for example:\n";
 print "nfit-profile.pl --nmondir $stage_dir [other options]\n\n";
 
 exit 0;
@@ -361,10 +439,13 @@ Usage: $script_name --srcdir <dir> --stagedir <dir> --days <N> [options]
    or: $script_name --srcdir <dir> --stagedir <dir> --startd <date> [--endd <date>] [options]
 
 Prepares a subset of NMON data for fast analysis by the nfit suite.
+This script creates a cache of the source directory scan within the staging
+directory to dramatically speed up subsequent runs.
 
 Required Arguments:
   --srcdir <dir>       The top-level source directory to search recursively for NMON files.
-  --stagedir <dir>     The destination staging directory to create.
+  --stagedir <dir>     The destination staging directory to create. This directory will also
+                       house the scan cache for future runs.
 
 Date/Time Selection (select one method):
   --days, -n <N>       Select files modified in the last N days.
@@ -384,17 +465,20 @@ Filtering Options:
 Other Options:
   --cleanup            Authorize the script to delete and recreate the --stagedir if it already
                        exists. This only works if the directory contains an '.nfit_stage_id'
-                       identifier file from a previous run.
+                       identifier file from a previous run. THIS WILL DELETE THE CACHE.
   --verbose, -v        Enable verbose output to see each file being staged.
   --help, -h           Display this help message and exit.
   --version            Display the script version and exit.
 
 Examples:
-  # Create a lightweight view of the last 90 days of data using symbolic links (default mode).
+  # First run: Create a lightweight view of the last 90 days. This will be slow as it scans.
   $script_name --srcdir /nmon/archive --stagedir /nfit/run01 --days 90 --cleanup
 
-  # Copy and decompress data for a specific date range for two specific VMs.
-  $script_name --srcdir /nmon/archive --stagedir /nfit/run02 --mode copy --startd 2025-05-01 --endd 2025-05-31 --vms "prod-db-01,prod-app-02" --cleanup
+  # Second run: Stage data for just two specific VMs from the same period. This will be very fast.
+  $script_name --srcdir /nmon/archive --stagedir /nfit/run01 --days 90 --vms "prod-db-01,prod-app-02"
+
+  # Another run: Copy and decompress data for a specific date range. Also fast due to the cache.
+  $script_name --srcdir /nmon/archive --stagedir /nfit/run01 --mode copy --startd 2025-05-01 --endd 2025-05-31
 
 END_USAGE
 }
