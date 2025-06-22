@@ -32,7 +32,7 @@ use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 
 # --- Version ---
-my $VERSION = '4.25.172.0';
+my $VERSION = '4.25.173.0';
 
 # --- Configuration ---
 my $DEFAULT_AVG_METHOD     = 'ema';
@@ -650,7 +650,6 @@ if ($physc_csv_file) {
 								$a->{vm_name} cmp $b->{vm_name} || $a->{start_epoch} <=> $b->{start_epoch}
 				} @all_selected_states;
 
-				# --- In the "Unified Analysis Engine" section, after @sorted_states_to_process is created
 				my %states_by_vm;
 				foreach my $state (@sorted_states_to_process) {
 								push @{$states_by_vm{$state->{vm_name}}}, $state;
@@ -661,8 +660,15 @@ if ($physc_csv_file) {
 
 # --- Phase 3: Main Analysis Execution ---
 				my %vm_results_aggregator;
-# --- In the "Unified Analysis Engine" section ---
-# Replace the old if ($enable_windowed_decay_internal) block with this one.
+
+				# This single sort prepares the data for BOTH the windowed and non-windowed analysis paths.
+				print STDERR "  INFO: Preparing data for analysis (sorting by VM, then Time)...\n" if $verbose;
+				my ($sorted_fh, $sorted_filename) = tempfile(UNLINK => 1);
+				# Use system sort for efficiency: preserve header, then sort by VM Name (col 2), then Timestamp (col 1)
+				system("cat '$data_source_file' | (head -n 1 && tail -n +2 | sort -t, -k2,2 -k1,1) > '$sorted_filename'") == 0
+								or die "Failed to create sorted temporary file: $!";
+				# The analysis engine will now read from this correctly sorted temp file for all paths.
+				$data_source_file = $sorted_filename;
 
 				if ($enable_windowed_decay_internal) {
 								# This new algorithm leverages the VM-sorted data from the cache to
@@ -742,70 +748,53 @@ if ($physc_csv_file) {
 												process_vm_buffer(\@vm_data_buffer, $current_vm_name, \%vm_results_aggregator, \%states_by_vm, \@processing_windows);
 								}
 				} else {
-# --- PATH 2: Non-Decay, Per-State Analysis ---
-								my $state_idx = 0;
-								my @data_points_for_current_state;
+								# --- PATH 2: Re-architected Non-Decay, Per-State Analysis ---
+								# This new path uses a control-break algorithm to handle disparate time frames correctly.
 
-								open my $data_fh, '<', $data_source_file or die "FATAL: Could not open data source file '$data_source_file': $!";
+								my @vm_data_buffer;
+								my $current_vm_name_for_buffer;
+
+								open my $data_fh, '<', $sorted_filename or die "FATAL: Could not open sorted data file '$sorted_filename': $!";
 								<$data_fh>; # Skip header
 
-												while (my $line = <$data_fh>) {
-																last if $state_idx >= @sorted_states_to_process;
-																my $current_state = $sorted_states_to_process[$state_idx];
-																chomp $line;
-																my ($ts, $vm_name, $physc, $runq) = split ',', $line, 4;
-																next unless defined $vm_name;
+								while (my $line = <$data_fh>) {
+												chomp $line;
+												my ($ts, $line_vm, $physc, $runq) = split ',', $line, 4;
+												next unless defined $line_vm && $line_vm ne '';
 
-																my $tp;
-																eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
-																next if $@;
-																my $current_epoch = $tp->epoch;
+												# Initialize with the first VM found in the sorted file
+												$current_vm_name_for_buffer = $line_vm unless defined $current_vm_name_for_buffer;
 
-																if ($vm_name ne $current_state->{vm_name} || $current_epoch > $current_state->{end_epoch}) {
-																				if (@data_points_for_current_state) {
-																								print STDERR "    - Finalising State " . $current_state->{state_id} . " for VM " . $current_state->{vm_name} . "...\n";
-																								my $metrics = calculate_metrics_for_period(\@data_points_for_current_state, $current_state->{metadata});
-																								push @{$vm_results_aggregator{$current_state->{vm_name}}{'states'}}, { metrics => $metrics, state_obj => $current_state };
-																				}
-																				$state_idx++;
-																				@data_points_for_current_state = ();
-																				redo if $state_idx < @sorted_states_to_process;
-																				last;
-																}
-
-																if ($vm_name eq $current_state->{vm_name} && $current_epoch >= $current_state->{start_epoch}) {
-                    # --- TIME FILTER LOGIC ---
-																				if ($no_weekends) {
-																								my $day_of_week = $tp->day_of_week;
-																								next if ($day_of_week == 1 || $day_of_week == 7);
-																				}
-																				if ($time_filter_active) {
-																								my $line_time = substr($tp->hms(':'), 0, 5);
-																								my $include_line = 0;
-																								if ($time_filter_overnight) {
-																												$include_line = 1 if ($line_time ge $time_filter_start || $line_time lt $time_filter_end);
-																								} else {
-																												$include_line = 1 if ($line_time ge $time_filter_start && $line_time lt $time_filter_end);
-																								}
-																								next unless $include_line;
-																				}
-                    # --- END TIME FILTER LOGIC ---
-
-																				push @data_points_for_current_state, {
-																								ts => $ts, physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
-																											runq => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef, tp => $tp,
-																				};
-																}
+												# If the VM name changes, it's a "control break".
+												# Process the complete buffer for the previous VM.
+												if ($line_vm ne $current_vm_name_for_buffer && @vm_data_buffer) {
+																# Find the states that belong to the VM we just buffered
+																my @states_for_buffered_vm = grep { $_->{vm_name} eq $current_vm_name_for_buffer } @sorted_states_to_process;
+																process_vm_buffer_non_windowed(\@vm_data_buffer, $current_vm_name_for_buffer, \%vm_results_aggregator, \@states_for_buffered_vm);
+																@vm_data_buffer = (); # Reset buffer for the new VM
 												}
+
+												# Set the current VM name for the next iteration
+												$current_vm_name_for_buffer = $line_vm;
+
+												# Create the data point hash to be buffered
+												my $tp;
+												eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
+												next if $@;
+
+												push @vm_data_buffer, {
+																ts    => $ts,
+																physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
+																runq  => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef,
+																tp    => $tp,
+												};
+								}
 								close $data_fh;
 
-								if ($state_idx < @sorted_states_to_process) {
-												my $last_state = $sorted_states_to_process[$state_idx];
-												if (@data_points_for_current_state) {
-																print STDERR "    - Finalising last State " . $last_state->{state_id} . " for VM " . $last_state->{vm_name} . "...\n";
-																my $metrics = calculate_metrics_for_period(\@data_points_for_current_state, $last_state->{metadata});
-																push @{$vm_results_aggregator{$last_state->{vm_name}}{'states'}}, { metrics => $metrics, state_obj => $last_state };
-												}
+								# After the loop, ensure the very last VM's buffer is processed.
+								if (@vm_data_buffer) {
+												my @states_for_last_vm = grep { $_->{vm_name} eq $current_vm_name_for_buffer } @sorted_states_to_process;
+												process_vm_buffer_non_windowed(\@vm_data_buffer, $current_vm_name_for_buffer, \%vm_results_aggregator, \@states_for_last_vm);
 								}
 				}
 				print STDERR "  State Analysis complete.\n";
@@ -3239,20 +3228,48 @@ sub parse_csv_line {
 # --- process_vm_buffer ---
 # Analyses the fully buffered data for a single VM, calculating metrics
 # for each time window in which the VM has data.
-#
 sub process_vm_buffer {
     my ($vm_buffer_aref, $vm_name, $results_agg_href, $states_by_vm, $windows_aref) = @_;
+
+    # This subroutine now generates its own windows instead of receiving them via $windows_aref.
 
     print STDERR "INFO: Processing " . scalar(@$vm_buffer_aref) . " data points for VM '$vm_name'...\n" if ($verbose);
 
     # Find all configuration states relevant to THIS VM ONLY (fast)
     my @vm_states = @{$states_by_vm->{$vm_name} || []};
-    return unless @vm_states;
+    return unless @vm_states && @$vm_buffer_aref > 0;
 
+    # --- NEW: Step 1 - Determine this VM's specific date range from its data buffer ---
+    my $min_epoch_for_vm = $vm_buffer_aref->[0]->{tp}->epoch;
+    my $max_epoch_for_vm = $vm_buffer_aref->[-1]->{tp}->epoch;
+
+    # A quick loop is safer than assuming the buffer is perfectly time-sorted.
+    foreach my $dp (@$vm_buffer_aref) {
+        my $current_epoch = $dp->{tp}->epoch;
+        $min_epoch_for_vm = $current_epoch if $current_epoch < $min_epoch_for_vm;
+        $max_epoch_for_vm = $current_epoch if $current_epoch > $max_epoch_for_vm;
+    }
+
+    my $vm_start_obj = Time::Piece->new($min_epoch_for_vm);
+    my $vm_end_obj   = Time::Piece->new($max_epoch_for_vm);
+
+    # --- NEW: Step 2 - Generate processing windows specifically for this VM ---
+    my @vm_processing_windows = generate_processing_time_windows(
+        $vm_start_obj,
+        $vm_end_obj,
+        $process_window_unit_str,
+        $process_window_size_val
+    );
+
+    # If no windows could be generated (e.g., data spans less than one window), exit.
+    return unless @vm_processing_windows;
+
+    # --- EXISTING LOGIC: Now applied using the new VM-specific windows ---
     # Group the buffered data points by the index of their time window
     my %window_data_groups;
     foreach my $dp (@$vm_buffer_aref) {
-        my $win_idx = get_window_index_for_timestamp($dp->{tp}, $windows_aref);
+        # Use the new @vm_processing_windows array for mapping
+        my $win_idx = get_window_index_for_timestamp($dp->{tp}, \@vm_processing_windows);
         next unless defined $win_idx;
         push @{$window_data_groups{$win_idx}}, $dp;
     }
@@ -3262,9 +3279,9 @@ sub process_vm_buffer {
         my @window_buffer = @{$window_data_groups{$win_idx}};
         next unless @window_buffer;
         
+        # Take a sample timestamp to find the correct configuration state
         my $sample_tp = $window_buffer[0]->{tp};
 
-        # Find the single correct state for this data point's timestamp from the VM's states
         my ($current_state) = grep { $sample_tp->epoch >= $_->{start_epoch} && $sample_tp->epoch <= $_->{end_epoch} } @vm_states;
         next unless $current_state;
 
@@ -3272,7 +3289,7 @@ sub process_vm_buffer {
         my $metrics = calculate_metrics_for_period(\@window_buffer, $current_state->{metadata});
 
         # Store results in the main aggregator hash
-        my $rep_date = $windows_aref->[$win_idx][2];
+        my $rep_date = $vm_processing_windows[$win_idx][2];
         my $win_key = $rep_date->ymd('') . "_" . $win_idx;
         $results_agg_href->{$vm_name}{'time_windows'}{$win_key} = { metrics => $metrics, date_obj => $rep_date };
     }
@@ -3425,6 +3442,61 @@ sub save_result_to_cache
 
     close $fh;
     close $lock_fh; # Releases the lock automatically on close.
+}
+
+# --- NEW HELPER SUBROUTINE for the non-windowed path ---
+sub process_vm_buffer_non_windowed {
+    my ($vm_buffer_aref, $vm_name, $results_agg_href, $states_for_vm_aref) = @_;
+
+    return unless @$vm_buffer_aref && @$states_for_vm_aref;
+    print STDERR "    - Finalising " . scalar(@$states_for_vm_aref) . " State(s) for VM $vm_name...\n";
+
+    my %state_data_buffers;
+    # Group all data points from the buffer into their correct state
+    foreach my $dp (@$vm_buffer_aref) {
+        foreach my $state (@$states_for_vm_aref) {
+            if ($dp->{tp}->epoch >= $state->{start_epoch} && $dp->{tp}->epoch <= $state->{end_epoch}) {
+                push @{$state_data_buffers{$state->{state_id}}}, $dp;
+                last; # Found the correct state for this datapoint, move to next datapoint
+            }
+        }
+    }
+
+    # Now, calculate metrics for each state that had data
+    foreach my $state_id (sort { $a <=> $b } keys %state_data_buffers) {
+        my ($state_obj) = grep { $_->{state_id} == $state_id } @$states_for_vm_aref;
+        next unless $state_obj;
+
+        my @data_for_this_state = @{$state_data_buffers{$state_id}};
+
+        # Apply time filters (online, batch, no-weekends) here
+        my @filtered_data_for_state;
+        if ($no_weekends || $time_filter_active) {
+            foreach my $dp (@data_for_this_state) {
+                 if ($no_weekends) {
+                    my $day_of_week = $dp->{tp}->day_of_week;
+                    next if ($day_of_week == 1 || $day_of_week == 7);
+                }
+                if ($time_filter_active) {
+                    my $line_time = substr($dp->{tp}->hms(':'), 0, 5);
+                    my $include_line = 0;
+                    if ($time_filter_overnight) {
+                        $include_line = 1 if ($line_time ge $time_filter_start || $line_time lt $time_filter_end);
+                    } else {
+                        $include_line = 1 if ($line_time ge $time_filter_start && $line_time lt $time_filter_end);
+                    }
+                    next unless $include_line;
+                }
+                push @filtered_data_for_state, $dp;
+            }
+        } else {
+            @filtered_data_for_state = @data_for_this_state;
+        }
+
+        # Calculate metrics using the filtered data
+        my $metrics = calculate_metrics_for_period(\@filtered_data_for_state, $state_obj->{metadata});
+        push @{$results_agg_href->{$vm_name}{'states'}}, { metrics => $metrics, state_obj => $state_obj };
+    }
 }
 
 sub usage
