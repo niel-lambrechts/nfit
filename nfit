@@ -118,6 +118,7 @@ my $process_window_unit_str = $DEFAULT_PROCESS_WINDOW_UNIT;
 my $process_window_size_val = $DEFAULT_PROCESS_WINDOW_SIZE;
 my $decay_half_life_days_val = $DEFAULT_DECAY_HALF_LIFE_DAYS;
 my $analysis_reference_date_str;
+my $decay_over_states_flag = 0;
 
 # Growth Prediction options (NEW)
 my $enable_growth_prediction = 0;
@@ -160,6 +161,7 @@ GetOptions(
     'process-window-size=i'     => \$process_window_size_val,
     'decay-half-life-days=i'    => \$decay_half_life_days_val,
     'analysis-reference-date=s' => \$analysis_reference_date_str,
+    'decay-over-states'         => \$decay_over_states_flag, 
     # Growth Prediction Options (NEW)
     'enable-growth-prediction'       => \$enable_growth_prediction,
     'growth-projection-days=i'       => \$growth_projection_days,
@@ -325,13 +327,13 @@ if ($enable_windowed_decay_internal)
 # Growth Prediction Option Validation (NEW)
 if ($enable_growth_prediction)
 {
-    unless ($enable_windowed_decay_internal)
+    # Growth prediction now works with EITHER standard windowed decay OR the new hybrid model.
+    unless ($enable_windowed_decay_internal || $decay_over_states_flag)
     {
-        # This also implies growth prediction cannot run in non-windowed decay mode.
-        # Set flag to false to ensure growth logic is skipped later, even if initially enabled by user.
-        print STDERR "Warning: --enable-growth-prediction requires --enable-windowed-decay to be active. Growth prediction will be SKIPPED.\n";
+        print STDERR "Warning: --enable-growth-prediction requires either --enable-windowed-decay or --decay-over-states to be active. Growth prediction will be SKIPPED.\n";
         $enable_growth_prediction = 0;
     }
+
     if ($growth_projection_days < 1)
     {
         die "Error: --growth-projection-days must be at least 1.\n";
@@ -654,9 +656,39 @@ if ($physc_csv_file) {
 				foreach my $state (@sorted_states_to_process) {
 								push @{$states_by_vm{$state->{vm_name}}}, $state;
 				}
-
 				my $total_vms_with_states = scalar(keys %config_states_by_vm);
+
 				print STDERR "  -> Analysing " . scalar(@sorted_states_to_process) . " selected configuration states across $total_vms_with_states VMs.\n";
+
+				# ------------------------------------------------------------------
+				# Define the Analysis Reference Date
+				# This is done once, before any analysis path is chosen, to ensure the
+				# variable is available to any mode that needs it (Windowed and Hybrid).
+				# ------------------------------------------------------------------
+				my $analysis_ref_obj;
+				if ($enable_windowed_decay_internal || $decay_over_states_flag)
+				{
+								if (defined $analysis_reference_date_str)
+								{
+												eval { $analysis_ref_obj = Time::Piece->strptime($analysis_reference_date_str, "%Y-%m-%d"); };
+												if ($@ || !$analysis_ref_obj)
+												{
+																	die "Error: Invalid --analysis-reference-date: '$analysis_reference_date_str'. Parser error: $@";
+												}
+								}
+								else
+								{
+												# Default to the end time of the latest state if no reference date is given
+												my $latest_epoch = 0;
+												foreach my $state (@all_selected_states)
+												{
+																$latest_epoch = $state->{end_time}->epoch if $state->{end_time}->epoch > $latest_epoch;
+												}
+												$analysis_ref_obj = Time::Piece->new($latest_epoch);
+								}
+								# Truncate to the start of the day for consistent calculations
+								$analysis_ref_obj = $analysis_ref_obj->truncate(to => 'day');
+				}
 
 # --- Phase 3: Main Analysis Execution ---
 				my %vm_results_aggregator;
@@ -670,133 +702,103 @@ if ($physc_csv_file) {
 				# The analysis engine will now read from this correctly sorted temp file for all paths.
 				$data_source_file = $sorted_filename;
 
-				if ($enable_windowed_decay_internal) {
-								# This new algorithm leverages the VM-sorted data from the cache to
-								# efficiently batch and process one VM at a time.
-								print STDERR "  Performing VM-batched windowed decay analysis (single pass)...\n";
+				# This is the main control-break loop that reads the sorted data file once
+				# and buffers data on a per-VM basis.
+				my @vm_data_buffer;
+				my $current_vm_name_for_buffer;
 
-								# --- Stage 1: Generate Processing Windows (Preserved Logic) ---
-								# This logic is unchanged and defines the time windows for the analysis.
-								my ($min_start_obj, $max_end_obj);
-								foreach my $state (@sorted_states_to_process) {
-												$min_start_obj = $state->{start_time} if !defined $min_start_obj || $state->{start_time}->epoch < $min_start_obj->epoch;
-												$max_end_obj = $state->{end_time} if !defined $max_end_obj || $state->{end_time}->epoch > $max_end_obj->epoch;
-								}
-								my @processing_windows = generate_processing_time_windows($min_start_obj, $max_end_obj, $process_window_unit_str, $process_window_size_val);
+				open my $data_fh, '<', $data_source_file or die "FATAL: Could not open sorted data file '$data_source_file': $!";
+				<$data_fh>; # Skip header
 
-								# --- Stage 2: Main Control-Break Loop (New Optimized Logic) ---
-								# This loop reads the sorted data file, buffering all data for one VM at a time.
-								my @vm_data_buffer;
-								my $current_vm_name;
+				while (my $line = <$data_fh>)
+				{
+								chomp $line;
+								my ($ts, $line_vm, $physc, $runq) = split ',', $line, 4;
+								next unless defined $line_vm && $line_vm ne '';
 
-								open my $data_fh, '<', $data_source_file or die "FATAL: Could not open data source file '$data_source_file': $!";
-								<$data_fh>; # Skip header
+								$current_vm_name_for_buffer = $line_vm unless defined $current_vm_name_for_buffer;
 
-								while (my $line = <$data_fh>) {
-												chomp $line;
-												my ($ts, $line_vm, $physc, $runq) = split ',', $line, 4;
-												next unless defined $line_vm;
+								# On a "control break" (when VM name changes), process the buffered data
+								if ($line_vm ne $current_vm_name_for_buffer && @vm_data_buffer)
+								{
+												my @states_for_buffered_vm = grep { $_->{vm_name} eq $current_vm_name_for_buffer } @sorted_states_to_process;
 
-												# Initialize with the first VM found in the sorted file
-												$current_vm_name = $line_vm unless defined $current_vm_name;
-
-												# If the VM name changes, it's a "control break".
-												# Process the complete buffer for the previous VM.
-												if ($line_vm ne $current_vm_name && @vm_data_buffer) {
-																process_vm_buffer(\@vm_data_buffer, $current_vm_name, \%vm_results_aggregator, \%states_by_vm, \@processing_windows);
-																@vm_data_buffer = (); # Reset buffer for the new VM
+												# --- Main Analysis Path Router ---
+												if ($enable_windowed_decay_internal)
+												{
+																# PATH A: Standard Windowed Decay
+																process_vm_buffer(\@vm_data_buffer, $current_vm_name_for_buffer, \%vm_results_aggregator, \%states_by_vm, \@processing_windows);
 												}
+												elsif ($decay_over_states_flag)
+												{
+																# PATH B: Hybrid State-Time Decay Model
+																my @state_results = get_metrics_for_each_state(\@vm_data_buffer, $current_vm_name_for_buffer, \@states_for_buffered_vm);
 
-												# Set the current VM name for the next iteration
-												$current_vm_name = $line_vm;
-
-												# --- Time Filtering Logic (Preserved Logic) ---
-												# Filters are applied here before adding data to the buffer.
-												my $tp;
-												eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
-												next if $@;
-
-												if ($no_weekends) {
-																my $day_of_week = $tp->day_of_week;
-																next if ($day_of_week == 1 || $day_of_week == 7);
-												}
-												if ($time_filter_active) {
-																my $line_time = substr($tp->hms(':'), 0, 5);
-																my $include_line = 0;
-																if ($time_filter_overnight) {
-																				$include_line = 1 if ($line_time ge $time_filter_start || $line_time lt $time_filter_end);
-																} else {
-																				$include_line = 1 if ($line_time ge $time_filter_start && $line_time lt $time_filter_end);
+																if (@state_results)
+																{
+																				# Synthesize a daily time series from the state-based results
+																				my @hybrid_timeseries = synthesize_hybrid_timeseries(\@state_results, "P".clean_perc_label($percentile));
+																				# Apply the final decay calculation to get a single hybrid metric
+																				my $final_hybrid_metric = calculate_recency_weighted_average(\@hybrid_timeseries, $analysis_ref_obj, $decay_half_life_days_val);
+																				# Store the single result in the aggregator
+																				$vm_results_aggregator{$current_vm_name_for_buffer}{'hybrid_metric'} = $final_hybrid_metric;
+																				$vm_results_aggregator{$current_vm_name_for_buffer}{'source_states'} = \@state_results;
 																}
-																next unless $include_line;
 												}
-												# --- End of Time Filtering ---
-
-												# Add the parsed data point to the buffer for the current VM
-												push @vm_data_buffer, {
-																ts    => $ts,
-																physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
-																runq  => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef,
-																tp    => $tp,
-												};
-								}
-								close $data_fh;
-
-								# --- Stage 3: Final Processing (Preserved Logic) ---
-								# After the loop, ensure the very last VM's buffer is processed.
-								if (@vm_data_buffer) {
-												process_vm_buffer(\@vm_data_buffer, $current_vm_name, \%vm_results_aggregator, \%states_by_vm, \@processing_windows);
-								}
-				} else {
-								# --- PATH 2: Re-architected Non-Decay, Per-State Analysis ---
-								# This new path uses a control-break algorithm to handle disparate time frames correctly.
-
-								my @vm_data_buffer;
-								my $current_vm_name_for_buffer;
-
-								open my $data_fh, '<', $sorted_filename or die "FATAL: Could not open sorted data file '$sorted_filename': $!";
-								<$data_fh>; # Skip header
-
-								while (my $line = <$data_fh>) {
-												chomp $line;
-												my ($ts, $line_vm, $physc, $runq) = split ',', $line, 4;
-												next unless defined $line_vm && $line_vm ne '';
-
-												# Initialize with the first VM found in the sorted file
-												$current_vm_name_for_buffer = $line_vm unless defined $current_vm_name_for_buffer;
-
-												# If the VM name changes, it's a "control break".
-												# Process the complete buffer for the previous VM.
-												if ($line_vm ne $current_vm_name_for_buffer && @vm_data_buffer) {
-																# Find the states that belong to the VM we just buffered
-																my @states_for_buffered_vm = grep { $_->{vm_name} eq $current_vm_name_for_buffer } @sorted_states_to_process;
-																process_vm_buffer_non_windowed(\@vm_data_buffer, $current_vm_name_for_buffer, \%vm_results_aggregator, \@states_for_buffered_vm);
-																@vm_data_buffer = (); # Reset buffer for the new VM
+												else
+												{
+																# PATH C: Standard Non-Windowed (State-by-State)
+																my @state_results = get_metrics_for_each_state(\@vm_data_buffer, $current_vm_name_for_buffer, \@states_for_buffered_vm);
+																$vm_results_aggregator{$current_vm_name_for_buffer}{'states'} = \@state_results if @state_results;
 												}
 
-												# Set the current VM name for the next iteration
-												$current_vm_name_for_buffer = $line_vm;
-
-												# Create the data point hash to be buffered
-												my $tp;
-												eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
-												next if $@;
-
-												push @vm_data_buffer, {
-																ts    => $ts,
-																physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
-																runq  => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef,
-																tp    => $tp,
-												};
+												@vm_data_buffer = (); # Reset buffer for the new VM
 								}
-								close $data_fh;
 
-								# After the loop, ensure the very last VM's buffer is processed.
-								if (@vm_data_buffer) {
-												my @states_for_last_vm = grep { $_->{vm_name} eq $current_vm_name_for_buffer } @sorted_states_to_process;
-												process_vm_buffer_non_windowed(\@vm_data_buffer, $current_vm_name_for_buffer, \%vm_results_aggregator, \@states_for_last_vm);
+								$current_vm_name_for_buffer = $line_vm;
+
+								# Buffer the current data point
+								my $tp;
+								eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); };
+								next if $@;
+
+								push @vm_data_buffer, {
+												ts    => $ts,
+												physc => (defined $physc && looks_like_number($physc)) ? $physc+0 : undef,
+												runq  => (defined $runq && looks_like_number($runq)) ? $runq+0 : undef,
+												tp    => $tp,
+								};
+				}
+				close $data_fh;
+
+				# After the loop, ensure the very last VM's buffer is processed
+				if (@vm_data_buffer)
+				{
+								my @states_for_last_vm = grep { $_->{vm_name} eq $current_vm_name_for_buffer } @sorted_states_to_process;
+
+								# --- Final Analysis Path Router ---
+								if ($enable_windowed_decay_internal)
+								{
+												process_vm_buffer(\@vm_data_buffer, $current_vm_name_for_buffer, \%vm_results_aggregator, \%states_by_vm, \@processing_windows);
+								}
+								elsif ($decay_over_states_flag)
+								{
+												my @state_results = get_metrics_for_each_state(\@vm_data_buffer, $current_vm_name_for_buffer, \@states_for_last_vm);
+												if (@state_results)
+												{
+																my @hybrid_timeseries = synthesize_hybrid_timeseries(\@state_results, "P".clean_perc_label($percentile));
+																my $final_hybrid_metric = calculate_recency_weighted_average(\@hybrid_timeseries, $analysis_ref_obj, $decay_half_life_days_val);
+																$vm_results_aggregator{$current_vm_name_for_buffer}{'hybrid_metric'} = $final_hybrid_metric;
+																$vm_results_aggregator{$current_vm_name_for_buffer}{'source_states'} = \@state_results;
+												}
+								}
+								else
+								{
+												my @state_results = get_metrics_for_each_state(\@vm_data_buffer, $current_vm_name_for_buffer, \@states_for_last_vm);
+												$vm_results_aggregator{$current_vm_name_for_buffer}{'states'} = \@state_results if @state_results;
 								}
 				}
+
 				print STDERR "  State Analysis complete.\n";
 # --- End of Analysis --- #
 
@@ -820,33 +822,30 @@ if ($physc_csv_file) {
 								push @metric_keys_in_order, "GrowthAdj", "GrowthAdjAbs";
 				}
 				push @output_header_cols, @metric_keys_in_order;
-#    print STDOUT join(",", @output_header_cols) . "\n";
 
-				if (!$enable_windowed_decay_internal) {
-# When decay is OFF, print one key=value pair line per state processed.
-								foreach my $vm_name (sort keys %vm_results_aggregator) {
-
+				# This is the conditional block that handles output for all three modes.
+				# Path A: Output for standard Non-Windowed (State-by-State) Mode.
+				if (!$enable_windowed_decay_internal && !$decay_over_states_flag)
+				{
+								# This logic is preserved to print one result line per configuration state.
+								foreach my $vm_name (sort keys %vm_results_aggregator)
+								{
 												next unless (exists $vm_results_aggregator{$vm_name}{'states'} && ref($vm_results_aggregator{$vm_name}{'states'}) eq 'ARRAY');
 
 												my @states_for_this_vm = @{$vm_results_aggregator{$vm_name}{'states'}};
 												my $total_states_for_vm = scalar(@states_for_this_vm);
 
-												foreach my $result (@states_for_this_vm) {
+												foreach my $result (@states_for_this_vm)
+												{
 																my $state_obj = $result->{state_obj};
 																my $md        = $result->{state_obj}{metadata};
 
-																# Build the descriptive state identifier prefix
 																my $state_prefix = sprintf("%s:State-%d_of_%d (%s_to_%s)",
-																								$vm_name,
-																								$state_obj->{state_id},
-																								$total_states_for_vm,
-																								$state_obj->{start_time}->strftime('%Y-%m-%d'),
-																								$state_obj->{end_time}->strftime('%Y-%m-%d')
-																								);
-
+																				$vm_name, $state_obj->{state_id}, $total_states_for_vm,
+																				$state_obj->{start_time}->strftime('%Y-%m-%d'),
+																				$state_obj->{end_time}->strftime('%Y-%m-%d')
+																);
 																my @output_parts = ($state_prefix);
-
-																# Push metadata key-value pairs
 																push @output_parts, sprintf("Entitlement=%.2f", $md->{entitlement} // 0);
 																push @output_parts, sprintf("MaxCPU=%.2f", $md->{max_cpu} // 0);
 																push @output_parts, sprintf("SMT=%d", $md->{smt} // 0);
@@ -854,111 +853,122 @@ if ($physc_csv_file) {
 																push @output_parts, sprintf("SerialNumber=%s", $md->{serial_number} // '');
 																push @output_parts, sprintf("PoolID=%s", $md->{pool_id} // '');
 
-																# Push metric key-value pairs
 																my @metric_keys = sort keys %{$result->{metrics}};
-																foreach my $key (@metric_keys) {
+																foreach my $key (@metric_keys)
+																{
 																				my $val = $result->{metrics}{$key};
 																				my $val_str = defined($val) && looks_like_number($val) ? sprintf("%.${output_dp}f", apply_rounding($val, $round_increment, $rounding_method)) : "N/A";
 																				push @output_parts, "$key=$val_str";
 																}
-
-																# Final print statement, joined by spaces (buffered, for results cache)
 																push @final_output_lines, join(" ", @output_parts);
-
 												}
 								}
-				} else {
-# When decay is ON, aggregate results and print one line per VM.
-								my $analysis_ref_obj;
-								if (defined $analysis_reference_date_str) {
-												eval { $analysis_ref_obj = Time::Piece->strptime($analysis_reference_date_str, "%Y-%m-%d"); };
-												die "Error: Invalid --analysis-reference-date: '$analysis_reference_date_str'. Parser error: $@" if ($@ || !$analysis_ref_obj);
-								} else {
-												my $latest_epoch = 0;
-												foreach my $state (@all_selected_states) { $latest_epoch = $state->{end_time}->epoch if $state->{end_time}->epoch > $latest_epoch; }
-												$analysis_ref_obj = Time::Piece->new($latest_epoch);
-								}
-								$analysis_ref_obj = $analysis_ref_obj->truncate(to => 'day');
+				}
+				else # Path B & C: Unified Output for ALL Aggregated Modes (Windowed Decay AND Hybrid)
+				{
+								# This block handles output for both --enable-windowed-decay and --decay-over-states
+								foreach my $vm_name (sort keys %vm_results_aggregator)
+								{
+												my %final_metrics;
+												my $last_state_metadata;
 
-								foreach my $vm_name (sort keys %vm_results_aggregator) {
-
-												my %final_metrics; my %all_keys;
-												foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
-																foreach my $key (keys %{$win_result->{metrics}}) { $all_keys{$key} = 1; }
-												}
-
-# Aggregate metrics across all time windows for the VM using recency weighting
-												foreach my $metric_key (sort keys %all_keys) {
-																my @metric_values_across_windows;
+												# Step 1: Populate the base metrics depending on the analysis mode.
+												if ($enable_windowed_decay_internal)
+												{
+																# --- Aggregate base metrics for Standard Windowed Decay mode ---
+																my %all_keys;
 																foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
-																				if (defined $win_result->{metrics}{$metric_key}) {
-																								push @metric_values_across_windows, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
+																				foreach my $key (keys %{$win_result->{metrics}}) { $all_keys{$key} = 1; }
+																}
+																foreach my $metric_key (sort keys %all_keys) {
+																				my @metric_values_across_windows;
+																				foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
+																								if (defined $win_result->{metrics}{$metric_key}) {
+																												push @metric_values_across_windows, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
+																								}
+																				}
+																				if ($metric_key ne 'Peak') {
+																								$final_metrics{$metric_key} = calculate_recency_weighted_average(\@metric_values_across_windows, $analysis_ref_obj, $decay_half_life_days_val);
+																				} else {
+																								my @values = map { $_->{value} } grep { defined $_->{value} && looks_like_number($_->{value}) } @metric_values_across_windows;
+																								$final_metrics{$metric_key} = @values ? max(@values) : "N/A";
 																				}
 																}
-
-# For all other (non-peak) metrics, apply the recency weighted average
-																if ($metric_key ne 'Peak') {
-																				$final_metrics{$metric_key} = calculate_recency_weighted_average(\@metric_values_across_windows, $analysis_ref_obj, $decay_half_life_days_val);
-																} else {
-# Peak is an absolute max, do not apply decay
-																				my @values = map { $_->{value} } grep { defined $_->{value} && looks_like_number($_->{value}) } @metric_values_across_windows;
-																				$final_metrics{$metric_key} = @values ? max(@values) : "N/A";
-																}
 												}
+												elsif ($decay_over_states_flag)
+												{
+																# --- Populate base metrics for the Hybrid State-Time Decay mode ---
+																my $p_label = "P" . clean_perc_label($percentile);
+																$final_metrics{$p_label} = $vm_results_aggregator{$vm_name}{'hybrid_metric'} // "N/A";
 
-# --- Growth Prediction logic for aggregated result ---
-												my $p_label_main = "P" . clean_perc_label($percentile);
-												my ($growth_adj_value, $growth_adj_abs_value) = (0.0, 0.0);
-
-												if ($enable_growth_prediction) {
-																my @timeseries_values; my @timeseries_points; my $time_idx = 0;
-																foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
-																				my $metric_val = $win_result->{metrics}{$p_label_main};
-																				if (defined $metric_val && looks_like_number($metric_val)) {
-																								push @timeseries_values, $metric_val; push @timeseries_points, [$time_idx, $metric_val]; $time_idx++;
-																				}
-																}
-
-																my $num_hist_periods = scalar(@timeseries_points);
-																if ($num_hist_periods >= $GROWTH_MIN_HISTORICAL_PERIODS) {
-																				my ($mean_val, $stddev_val, $cv_val) = calculate_statistics_for_trend(\@timeseries_values);
-																				if (defined $cv_val && $cv_val < $GROWTH_MAX_CV_THRESHOLD) {
-																								my ($slope, $intercept) = calculate_manual_linear_regression(\@timeseries_points);
-																								if ($slope > $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD) {
-																												my $projected_val = $slope * ($num_hist_periods - 1 + $growth_projection_days) + $intercept;
-																												my $baseline_val = $final_metrics{$p_label_main} // 0;
-																												if ($baseline_val > $FLOAT_EPSILON) {
-																																my $inflation_perc = (($projected_val - $baseline_val) / $baseline_val) * 100;
-																																$inflation_perc = $max_growth_inflation_percent if $inflation_perc > $max_growth_inflation_percent;
-																																$growth_adj_value = ($baseline_val * $inflation_perc / 100);
-																																$growth_adj_abs_value = $growth_adj_value;
+																my $source_states_aref = $vm_results_aggregator{$vm_name}{'source_states'};
+																if ($calculate_peak) {
+																				my @all_peaks;
+																				if ($source_states_aref && @$source_states_aref) {
+																								foreach my $state_res (@$source_states_aref) {
+																												if (defined $state_res->{metrics}{'Peak'}) {
+																																push @all_peaks, $state_res->{metrics}{'Peak'};
 																												}
 																								}
 																				}
+																				$final_metrics{'Peak'} = @all_peaks ? max(@all_peaks) : "N/A";
+																}
+																if ($source_states_aref && @$source_states_aref) {
+																				my $last_state_metrics = $source_states_aref->[-1]{metrics};
+																				foreach my $p (@runq_norm_percentiles_to_calc) { my $key = "NormRunQ_P".clean_perc_label($p); $final_metrics{$key} = $last_state_metrics->{$key} // "N/A"; }
+																				foreach my $p (@runq_abs_percentiles_to_calc)  { my $key = "AbsRunQ_P".clean_perc_label($p);  $final_metrics{$key} = $last_state_metrics->{$key} // "N/A"; }
 																}
 												}
-												$final_metrics{"GrowthAdj"} = $growth_adj_value;
-												$final_metrics{"GrowthAdjAbs"} = $growth_adj_abs_value;
 
-												if (defined $final_metrics{$p_label_main} && looks_like_number($final_metrics{$p_label_main})) {
-																$final_metrics{$p_label_main} += $growth_adj_value;
+												# Step 2: If enabled, calculate and apply growth prediction to the base metrics.
+												if ($enable_growth_prediction)
+												{
+																my $p_label_main = "P" . clean_perc_label($percentile);
+																my @timeseries_for_growth;
+
+																if ($enable_windowed_decay_internal)
+																{
+																				# For standard decay, build the time series from the per-window results.
+																				my @sorted_windows = sort { $a->{date_obj}->epoch <=> $b->{date_obj}->epoch } values %{$vm_results_aggregator{$vm_name}{time_windows}};
+																				foreach my $win_result (@sorted_windows)
+																				{
+																								push @timeseries_for_growth, $win_result->{metrics}{$p_label_main};
+																				}
+																}
+																elsif ($decay_over_states_flag)
+																{
+																				# For hybrid decay, use the daily stamped values from the synthesized time series.
+																				if (exists $vm_results_aggregator{$vm_name}{'hybrid_timeseries_data'})
+																				{
+																								@timeseries_for_growth = map { $_->{value} } @{$vm_results_aggregator{$vm_name}{'hybrid_timeseries_data'}};
+																				}
+																}
+
+																# Call the reusable subroutine to get the growth adjustment values.
+																my ($growth_adj, $growth_adj_abs) = calculate_growth_prediction(\@timeseries_for_growth, $final_metrics{$p_label_main});
+
+																# Apply the adjustments to the final metrics hash.
+																$final_metrics{"GrowthAdj"} = $growth_adj;
+																$final_metrics{"GrowthAdjAbs"} = $growth_adj_abs;
+																$final_metrics{$p_label_main} += $growth_adj if (defined $final_metrics{$p_label_main} && looks_like_number($final_metrics{$p_label_main}));
 												}
 
-												# --- Print the single aggregated output line ---
+												# Step 3: Common Printing Logic for All Aggregated Modes.
 												my ($last_state_obj) = grep { $_->{vm_name} eq $vm_name } reverse @sorted_states_to_process;
+												next unless $last_state_obj;
 
-												unless ($last_state_obj) {
-																print STDERR "WARN: Could not find a valid state object for VM '$vm_name' to print metadata. Skipping.\n";
-																next;
+												# Get the most recent metadata for the VM.
+												if (exists $config_states_by_vm{$vm_name} && @{$config_states_by_vm{$vm_name}})
+												{
+																$last_state_metadata = $config_states_by_vm{$vm_name}[-1]{metadata};
 												}
-												my $last_state_metadata = {};
-												if (exists $config_states_by_vm{$vm_name} && @{$config_states_by_vm{$vm_name}}) {
-																$last_state_metadata = $config_states_by_vm{$vm_name}[-1]->{metadata};
+												else
+												{
+																$last_state_metadata = {};
 												}
 
-												# --- Print the single aggregated output line ---
+												# Build and buffer the final output line.
 												my $output_string = "$vm_name:";
-
 												$output_string .= sprintf(" Entitlement=%.2f", $last_state_metadata->{entitlement} // 0);
 												$output_string .= sprintf(" MaxCPU=%.2f", $last_state_metadata->{max_cpu} // 0);
 												$output_string .= sprintf(" SMT=%s", $last_state_metadata->{smt} // '');
@@ -967,15 +977,16 @@ if ($physc_csv_file) {
 												$output_string .= sprintf(" PoolID=%s", $last_state_metadata->{pool_id} // '');
 
 												my @keys_out = sort keys %final_metrics;
-												foreach my $key (@keys_out) {
+												foreach my $key (@keys_out)
+												{
 																my $val = $final_metrics{$key};
 																my $val_str = defined($val) && looks_like_number($val) ? sprintf("%.${output_dp}f", apply_rounding($val, $round_increment, $rounding_method)) : "N/A";
 																$output_string .= " $key=$val_str";
 												}
-            # buffered for results cache
 												push @final_output_lines, $output_string;
 								}
 				}
+
 }
 
 # --- L2 Cache Save and Final Output ---
@@ -3108,12 +3119,19 @@ sub generate_run_summary_string {
     }
     push @summary_lines, sprintf("%-".$label_width."s: %s", "Filters Applied", join(', ', @filters)) if @filters;
 
-    # Decay / Growth
-    my $decay_status = $enable_windowed_decay_internal ? "Windowed Decay ON" : "Windowed Decay OFF";
-    my $growth_status = $enable_growth_prediction ? "Growth Prediction ON" : "Growth Prediction OFF";
-    push @summary_lines, sprintf("%-".$label_width."s: %s, %s", "Decay / Growth", $decay_status, $growth_status);
+    # Decay / Growth / Analysis Model
+    my $analysis_model_str;
+    if ($enable_windowed_decay_internal) {
+        $analysis_model_str = "Time-Based Windowed Decay ON";
+    } elsif ($decay_over_states_flag) {
+        $analysis_model_str = "Hybrid State-Time Decay ON";
+    } else {
+        $analysis_model_str = "State-Based (Decay OFF)";
+    }
 
-#    push @summary_lines, "------------------------------------------------------------------";
+    my $growth_status = $enable_growth_prediction ? "Growth Prediction ON" : "Growth Prediction OFF";
+    push @summary_lines, sprintf("%-".$label_width."s: %s", "Analysis Model", $analysis_model_str);
+    push @summary_lines, sprintf("%-".$label_width."s: %s", "Growth Prediction", $growth_status);
 
     return join("\n", @summary_lines) . "\n";
 }
@@ -3499,6 +3517,203 @@ sub process_vm_buffer_non_windowed {
     }
 }
 
+# Subroutine for the Hybrid State-Time Decay Model
+sub synthesize_hybrid_timeseries {
+    my ($state_results_aref, $metric_key) = @_;
+    my @timeseries_points;
+
+    foreach my $state_result (@$state_results_aref) {
+        my $start_obj = $state_result->{state_obj}{start_time}->truncate(to => 'day');
+        my $end_obj   = $state_result->{state_obj}{end_time}->truncate(to => 'day');
+        my $metric_val = $state_result->{metrics}{$metric_key};
+
+        # Skip if this state didn't have a valid metric
+        next unless defined $metric_val && looks_like_number($metric_val);
+
+        my $current_day = $start_obj;
+        while ($current_day <= $end_obj) {
+            # Add a data point for every day the state was active
+            push @timeseries_points, {
+                value => $metric_val,
+                date  => Time::Piece->new($current_day->epoch) # Use a copy
+            };
+            $current_day += ONE_DAY;
+        }
+    }
+    return @timeseries_points;
+}
+
+# --- get_metrics_for_each_state ---
+# A modular subroutine for the non-windowed and hybrid analysis paths.
+# It takes a VM's buffered data and its known states, and returns an array
+# containing the calculated metrics for each state that had data.
+#
+# Args:
+#   1. $vm_buffer_aref (array ref): A buffer of all data points for a single VM.
+#   2. $vm_name (string): The name of the VM being processed.
+#   3. $states_for_vm_aref (array ref): The array of state objects for this VM.
+#
+# Returns:
+#   - An array of hashes, where each hash is { metrics => \%metrics, state_obj => $state }
+#
+sub get_metrics_for_each_state
+{
+    my ($vm_buffer_aref, $vm_name, $states_for_vm_aref) = @_;
+
+    my @state_results; # Array to hold the results for each state
+
+    return () unless @$vm_buffer_aref && @$states_for_vm_aref;
+    my $count = scalar(@$states_for_vm_aref);
+    my $label = $count == 1 ? 'state' : 'states';
+    print STDERR "    - Analysing $count $label for VM $vm_name...\n";
+
+    my %state_data_buffers;
+    # Group all data points from the buffer into their correct state
+    foreach my $dp (@$vm_buffer_aref)
+    {
+        foreach my $state (@$states_for_vm_aref)
+        {
+            if ($dp->{tp}->epoch >= $state->{start_epoch} && $dp->{tp}->epoch <= $state->{end_epoch})
+            {
+                push @{$state_data_buffers{$state->{state_id}}}, $dp;
+                last; # Found the correct state, move to the next data point
+            }
+        }
+    }
+
+    # Now, calculate metrics for each state that had data
+    foreach my $state_id (sort { $a <=> $b } keys %state_data_buffers)
+    {
+        my ($state_obj) = grep { $_->{state_id} == $state_id } @$states_for_vm_aref;
+        next unless $state_obj;
+
+        my @data_for_this_state = @{$state_data_buffers{$state_id}};
+
+        # Apply time filters (online, batch, no-weekends)
+        my @filtered_data_for_state;
+        if ($no_weekends || $time_filter_active)
+        {
+            foreach my $dp (@data_for_this_state)
+            {
+                 if ($no_weekends)
+                 {
+                    my $day_of_week = $dp->{tp}->day_of_week;
+                    next if ($day_of_week == 1 || $day_of_week == 7);
+                }
+                if ($time_filter_active)
+                {
+                    my $line_time = substr($dp->{tp}->hms(':'), 0, 5);
+                    my $include_line = 0;
+                    if ($time_filter_overnight)
+                    {
+                        $include_line = 1 if ($line_time ge $time_filter_start || $line_time lt $time_filter_end);
+                    }
+                    else
+                    {
+                        $include_line = 1 if ($line_time ge $time_filter_start && $line_time lt $time_filter_end);
+                    }
+                    next unless $include_line;
+                }
+                push @filtered_data_for_state, $dp;
+            }
+        }
+        else
+        {
+            @filtered_data_for_state = @data_for_this_state;
+        }
+
+        next unless @filtered_data_for_state;
+
+        # Calculate metrics using the filtered data and the existing, robust subroutine
+        my $metrics = calculate_metrics_for_period(\@filtered_data_for_state, $state_obj->{metadata});
+        push @state_results, { metrics => $metrics, state_obj => $state_obj };
+    }
+
+    return @state_results;
+}
+
+# --- calculate_growth_prediction ---
+# Performs trend analysis on a time series of metric values and calculates
+# a growth adjustment factor based on a linear regression projection. This
+# function is now self-contained and used by all aggregated analysis modes.
+#
+# Args:
+#   1. $timeseries_values_aref (array ref): An array of the numeric metric values over time.
+#   2. $baseline_val (float): The final aggregated metric value, used as the base for inflation.
+#
+# Returns:
+#   - A list: ($growth_adj_value, $growth_adj_abs_value)
+#
+sub calculate_growth_prediction
+{
+    my ($timeseries_values_aref, $baseline_val) = @_;
+
+    my ($growth_adj_value, $growth_adj_abs_value) = (0.0, 0.0);
+
+    # Growth calculation is only possible if there is a positive baseline to inflate.
+    return ($growth_adj_value, $growth_adj_abs_value) unless (defined $baseline_val && $baseline_val > $FLOAT_EPSILON);
+
+    my @timeseries_points;
+    my $time_idx = 0;
+
+    # Create [x, y] points for regression, where x is the time index (0, 1, 2...).
+    foreach my $metric_val (@$timeseries_values_aref)
+    {
+        if (defined $metric_val && looks_like_number($metric_val))
+        {
+            push @timeseries_points, [$time_idx, $metric_val];
+            $time_idx++;
+        }
+    }
+
+    my $num_hist_periods = scalar(@timeseries_points);
+
+    # Ensure there are enough data points to establish a meaningful trend.
+    if ($num_hist_periods >= $GROWTH_MIN_HISTORICAL_PERIODS)
+    {
+        my @values_for_stats = map { $_->[1] } @timeseries_points;
+        my ($mean_val, $stddev_val, $cv_val) = calculate_statistics_for_trend(\@values_for_stats);
+
+        # Only proceed if the data is not excessively volatile (low coefficient of variation).
+        if (defined $cv_val && $cv_val < $GROWTH_MAX_CV_THRESHOLD)
+        {
+            my ($slope, $intercept) = calculate_manual_linear_regression(\@timeseries_points);
+
+            # Only apply inflation if there is a clear positive growth trend.
+            if (defined $slope && $slope > $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD)
+            {
+                # Project the value N days into the future.
+                # Note: For the Hybrid model, which provides daily data points, the projection
+                # period logic is simplified as each period is one day. For the standard
+                # windowed model, it's scaled by the window size. This logic handles both.
+                my $projection_periods = ($process_window_unit_str eq 'weeks') 
+                                       ? ($growth_projection_days / 7) * (1 / $process_window_size_val)
+                                       : ($growth_projection_days / $process_window_size_val);
+
+                # For the daily data from the Hybrid model, we need to adjust the projection period.
+                # The simplest way is to check the number of points relative to a known time span,
+                # but for now, we assume the projection is in units matching the time series points.
+                if (scalar(@$timeseries_values_aref) > $num_hist_periods * 1.5) # Heuristic for daily data
+                {
+                    $projection_periods = $growth_projection_days;
+                }
+
+                my $projected_val = $slope * ($num_hist_periods - 1 + $projection_periods) + $intercept;
+
+                if ($projected_val > $baseline_val)
+                {
+                    my $inflation_perc = (($projected_val - $baseline_val) / $baseline_val) * 100;
+                    $inflation_perc = $max_growth_inflation_percent if $inflation_perc > $max_growth_inflation_percent;
+                    $growth_adj_value = ($baseline_val * $inflation_perc / 100);
+                    $growth_adj_abs_value = $growth_adj_value;
+                }
+            }
+        }
+    }
+
+    return ($growth_adj_value, $growth_adj_abs_value);
+}
+
 sub usage
 {
     my $script_name = $0;
@@ -3561,14 +3776,18 @@ PhysC Calculation Options:
   --filter-above-perc <N>    : Optional. Filter rolling PhysC values before PXX calc. (Applied per window if decay enabled).
 
 Windowed Recency Decay (Prerequisite for Growth Prediction):
-  --enable-windowed-decay     : Enable internal windowed processing with recency decay.
+  --enable-windowed-decay    : Enable internal windowed processing with recency decay.
   --process-window-unit <days|weeks> : Unit for processing window size (Default: $DEFAULT_PROCESS_WINDOW_UNIT).
-  --process-window-size <N>   : Size of each window in specified units (Default: $DEFAULT_PROCESS_WINDOW_SIZE).
-  --decay-half-life-days <N>  : Half-life in days for recency weighting (Default: $DEFAULT_DECAY_HALF_LIFE_DAYS).
+  --process-window-size <N>  : Size of each window in specified units (Default: $DEFAULT_PROCESS_WINDOW_SIZE).
+  --decay-half-life-days <N> : Half-life in days for recency weighting (Default: $DEFAULT_DECAY_HALF_LIFE_DAYS).
   --analysis-reference-date <YYYY-MM-DD> : "Current" date for recency calculation
                                 (Default: Date of last record in filtered NMON PhysC data).
+  --decay-over-states        : Enable Hybrid State-Time Decay Model. This advanced mode first
+                             calculates metrics per configuration state, then applies recency
+                             decay to those results. It provides a single, aggregated output
+                             per VM. Mutually exclusive with --enable-windowed-decay.
 
-Predicted Growth Feature (Requires --enable-windowed-decay):
+Predicted Growth Feature (Requires --enable-windowed-decay or --decay-over-states):
   --enable-growth-prediction         : Enable growth prediction based on per-window primary percentile trend.
   --growth-projection-days <N>       : Project growth for N days into the future (e.g., 30 for 1 month, 90 for ~3 months). (Default: $DEFAULT_GROWTH_PROJECTION_DAYS)
   --max-growth-inflation-percent <X> : Maximum percentage to inflate the baseline by due to growth. (Default: $DEFAULT_MAX_GROWTH_INFLATION_PERCENT)
