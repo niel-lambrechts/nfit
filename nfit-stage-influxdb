@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+nfit-stage-influxdb.py: A tool to query performance and configuration data
+from an InfluxDB database and build a local cache for the nFit toolkit.
+"""
+
+import argparse
+import configparser
+import os
+import sys
+import json
+import fcntl
+import time
+from datetime import datetime, timezone
+from collections import defaultdict
+
+# --- Dynamic InfluxDB Client Importing ---
+try:
+    from influxdb_client import InfluxDBClient
+    INFLUXDB_V2_AVAILABLE = True
+except ImportError:
+    INFLUXDB_V2_AVAILABLE = False
+
+try:
+    from influxdb import InfluxDBClient as InfluxDBClientV1
+    INFLUXDB_V1_AVAILABLE = True
+except ImportError:
+    INFLUXDB_V1_AVAILABLE = False
+
+VERSION = '5.25.185.0'
+
+# --- InfluxQL Query Definitions (Consolidated for Performance) ---
+# The 'physc' query has been replaced with a combined query for the cpu_util table.
+INFLUXQL_PERF_QUERIES = {
+    'cpu_util_combined': 'SELECT "physical_consumed", "entitlement", "serial_no" FROM "cpu_util" WHERE {filter} AND {time_filter} GROUP BY "host"',
+    'runq':  'SELECT "run_queue" FROM "kernel" WHERE {time_filter} GROUP BY "host"',
+}
+
+# The 'cpu_util' entry has been removed from this dictionary as its fields are now
+# fetched by the combined query in the performance section.
+INFLUXQL_CONFIG_QUERIES_BY_TABLE = {
+    'config': {
+        'fields': ['smtthreads', 'processorModel', 'processorFamily', 'processorMHz'],
+        'query': 'SELECT "smtthreads", "processorModel", "processorFamily", "processorMHz" FROM "config" WHERE {vm_filter} AND {time_filter} GROUP BY "host"'
+    },
+    'lpar_format1': {
+        'fields': ['desired_vcpus'],
+        'query': 'SELECT "desired_vcpus" FROM "lpar_format1" WHERE {vm_filter} AND {time_filter} GROUP BY "host"'
+    },
+    'partition_type': {
+        'fields': ['capped'],
+        'query': 'SELECT "capped" FROM "partition_type" WHERE {vm_filter} AND {time_filter} GROUP BY "host"'
+    },
+    'processor_pool': {
+        'fields': ['phys_cpus_pool', 'pool_id'],
+        'query': 'SELECT "phys_cpus_pool", "pool_id" FROM "processor_pool" WHERE {vm_filter} AND {time_filter} GROUP BY "host"'
+    }
+}
+
+CONFIG_FIELD_MAP = {
+    'entitlement': 'entitlement', 'serial_number': 'serial_no', 'smt': 'smtthreads', 'virtual_cpus': 'desired_vcpus',
+    'capped': 'capped', 'pool_cpu': 'phys_cpus_pool',
+    'pool_id': 'pool_id', 'proc_type': 'processorModel', 'proc_version': 'processorFamily',
+    'proc_clock': 'processorMHz'
+}
+
+
+# --- Helper Functions ---
+
+class FcntlLock:
+    """A context manager for file locking using the native fcntl module."""
+    def __init__(self, lock_path, timeout=10):
+        self.lock_path = lock_path
+        self.timeout = timeout
+        self.lock_file = None
+
+    def __enter__(self):
+        start_time = time.time()
+        self.lock_file = open(self.lock_path, 'a')
+        while time.time() - start_time < self.timeout:
+            try:
+                fcntl.flock(self.lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.lock_file.write(str(os.getpid()))
+                self.lock_file.flush()
+                return self
+            except (IOError, BlockingIOError):
+                time.sleep(0.5)
+        raise TimeoutError(f"Could not acquire lock on {self.lock_path} within {self.timeout} seconds.")
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.lock_file:
+            fcntl.flock(self.lock_file, fcntl.LOCK_UN)
+            self.lock_file.close()
+            if os.path.exists(self.lock_path):
+                os.remove(self.lock_path)
+
+
+def get_db_client(config_path):
+    """Reads config and returns an appropriate InfluxDB client."""
+    config = configparser.ConfigParser()
+    if not os.path.exists(config_path):
+        print(f"Error: Configuration file not found at {config_path}", file=sys.stderr)
+        sys.exit(1)
+
+    config.read(config_path)
+    db_config = config['database']
+    db_version = db_config.getint('VERSION', 1)
+
+    client = None
+    if db_version == 2:
+        if not INFLUXDB_V2_AVAILABLE:
+            print("Error: InfluxDB v2 client not installed. Please run 'pip install influxdb-client'.", file=sys.stderr)
+            sys.exit(1)
+        client = InfluxDBClient(
+            url=f"http://{db_config['HOST']}:{db_config['PORT']}",
+            token=db_config['PASSWORD'],
+            org=db_config.get('ORG', '-')
+        )
+    else: # Default to v1
+        if not INFLUXDB_V1_AVAILABLE:
+            print("Error: InfluxDB v1 client is not installed. Please run 'pip install influxdb'.", file=sys.stderr)
+            sys.exit(1)
+        client = InfluxDBClientV1(
+            host=db_config['HOST'],
+            port=db_config['PORT'],
+            username=db_config['USER'],
+            password=db_config['PASSWORD'],
+            database=db_config['DATABASE']
+        )
+    return client, db_version, db_config
+
+
+def execute_query(client, query, db_version, verbose=False):
+    """Executes a query using the appropriate client version."""
+    if verbose:
+        print(f"\n[DEBUG] Executing Query:\n{query}\n")
+    if db_version == 2:
+        query_api = client.query_api()
+        return query_api.query(query)
+    else:
+        return client.query(query)
+
+def parse_utc_string(ts_str):
+    """Parses a UTC timestamp string (various formats) into a timezone-aware UTC datetime."""
+    ts_str = ts_str.rstrip('Z')
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S"):
+        try:
+            dt = datetime.strptime(ts_str, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported datetime format: {ts_str}")
+
+def main():
+    """Main function for the nfit-stage-influxdb script."""
+    parser = argparse.ArgumentParser(
+        description="Query InfluxDB and stage data for nfit analysis.",
+        formatter_class=argparse.RawTextHelpFormatter
+    )
+    # --- Mutually exclusive group for specifying targets ---
+    target_group = parser.add_mutually_exclusive_group(required=True)
+    target_group.add_argument("--mgsys", "--system", "--serial", "--host",
+                              help="A comma-separated list of managed system serial numbers to query.")
+    target_group.add_argument("--vms",
+                              help="A comma-separated list of specific VM hostnames to query.")
+    target_group.add_argument("--vmfile",
+                              help="Path to a file containing a list of VM hostnames to query (one per line).")
+
+    # Date/time arguments are now optional to accommodate the --days flag
+    parser.add_argument("--startd", "--start-date",
+                        help="The start date for the query in YYYY-MM-DD format. Required if --days is not used.")
+    parser.add_argument("--endd", "--end-date",
+                        help="The end date for the query in YYYY-MM-DD format. Required if --days is not used.")
+    # New --days argument
+    parser.add_argument("--days", type=int,
+                        help="Specify the number of recent days to query (e.g., 90). Mutually exclusive with --startd/--endd.")
+
+    parser.add_argument("--datadir",
+                        help="Optional path to a cache directory. Defaults to '<ProjectRoot>/stage/influxdb/'.")
+    # Renamed --rebuild-cache to --cleanup
+    parser.add_argument("--cleanup", action="store_true",
+                        help="Delete all existing cache files before running the new query.")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Enable verbose output, including printing all queries.")
+    parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+
+    args = parser.parse_args()
+
+    # --- Date and cleanup argument processing ---
+    from datetime import timedelta
+
+    # Validate date/day selection
+    if args.days and (args.startd or args.endd):
+        print("Error: --days cannot be used with --startd or --endd.", file=sys.stderr)
+        sys.exit(1)
+
+    if not args.days and not (args.startd and args.endd):
+        print("Error: You must specify a time window using either --days or both --startd and --endd.", file=sys.stderr)
+        sys.exit(1)
+
+    # Calculate date range if --days is used
+    if args.days:
+        if args.days <= 0:
+            print("Error: --days must be a positive number.", file=sys.stderr)
+            sys.exit(1)
+        end_date = datetime.now(timezone.utc)
+        start_date = end_date - timedelta(days=args.days)
+        startd_for_query = start_date.strftime('%Y-%m-%d')
+        endd_for_query = end_date.strftime('%Y-%m-%d')
+        print(f"Querying for the last {args.days} days ({startd_for_query} to {endd_for_query}).")
+    else:
+        # Use user-provided dates
+        startd_for_query = args.startd
+        endd_for_query = args.endd
+
+    script_root = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(script_root, 'etc', 'influxdb.conf')
+    client, db_version, db_config = get_db_client(config_path)
+
+    if args.datadir:
+        cache_dir = args.datadir
+    else:
+        cache_dir = os.path.join(script_root, 'stage', 'influxdb')
+
+    os.makedirs(cache_dir, exist_ok=True)
+    print(f"Using cache directory: {cache_dir}")
+
+    lock_path = os.path.join(cache_dir, '.nfit.cache.lock')
+
+    try:
+        with FcntlLock(lock_path, timeout=10):
+            print("Acquired cache lock.")
+
+            # Note: The --cleanup flag will clear the *entire* influxdb stage
+            # including all serial number subdirectories, which is the expected behaviour.
+            if args.cleanup:
+                print("Cleanup requested. Rebuilding entire cache...")
+                # This logic now correctly removes subdirectories and files
+                for root, dirs, files in os.walk(cache_dir, topdown=False):
+                    for name in files:
+                        if name.startswith('.nfit.cache') or name == '.nfit_stage_id':
+                            os.remove(os.path.join(root, name))
+                    # Remove empty directories after cleaning files
+                    for name in dirs:
+                        if not os.listdir(os.path.join(root, name)):
+                            os.rmdir(os.path.join(root, name))
+                print("Existing cache directories and files removed.")
+
+            # --- Phase 1: Performance and Consolidated Config Data Query ---
+            print("\nStarting Phase 1: Performance Data Query")
+
+            time_filter_v1 = f"time >= '{startd_for_query}T00:00:00Z' AND time <= '{endd_for_query}T23:59:59Z'"
+
+            if args.mgsys:
+                mgsys_list = [s.strip() for s in args.mgsys.split(',')]
+                query_filter = "(" + " OR ".join([f"\"serial_no\" = '{s}'" for s in mgsys_list]) + ")"
+            else:
+                if args.vms:
+                    vm_list = [s.strip() for s in args.vms.split(',')]
+                else: # args.vmfile
+                    with open(args.vmfile, 'r') as f:
+                        vm_list = [line.strip() for line in f if line.strip()]
+                query_filter = "(" + " OR ".join([f"host = '{vm}'" for vm in vm_list]) + ")"
+
+            all_perf_data = defaultdict(lambda: defaultdict(dict))
+            config_events = defaultdict(list) # Initialise here for the combined loop
+
+            # This single loop now handles both performance metrics and the consolidated cpu_util config.
+            for metric, query_template in INFLUXQL_PERF_QUERIES.items():
+                print(f"  Querying data for: {metric}...")
+                query = query_template.format(filter=query_filter, time_filter=time_filter_v1)
+                results = execute_query(client, query, db_version, args.verbose)
+
+                for series in results.items():
+                    vm_name = series[0][1]['host']
+                    for point in series[1]:
+                        ts_dt = parse_utc_string(point['time'])
+                        ts_str = ts_dt.strftime('%Y-%m-%d %H:%M:%S')
+                        ts_epoch = int(ts_dt.timestamp())
+
+                        # Populate performance data structure
+                        if 'physical_consumed' in point and point['physical_consumed'] is not None:
+                            all_perf_data[ts_str][vm_name]['physc'] = point['physical_consumed']
+                        if 'run_queue' in point and point['run_queue'] is not None:
+                             all_perf_data[ts_str][vm_name]['runq'] = point['run_queue']
+
+                        # Populate config event structure with piggybacked data from the cpu_util query
+                        if 'entitlement' in point and point['entitlement'] is not None:
+                            config_events[vm_name].append({'ts': ts_epoch, 'key': 'entitlement', 'value': point['entitlement']})
+                        if 'serial_no' in point and point['serial_no'] is not None:
+                            config_events[vm_name].append({'ts': ts_epoch, 'key': 'serial_number', 'value': point['serial_no']})
+
+            if not all_perf_data:
+                print("Warning: No performance data was fetched. Check query parameters and InfluxDB data.", file=sys.stderr)
+
+            # --- This is the intermediate logic you correctly identified as essential. It is PRESERVED. ---
+            print("\nStarting Phase 2: Configuration Data Query")
+
+            discovered_vms = sorted(list(set(vm for ts_data in all_perf_data.values() for vm in ts_data.keys())))
+            if not discovered_vms:
+                 print("No VMs discovered in performance data. Cannot proceed with configuration query.")
+                 sys.exit(0)
+
+            timestamps = [parse_utc_string(ts) for ts in all_perf_data.keys()]
+            min_ts, max_ts = min(timestamps), max(timestamps)
+            print(f"Found {len(discovered_vms)} VMs in data, spanning from {min_ts} to {max_ts}")
+
+            vm_filter_v1 = "(" + " OR ".join([f"host = '{vm}'" for vm in discovered_vms]) + ")"
+            # Note: The config_events dictionary is already populated with data from cpu_util.
+
+            # --- This loop now only processes the remaining configuration tables. ---
+            for table, details in INFLUXQL_CONFIG_QUERIES_BY_TABLE.items():
+                print(f"  Querying config table: {table}...")
+                query = details['query'].format(vm_filter=vm_filter_v1, time_filter=time_filter_v1)
+                results = execute_query(client, query, db_version, args.verbose)
+
+                for series in results.items():
+                    vm_name = series[0][1]['host']
+                    for point in series[1]:
+                        dt_object = parse_utc_string(point['time'])
+                        ts_epoch = int(dt_object.timestamp())
+
+                        for internal_metric, db_field in CONFIG_FIELD_MAP.items():
+                            if db_field in point and point[db_field] is not None:
+                                config_events[vm_name].append({'ts': ts_epoch, 'key': internal_metric, 'value': point[db_field]})
+
+            all_states = {}
+            for vm_name in discovered_vms:
+                events = config_events.get(vm_name, [])
+                if not events: continue
+                events.sort(key=lambda x: x['ts'])
+
+                all_states[vm_name] = []
+                last_known_metadata = {}
+                current_state_start_epoch = None
+
+                event_timeline = defaultdict(dict)
+                for event in events:
+                    event_timeline[event['ts']][event['key']] = event['value']
+
+                sorted_timestamps = sorted(event_timeline.keys())
+
+                for i, ts in enumerate(sorted_timestamps):
+                    metadata_before_change = last_known_metadata.copy()
+
+                    for key, value in event_timeline[ts].items():
+                        last_known_metadata[key] = value
+
+                    current_fingerprint = json.dumps(last_known_metadata, sort_keys=True)
+
+                    if i == 0:
+                        current_state_start_epoch = ts
+                    elif current_fingerprint != json.dumps(metadata_before_change, sort_keys=True):
+                        all_states[vm_name].append({
+                            'start_epoch': current_state_start_epoch,
+                            'end_epoch': ts - 1,
+                            'metadata': metadata_before_change
+                        })
+                        current_state_start_epoch = ts
+
+                if current_state_start_epoch is not None:
+                    all_states[vm_name].append({
+                        'start_epoch': current_state_start_epoch,
+                        'end_epoch': int(max_ts.timestamp()),
+                        'metadata': last_known_metadata
+                    })
+
+            # --- Phase 3: Group Data by Serial Number and Write to Split Caches ---
+            print("\nStarting Phase 3: Writing to split cache directories")
+
+            data_by_serial = defaultdict(lambda: {'perf': [], 'states': {}})
+
+            # Group state data by serial number
+            for vm, states in all_states.items():
+                for state in states:
+                    serial = state.get('metadata', {}).get('serial_number', 'UNKNOWN_SERIAL')
+                    if vm not in data_by_serial[serial]['states']:
+                        data_by_serial[serial]['states'][vm] = []
+                    data_by_serial[serial]['states'][vm].append(state)
+
+            # Group performance data by serial number
+            for ts, vm_data in all_perf_data.items():
+                for vm, metrics in vm_data.items():
+                    # Find the correct serial number for this VM at this timestamp
+                    serial = 'UNKNOWN_SERIAL'
+                    if vm in all_states:
+                        for state in all_states[vm]:
+                            if state['start_epoch'] <= parse_utc_string(ts).timestamp() <= state['end_epoch']:
+                                serial = state.get('metadata', {}).get('serial_number', 'UNKNOWN_SERIAL')
+                                break
+
+                    physc = metrics.get('physc')
+                    runq = metrics.get('runq')
+                    if physc is not None or runq is not None:
+                        line = f"{ts},{vm},{physc if physc is not None else ''},{runq if runq is not None else ''}"
+                        data_by_serial[serial]['perf'].append(line)
+
+            # Write the grouped data to the respective serial number directories
+            for serial, data in data_by_serial.items():
+                serial_cache_dir = os.path.join(cache_dir, serial)
+                os.makedirs(serial_cache_dir, exist_ok=True)
+                print(f"  Writing data for managed system: {serial} to {serial_cache_dir}/")
+
+                # Write performance data
+                cache_data_path = os.path.join(serial_cache_dir, '.nfit.cache.data')
+                with open(cache_data_path, 'w') as f:
+                    f.write("Timestamp,VMName,PhysC,RunQ\n")
+                    # Sort performance data by timestamp for consistency
+                    data['perf'].sort()
+                    f.write("\n".join(data['perf']))
+                    f.write("\n")
+                print(f"    - Performance data cache created: {cache_data_path}")
+
+                # Write state data
+                cache_states_path = os.path.join(serial_cache_dir, '.nfit.cache.states')
+                with open(cache_states_path, 'w') as f:
+                    json.dump(data['states'], f, indent=2)
+                print(f"    - State cache (JSON) created: {cache_states_path}")
+
+                # Write manifest and stage ID
+                manifest_path = os.path.join(serial_cache_dir, '.nfit.cache.manifest')
+                with open(manifest_path, 'w') as f:
+                    f.write(f"cache_build_status: success\n")
+                    f.write(f"build_timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+
+                stage_id_path = os.path.join(serial_cache_dir, '.nfit_stage_id')
+                with open(stage_id_path, 'w') as f:
+                    f.write(f"Created by nfit-stage-influxdb.py v{VERSION} for system {serial}\n")
+
+            print("\nStaging complete.")
+
+    except TimeoutError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        # Clean up the main lock file in case of an unhandled error
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
+        # Re-raise the exception to get a full traceback for debugging
+        raise
+
+if __name__ == "__main__":
+    main()
+
