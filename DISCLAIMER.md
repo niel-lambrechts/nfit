@@ -7,7 +7,7 @@ This software is provided by the author(s) "AS IS" and ANY EXPRESS OR IMPLIED WA
 The nFit Suite, including all its components (`nfit`, `nfit-profile`, `nfit-plot`, and any associated scripts or documentation), is a tool designed to assist with AIX LPAR CPU capacity planning and right-sizing based on historical NMON data. The analysis, recommendations, hints, and visualisations produced by this software are based on statistical methods and user-provided configurations.
 
 **No Guarantee of Accuracy or Suitability:**
-While efforts have been made to ensure the scripts function as described, there is no guarantee that the results produced will be accurate, complete, suitable for your specific environment, or fit for any particular purpose. Capacity planning involves many factors beyond the scope of this tool, including but not limited to business requirements, application-specific behaviours, future growth projections, hardware limitations, and software licensing implications.
+While efforts have been made to ensure the scripts function as described, there is no guarantee that the results produced will be accurate, complete, suitable for your specific environment, or fit for any particular purpose. Capacity planning involves many factors beyond the scope of this tool, including but not limited to business requirements, application-specific behaviours, source data precision, future growth projections, hardware limitations, and software licensing implications.
 
 **User Responsibility:**
 The user is solely responsible for:
