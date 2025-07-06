@@ -10,7 +10,8 @@ use strict;
 use warnings;
 use Getopt::Long qw(GetOptions);
 use Cwd qw(abs_path);
-use File::Basename qw(dirname);
+use File::Basename qw(dirname basename);
+use File::Spec qw(catfile);
 use Time::Piece;
 use List::Util qw(sum sum0 min max); # sum0 is available from List::Util 1.33+
 use Scalar::Util qw(looks_like_number);
@@ -152,8 +153,6 @@ my $excel_formulas_flag = "false";
 my $mgsys_filter;
 
 GetOptions(
-    'physc-data|pc=s'            => \$physc_data_file,
-    'runq-data|rq=s'             => \$runq_data_file_arg,
     'nmondir=s'                  => \$nmon_dir,
     'config=s'                   => \$vm_config_file_arg,
     'profiles-config=s'          => \$profiles_config_file_arg,
@@ -222,45 +221,36 @@ if ($show_version)
 }
 
 # --- Data Source Validation ---
-my $influxdb_base_dir = "$script_dir/stage/influxdb";
+# The script now operates exclusively on pre-built cache directories.
+my $DEFAULT_BASE_STAGE_DIR = File::Spec->catfile($script_dir, 'stage');
 
-if ($help) {
+if ($help)
+{
     print STDERR usage_wrapper();
     exit 0;
 }
 
-# This logic block now includes an implicit fallback to the InfluxDB cache
-# if --mgsys is specified without any other data source.
-
-if (defined $physc_data_file) {
-    # Highest priority: user-specified --physc-data.
-    print STDERR "Using user-specified --physc-data: $physc_data_file\n";
-    if (!-f $physc_data_file) {
-        die "Error: Input PhysC data file (--physc-data) not found: $physc_data_file\n";
-    }
-    if (defined $runq_data_file_arg && !-f $runq_data_file_arg) {
-        die "Error: Specified RunQ data file (--runq-data) not found: $runq_data_file_arg\n";
-    }
-} elsif (defined $nmon_dir) {
-    # Second priority: user-specified --nmondir.
-    print STDERR "Using user-specified --nmondir: $nmon_dir\n";
-    if (!-d $nmon_dir) {
-        die "Error: Provided --nmondir path is not a valid directory: $nmon_dir\n";
-    }
-} elsif (defined $mgsys_filter) {
-    # NEW: Third priority, implied data source.
-    # If --mgsys is given without --nmondir or --pc, default to the standard InfluxDB cache path.
-    print STDERR "INFO: Using InfluxDB NMON cache: '$influxdb_base_dir'\n";
-    $nmon_dir = $influxdb_base_dir; # Set $nmon_dir to point to the cache.
-    if (!-d $nmon_dir) {
-        die "Error: Default InfluxDB cache directory not found at '$nmon_dir'.\n" .
-            "       Please ensure the cache exists or specify a data source with --nmondir or --physc-data.\n";
-    }
-} else {
-    # If no flags are provided, the script cannot proceed.
+# A cache source must be specified via --nmondir or --mgsys.
+if (!defined $nmon_dir && !defined $mgsys_filter)
+{
     print STDERR usage_wrapper();
-    die "Error: No data source specified. Please use --physc-data, --nmondir, or --mgsys.\n";
+    die "Error: No data source cache specified. Please use --nmondir or --mgsys.\n";
 }
+
+# If --mgsys is provided without a base --nmondir, set --nmondir to the default.
+# This allows the Smart Dispatcher to find the system-specific cache.
+if (defined $mgsys_filter && !defined $nmon_dir)
+{
+    $nmon_dir = $DEFAULT_BASE_STAGE_DIR;
+    print STDERR "INFO: --mgsys used without --nmondir. Defaulting base cache path to: '$nmon_dir'\n";
+}
+
+# Final check to ensure the base directory exists.
+if (defined $nmon_dir && !-d $nmon_dir)
+{
+    die "Error: The specified cache directory (--nmondir) was not found: '$nmon_dir'\n";
+}
+
 
 if ($default_smt_arg <= 0)
 {
@@ -336,131 +326,101 @@ if (defined $excel_formulas_flag)
 }
 
 # --- Smart Dispatcher Logic ---
+# This block determines which cache directories to process. It can handle
+# being pointed at a single cache directory or a parent directory containing
+# multiple system-specific caches.
+
 my @target_systems_to_process;
-my $is_influxdb_cache_run = 0;
-my $base_cache_dir;
+my $base_cache_dir = $nmon_dir; # Assume the provided dir is the base by default.
 
-# Default log path, may be overwritten below.
-$LOG_FILE_PATH = "/tmp/nfit-profile.log";
-
-# Detect if we are operating on a InfluxDB cache directory structure.
-if ($nmon_dir && -d $nmon_dir) {
-    # An InfluxDB cache is detected if the --nmondir contains subdirectories that have .nfit_stage_id files.
+# First, check if the provided --nmondir is ITSELF a valid cache directory.
+if (-f File::Spec->catfile($nmon_dir, '.nfit_stage_id'))
+{
+    # This is a singular run targeting a specific cache directory.
+    print STDERR "Single cache directory detected. Enabling singular analysis mode.\n";
+    push @target_systems_to_process, undef; # 'undef' signals a single run.
+    $base_cache_dir = dirname($nmon_dir); # The base is the parent of the cache dir.
+}
+else
+{
+    # If not, check if it's a PARENT directory containing multiple caches.
     opendir(my $dh, $nmon_dir) or die "Cannot open directory $nmon_dir: $!";
-    my @subdirs = grep { -d "$nmon_dir/$_" && !/^\./ } readdir($dh);
+    my @subdirs = grep { -d File::Spec->catfile($nmon_dir, $_) && !/^\./ } readdir($dh);
     closedir($dh);
 
-    foreach my $subdir (@subdirs) {
-        if (-f "$nmon_dir/$subdir/.nfit_stage_id") {
-            $is_influxdb_cache_run = 1;
-            $base_cache_dir = $nmon_dir;
-            last;
-        }
-    }
-}
-
-if ($is_influxdb_cache_run) {
-    print STDERR "Managed system cache hierarchy detected. Enabling Smart Dispatcher mode.\n";
-
-    # In InfluxDB cache mode, determine which managed system directories to process.
-    if (defined $mgsys_filter) {
-        # If --mgsys is specified, those are our targets.
-        @target_systems_to_process = split /,/, $mgsys_filter;
-    } else {
-        # If --mgsys is not specified, we must discover the target systems.
-        my %systems_found;
-        opendir(my $dh, $base_cache_dir) or die "Cannot open base cache directory $base_cache_dir: $!";
-        my @serial_dirs = grep { -d "$base_cache_dir/$_" && -f "$base_cache_dir/$_/$CACHE_STATES_FILE" } readdir($dh);
-        closedir($dh);
-
-        if (defined $target_vm_name) {
-            # If specific VMs are targeted, find which systems they belong to.
-            my %vms_to_find = map { $_ => 1 } split /,/, $target_vm_name;
-            foreach my $serial (@serial_dirs) {
-                my $states_file = "$base_cache_dir/$serial/$CACHE_STATES_FILE";
-                my $json_text = do {
-                    open my $fh, '<:encoding(utf8)', $states_file or next;
-                    local $/;
-                    my $content = <$fh>;
-                    close $fh;
-                    $content;
-                };
-                next unless defined $json_text;
-                my $states = eval { decode_json($json_text) };
-                if ($@) {
-                    warn "Warning: Could not decode JSON from '$states_file': $@. Skipping for VM discovery.";
-                    next;
-                }
-                foreach my $vm_in_state (keys %$states) {
-                    if (exists $vms_to_find{$vm_in_state}) {
-                        $systems_found{$serial} = 1;
-                    }
-                }
-            }
-        } else {
-            # If no --mgsys or --vm filter, process all found systems.
-            %systems_found = map { $_ => 1 } @serial_dirs;
-        }
-        @target_systems_to_process = sort keys %systems_found;
-    }
-
-    if (!@target_systems_to_process) {
-        die "Error: No target managed systems could be identified for processing based on the provided filters.\n";
-    }
-
-    if (@target_systems_to_process == 1) {
-        my $log_suffix = $target_systems_to_process[0];
-        $log_suffix =~ s/[^a-zA-Z0-9_.-]//g; # Sanitize
-        $LOG_FILE_PATH = "/tmp/nfit-profile.$log_suffix.log";
-    }
-
-    print STDERR "Dispatcher will process " . scalar(@target_systems_to_process) . " managed system(s): " . join(", ", @target_systems_to_process) . "\n";
-
-} else {
-    # This is a file source run (raw NMONs or flat CSV files). We process it as a single "system".
-    # The 'undef' serves as a key to run the main processing loop just once.
-    print STDERR "Standard NMON / CSV data cache detected. Enabling singular analysis mode.\n";
-    push @target_systems_to_process, undef;
-}
-
-# --- Open Log File ---
-my $LOG_FH = IO::File->new($LOG_FILE_PATH, '>')
-    or warn "Error: Cannot open rationale log file '$LOG_FILE_PATH' for writing: $!. Rationale logging will be skipped.\n";
-
-if ($LOG_FH)
-{
-    $LOG_FH->autoflush(1); # Ensure immediate writing to log
-    print {$LOG_FH} "======================================================================\n";
-    print {$LOG_FH} "nFit Profile Rationale Log\n";
-    print {$LOG_FH} "======================================================================\n";
-    print {$LOG_FH} "nfit-profile.pl Run Started: $PROFILE_SCRIPT_START_TIME_STR\n";
-    print {$LOG_FH} "nfit-profile.pl Version  : $VERSION\n";
-
-    # Log nfit version used (attempt again if not already fetched by --version flag)
-    if ($nfit_ver eq "N/A" && -x $nfit_script_path)
+    my @found_serials;
+    foreach my $subdir (@subdirs)
     {
-        my $nfit_ver_output_log = `$nfit_script_path --version 2>&1`;
-        my ($parsed_nfit_ver_log) = ($nfit_ver_output_log =~ /nfit version\s*([0-9.a-zA-Z-]+)/i);
-        $nfit_ver = $parsed_nfit_ver_log // "Unknown (parse failed)";
+        if (-f File::Spec->catfile($nmon_dir, $subdir, '.nfit_stage_id'))
+        {
+            push @found_serials, $subdir;
+        }
     }
-    print {$LOG_FH} "nfit.pl Version Used     : $nfit_ver\n";
 
-    print {$LOG_FH} "----------------------------------------------------------------------\n";
-    print {$LOG_FH} "Invocation:\n";
-    my @quoted_original_argv_log = map { $_ =~ /\s/ ? qq/"$_"/ : $_ } @original_argv;
-    print {$LOG_FH} "  $0 " . join(" ", @quoted_original_argv_log) . "\n";
-    print {$LOG_FH} "----------------------------------------------------------------------\n";
-    print {$LOG_FH} "Key Global Settings:\n";
-    if ($nmon_dir) {
-        print {$LOG_FH} "  - NMON Directory Input     : $nmon_dir\n";
-    } else {
-        print {$LOG_FH} "  - PhysC Data File          : $physc_data_file\n";
-        print {$LOG_FH} "  - RunQ Data File           : " . ($runq_data_file_arg // "Not Provided") . "\n";
+    if (@found_serials)
+    {
+        # This is a multi-system run.
+        print STDERR "Managed system cache hierarchy detected. Enabling multi-system mode.\n";
+        $base_cache_dir = $nmon_dir; # The provided dir is the base.
+
+        # Apply --mgsys filter if provided, otherwise target all found systems.
+        if (defined $mgsys_filter)
+        {
+            my %serials_from_args = map { $_ => 1 } split /,/, $mgsys_filter;
+            @target_systems_to_process = grep { exists $serials_from_args{$_} } @found_serials;
+        }
+        else
+        {
+            @target_systems_to_process = @found_serials;
+        }
     }
-    print {$LOG_FH} "  - Match RunQ Perc to Profile : " . ($match_runq_perc_to_profile ? "Enabled" : "Disabled (Using AbsRunQ_P90 default for additive logic)") . "\n"; # Log new option
+    else
+    {
+        # The directory is neither a cache itself, nor does it contain any caches.
+        die "Error: The directory '$nmon_dir' is not a valid nFit cache and does not contain any cache subdirectories.\n";
+    }
 }
+
+# If a --vm filter was provided, we must refine our list of target systems.
+# This only makes sense in a multi-system context where we can check each one.
+if (scalar(@target_systems_to_process) > 1 && defined $target_vm_name)
+{
+    my %vms_to_find = map { $_ => 1 } split /,/, $target_vm_name;
+    my %systems_with_target_vms;
+
+    foreach my $serial (@target_systems_to_process)
+    {
+        my $states_file = File::Spec->catfile($base_cache_dir, $serial, $CACHE_STATES_FILE);
+        next unless -f $states_file;
+
+        my $json_text = do { open my $fh, '<:encoding(utf8)', $states_file or next; local $/; my $content = <$fh>; close $fh; $content; };
+        next unless defined $json_text;
+
+        my $states = eval { decode_json($json_text) };
+        if ($@) { warn "Warning: Could not decode JSON from '$states_file': $@. Skipping for VM discovery."; next; }
+
+        foreach my $vm_in_state (keys %$states)
+        {
+            if (exists $vms_to_find{$vm_in_state})
+            {
+                $systems_with_target_vms{$serial} = 1;
+                last; # Found a match for this system.
+            }
+        }
+    }
+    # The new target list is only the systems that contain the specified VMs.
+    @target_systems_to_process = sort keys %systems_with_target_vms;
+}
+
+if (!@target_systems_to_process)
+{
+    die "Error: No target managed systems could be identified for processing based on the provided filters.\n";
+}
+
+print STDERR "Dispatcher will process " . scalar(@target_systems_to_process) . " managed system(s).\n";
 
 # --- Load Profile Definitions ---
+# The log file will now be created inside the main processing loop for each system.
 my $profiles_config_path_to_load;
 if (defined $profiles_config_file_arg)
 {
@@ -486,7 +446,6 @@ else # Attempt to find default profiles config
     }
 }
 print STDERR "Loading profile definitions from: $profiles_config_path_to_load\n";
-if ($LOG_FH) { print {$LOG_FH} "  - Profiles Config File     : $profiles_config_path_to_load\n"; }
 @profiles = load_profile_definitions($profiles_config_path_to_load);
 if (scalar @profiles == 0)
 {
@@ -566,7 +525,6 @@ else # No VM config file specified, try default locations
         }
     }
 }
-if ($LOG_FH) { print {$LOG_FH} "  - VM Config File           : " . ($vm_config_file_path // "Not Provided/Default Attempted") . "\n"; }
 
 if ($vm_config_found)
 {
@@ -774,17 +732,6 @@ elsif ($nfit_decay_over_states)
 }
 $common_nfit_flags_base .= $nfit_windowing_decay_flags; # Add windowing/decay to common flags if enabled
 
-# Log common flags (updated to reflect that runq percentiles are now per-profile)
-if ($LOG_FH)
-{
-    print {$LOG_FH} "  - nfit Common Base Flags   : $common_nfit_flags_base (RunQ percentiles determined per profile)\n";
-    print {$LOG_FH} "  - nfit Windowed Decay Opts : " . ($nfit_windowing_decay_flags ne "" ? $nfit_windowing_decay_flags : "Not Enabled") . "\n";
-    print {$LOG_FH} "  - nfit RunQ Avg Method     : $nfit_runq_avg_method_str\n";
-    print {$LOG_FH} "  - Default SMT for Profile  : $default_smt_arg\n";
-    print {$LOG_FH} "======================================================================\n\n";
-    print {$LOG_FH} "===== Per-VM / Per-Profile RunQ Adjustment Details =====\n\n";
-}
-
 # --- Main Logic: Run nfit Profiles ---
 my %results_table; # Stores PhysC values from nfit for each profile: $results_table{vm_name}{profile_name}
 my @vm_order;      # To maintain CSV output order consistent with first nfit run that reports VMs
@@ -801,211 +748,273 @@ my $FLOAT_EPSILON = 1e-9;
 
 print STDERR "nfit-profile version $VERSION\n";
 
+my $LOG_FH;
+my %open_log_files;
 
 # --- Main Processing Loop (iterates through systems for InfluxDB cache, runs once for standard file source modes) ---
-foreach my $system_serial (@target_systems_to_process) {
+foreach my $system_serial (@target_systems_to_process)
+{
+    # First, determine the full path to the cache we are processing in this iteration.
+    my $current_cache_path = defined($system_serial) ? File::Spec->catfile($base_cache_dir, $system_serial) : $nmon_dir;
 
-				if (defined $system_serial) {
-								print STDERR "\n--- Processing Managed System: $system_serial ---\n";
-				}
+    # Now, robustly determine the system identifier for logging.
+    # Default to the directory name, but prefer the canonical name from the ID file.
+    my $system_identifier = basename($current_cache_path); # Tier 2 Fallback identifier
+    my $id_file_path = File::Spec->catfile($current_cache_path, '.nfit_stage_id');
+
+    if (-f $id_file_path) {
+        eval {
+            open my $id_fh, '<:encoding(utf8)', $id_file_path;
+            my $id_content = <$id_fh>;
+            close $id_fh;
+
+            # Tier 1 Attempt: Extract the system name from the file.
+            if ($id_content && $id_content =~ /for system\s+(.+)/) {
+                my $candidate_name = $1;
+                $candidate_name =~ s/^\s+|\s+$//g; # Trim leading/trailing whitespace
+
+                # --> ADDED: Validate the extracted name.
+                # It must not be empty and must not contain illegal filename characters.
+                if ($candidate_name ne '' && $candidate_name !~ /[\\\/:\*\?"<>\|]/) {
+                    # Validation passed. Use the canonical name.
+                    $system_identifier = $candidate_name;
+                } else {
+                    # Validation failed. The fallback (directory name) will be used.
+                    warn "Warning: Unusable system identifier ('$candidate_name') found in '$id_file_path'. Reverting to directory name.";
+                }
+            }
+        };
+        if ($@) {
+            # This catches errors during file open/read. The fallback will be used.
+            warn "Warning: Could not read or parse '$id_file_path'. Using directory name for log. Error: $@";
+        }
+    }
+
+    my $log_file_path_for_run;
+    if ($system_identifier && $system_identifier ne '.')
+    {
+       print STDERR "\n--- Processing Managed System: $system_identifier ---\n";
+        # Sanitise the serial number for use in a filename.
+        my $log_suffix = $system_identifier;
+        $log_suffix =~ s/[^a-zA-Z0-9_.-]//g;
+        $log_file_path_for_run = "/tmp/nfit-profile.$log_suffix.log";
+    }
+    else
+    {
+        # Fallback to the default log path for single/non-serial runs.
+        $log_file_path_for_run = $LOG_FILE_PATH;
+    }
+
+    # --- Open Log File for this specific system ---
+    my $log_fh_for_system = IO::File->new($log_file_path_for_run, '>')
+    or warn "Error: Cannot open rationale log for '$system_serial' at '$log_file_path_for_run': $!. Rationale logging will be skipped for this system.\n";
+
+    if ($log_fh_for_system)
+    {
+        $open_log_files{$system_identifier} = $log_fh_for_system;
+        my $LOG_FH = $log_fh_for_system; # Use a lexical variable for printing the header
+
+        $LOG_FH->autoflush(1); # Ensure immediate writing to log
+        print {$LOG_FH} "======================================================================\n";
+        print {$LOG_FH} "nFit Profile Rationale Log\n";
+        print {$LOG_FH} "======================================================================\n";
+        print {$LOG_FH} "nfit-profile.pl Run Started: $PROFILE_SCRIPT_START_TIME_STR\n";
+        print {$LOG_FH} "nfit-profile.pl Version  : $VERSION\n";
+        print {$LOG_FH} "nfit.pl Version Used     : $nfit_ver\n";
+        print {$LOG_FH} "----------------------------------------------------------------------\n";
+        my @quoted_original_argv_log = map { $_ =~ /\s/ ? qq/"$_"/ : $_ } @original_argv;
+        print {$LOG_FH} "Invocation: $0 " . join(" ", @quoted_original_argv_log) . "\n";
+        print {$LOG_FH} "----------------------------------------------------------------------\n";
+        print {$LOG_FH} "Key Global Settings for System: " . ($system_serial // 'N/A') . "\n";
+        print {$LOG_FH} "  - Profiles Config File     : $profiles_config_path_to_load\n";
+        print {$LOG_FH} "  - VM Config File           : " . ($vm_config_file_path // "Not Provided/Default Attempted") . "\n";
+        print {$LOG_FH} "  - nfit Common Base Flags   : $common_nfit_flags_base (RunQ percentiles determined per profile)\n";
+        print {$LOG_FH} "  - nfit Windowed Decay Opts : " . ($nfit_windowing_decay_flags ne "" ? $nfit_windowing_decay_flags : "Not Enabled") . "\n";
+        print {$LOG_FH} "  - nfit RunQ Avg Method     : $nfit_runq_avg_method_str\n";
+        print {$LOG_FH} "  - Default SMT for Profile  : $default_smt_arg\n";
+        print {$LOG_FH} "======================================================================\n\n";
+        print {$LOG_FH} "===== Per-VM / Per-Profile RunQ Adjustment Details =====\n\n";
+    }
+
+    # --- Capture the start time for this specific system's analysis ---
+    my $system_analysis_start_time = time();
 
     # This inner loop iterates through the profiles from the config file.
 				foreach my $profile (@profiles)
 				{
-								my $profile_name = $profile->{name};
-								my $profile_runq_behavior = $profile->{runq_behavior} // 'default'; # Default RunQ modifier behavior if not in config
+       my $profile_name = $profile->{name};
+        my $profile_runq_behavior = $profile->{runq_behavior} // 'default'; # Default RunQ modifier behavior if not in config
 
-								# Determine Profile's PhysC Percentile (e.g., value X from -p X in profile's flags)
-								# This is used for:
-								# 1. Extracting the correct PhysC metric from nfit's output (e.g., P98=value).
-								# 2. Optionally matching the AbsRunQ percentile if --match-runq-perc-to-profile is set.
-								my $profile_physc_perc_val_num;
-								if ($profile->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/)
-								{
-												$profile_physc_perc_val_num = $1 + 0; # Store as number
-								}
+# Determine Profile's PhysC Percentile (e.g., value X from -p X in profile's flags)
+# This is used for:
+# 1. Extracting the correct PhysC metric from nfit's output (e.g., P98=value).
+# 2. Optionally matching the AbsRunQ percentile if --match-runq-perc-to-profile is set.
+        my $profile_physc_perc_val_num;
+        if ($profile->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/)
+        {
+            $profile_physc_perc_val_num = $1 + 0; # Store as number
+        }
 
-								# --- Construct nfit command with dynamically determined RunQ percentile flags for THIS profile run ---
+# --- Construct nfit command with dynamically determined RunQ percentile flags for THIS profile run ---
 
-								my $profile_specific_flags_for_nfit_run = $profile->{flags};
-								my $nfit_runq_related_flags_for_command = ""; # This will hold the final --runq-...-perc flags for this nfit call
+        my $profile_specific_flags_for_nfit_run = $profile->{flags};
+        my $nfit_runq_related_flags_for_command = ""; # This will hold the final --runq-...-perc flags for this nfit call
 
-        my $has_runq_source = $is_influxdb_cache_run || defined($runq_data_file_arg) || defined($nmon_dir);
+        my $has_runq_source = defined($runq_data_file_arg) || defined($nmon_dir);
 
-								# Check if any RunQ data source is available
-								if ($has_runq_source)
-								{
-												# --- Handle Absolute RunQ Percentiles ---
-												my @abs_percs_to_collate;
-												if ($profile_specific_flags_for_nfit_run =~ /--runq-abs-perc\s+([^\s\'\"]+)/)
-												{
-																push @abs_percs_to_collate, split(/,/, $1);
-												}
-												push @abs_percs_to_collate, split(/,/, $runq_abs_perc_list_str);
-												push @abs_percs_to_collate, 90;
-												if ($match_runq_perc_to_profile && defined $profile_physc_perc_val_num)
-												{
-																push @abs_percs_to_collate, $profile_physc_perc_val_num;
-												}
-												$profile_specific_flags_for_nfit_run =~ s/--runq-abs-perc\s+[^\s\'\"]+//g;
-												my %seen_abs;
-												my @unique_abs_percs = sort {$a <=> $b} grep { looks_like_number($_) && !$seen_abs{$_}++ } @abs_percs_to_collate;
-												if (@unique_abs_percs)
-												{
-																$nfit_runq_related_flags_for_command .= " --runq-abs-perc '" . join(",", @unique_abs_percs) . "'";
-												}
-
-												# --- Handle Normalized RunQ Percentiles ---
-												my @norm_percs_to_collate;
-												if ($profile_specific_flags_for_nfit_run =~ /--runq-norm-perc\s+([^\s\'\"]+)/)
-												{
-																push @norm_percs_to_collate, split(/,/, $1);
-												}
-												push @norm_percs_to_collate, split(/,/, $runq_norm_perc_list_str);
-												push @norm_percs_to_collate, (25, 50, 75, 90);
-												$profile_specific_flags_for_nfit_run =~ s/--runq-norm-perc\s+[^\s\'\"]+//g;
-												my %seen_norm;
-												my @unique_norm_percs = sort {$a <=> $b} grep { looks_like_number($_) && !$seen_norm{$_}++ } @norm_percs_to_collate;
-												if (@unique_norm_percs)
-												{
-																$nfit_runq_related_flags_for_command .= " --runq-norm-perc '" . join(",", @unique_norm_percs) . "'";
-												}
-								}
-
-        # Display the formatted flags for the upcoming run.
-        my $formatted_run_info = format_nfit_flags_for_display($profile_name, $profile_specific_flags_for_nfit_run, $nfit_runq_related_flags_for_command, $profile_runq_behavior);
-								print STDERR $formatted_run_info . "\n";
-
-        my $current_nmon_dir_arg;
-        my $current_vm_filter_arg = "";
-
-        if ($is_influxdb_cache_run) {
-            $current_nmon_dir_arg = "--nmondir \"$base_cache_dir/$system_serial/\"";
-            if (defined $target_vm_name) {
-                my %all_vms_for_system;
-                my $states_file = "$base_cache_dir/$system_serial/$CACHE_STATES_FILE";
-																my $json_text = do {
-																				open my $fh, '<:encoding(utf8)', $states_file or die "Could not open '$states_file': $!";
-																				local $/; # Temporarily undefine the record separator to read the whole file
-																				my $content = <$fh>;
-																				close $fh;
-																				$content; # This is the last expression, its value is returned by the do block
-																};
-                my $states = eval { decode_json($json_text) };
-                if ($@) { warn "Warning: Could not decode '$states_file': $@"; next; }
-                %all_vms_for_system = map { $_ => 1 } keys %$states;
-
-                my @vms_to_run_on_this_system = grep { exists $all_vms_for_system{$_} } (split /,/, $target_vm_name);
-                if (@vms_to_run_on_this_system) {
-                    $current_vm_filter_arg = "-vm \"" . join(",", @vms_to_run_on_this_system) . "\"";
-                } else {
-                    print STDERR "  Skipping profile '$profile_name' for system '$system_serial': No target VMs found in this cache.\n";
-                    next;
-                }
+# Check if any RunQ data source is available
+        if ($has_runq_source)
+        {
+# --- Handle Absolute RunQ Percentiles ---
+            my @abs_percs_to_collate;
+            if ($profile_specific_flags_for_nfit_run =~ /--runq-abs-perc\s+([^\s\'\"]+)/)
+            {
+                push @abs_percs_to_collate, split(/,/, $1);
             }
-        } elsif ($nmon_dir) {
-             $current_nmon_dir_arg = "--nmondir \"$nmon_dir\"";
-             $current_vm_filter_arg = defined($target_vm_name) ? " -vm \"$target_vm_name\"" : "";
-        } else {
-             # Flat file standard file source mode. $common_nfit_flags_base handles this.
-             $current_nmon_dir_arg = "";
-             $current_vm_filter_arg = defined($target_vm_name) ? " -vm \"$target_vm_name\"" : "";
+            push @abs_percs_to_collate, split(/,/, $runq_abs_perc_list_str);
+            push @abs_percs_to_collate, 90;
+            if ($match_runq_perc_to_profile && defined $profile_physc_perc_val_num)
+            {
+                push @abs_percs_to_collate, $profile_physc_perc_val_num;
+            }
+            $profile_specific_flags_for_nfit_run =~ s/--runq-abs-perc\s+[^\s\'\"]+//g;
+            my %seen_abs;
+            my @unique_abs_percs = sort {$a <=> $b} grep { looks_like_number($_) && !$seen_abs{$_}++ } @abs_percs_to_collate;
+            if (@unique_abs_percs)
+            {
+                $nfit_runq_related_flags_for_command .= " --runq-abs-perc '" . join(",", @unique_abs_percs) . "'";
+            }
+
+# --- Handle Normalized RunQ Percentiles ---
+            my @norm_percs_to_collate;
+            if ($profile_specific_flags_for_nfit_run =~ /--runq-norm-perc\s+([^\s\'\"]+)/)
+            {
+                push @norm_percs_to_collate, split(/,/, $1);
+            }
+            push @norm_percs_to_collate, split(/,/, $runq_norm_perc_list_str);
+            push @norm_percs_to_collate, (25, 50, 75, 90);
+            $profile_specific_flags_for_nfit_run =~ s/--runq-norm-perc\s+[^\s\'\"]+//g;
+            my %seen_norm;
+            my @unique_norm_percs = sort {$a <=> $b} grep { looks_like_number($_) && !$seen_norm{$_}++ } @norm_percs_to_collate;
+            if (@unique_norm_percs)
+            {
+                $nfit_runq_related_flags_for_command .= " --runq-norm-perc '" . join(",", @unique_norm_percs) . "'";
+            }
         }
 
-        my $nfit_smt_flag_for_current_run = "--smt $default_smt_arg";
+# Display the formatted flags for the upcoming run.
+        my $formatted_run_info = format_nfit_flags_for_display($profile_name, $profile_specific_flags_for_nfit_run, $nfit_runq_related_flags_for_command, $profile_runq_behavior);
+        print STDERR $formatted_run_info . "\n";
 
-        my $base_flags = "-q -k";
-        if ($current_nmon_dir_arg) {
-             $base_flags .= " $current_nmon_dir_arg";
-        } else {
-             $base_flags .= " --physc-data \"$physc_data_file\"";
-             if (defined $runq_data_file_arg) { $base_flags .= " --runq-data \"$runq_data_file_arg\""; }
+# --- NEW: Simplified and Standardised Command Construction ---
+# The logic now assumes a hierarchical cache and always calls nfit.pl
+# with --nmondir pointing to the specific system's cache directory.
+
+        my $target_cache_for_nfit_run;
+        if (defined $system_serial)
+        {
+# This is a multi-system run; point to the specific serial's cache.
+            $target_cache_for_nfit_run = File::Spec->catfile($base_cache_dir, $system_serial);
+        }
+        else
+        {
+# This is a single run on a cache directory directly specified by the user.
+            $target_cache_for_nfit_run = $nmon_dir;
         }
 
+# The base flags for nfit are now much simpler.
+# It always gets --nmondir. All other flags are for analysis control.
+        my $base_flags = "-q -k --nmondir \"$target_cache_for_nfit_run\"";
         $base_flags .= " $rounding_flags_for_nfit $nfit_windowing_decay_flags";
         if (defined $start_date_str) { $base_flags .= " -s $start_date_str"; }
         if (defined $nfit_runq_avg_method_str) { $base_flags .= " --runq-avg-method \"$nfit_runq_avg_method_str\""; }
 
+# The VM filter is still passed through if specified.
+        my $current_vm_filter_arg = defined($target_vm_name) ? " -vm \"$target_vm_name\"" : "";
+        my $nfit_smt_flag_for_current_run = "--smt $default_smt_arg";
+
+# Assemble the final, complete command.
         my $command = "$nfit_script_path $base_flags $current_vm_filter_arg $nfit_smt_flag_for_current_run $profile_specific_flags_for_nfit_run $nfit_runq_related_flags_for_command";
 
-        # Execute and process the command (this part of the logic remains largely the same)
-								my $raw_nfit_output = `$command`;
-								my $exit_status = $? >> 8;
+# Execute and process the command
+        my $raw_nfit_output = `$command`;
 
-								if ($exit_status != 0)
-								{
-												warn "Warning: '$nfit_script_path' cmd failed for profile '$profile_name' (exit $exit_status). Command was: $command. Output: $raw_nfit_output. Skip.\n";
-												if ($LOG_FH)
-												{
-																print {$LOG_FH} "ERROR: nfit.pl execution FAILED for profile '$profile_name' on VM(s) '". ($target_vm_name // "All") ."'.\n";
-																print {$LOG_FH} "  Command: $command\n";
-																print {$LOG_FH} "  Exit Status: $exit_status\n";
-																my $short_output = substr($raw_nfit_output, 0, 1000) . (length($raw_nfit_output) > 1000 ? "..." : ""); # Log first 1KB of output
-																				print {$LOG_FH} "  Output (first 1000 chars): $short_output\n";
-												}
-												next; # Skip to the next profile in the loop
-								}
+        my $exit_status = $? >> 8;
 
-								# --- ASSIMILATION LOGIC ---
-								my $parsed_nfit_results = parse_nfit_key_value_output($raw_nfit_output);
+        if ($exit_status != 0)
+        {
+            warn "Warning: '$nfit_script_path' cmd failed for profile '$profile_name' (exit $exit_status). Command was: $command. Output: $raw_nfit_output. Skip.\n";
+            if ($LOG_FH)
+            {
+                print {$LOG_FH} "ERROR: nfit.pl execution FAILED for profile '$profile_name' on VM(s) '". ($target_vm_name // "All") ."'.\n";
+                print {$LOG_FH} "  Command: $command\n";
+                print {$LOG_FH} "  Exit Status: $exit_status\n";
+                my $short_output = substr($raw_nfit_output, 0, 1000) . (length($raw_nfit_output) > 1000 ? "..." : ""); # Log first 1KB of output
+                    print {$LOG_FH} "  Output (first 1000 chars): $short_output\n";
+            }
+            next; # Skip to the next profile in the loop
+        }
 
-								foreach my $vm_name (sort keys %{$parsed_nfit_results})
-								{
-												unless ($vm_seen{$vm_name}++) {
-																push @vm_order, $vm_name;
-												}
+# --- ASSIMILATION LOGIC ---
+        my $parsed_nfit_results = parse_nfit_key_value_output($raw_nfit_output);
 
-												my @states_for_vm = @{$parsed_nfit_results->{$vm_name}};
-												$per_profile_nfit_raw_results{$vm_name}{$profile_name} = \@states_for_vm; # Store for logging
+        foreach my $vm_name (sort keys %{$parsed_nfit_results})
+        {
+            unless ($vm_seen{$vm_name}++) {
+                push @vm_order, $vm_name;
+            }
 
-												next unless @states_for_vm; # Skip if no data for this VM
+            my @states_for_vm = @{$parsed_nfit_results->{$vm_name}};
+            $per_profile_nfit_raw_results{$vm_name}{$profile_name} = \@states_for_vm; # Store for logging
 
-												my $p_metric_key = "P" . clean_perc_label($profile_physc_perc_val_num // $DEFAULT_PERCENTILE);
-												my @valid_p_values;
-												foreach my $state (@states_for_vm) {
-																if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key})) {
-																				push @valid_p_values, $state->{$p_metric_key};
-																}
-												}
+                next unless @states_for_vm; # Skip if no data for this VM
 
-												my $base_physc_for_profile = "N/A";
-												if (@valid_p_values) {
-																# Simple, unweighted average as per design for multi-state results
-												    $base_physc_for_profile = sum0(@valid_p_values) / scalar(@valid_p_values);
-												}
+                my $p_metric_key = "P" . clean_perc_label($profile_physc_perc_val_num // $DEFAULT_PERCENTILE);
+            my @valid_p_values;
+            foreach my $state (@states_for_vm) {
+                if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key})) {
+                    push @valid_p_values, $state->{$p_metric_key};
+                }
+            }
 
-												$results_table{$vm_name}{$profile_name} = $base_physc_for_profile;
+            my $base_physc_for_profile = "N/A";
+            if (@valid_p_values) {
+# Simple, unweighted average as per design for multi-state results
+                $base_physc_for_profile = sum0(@valid_p_values) / scalar(@valid_p_values);
+            }
 
-												# --- Data Capture for Sizing Hints and Modifiers ---
-												# For hints, we always use the MOST RECENT state from the P-99W1 profile run.
-												if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT)
-												{
-																my $most_recent_state = $states_for_vm[-1]; # The last state in the time-sorted list
+            $results_table{$vm_name}{$profile_name} = $base_physc_for_profile;
 
-																# Capture Peak value from the most recent state
-																$results_table{$vm_name}{$PEAK_PROFILE_NAME} = $most_recent_state->{'Peak'} // "N/A";
+# --- Data Capture for Sizing Hints and Modifiers ---
+# For hints, we always use the MOST RECENT state from the P-99W1 profile run.
+            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT)
+            {
+                my $most_recent_state = $states_for_vm[-1]; # The last state in the time-sorted list
 
-																# Capture RunQ metrics from the most recent state for global hints
-																$per_profile_runq_metrics{$vm_name}{$profile_name} = $most_recent_state;
+# Capture Peak value from the most recent state
+                    $results_table{$vm_name}{$PEAK_PROFILE_NAME} = $most_recent_state->{'Peak'} // "N/A";
 
-																# This logic below is now simplified, as we just grab the values from the hash
-																my %first_capture_target_keys = ( 'NormRunQ_P50' => 1, 'NormRunQ_P90' => 1, 'AbsRunQ_P90'  => 1 );
-																foreach my $key (keys %first_capture_target_keys) {
-																				if (!$primary_runq_metrics_captured_for_vm{$vm_name}{$key}) {
-																								$results_table{$vm_name}{$key} = $most_recent_state->{$key} // "N/A";
-																								$primary_runq_metrics_captured_for_vm{$vm_name}{$key} = 1;
-																								$source_profile_for_global_runq{$vm_name} //= $profile_name;
-																				}
-																}
-												}
-												else {
-																# For other profiles, we still need to store their RunQ metrics for their own modifications
-																# We'll use the most recent state's metrics for this as well for consistency.
-																$per_profile_runq_metrics{$vm_name}{$profile_name} = $states_for_vm[-1];
-												}
-								}
+# Capture RunQ metrics from the most recent state for global hints
+                $per_profile_runq_metrics{$vm_name}{$profile_name} = $most_recent_state;
 
-				} # End foreach profile
+# This logic below is now simplified, as we just grab the values from the hash
+                my %first_capture_target_keys = ( 'NormRunQ_P50' => 1, 'NormRunQ_P90' => 1, 'AbsRunQ_P90'  => 1 );
+                foreach my $key (keys %first_capture_target_keys) {
+                    if (!$primary_runq_metrics_captured_for_vm{$vm_name}{$key}) {
+                        $results_table{$vm_name}{$key} = $most_recent_state->{$key} // "N/A";
+                        $primary_runq_metrics_captured_for_vm{$vm_name}{$key} = 1;
+                        $source_profile_for_global_runq{$vm_name} //= $profile_name;
+                    }
+                }
+            }
+            else {
+# For other profiles, we still need to store their RunQ metrics for their own modifications
+# We'll use the most recent state's metrics for this as well for consistency.
+                $per_profile_runq_metrics{$vm_name}{$profile_name} = $states_for_vm[-1];
+            }
+        }
+
+    } # End foreach profile
 } # End foreach system
 print STDERR "Finished nfit profile runs. Generating CSV output and rationale log...\n";
 
@@ -1028,6 +1037,16 @@ my $excel_row_num_counter = 1; # Excel rows are 1-based; header is row 1, so fir
 foreach my $vm_name (sort @vm_order)
 {
     $excel_row_num_counter++; # Increment for current data row number in Excel sheet.
+    # --- Retrieve the correct log file handle for this VM's system ---
+    my $system_id_for_vm = '';
+    # Use the mandatory profile's results to reliably find the SerialNumber
+    if (exists $per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT}) {
+        my $raw_results_aref = $per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
+        if (ref($raw_results_aref) eq 'ARRAY' && @$raw_results_aref && exists $raw_results_aref->[-1]{'SerialNumber'}) {
+            $system_id_for_vm = $raw_results_aref->[-1]{'SerialNumber'};
+        }
+    }
+    my $current_log_fh = $open_log_files{$system_id_for_vm};
 
     my @data_row_csv; # Holds data for the current VM's CSV row
     my $cfg_csv = $vm_config_data{$vm_name}; # VM's config data from config-all.csv (if loaded)
@@ -1076,6 +1095,7 @@ foreach my $vm_name (sort @vm_order)
     # --- Generate Sizing Hint and get ACTUAL pressure details for ALL servers ---
     my ($hint_type_tier_csv, $hint_pattern_shape_csv, $hint_pressure_bool_csv, $pressure_detail_str_csv, $global_pressure_log_details_str, $p99w1_vm_has_abs_runq_pressure, $p99w1_vm_has_norm_runq_pressure) =
         generate_sizing_hint(
+            'log_fh_ref'               => $current_log_fh, # Pass the file handle
             'results_ref'              => \%results_table,
             'vm'                       => $vm_name,
             'config_ref'               => $cfg_csv,
@@ -1085,11 +1105,11 @@ foreach my $vm_name (sort @vm_order)
         );
     my $pressure_bool_str_csv = $hint_pressure_bool_csv ? "True" : "False";
 
-    if ($LOG_FH)
+    if ($current_log_fh)
     {
-        print {$LOG_FH} "----------------------------------------------------------------------\n";
-        print {$LOG_FH} "Global Sizing Hint Pressure Assessment (VM: $vm_name)\n";
-        print {$LOG_FH} $global_pressure_log_details_str . "\n";
+        print {$current_log_fh} "----------------------------------------------------------------------\n";
+        print {$current_log_fh} "Global Sizing Hint Pressure Assessment (VM: $vm_name)\n";
+        print {$current_log_fh} $global_pressure_log_details_str . "\n";
     }
 
     # --- Build the initial part of the CSV row ---
@@ -1177,8 +1197,8 @@ foreach my $vm_name (sort @vm_order)
                     $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{$potential_key};
                     $abs_runq_key_actually_used = $potential_key;
                 } else {
-                    if ($LOG_FH) {
-                        print {$LOG_FH} "WARNING VM '$vm_name', Profile '$profile_name_being_adjusted': Matched key '$potential_key' for AbsRunQ not found. Falling back to AbsRunQ_P90.\n";
+                    if ($current_log_fh) {
+                        print {$current_log_fh} "WARNING VM '$vm_name', Profile '$profile_name_being_adjusted': Matched key '$potential_key' for AbsRunQ not found. Falling back to AbsRunQ_P90.\n";
                     }
                     $abs_runq_p_value_to_use_for_calc = $per_profile_runq_metrics{$vm_name}{$profile_name_being_adjusted}{"AbsRunQ_P90"} // "N/A";
                 }
@@ -1249,7 +1269,7 @@ foreach my $vm_name (sort @vm_order)
                 # The log call can remain the same. The rationale log already displays the
                 # growth adjustment value, providing context for the calculation. The important
                 # part is that the calculation itself is now correct.
-                if ($LOG_FH)
+                if ($current_log_fh)
                 {
                     # For logging purposes, we still show the original inflated value as the "Base PhysC"
                     # from nfit's perspective, as the log details the subsequent adjustments.
@@ -1257,7 +1277,7 @@ foreach my $vm_name (sort @vm_order)
                     my $nfit_growth_adj_abs_for_log = $parsed_growth_adj_abs_values{$vm_name}{$profile_name_being_adjusted} // "0.0000 (not parsed)";
 
                     log_profile_rationale(
-                        $LOG_FH, $vm_name, $profile_name_being_adjusted, $raw_physc_profile_value_str,
+                        $current_log_fh, $vm_name, $profile_name_being_adjusted, $raw_physc_profile_value_str,
                         $per_profile_nfit_raw_results{$vm_name}{$profile_name_being_adjusted},
                         $profile_name_being_adjusted, $abs_runq_p_value_to_use_for_calc,
                         $this_profile_norm_p50, $this_profile_norm_p90, $cfg_csv, $smt_used_for_vm_csv,
@@ -1350,20 +1370,24 @@ if ($nfit_enable_windowed_decay) # If nfit was instructed to use its internal de
 {
     print STDERR "Note: nfit was instructed to use internal windowed decay processing.\n";
 }
-if ($LOG_FH) # If logging was enabled and successful
-{
-    my $PROFILE_SCRIPT_END_TIME_EPOCH = time();
-    my $PROFILE_SCRIPT_END_TIME_STR = localtime($PROFILE_SCRIPT_END_TIME_EPOCH)->strftime("%Y-%m-%d %H:%M:%S %Z");
-    my $PROFILE_SCRIPT_DURATION = $PROFILE_SCRIPT_END_TIME_EPOCH - $PROFILE_SCRIPT_START_TIME_EPOCH;
 
-    print {$LOG_FH} "\n----------------------------------------------------------------------\n";
-    print {$LOG_FH} "nfit-profile.pl Run Ended  : $PROFILE_SCRIPT_END_TIME_STR\n";
-    print {$LOG_FH} "Total Duration             : $PROFILE_SCRIPT_DURATION seconds\n";
-    print {$LOG_FH} "======================================================================\n";
-    print {$LOG_FH} "End of Rationale Log.\n";
-    print {$LOG_FH} "======================================================================\n";
-    close $LOG_FH;
-    print STDERR "Rationale log written to: $LOG_FILE_PATH\n";
+# --- Report final script duration summary to STDERR ---
+my $PROFILE_SCRIPT_END_TIME_EPOCH = time();
+my $PROFILE_SCRIPT_DURATION = $PROFILE_SCRIPT_END_TIME_EPOCH - $PROFILE_SCRIPT_START_TIME_EPOCH;
+print STDERR "Total execution time: $PROFILE_SCRIPT_DURATION seconds.\n";
+
+# --- Finalise and close all rationale log files ---
+my $final_end_time_str = localtime($PROFILE_SCRIPT_END_TIME_EPOCH)->strftime("%Y-%m-%d %H:%M:%S %Z");
+foreach my $system_id (keys %open_log_files) {
+    my $log_fh = $open_log_files{$system_id};
+    if ($log_fh) {
+        print {$log_fh} "\n----------------------------------------------------------------------\n";
+        print {$log_fh} "Analysis for System '$system_id' completed at: " . $final_end_time_str . "\n";
+        # Note: A per-system duration would require storing start times in a hash as well.
+        # This is sufficient to close the log with a final timestamp.
+        print {$log_fh} "======================================================================\n";
+        close $log_fh;
+    }
 }
 
 exit 0;
@@ -2928,6 +2952,8 @@ sub calculate_runq_modified_physc
 sub generate_sizing_hint
 {
     my %args = @_;
+    # Unpack arguments, including the log file handle reference.
+    my $LOG_FH                       = $args{'log_fh_ref'};
     my $results_ref                  = $args{'results_ref'};
     my $vm                           = $args{'vm'};
     my $config_ref                   = $args{'config_ref'};
@@ -3349,14 +3375,15 @@ per profile via the 'runq_modifier_behavior' attribute in nfit.profiles.cfg.
 Optionally passes flags to nfit for its internal windowed decay processing.
 A detailed rationale log is written to $LOG_FILE_PATH.
 
-Input Method:
-  --physc-data, -pc <file> : Path to NMON PhysC data CSV.
-      --runq-data, -rq <file>  : Optional. Path to NMON RunQ data CSV.
-  --nmondir <directory>    : Path to a directory of .nmon files or a InfluxDB staging area.
-  --mgsys <serial>         : Specifies a managed system. If --nmondir or --physc-data are absent,
-                             implicitly uses the default InfluxDB cache at './stage/influxdb'.
+Input Method (Provide one):
+  --nmondir <directory>    : Path to a base directory containing system-specific caches
+                             (e.g., './stage/'), or to a single cache directory
+                             (e.g., './stage/12345ABC/').
+  --mgsys <serial>         : Specifies a managed system. If --nmondir is absent,
+                             implicitly uses the default base cache at './stage/'.
+                             Can be combined with --nmondir to select a system
+                             from a non-default base path.
   --default-smt, --smt <N> : Optional. Default SMT level (Default: $DEFAULT_SMT_VALUE_PROFILE).
-
 
 RunQ Metric Configuration (for nfit calls):
   --runq-norm-percentiles <list> : Global default for Normalised RunQ (Default: "$DEFAULT_RUNQ_NORM_PERCS").

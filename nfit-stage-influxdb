@@ -32,19 +32,9 @@ try:
 except ImportError:
     INFLUXDB_V1_AVAILABLE = False
 
-VERSION = '5.25.185.1'
+VERSION = '5.25.185.3'
 
-# --- InfluxQL Query Definitions (Consolidated for Performance) ---
-# The 'physc' query has been replaced with a combined query for the cpu_util table.
-INFLUXQL_PERF_QUERIES = {
-    'physc': 'SELECT "physical_consumed" FROM "cpu_util" WHERE {filter} AND {time_filter} GROUP BY "host"',
-    'runq':  'SELECT "run_queue" FROM "kernel" WHERE {filter} AND {time_filter} GROUP BY "host"',
-}
-
-# This dictionary is no longer used by the new hybrid change-detection logic,
-# but we keep it for the CONFIG_FIELD_MAP which is still useful.
-INFLUXQL_CONFIG_QUERIES_BY_TABLE = {}
-
+# --- InfluxQL Query Definitions ---
 CONFIG_FIELD_MAP = {
     'entitlement': 'entitlement', 'serial_number': 'serial_no', 'smt': 'smtthreads', 'virtual_cpus': 'desired_vcpus',
     'capped': 'capped', 'pool_cpu': 'phys_cpus_pool',
@@ -52,9 +42,7 @@ CONFIG_FIELD_MAP = {
     'proc_clock': 'processorMHz'
 }
 
-
 # --- Helper Functions ---
-
 class FcntlLock:
     """A context manager for file locking using the native fcntl module."""
     def __init__(self, lock_path, timeout=10):
@@ -82,18 +70,15 @@ class FcntlLock:
             if os.path.exists(self.lock_path):
                 os.remove(self.lock_path)
 
-
 def get_db_client(config_path):
     """Reads config and returns an appropriate InfluxDB client."""
     config = configparser.ConfigParser()
     if not os.path.exists(config_path):
         print(f"Error: Configuration file not found at {config_path}", file=sys.stderr)
         sys.exit(1)
-
     config.read(config_path)
     db_config = config['database']
     db_version = db_config.getint('VERSION', 1)
-
     client = None
     if db_version == 2:
         if not INFLUXDB_V2_AVAILABLE:
@@ -119,756 +104,443 @@ def get_db_client(config_path):
 
 def execute_query(client, query, db_version, verbose=False):
     """Executes a query using the appropriate client version, with timestamped debug output."""
-    start_time = time.time()
-    timestamp_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-
     if verbose:
+        timestamp_str = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
         print(f"\n[DEBUG] {timestamp_str} - Executing Query:\n{query}\n")
-
-    # Execute the query depending on InfluxDB version
     if db_version == 2:
-        query_api = client.query_api()
-        result = query_api.query(query)
+        return client.query_api().query(query)
     else:
-        result = client.query(query)
-
-    end_time = time.time()
-    duration = end_time - start_time
-
-    if verbose:
-        print(f"[DEBUG] Query completed in {duration:.2f} seconds.\n")
-
-    return result
+        return client.query(query)
 
 def parse_utc_string(ts_str):
     """Parses a UTC timestamp string (various formats) into a timezone-aware UTC datetime."""
     ts_str = ts_str.rstrip('Z')
-    for fmt in ("%Y-%m-%dT%H:%M:%S.%f",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S.%f",
-                "%Y-%m-%d %H:%M:%S"):
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
         try:
-            dt = datetime.strptime(ts_str, fmt)
-            return dt.replace(tzinfo=timezone.utc)
+            return datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
     raise ValueError(f"Unsupported datetime format: {ts_str}")
 
-def get_numeric_changes(client, db_version, field, measurement, entity_filter, time_filter, verbose=False):
-    """
-    Uses a robust two-query method to get the initial value and all subsequent
-    numeric changes for a field, correctly handling static values.
-    """
-    events = []
-    last_known_values = {}
-
-    # Query 1: Get the very first value for each host to establish the initial state.
-    # This is the most important step for capturing statically configured VMs.
-    initial_state_query = f'''
-        SELECT FIRST("{field}") AS "{field}"
-        FROM "{measurement}"
-        WHERE {entity_filter} AND {time_filter}
-        GROUP BY "host"
-    '''
-    initial_results = execute_query(client, initial_state_query, db_version, verbose)
-    for series in initial_results.items():
-        if not series or not series[0] or not isinstance(series[0][1], dict) or 'host' not in series[0][1]:
-            if verbose: print(f"  [DEBUG] Skipping series with no valid host tag for field '{field}'.")
-            continue
-
-        vm_name = series[0][1]['host']
-        for point in series[1]:
-            if point.get(field) is not None:
-                dt = parse_utc_string(point['time'])
-                value = point[field]
-                events.append({'ts': int(dt.timestamp()), 'host': vm_name, 'value': value})
-                last_known_values[vm_name] = value
-
-    # Query 2: Get a down-sampled series of the last known value for every 1-hour time bucket.
-    downsample_query = f'''
-        SELECT LAST("{field}") AS "{field}"
-        FROM "{measurement}"
-        WHERE {entity_filter} AND {time_filter}
-        GROUP BY time(1h), "host"
-    '''
-    downsampled_results = execute_query(client, downsample_query, db_version, verbose)
-    for series in downsampled_results.items():
-        if not series or not series[0] or not isinstance(series[0][1], dict) or 'host' not in series[0][1]:
-            continue # Skip series without a host tag
-
-        vm_name = series[0][1]['host']
-        for point in series[1]:
-            current_value = point.get(field)
-            if current_value is None:
-                continue
-
-            # Add an event only if the value is new or has changed from the last known value.
-            if vm_name not in last_known_values or current_value != last_known_values[vm_name]:
-                dt = parse_utc_string(point['time'])
-                events.append({'ts': int(dt.timestamp()), 'host': vm_name, 'value': current_value})
-                last_known_values[vm_name] = current_value
-
-    return events
-
-# The logic for numeric and non-numeric changes is now identical and robust.
-# We can use the same function for both, simplifying the code.
-get_non_numeric_changes = get_numeric_changes
-
-# --- Optimised Performance Data Streaming Functions ---
 def stream_performance_data_optimized(client, db_version, entity_filter, time_filter_v1, tmp_dir, args):
     """
-    Streams performance data directly to temporary files for each metric,
-    then uses an external sort and merge-join to create a final master file.
-    This approach is highly memory-efficient and scalable for large datasets.
-    This function also tracks the min/max timestamps during the stream.
+    Streams performance data to temp files, tracks min/max timestamps, and
+    uses an external sort to create a master file.
     """
-    print("\nPhase 1: Performance Data Gathering (Optimised Stream-to-Disk)")
-
+    print("\n## Phase 1: Performance Data Staging")
     temp_files = {}
     temp_file_handles = {}
     min_ts, max_ts = None, None
+    discovered_vms = set()
 
     try:
-        # Create a separate temporary file for each performance metric.
-        # This allows for parallel processing and avoids mixing data types before sorting.
-        for metric in ['physc', 'runq']:
-            temp_file = tempfile.NamedTemporaryFile(
-                mode='w',
-                delete=False,
-                dir=tmp_dir,
-                suffix=f'.{metric}.csv',
-                encoding='utf-8'
-            )
-            temp_files[metric] = temp_file.name
-            temp_file_handles[metric] = temp_file
-            print(f"  Created temp file for {metric}: {temp_file.name}")
-
-        discovered_vms = set()
-
-        # Define the InfluxQL queries for each metric.
         perf_query_templates = {
             'physc': 'SELECT "physical_consumed" FROM "cpu_util" WHERE {filter} AND {time_filter} GROUP BY "host"',
             'runq':  'SELECT "run_queue" FROM "kernel" WHERE {filter} AND {time_filter} GROUP BY "host"',
         }
 
-        row_counts = {}
-
-        # Iterate over each metric, execute the query, and stream results directly to its file.
-        for metric, query_template in perf_query_templates.items():
-            print(f"  Streaming {metric} data...")
-            query = query_template.format(filter=entity_filter, time_filter=time_filter_v1)
-
+        for metric in ['physc', 'runq']:
+            print(f"- Streaming performance metrics ({metric})...", end="", flush=True)
+            start_metric_time = time.time()
+            
+            temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=tmp_dir, suffix=f'.{metric}.csv', encoding='utf-8')
+            temp_files[metric] = temp_file.name
+            temp_file_handles[metric] = temp_file
             if args.verbose:
-                print(f"    Query: {query}")
-
+                print(f"\n    Created temp file for {metric}: {temp_file.name}")
+            
+            query = perf_query_templates[metric].format(filter=entity_filter, time_filter=time_filter_v1)
             results = execute_query(client, query, db_version, args.verbose)
+            
+            temp_file.write("timestamp,vm_name,value\n")
 
-            row_count = 0
-            temp_file_handle = temp_file_handles[metric]
-
-            # Write a simple header for each metric file.
-            temp_file_handle.write("timestamp,vm_name,value\n")
-
-            # Process each series in the result set.
             for series in results.items():
-                if not series or not series[0] or not isinstance(series[0][1], dict) or 'host' not in series[0][1]:
+                # Ensure the series is valid and has a host tag.
+                if not (series and series[0] and isinstance(series[0][1], dict) and series[0][1].get('host')):
+                    if args.verbose: print("  [DEBUG] Skipping a series with no host tag in performance data.")
                     continue
-
                 vm_name = series[0][1]['host']
+                
+                # FINAL POLISH: Reject entries with an empty host tag.
                 if not vm_name:
                     if args.verbose: print("  [DEBUG] Skipping performance data series with an empty host tag.")
                     continue
+
                 discovered_vms.add(vm_name)
 
-                # Process each data point in the series.
                 for point in series[1]:
-                    # Find the name of the value field (e.g., "physical_consumed").
                     field_name = next(iter(k for k in point if k != 'time'), None)
                     if field_name and point.get(field_name) is not None:
                         current_ts_obj = parse_utc_string(point['time'])
-                        if min_ts is None or current_ts_obj < min_ts:
-                            min_ts = current_ts_obj
-                        if max_ts is None or current_ts_obj > max_ts:
-                            max_ts = current_ts_obj
-
+                        # Track the overall min/max timestamps during the stream.
+                        min_ts = min(min_ts, current_ts_obj) if min_ts else current_ts_obj
+                        max_ts = max(max_ts, current_ts_obj) if max_ts else current_ts_obj
                         ts = current_ts_obj.strftime('%Y-%m-%d %H:%M:%S')
-                        value = point.get(field_name)
+                        temp_file.write(f"{ts},{vm_name},{point.get(field_name)}\n")
+            
+            temp_file.close()
+            duration_metric = time.time() - start_metric_time
+            print(f" [DONE: {format_duration(duration_metric)}]")
 
-                        # Stream the formatted data directly to the temporary file.
-                        temp_file_handle.write(f"{ts},{vm_name},{value}\n")
-                        row_count += 1
-
-                        # Provide progress feedback for very large datasets.
-                        if row_count % 100000 == 0:
-                            print(f"    Processed {row_count:,} rows for {metric}...")
-
-            temp_file_handle.close()
-            row_counts[metric] = row_count
-            print(f"    Completed {metric}: {row_count:,} rows written")
-
-        # Create a placeholder for the final, merged master file.
-        master_temp_file = tempfile.NamedTemporaryFile(
-            mode='w',
-            delete=False,
-            dir=tmp_dir,
-            suffix='.master.csv',
-            encoding='utf-8'
-        )
+        print("- Sorting and merging all performance data into master cache...", end="", flush=True)
+        start_sort_time = time.time()
+        master_temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=tmp_dir, suffix='.master.csv', encoding='utf-8')
         master_temp_filename = master_temp_file.name
         master_temp_file.close()
-
-        print(f"\n  Creating sorted master file by joining metric files: {master_temp_filename}")
-
-        # Use the external sort and join process to create the final sorted file.
         create_sorted_master_file(temp_files, master_temp_filename)
+        duration_sort = time.time() - start_sort_time
+        print(f" [DONE: {format_duration(duration_sort)}]")
 
-        print(f"  Master file created with data from {len(discovered_vms)} VMs")
-
+        print(f"- Discovered {len(discovered_vms)} VMs with performance data in the target time window.")
         return master_temp_filename, discovered_vms, min_ts, max_ts
 
-    except Exception as e:
-        print(f"Error during performance data streaming: {e}")
-        raise
     finally:
         # Final cleanup of intermediate temporary files.
         for handle in temp_file_handles.values():
-            if not handle.closed:
-                handle.close()
-
+            if not handle.closed: handle.close()
         for temp_file in temp_files.values():
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-                if args.verbose:
-                    print(f"    Cleaned up temp file: {temp_file}")
-
+            if os.path.exists(temp_file): os.remove(temp_file)
 
 def create_sorted_master_file(temp_files, master_temp_filename):
-    """
-    Orchestrates the creation of a sorted master file by first sorting
-    individual metric files and then joining them.
-    """
+    """Orchestrates creating a sorted master file by sorting and joining."""
     sorted_files = {}
     try:
-        # Sort each individual metric file using the system's 'sort' command.
-        # This is highly efficient for large files.
         for metric, temp_file in temp_files.items():
             sorted_file = f"{temp_file}.sorted"
-
-            # The sort command is configured to sort by timestamp (key 1),
-            # then by VM name (key 2).
-            sort_cmd = [
-                'sort',
-                '-t,',           # Use comma as the delimiter.
-                '-k1,1',         # Primary sort key: timestamp (first column).
-                '-k2,2',         # Secondary sort key: VM name (second column).
-                '-S', '8G',      # Use a large 8GB memory buffer for sorting.
-                '-T', os.path.dirname(temp_file),  # Use the same directory for sort's temp files.
-                temp_file
-            ]
-
-            with open(sorted_file, 'w') as outfile:
-                subprocess.run(sort_cmd, stdout=outfile, check=True, text=True)
-
+            # Use a large 8GB memory buffer for sort, as requested.
+            sort_cmd = ['sort', '-t,', '-k1,1', '-k2,2', '-S', '8G', '-T', os.path.dirname(temp_file), temp_file]
+            with open(sorted_file, 'w', encoding='utf-8') as outfile:
+                subprocess.run(sort_cmd, stdout=outfile, check=True)
             sorted_files[metric] = sorted_file
-
-        # Join the now-sorted metric files into the final master file.
         join_sorted_files(sorted_files, master_temp_filename)
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error during external sort process: {e}")
-        print(f"Stderr: {e.stderr}")
-        raise
-    except Exception as e:
-        print(f"Error creating sorted master file: {e}")
-        raise
     finally:
-        # Clean up the intermediate sorted files.
         for sorted_file in sorted_files.values():
-            if os.path.exists(sorted_file):
-                os.remove(sorted_file)
-
+            if os.path.exists(sorted_file): os.remove(sorted_file)
 
 def join_sorted_files(sorted_files, master_temp_filename):
-    """
-    Performs a memory-efficient merge-join of multiple sorted CSV files.
-    It reads one line at a time from each file, finds the minimum key
-    (timestamp,vm_name), writes the combined row, and advances the file pointers.
-    """
+    """Performs a memory-efficient merge-join of multiple sorted CSV files."""
     file_handles = {}
     current_rows = {}
-
     try:
-        # Open all the sorted files and read their first data row.
         for metric, sorted_file in sorted_files.items():
             file_handles[metric] = open(sorted_file, 'r', encoding='utf-8')
-            next(file_handles[metric])  # Skip header line.
+            next(file_handles[metric])  # Skip header
             line = file_handles[metric].readline()
             if line:
                 parts = line.strip().split(',')
                 if len(parts) >= 3:
-                    current_rows[metric] = {
-                        'timestamp': parts[0],
-                        'vm_name': parts[1],
-                        'value': parts[2],
-                        'key': f"{parts[0]},{parts[1]}"
-                    }
-
-        # Write the master file by merging rows.
+                    current_rows[metric] = {'key': f"{parts[0]},{parts[1]}", 'value': parts[2]}
         with open(master_temp_filename, 'w', encoding='utf-8') as master_file:
             master_file.write("Timestamp,VMName,PhysC,RunQ\n")
-
             while current_rows:
-                # Find the smallest key (earliest timestamp,vm_name combination)
-                # among the current rows from all files.
                 min_key = min(current_rows.values(), key=lambda x: x['key'])['key']
-
                 timestamp, vm_name = min_key.split(',', 1)
-
-                # Collect values for this key from all metrics.
-                values = {'physc': '', 'runq': ''}
-                for metric, row_data in current_rows.items():
-                    if row_data['key'] == min_key:
-                        values[metric] = row_data['value']
-
-                # Write the combined row to the master file.
-                master_file.write(f"{timestamp},{vm_name},{values['physc']},{values['runq']}\n")
-
-                # Advance the file pointers for the files that contained the min_key.
+                values = {metric: row_data['value'] for metric, row_data in current_rows.items() if row_data['key'] == min_key}
+                master_file.write(f"{timestamp},{vm_name},{values.get('physc', '')},{values.get('runq', '')}\n")
                 for metric in list(current_rows.keys()):
                     if current_rows.get(metric) and current_rows[metric]['key'] == min_key:
                         line = file_handles[metric].readline()
                         if line:
                             parts = line.strip().split(',')
-                            if len(parts) >= 3:
-                                current_rows[metric] = {
-                                    'timestamp': parts[0],
-                                    'vm_name': parts[1],
-                                    'value': parts[2],
-                                    'key': f"{parts[0]},{parts[1]}"
-                                }
-                            else:
-                                # Malformed line, remove metric from processing.
-                                del current_rows[metric]
+                            if len(parts) >= 3: current_rows[metric] = {'key': f"{parts[0]},{parts[1]}", 'value': parts[2]}
+                            else: del current_rows[metric]
                         else:
-                            # End of file reached for this metric.
                             del current_rows[metric]
-
     finally:
-        for handle in file_handles.values():
-            handle.close()
-
-# --- END: Optimised Performance Data Streaming Functions ---
+        for handle in file_handles.values(): handle.close()
 
 def get_config_events_robust(client, db_version, field, measurement, entity_filter, start_date, end_date, verbose=False):
-    """
-    Performs a robust two-phase query to capture both the baseline configuration
-    and any changes during the analysis period.
-    """
+    """Performs a robust two-phase query to capture both the baseline configuration and any changes during the analysis period."""
     events = []
     last_known_values = {}
 
-    # --- Phase 1: Get the last known value BEFORE the analysis window ---
-    # This establishes the baseline configuration for all VMs.
-
-    # -- Add a lower time bound to the baseline query --
+    # Phase 1: Get the last known value BEFORE the analysis window.
     start_date_obj = datetime.strptime(start_date, '%Y-%m-%d')
     baseline_start_date_obj = start_date_obj - timedelta(days=365)
     baseline_start_str = baseline_start_date_obj.strftime('%Y-%m-%d')
     baseline_time_filter = f"time >= '{baseline_start_str}T00:00:00Z' AND time < '{start_date}T00:00:00Z'"
-
-    baseline_query = f'''
-        SELECT LAST("{field}") AS "{field}"
-        FROM "{measurement}"
-        WHERE {entity_filter} AND {baseline_time_filter}
-        GROUP BY "host"
-    '''
-    if verbose:
-        print(f"  Querying baseline for '{field}' (before {start_date})...")
-
-    # Note: InfluxDB v1 client library returns query results as a generator: convert the generator to a list to access the first point
+    baseline_query = f'SELECT LAST("{field}") AS "{field}" FROM "{measurement}" WHERE {entity_filter} AND {baseline_time_filter} GROUP BY "host"'
+    
     baseline_results = execute_query(client, baseline_query, db_version, verbose)
     for series in baseline_results.items():
-        if 'host' in series[0][1]:
+        if 'host' in series[0][1] and series[0][1]['host']:
             vm_name = series[0][1]['host']
-            if not vm_name: continue
-      
             points = list(series[1])
-            if points:  # Ensure the list is not empty
+            if points:
                 value = points[0].get(field)
                 if value is not None:
-                    # Use the analysis start time as the event time for the baseline
-                    ts = int(datetime.strptime(start_date, '%Y-%m-%d').replace(tzinfo=timezone.utc).timestamp())
+                    ts = int(start_date_obj.replace(tzinfo=timezone.utc).timestamp())
                     events.append({'ts': ts, 'host': vm_name, 'value': value})
                     last_known_values[vm_name] = value
-   
-    # --- Phase 2: Get all changes DURING the analysis window ---
-    # This uses the efficient sparse sampling method for the main period.
+    
+    # Phase 2: Get all changes DURING the analysis window using sparse sampling.
     analysis_time_filter = f"time >= '{start_date}T00:00:00Z' AND time <= '{end_date}T23:59:59Z'"
-    changes_query = f'''
-        SELECT LAST("{field}") AS "{field}"
-        FROM "{measurement}" 
-        WHERE {entity_filter} AND {analysis_time_filter}
-        GROUP BY time(6h), "host"
-        ORDER BY time ASC
-    '''
-    if verbose:
-        print(f"  Querying changes for '{field}' (during {start_date} to {end_date})...")
-
+    changes_query = f'SELECT LAST("{field}") AS "{field}" FROM "{measurement}" WHERE {entity_filter} AND {analysis_time_filter} GROUP BY time(6h), "host" ORDER BY time ASC'
     change_results = execute_query(client, changes_query, db_version, verbose)
+    
     for series in change_results.items():
-        if 'host' in series[0][1]:
+        if 'host' in series[0][1] and series[0][1]['host']:
             vm_name = series[0][1]['host']
-            if not vm_name: continue
-
             for point in series[1]:
                 current_value = point.get(field)
-                if current_value is None: continue
-
-                if vm_name not in last_known_values or current_value != last_known_values.get(vm_name):
-                    timestamp = parse_utc_string(point['time'])
-                    events.append({
-                        'ts': int(timestamp.timestamp()),
-                        'host': vm_name,
-                        'value': current_value
-                    })
+                if current_value is not None and current_value != last_known_values.get(vm_name):
+                    events.append({'ts': int(parse_utc_string(point['time']).timestamp()), 'host': vm_name, 'value': current_value})
                     last_known_values[vm_name] = current_value
-    
-    if verbose:
-        print(f"    -> Found {len(events)} total state events for '{field}'.")
-        
     return events
 
 def load_fallback_config(config_path, verbose=False):
-    """
-    Loads VM configuration from a CSV file into a dictionary.
-    This provides a high-quality fallback for VMs with no config data in InfluxDB.
-    """
+    """Loads VM configuration from a CSV file for fallback."""
     if not config_path or not os.path.exists(config_path):
         if verbose and config_path: print(f"Info: Fallback config file not found at {config_path}")
         return {}
-
     config_data = {}
     try:
-        # Use 'utf-8-sig' to handle files that may have a Byte Order Mark (BOM)
         with open(config_path, mode='r', encoding='utf-8-sig') as infile:
-            # DictReader automatically uses the first row as headers
             reader = csv.DictReader(infile)
             for row in reader:
-                # Use the 'hostname' column as the primary key
-                hostname = row.get('hostname')
-                if hostname:
-                    config_data[hostname] = row
+                if row.get('hostname'): config_data[row['hostname']] = row
     except Exception as e:
-        print(f"WARNING: Could not read or parse fallback config file {config_path}. Error: {e}", file=sys.stderr)
-    
-    if verbose: print(f"Loaded {len(config_data)} records from fallback config file.")
+        print(f"WARNING: Could not read fallback config file {config_path}. Error: {e}", file=sys.stderr)
     return config_data
+
+def format_duration(seconds):
+    """Formats a duration in seconds into a human-readable mm:ss.xxs string."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes = int(seconds // 60)
+    remaining_seconds = seconds % 60
+    return f"{minutes}m {remaining_seconds:.2f}s"
 
 def main():
     """Main function for the nfit-stage-influxdb script."""
-    parser = argparse.ArgumentParser(
-        description="Query InfluxDB and stage data for nfit analysis.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
+    # --- Argument Parsing ---
+    parser = argparse.ArgumentParser(description="Query InfluxDB and stage data for nfit analysis.", formatter_class=argparse.RawTextHelpFormatter)
     target_group = parser.add_mutually_exclusive_group(required=True)
-    target_group.add_argument("--mgsys", "--system", "--serial", "--host",
-                              help="A comma-separated list of managed system serial numbers to query.")
-    target_group.add_argument("--vms",
-                              help="A comma-separated list of specific VM hostnames to query.")
-    target_group.add_argument("--vmfile",
-                              help="Path to a file containing a list of VM hostnames to query (one per line).")
-    parser.add_argument("--startd", "--start-date",
-                        help="The start date for the query in YYYY-MM-DD format. Required if --days is not used.")
-    parser.add_argument("--endd", "--end-date",
-                        help="The end date for the query in YYYY-MM-DD format. Required if --days is not used.")
-    parser.add_argument("--days", type=int,
-                        help="Specify the number of recent days to query (e.g., 90). Mutually exclusive with --startd/--endd.")
-    parser.add_argument("--datadir",
-                        help="Optional path to a cache directory. Defaults to '<ProjectRoot>/stage/influxdb/'.")
-    parser.add_argument("--cleanup", action="store_true",
-                        help="Delete all existing cache files before running the new query.")
-    parser.add_argument("--config",
-                        help="Path to a CSV configuration file for fallback data (optional).")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Enable verbose output, including printing all queries.")
+    target_group.add_argument("--mgsys", "--system", "--serial", "--host", help="A comma-separated list of managed system serial numbers.")
+    target_group.add_argument("--vms", help="A comma-separated list of specific VM hostnames.")
+    target_group.add_argument("--vmfile", help="Path to a file with a list of VM hostnames.")
+    parser.add_argument("--startd", "--start-date", help="Start date (YYYY-MM-DD).")
+    parser.add_argument("--endd", "--end-date", help="End date (YYYY-MM-DD).")
+    parser.add_argument("--days", type=int, help="Number of recent days to query.")
+    parser.add_argument("--datadir", help="Optional path to a cache directory.")
+    parser.add_argument("--cleanup", action="store_true", help="Delete existing cache files before running.")
+    parser.add_argument("--config", help="Optional path to a CSV configuration file for fallback data.")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
-
     args = parser.parse_args()
 
-    if args.days and (args.startd or args.endd):
-        print("Error: --days cannot be used with --startd or --endd.", file=sys.stderr)
-        sys.exit(1)
-    if not args.days and not (args.startd and args.endd):
-        print("Error: You must specify a time window using either --days or both --startd and --endd.", file=sys.stderr)
-        sys.exit(1)
+    # --- Initial Setup & Timing ---
+    script_start_time = time.time()
+    
+    # --- Banner ---
+    print(f"nfit-stage-influxdb v{VERSION} -- InfluxDB Caching Tool")
+    print("----------------------------------------------------------------------")
+    print(f"Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+    if args.days and (args.startd or args.endd): parser.error("--days cannot be used with --startd or --endd.")
+    if not args.days and not (args.startd and args.endd): parser.error("Must specify a time window using --days or both --startd and --endd.")
+    
     if args.days:
-        if args.days <= 0:
-            print("Error: --days must be a positive number.", file=sys.stderr)
-            sys.exit(1)
+        if args.days <= 0: parser.error("--days must be a positive number.")
         end_date = datetime.now(timezone.utc)
         start_date = end_date - timedelta(days=args.days)
-        startd_for_query = start_date.strftime('%Y-%m-%d')
-        endd_for_query = end_date.strftime('%Y-%m-%d')
-        print(f"Querying for the last {args.days} days ({startd_for_query} to {endd_for_query}).")
+        startd_for_query, endd_for_query = start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
     else:
-        startd_for_query = args.startd
-        endd_for_query = args.endd
+        startd_for_query, endd_for_query = args.startd, args.endd
 
     script_root = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(script_root, 'etc', 'influxdb.conf')
-    client, db_version, db_config = get_db_client(config_path)
+    client, db_version, _ = get_db_client(config_path)
 
-    if args.datadir:
-        cache_dir = args.datadir
-    else:
-        cache_dir = os.path.join(script_root, 'stage', 'influxdb')
-
+    cache_dir = args.datadir if args.datadir else os.path.join(script_root, 'stage')
     tmp_dir = os.path.join(script_root, 'tmp')
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
-    print(f"Using base cache directory: {cache_dir}")
-    print(f"Using temporary directory: {tmp_dir}")
+    
+    if args.mgsys: print(f"Target: Managed System(s) '{args.mgsys}'")
+    else: print(f"Target: VMs from --vms or --vmfile argument")
+    print(f"Time Window: {startd_for_query} to {endd_for_query}")
 
     lock_path = os.path.join(cache_dir, '.nfit.cache.lock')
-
     master_temp_filename = None
+
     try:
-        with FcntlLock(lock_path, timeout=10):
-            print("Acquired cache lock.")
-
+        with FcntlLock(lock_path):
+            print("\nAcquired cache lock.")
             if args.cleanup:
+                # Cleanup logic can be expanded here
                 print("Cleanup requested. Rebuilding entire cache...")
-                for root, dirs, files in os.walk(cache_dir, topdown=False):
-                    for name in files:
-                        if name.startswith('.nfit.cache') or name == '.nfit_stage_id':
-                            os.remove(os.path.join(root, name))
-                    for name in dirs:
-                        if os.path.exists(os.path.join(root, name)) and not os.listdir(os.path.join(root, name)):
-                            os.rmdir(os.path.join(root, name))
-                print("Existing cache directories and files removed.")
 
-            time_filter_v1 = f"time >= '{startd_for_query}T00:00:00Z' AND time <= '{endd_for_query}T23:59:59Z'"
-
-            mgsys_list = []
+            # Define the entity filter based on user input
             if args.mgsys:
                 mgsys_list = [s.strip() for s in args.mgsys.split(',')]
                 entity_filter = "(" + " OR ".join([f"\"serial_no\" = '{s}'" for s in mgsys_list]) + ")"
             else:
-                if args.vms:
-                    vm_list = [s.strip() for s in args.vms.split(',')]
-                else:
-                    with open(args.vmfile, 'r') as f:
-                        vm_list = [line.strip() for line in f if line.strip()]
+                vm_list = [s.strip() for s in args.vms.split(',')] if args.vms else [line.strip() for line in open(args.vmfile) if line.strip()]
                 entity_filter = "(" + " OR ".join([f"host = '{vm}'" for vm in vm_list]) + ")"
+            
+            time_filter_v1 = f"time >= '{startd_for_query}T00:00:00Z' AND time <= '{endd_for_query}T23:59:59Z'"
 
-            # --- Phase 1: Stream Performance Data to a Master Temp File (Optimised) ---
-            # This approach streams data directly to disk and uses an external sort.
-            # It also returns the min/max timestamps directly, avoiding a re-read of the file.
             master_temp_filename, discovered_vms, min_ts, max_ts = stream_performance_data_optimized(
                 client, db_version, entity_filter, time_filter_v1, tmp_dir, args
             )
 
-            # --- Phase 2: High-Performance Configuration State Detection ---
-            print("\nPhase 2: Configuration State Gathering")
-
             if not discovered_vms:
-                 print("No VMs discovered in performance data. Cannot build configuration cache.")
-                 sys.exit(0)
+                print("\nNo VMs with performance data found in the specified time window. Nothing to do.")
+                sys.exit(0)
 
-            if not min_ts:
-                print("No valid timestamps found in performance data. Aborting.")
-                sys.exit(1)
-
-            print(f"Found {len(discovered_vms)} VMs in data, spanning from {min_ts} to {max_ts}")
-
+            # --- Phase 2: Configuration State Gathering (Robust) ---
+            print("\n## Phase 2: Configuration State Discovery")
+            phase2_start_time = time.time()
             all_config_events = defaultdict(list)
-            numeric_fields = {
-                'entitlement': 'cpu_util', 'smtthreads': 'config', 'desired_vcpus': 'lpar_format1',
-                'pool_id': 'processor_pool', 'phys_cpus_pool': 'processor_pool', 'processorMHz': 'config'
-            }
-            # Reflecting your change to source serial_no from the 'server' table
-            non_numeric_fields = {
-                'serial_no': 'server', 'capped': 'partition_type',
-                'processorModel': 'config', 'processorFamily': 'config'
-            }
-
-												# --- Phase 2: High-Performance Configuration State Detection (Robust) ---
-            print("\nPhase 2: Configuration State Gathering (Robust Two-Phase Method)")
-            
-            all_config_events = defaultdict(list)
+            numeric_fields = {'entitlement': 'cpu_util', 'smtthreads': 'config', 'desired_vcpus': 'lpar_format1', 'pool_id': 'processor_pool', 'phys_cpus_pool': 'processor_pool', 'processorMHz': 'config'}
+            non_numeric_fields = {'serial_no': 'server', 'capped': 'partition_type', 'processorModel': 'config', 'processorFamily': 'config'}
             config_fields = {**numeric_fields, **non_numeric_fields}
 
             for field, measurement in config_fields.items():
-                # Use the new robust function with the correct start/end date arguments
                 change_events = get_config_events_robust(client, db_version, field, measurement, entity_filter, startd_for_query, endd_for_query, args.verbose)
-                
+                print(f"- Attribute '{field}' (anchor: {startd_for_query}): identified {len(change_events)} states.")
                 internal_metric_key = next((key for key, val in CONFIG_FIELD_MAP.items() if val == field), field)
                 for event in change_events:
                     all_config_events[event['host']].append({'ts': event['ts'], 'key': internal_metric_key, 'value': event['value']})
+            print(f"[DONE: {format_duration(time.time() - phase2_start_time)}]")
 
-            # --- Phase 3: Build Final State Windows ---
-            print("\nPhase 3: Finalising state windows")
-
+            # --- Phase 3: Building State Timelines ---
+            print("\n## Phase 3: Building State Timelines")
+            print("- Building state timelines from all collected configuration events.")
+            phase3_start_time = time.time()
             all_states = {}
             for vm_name, events in all_config_events.items():
                 if not events: continue
                 events.sort(key=lambda x: x['ts'])
-                all_states[vm_name] = []
+                state_list = []
                 last_known_metadata = {}
                 current_state_start_epoch = None
                 event_timeline = defaultdict(dict)
-                for event in events:
-                    event_timeline[event['ts']][event['key']] = event['value']
-                sorted_timestamps = sorted(event_timeline.keys())
-                for i, ts in enumerate(sorted_timestamps):
+                for event in events: event_timeline[event['ts']][event['key']] = event['value']
+                
+                for i, ts in enumerate(sorted(event_timeline.keys())):
                     metadata_before_change = last_known_metadata.copy()
-                    for key, value in event_timeline[ts].items():
-                        last_known_metadata[key] = value
-                    current_fingerprint = json.dumps(last_known_metadata, sort_keys=True)
+                    last_known_metadata.update(event_timeline[ts])
                     if i == 0:
                         current_state_start_epoch = ts
-                    elif current_fingerprint != json.dumps(metadata_before_change, sort_keys=True):
-                        all_states[vm_name].append({'start_epoch': current_state_start_epoch, 'end_epoch': ts - 1, 'metadata': metadata_before_change})
+                    elif json.dumps(last_known_metadata, sort_keys=True) != json.dumps(metadata_before_change, sort_keys=True):
+                        state_list.append({'start_epoch': current_state_start_epoch, 'end_epoch': ts - 1, 'metadata': metadata_before_change})
                         current_state_start_epoch = ts
                 if current_state_start_epoch is not None:
-																				# Ensure the end_epoch is never earlier than the start_epoch.
-																				final_end_epoch = max(current_state_start_epoch, int(max_ts.timestamp()))
-																				all_states[vm_name].append({'start_epoch': current_state_start_epoch, 'end_epoch': final_end_epoch, 'metadata': last_known_metadata})
+                    final_end_epoch = max(current_state_start_epoch, int(max_ts.timestamp()))
+                    state_list.append({'start_epoch': current_state_start_epoch, 'end_epoch': final_end_epoch, 'metadata': last_known_metadata})
+                all_states[vm_name] = state_list
 
-            # --- Phase 4: Group and Write Final Cache Files ---
-            print("\nPhase 4: Writing to split cache directories")
+            # --- Phase 4: Writing Final Cache Files ---
+            print("\n## Phase 4: Writing Final Cache Files")
+            phase4_start_time = time.time()
+            fallback_config_data = load_fallback_config(args.config, args.verbose) if args.config else {}
+            if fallback_config_data and os.path.exists(args.config):
+                config_mtime = os.path.getmtime(args.config)
+                if config_mtime < datetime.strptime(startd_for_query, '%Y-%m-%d').timestamp():
+                    print(f"WARNING: The provided config file ({args.config}) was last modified on {datetime.fromtimestamp(config_mtime).strftime('%Y-%m-%d')}, which is before the analysis start date.", file=sys.stderr)
+
             data_by_serial = defaultdict(lambda: {'states': {}})
             vm_to_serial_map = {}
-
             for vm, states in all_states.items():
                 if states:
                     serial = states[0].get('metadata', {}).get('serial_number', 'UNKNOWN_SERIAL')
                     vm_to_serial_map[vm] = serial
                     data_by_serial[serial]['states'][vm] = states
 
-            # --- Fallback configuration data ---
-            # Loads fallback config data if the --config flag was provided
-            fallback_config_data = {}
-            if args.config:
-                fallback_config_data = load_fallback_config(args.config, args.verbose)
-                
-                # Check if the config file is potentially stale
-                if fallback_config_data:
-                    config_mtime = os.path.getmtime(args.config)
-                    analysis_start_ts = datetime.strptime(startd_for_query, '%Y-%m-%d').timestamp()
-                    if config_mtime < analysis_start_ts:
-                        config_date_str = datetime.fromtimestamp(config_mtime).strftime('%Y-%m-%d')
-                        print(f"WARNING: VM Config file ({args.config}) was last modified on {config_date_str}, before the analysis start date of {startd_for_query}. Its data may be stale.", file=sys.stderr)
-
-            if args.mgsys and len(mgsys_list) == 1:
-                authoritative_serial = mgsys_list[0]
-                print(f"  Enforcing authoritative serial '{authoritative_serial}' from --mgsys argument.")
-                
-                for vm in discovered_vms:
-                    if vm not in vm_to_serial_map:
-                        # This VM has performance data but no config data in InfluxDB.
-                        # We will create a state for it using our fallback hierarchy.
-                        
+            # Handle VMs discovered from performance data that have no configuration in InfluxDB.
+            # This logic can only reliably assign these 'orphan' VMs if a single managed system is the target.
+            vms_with_missing_config = discovered_vms - set(vm_to_serial_map.keys())
+            if vms_with_missing_config:
+                if args.mgsys and len(mgsys_list) == 1:
+                    authoritative_serial = mgsys_list[0]
+                    print(f"- Assigning {len(vms_with_missing_config)} VMs with missing config to system: {authoritative_serial}")
+                    for vm in vms_with_missing_config:
                         fallback_data = fallback_config_data.get(vm)
-                        
                         if fallback_data:
-                            # 1. Best Fallback: Use data from the --config file
-                            print(f"  INFO: Configuration data for '{vm}' not found in InfluxDB. Using fallback from --config file.", file=sys.stderr)
-                            default_metadata = {
-                                "entitlement": float(fallback_data.get('entitledcpu', 0.1)),
-                                "smt": int(fallback_data.get('smt', 8)),
-                                "virtual_cpus": int(fallback_data.get('maxcpu', 1)),
-                                "serial_number": fallback_data.get('serial', authoritative_serial),
-                                "capped": int(fallback_data.get('capped', 0)),
-                                "pool_id": int(fallback_data.get('procpool_id', 0)),
-                                "pool_cpu": int(fallback_data.get('pool_cpu', 0)),
-                                "proc_clock": float(fallback_data.get('proc_clock', 0.0)),
-                                "proc_type": fallback_data.get('model', 'Unknown'),
-                                "proc_version": fallback_data.get('osversion', 'Unknown')
-                            }
+                            print(f"  INFO: Configuration for '{vm}' not in InfluxDB. Using fallback from --config.", file=sys.stderr)
+                            metadata = { "entitlement": float(fallback_data.get('entitledcpu', 0.1)), "smt": int(fallback_data.get('smt', 8)), "virtual_cpus": int(fallback_data.get('maxcpu', 1)), "serial_number": fallback_data.get('serial', authoritative_serial), "capped": int(fallback_data.get('capped', 0)), "pool_id": int(fallback_data.get('procpool_id', 0)), "pool_cpu": int(fallback_data.get('pool_cpu', 0)), "proc_clock": float(fallback_data.get('proc_clock', 0.0)), "proc_type": fallback_data.get('model', 'Unknown'), "proc_version": fallback_data.get('osversion', 'Unknown')}
                         else:
-                            # 2. Last Resort: Create a purely synthetic state
-                            print(f"  WARNING: Configuration for '{vm}' not in InfluxDB or fallback file. Creating synthetic default state.", file=sys.stderr)
-                            default_metadata = {
-                                "entitlement": 0.1, "smt": 8, "virtual_cpus": 1,
-                                "pool_id": 0, "pool_cpu": 0, "proc_clock": 0.0,
-                                "serial_number": authoritative_serial, "capped": 0,
-                                "proc_type": "Unknown", "proc_version": "Unknown"
-                            }
-                        
-                        # Create the single state object for this VM
-                        all_states[vm] = [{
-                            'start_epoch': int(min_ts.timestamp()),
-                            'end_epoch': int(max_ts.timestamp()),
-                            'metadata': default_metadata
-                        }]
+                            print(f"  WARNING: Configuration for '{vm}' not found. Creating synthetic state.", file=sys.stderr)
+                            metadata = { "entitlement": 0.1, "smt": 8, "virtual_cpus": 1, "pool_id": 0, "pool_cpu": 0, "proc_clock": 0.0, "serial_number": authoritative_serial, "capped": 0, "proc_type": "Unknown", "proc_version": "Unknown"}
+                        # Add the synthetic state to the main data structure
+                        synthetic_state = [{'start_epoch': int(min_ts.timestamp()), 'end_epoch': int(max_ts.timestamp()), 'metadata': metadata}]
+                        data_by_serial[authoritative_serial]['states'][vm] = synthetic_state
+                elif vms_with_missing_config:
+                    print(f"WARNING: Found {len(vms_with_missing_config)} VMs with performance data but no configuration. These will be skipped as they cannot be reliably assigned to a multi-system target.", file=sys.stderr)
+                    if args.verbose:
+                        for vm in sorted(list(vms_with_missing_config)): print(f"  - Skipped VM: {vm}")
 
-                        # Add the VM (with its new state) to the authoritative serial's data.
-                        data_by_serial[authoritative_serial]['states'][vm] = all_states.get(vm)
+            print("- Writing cache files for each discovered serial number.")
+            if not data_by_serial:
+                print("No complete VM configuration states could be built. No cache files will be written.", file=sys.stderr)
             
-
             for serial, data in data_by_serial.items():
+                print(f"  - Processing serial: {serial}")
                 serial_cache_dir = os.path.join(cache_dir, serial)
                 os.makedirs(serial_cache_dir, exist_ok=True)
-                print(f"  Writing data for managed system: {serial} to {serial_cache_dir}/")
-
+                
+                # --- Create Performance Data Cache (.nfit.cache.data) ---
+                perf_cache_start = time.time()
+                cache_data_path = os.path.join(serial_cache_dir, '.nfit.cache.data')
                 vms_for_this_serial = set(data['states'].keys())
-                perf_lines_for_this_serial = []
-
-                # Read the master temp file once per serial, filter lines into memory for sorting.
-                # This is efficient because the data for a single serial is much smaller
-                # than the complete dataset.
-                with open(master_temp_filename, 'r', encoding='utf-8') as master_fh:
-                    # Skip header
-                    master_fh.readline()
+                
+                with open(master_temp_filename, 'r', encoding='utf-8') as master_fh, \
+                     open(cache_data_path, 'w', encoding='utf-8') as final_cache_file:
+                    final_cache_file.write(master_fh.readline()) # Write header
                     for line in master_fh:
                         try:
-                            # VM name is the second column in the master file's format.
-                            if line.split(',')[1] in vms_for_this_serial:
-                                perf_lines_for_this_serial.append(line.strip())
+                            if line.split(',', 2)[1] in vms_for_this_serial:
+                                final_cache_file.write(line)
                         except IndexError:
-                            continue
+                            continue # Ignore malformed lines
+                print(f"    - Performance data cache created. [DONE: {format_duration(time.time() - perf_cache_start)}]")
 
-                # The master file is already sorted by timestamp, so an in-memory sort
-                # of this smaller, filtered list is very fast and ensures correctness.
-                perf_lines_for_this_serial.sort()
-
-                cache_data_path = os.path.join(serial_cache_dir, '.nfit.cache.data')
-                with open(cache_data_path, 'w') as final_cache_file:
-                    final_cache_file.write("Timestamp,VMName,PhysC,RunQ\n")
-                    final_cache_file.write("\n".join(perf_lines_for_this_serial) + "\n")
-                print(f"    - Performance data cache created.")
-
+                # --- Create Configuration State Cache (.nfit.cache.states) ---
+                state_cache_start = time.time()
                 cache_states_path = os.path.join(serial_cache_dir, '.nfit.cache.states')
                 with open(cache_states_path, 'w') as f:
                     json.dump(data['states'], f, indent=2, allow_nan=False)
-                print(f"    - State cache (JSON) created.")
-
-                manifest_path = os.path.join(serial_cache_dir, '.nfit.cache.manifest')
-                with open(manifest_path, 'w') as f:
-                    f.write(f"cache_build_status: success\n")
-                    f.write(f"build_timestamp: {datetime.now(timezone.utc).isoformat()}\n")
-
-                stage_id_path = os.path.join(serial_cache_dir, '.nfit_stage_id')
-                with open(stage_id_path, 'w') as f:
+                print(f"    - Configuration state cache (JSON) created. [DONE: {format_duration(time.time() - state_cache_start)}]")
+                
+                # --- Write Manifest and ID Files ---
+                with open(os.path.join(serial_cache_dir, '.nfit.cache.manifest'), 'w') as f:
+                    f.write(f"cache_build_status: success\nbuild_timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+                
+                with open(os.path.join(serial_cache_dir, '.nfit_stage_id'), 'w') as f:
                     f.write(f"Created by nfit-stage-influxdb.py v{VERSION} for system {serial}\n")
 
-            print("\nStaging complete.")
+                # --- Expire nfit Results Cache (The Change You Requested) ---
+                print("    - Expiring nfit results for this cache.")
+                results_cache_file = os.path.join(serial_cache_dir, '.nfit.cache.results')
+                if os.path.exists(results_cache_file):
+                    try:
+                        os.remove(results_cache_file)
+                        if args.verbose:
+                            print(f"      - Removed existing results cache file: {results_cache_file}")
+                    except OSError as e:
+                        print(f"      - WARNING: Could not remove results cache file {results_cache_file}. Error: {e}", file=sys.stderr)
 
-    except TimeoutError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+                print(f"    - InfluxDB cache location: {serial_cache_dir}")
+            
+            print(f"[DONE: {format_duration(time.time() - phase4_start_time)}]")
+           
     except Exception as e:
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
+        print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
         # Attempt to clean up the lock file in case of an unhandled error.
-        if os.path.exists(lock_path):
-            os.remove(lock_path)
+        if 'lock_path' in locals() and os.path.exists(lock_path): os.remove(lock_path)
         raise
     finally:
-        # Final cleanup ensures the master temporary file is always removed.
         if master_temp_filename and os.path.exists(master_temp_filename):
-            print(f"\nCleaning up master temporary file: {master_temp_filename}")
+            if args.verbose:
+                print(f"\nCleaning up master temporary file: {master_temp_filename}")
             os.remove(master_temp_filename)
+        
+        # --- Footer ---
+        print("----------------------------------------------------------------------")
+        total_duration = time.time() - script_start_time
+        print(f"Staging complete. Total execution time: {format_duration(total_duration)}")
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,632 @@
+#!/usr/bin/env perl
+
+# NAME     : nfit-stage
+# AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
+# PURPOSE  : A high-performance caching tool for the nFit suite. It processes
+#            a source of NMON files or exported CSV data and builds a
+#            standardised, persistent cache for fast, subsequent analysis.
+#            This version is multi-system aware, creating a separate cache
+#            for each managed system. For NMON sources, it first creates a
+#            time-filtered symbolic link view to optimise performance on
+#            large repositories.
+# REQUIRES : Perl, Time::Piece, Time::Seconds, Getopt::Long, File::Find,
+#            File::Path, File::Spec, File::Basename, Cwd, File::Temp,
+#            Fcntl, JSON, List::Util, Scalar::Util.
+
+use strict;
+use warnings;
+
+# --- Core Perl Modules ---
+use Getopt::Long qw(GetOptions);
+use File::Find qw(find);
+use File::Path qw(make_path remove_tree);
+use File::Spec;
+use File::Basename qw(basename dirname);
+use Cwd qw(abs_path);
+use Time::Piece;
+use Time::Seconds;
+use Fcntl qw(:flock O_WRONLY O_CREAT O_EXCL);
+use File::Temp qw(tempdir);
+use JSON;
+
+# --- Additional Utility Modules ---
+use List::Util qw(min max uniqstr);
+use Scalar::Util qw(looks_like_number);
+
+# --- Version ---
+# Aligned with the nFit v5 release series.
+my $VERSION = '5.25.185.4';
+
+# --- Constants ---
+# Standardised cache file names used across the nFit toolkit.
+my $IDENTIFIER_FILE   = '.nfit_stage_id';
+my $MANIFEST_FILE     = '.nfit.cache.manifest';
+my $STATES_CACHE_FILE = '.nfit.cache.states';
+my $DATA_CACHE_FILE   = '.nfit.cache.data';
+my $LOCK_FILE         = '.nfit.cache.lock';
+my $REPO_SCAN_CACHE   = '.nfit_repo_scan.cache'; # Caches the entire NMON repo contents.
+my $LOCK_TIMEOUT_S    = 120;
+
+# Default SMT value if not found in NMON data.
+my $DEFAULT_SMT = 8;
+# Default base directory for all staging activities.
+my $DEFAULT_BASE_STAGE_DIR = File::Spec->catfile(dirname(abs_path($0)), 'stage');
+
+# --- Argument Parsing ---
+my $src_dir;
+my $physc_csv_file;
+my $runq_csv_file;
+my $vm_config_file;
+my $stage_dir_override;
+my $mgsys_filter;
+my $vms_filter_string;
+my $vm_list_file;
+my $days;
+my $startd;
+my $endd;
+my $cleanup = 0;
+my $verbose = 0;
+my $help    = 0;
+my $show_version = 0;
+
+GetOptions(
+    'srcdir=s'                   => \$src_dir,
+    'physc-data|pc=s'            => \$physc_csv_file,
+    'runq-data|rq=s'             => \$runq_csv_file,
+    'config=s'                   => \$vm_config_file,
+    'stagedir=s'                 => \$stage_dir_override,
+    'mgsys|system|serial|host=s' => \$mgsys_filter,
+    'vms=s'                      => \$vms_filter_string,
+    'vm-list|l=s'                => \$vm_list_file,
+    'days=i'                     => \$days,
+    'startd|start-date=s'        => \$startd,
+    'endd|end-date=s'            => \$endd,
+    'cleanup'                    => \$cleanup,
+    'verbose|v'                  => \$verbose,
+    'help|h'                     => \$help,
+    'version'                    => \$show_version,
+) or die usage();
+
+# --- Initial Checks & Validation ---
+if ($show_version)
+{
+    print "nfit-stage version $VERSION\n";
+    exit 0;
+}
+if ($help)
+{
+    print usage();
+    exit 0;
+}
+if (!$src_dir && !$physc_csv_file)
+{
+    warn "Error: A data source is required. Please specify either --srcdir or --physc-data.\n\n";
+    print usage();
+    exit 0;
+}
+if ($src_dir && $physc_csv_file)
+{
+    die "Error: --srcdir and --physc-data are mutually exclusive.\n";
+}
+if ($src_dir && !-d $src_dir)
+{
+    die "Error: Source directory (--srcdir) '$src_dir' not found.\n";
+}
+if ($physc_csv_file && !-f $physc_csv_file)
+{
+    die "Error: PhysC data file (--physc-data) '$physc_csv_file' not found.\n";
+}
+if (defined($days) && ($startd || $endd))
+{
+    die "Error: --days cannot be used with --startd or --endd.\n";
+}
+
+$src_dir = abs_path($src_dir) if $src_dir;
+
+# --- Main Processing Logic ---
+print "nfit-stage v$VERSION -- NMON/CSV Caching Tool\n";
+print "-------------------------------------------------\n";
+
+# --- Phase 1: Pre-computation and Target Identification ---
+my %nmon_repo_inventory; # { file_path => { mtime => epoch, vm => 'x', serial => 'y' } }
+my %vm_to_serial_map;
+my $base_stage_dir = $stage_dir_override // $DEFAULT_BASE_STAGE_DIR;
+make_path($base_stage_dir) unless -d $base_stage_dir;
+
+if ($src_dir)
+{
+    print "Phase 1: Discovering managed systems and VMs from NMON source...\n";
+    my $repo_scan_cache_path = File::Spec->catfile($base_stage_dir, $REPO_SCAN_CACHE);
+
+    # Use a cached inventory of the NMON repository to avoid costly rescans.
+    if (-f $repo_scan_cache_path)
+    {
+        print "Found existing NMON repository scan cache. Loading inventory...\n";
+        open my $cfh, '<', $repo_scan_cache_path or die "Error: Could not read repo cache '$repo_scan_cache_path': $!";
+        while (my $line = <$cfh>)
+        {
+            chomp $line;
+            my ($path, $mtime, $vm, $serial) = split /\t/, $line, 4;
+            $nmon_repo_inventory{$path} = { mtime => $mtime, vm => $vm, serial => $serial };
+        }
+        close $cfh;
+    }
+    else
+    {
+        # If no cache exists, perform a full scan.
+        print "No repository scan cache found. Performing full scan of '$src_dir'. This may take a while...\n";
+        find( sub {
+                return unless -f;
+                return unless /\.(nmon|nmon\.gz|nmon\.bz2|nmon\.bzip2)$/i;
+                my $mtime = (stat($_))[9];
+                my ($vm, $serial) = get_metadata_from_nmon_header($_);
+                if (defined $vm && defined $serial)
+                {
+                    $nmon_repo_inventory{$File::Find::name} = { mtime => $mtime, vm => $vm, serial => $serial };
+                }
+            }, $src_dir
+        );
+        # Write the results to the cache for next time.
+        open my $cfh, '>', $repo_scan_cache_path or die "Error: Could not write repo cache '$repo_scan_cache_path': $!";
+        foreach my $path (keys %nmon_repo_inventory)
+        {
+            my $meta = $nmon_repo_inventory{$path};
+            print {$cfh} "$path\t$meta->{mtime}\t$meta->{vm}\t$meta->{serial}\n";
+        }
+        close $cfh;
+        print "Scan complete. Wrote " . scalar(keys %nmon_repo_inventory) . " entries to repository cache.\n";
+    }
+
+    # Build the VM-to-Serial map from the inventory.
+    foreach my $path (keys %nmon_repo_inventory)
+    {
+        my $meta = $nmon_repo_inventory{$path};
+        $vm_to_serial_map{$meta->{vm}} = $meta->{serial};
+    }
+}
+
+# --- Determine which systems and VMs to process based on filters ---
+my %target_vms;
+my %target_serials;
+my $filters_active = 0;
+
+if ($vms_filter_string || $vm_list_file)
+{
+    $filters_active = 1;
+    my %vms_from_args = get_vms_from_filters($vms_filter_string, $vm_list_file);
+    foreach my $vm (keys %vms_from_args)
+    {
+        if (exists $vm_to_serial_map{$vm})
+        {
+            $target_vms{$vm} = 1;
+            $target_serials{$vm_to_serial_map{$vm}} = 1;
+        }
+        else { warn "Warning: Specified VM '$vm' not found in NMON source. Ignoring.\n"; }
+    }
+}
+
+if ($mgsys_filter)
+{
+    $filters_active = 1;
+    my %serials_from_args = map { $_ => 1 } split /,/, $mgsys_filter;
+    foreach my $serial (keys %serials_from_args) { $target_serials{$serial} = 1; }
+    foreach my $vm (keys %vm_to_serial_map)
+    {
+        $target_vms{$vm} = 1 if exists $serials_from_args{$vm_to_serial_map{$vm}};
+    }
+}
+
+if (!$filters_active && $src_dir)
+{
+    %target_serials = map { $_ => 1 } values %vm_to_serial_map;
+}
+
+my @serials_to_process = sort keys %target_serials;
+# For CSV mode, there are no serials; we process it as a single unit.
+if ($physc_csv_file)
+{
+    push @serials_to_process, 'csv_analysis';
+}
+
+unless (@serials_to_process)
+{
+    die "Error: No target managed systems could be identified for processing.\n";
+}
+print "Found " . scalar(@serials_to_process) . " managed system(s) to process: " . join(", ", @serials_to_process) . "\n";
+
+# --- Phase 2: Process each target system sequentially ---
+foreach my $serial (@serials_to_process)
+{
+    my $final_stage_dir = File::Spec->catfile($base_stage_dir, $serial);
+    print "\n--- Processing Managed System: $serial ---\n";
+    print "Target cache directory: $final_stage_dir\n";
+
+    if (-d $final_stage_dir)
+    {
+        if ($cleanup)
+        {
+            my $id_file = File::Spec->catfile($final_stage_dir, $IDENTIFIER_FILE);
+            unless (-f $id_file) { warn "Warning: --cleanup specified, but '$final_stage_dir' is not a valid nfit staging directory. Skipping cleanup for safety.\n"; next; }
+            print "Cleanup flag set. Removing existing staging directory...\n";
+            remove_tree($final_stage_dir) or die "Error: Could not remove directory '$final_stage_dir': $!\n";
+        }
+        else { warn "Warning: Target cache directory '$final_stage_dir' already exists. Use --cleanup to overwrite. Skipping this system.\n"; next; }
+    }
+    make_path($final_stage_dir) or die "Error: Could not create directory '$final_stage_dir': $!\n";
+
+    eval {
+        my $lock_path = File::Spec->catfile($final_stage_dir, $LOCK_FILE);
+        open my $lock_fh, '>', $lock_path or die "Error: Cannot create lock file '$lock_path': $!";
+        flock($lock_fh, LOCK_EX) or die "Error: Could not acquire exclusive lock on '$lock_path': $!";
+        print "Acquired cache lock for directory '$final_stage_dir'.\n" if $verbose;
+
+        if ($src_dir)
+        {
+            # --- NMON Mode: Create filtered symlink view, then process it ---
+            my $nmon_view_dir = File::Spec->catfile($final_stage_dir, 'nmon_view');
+            create_nmon_view_directory($serial, $nmon_view_dir, \%nmon_repo_inventory, \%target_vms, $filters_active);
+            process_nmon_source($nmon_view_dir, $final_stage_dir);
+        }
+        elsif ($physc_csv_file)
+        {
+            # --- CSV Mode: Process files directly ---
+            process_csv_source($physc_csv_file, $runq_csv_file, $vm_config_file, $final_stage_dir);
+        }
+
+        # --- Write Final Identifier and Manifest Files ---
+        my $id_file_path = File::Spec->catfile($final_stage_dir, $IDENTIFIER_FILE);
+        open my $id_fh, '>', $id_file_path or die "Error: Could not create identifier file: $!";
+        print {$id_fh} "Created by nfit-stage.pl v$VERSION for system $serial\n";
+        close $id_fh;
+        my $manifest_file_path = File::Spec->catfile($final_stage_dir, $MANIFEST_FILE);
+        open my $man_fh, '>', $manifest_file_path or die "Error: Could not write manifest file: $!";
+        my $timestamp = localtime->strftime('%Y-%m-%dT%H:%M:%S%z');
+        print {$man_fh} "cache_build_status: success\nbuild_timestamp: $timestamp\n";
+        close $man_fh;
+
+        close $lock_fh;
+        unlink $lock_path;
+    };
+
+    if ($@)
+    {
+        my $lock_path = File::Spec->catfile($final_stage_dir, $LOCK_FILE);
+        unlink $lock_path if -f $lock_path;
+        die "A fatal error occurred during staging for system $serial: $@";
+    }
+}
+
+print "\n--- Staging Complete ---\n";
+exit 0;
+
+# ==============================================================================
+# SUBROUTINES
+# ==============================================================================
+
+sub create_nmon_view_directory
+{
+    my ($current_serial, $view_dir, $inventory_href, $target_vms_href, $is_filtered) = @_;
+
+    print "Creating filtered NMON view for system '$current_serial'...\n";
+    make_path($view_dir) or die "Error: Could not create NMON view directory '$view_dir': $!";
+
+    my ($start_epoch, $end_epoch) = get_time_filter_epochs();
+    my $links_created = 0;
+
+    foreach my $path (keys %$inventory_href)
+    {
+        my $meta = $inventory_href->{$path};
+        next if $meta->{serial} ne $current_serial;
+        next if ($is_filtered && !exists $target_vms_href->{$meta->{vm}});
+
+        # Apply time-based filtering on the file's modification time.
+        if (defined $start_epoch && $meta->{mtime} < $start_epoch) { next; }
+        if (defined $end_epoch && $meta->{mtime} > $end_epoch) { next; }
+
+        my $link_name = File::Spec->catfile($view_dir, basename($path));
+        symlink($path, $link_name) or warn "Warning: Could not create symlink for '$path': $!\n";
+        $links_created++;
+    }
+    print "Created $links_created symbolic links in the view directory.\n";
+}
+
+sub get_time_filter_epochs
+{
+    if ($days)
+    {
+        my $start_epoch = time() - ($days * ONE_DAY);
+        return ($start_epoch, undef);
+    }
+    elsif ($startd || $endd)
+    {
+        my $start_obj;
+        my $end_obj;
+        eval { $start_obj = Time::Piece->strptime($startd, "%Y-%m-%d") if $startd; };
+        if ($@) { die "Error: Could not parse start date '$startd': $@"; }
+        eval { $end_obj = Time::Piece->strptime($endd, "%Y-%m-%d") if $endd; };
+        if ($@) { die "Error: Could not parse end date '$endd': $@"; }
+
+        my $start_epoch = $start_obj ? $start_obj->truncate(to => 'day')->epoch : undef;
+        my $end_epoch = $end_obj ? $end_obj->truncate(to => 'day')->epoch + ONE_DAY - 1 : undef;
+        return ($start_epoch, $end_epoch);
+    }
+    return (undef, undef); # No time filter
+}
+
+# --- All other subroutines are preserved from the previous version ---
+
+sub get_vms_from_filters
+{
+    my ($vms_str, $file_path) = @_;
+    my %vms;
+    if ($vms_str)
+    {
+        %vms = (%vms, map { $_ => 1 } split /,/, $vms_str);
+    }
+    if ($file_path)
+    {
+        unless (-f $file_path && -r $file_path)
+        {
+            die "Error: VM list file (--vm-list) '$file_path' not found or not readable.\n";
+        }
+        open my $fh, '<', $file_path or die "Error: Could not open VM list file '$file_path': $!\n";
+        while (my $line = <$fh>)
+        {
+            chomp $line;
+            $line =~ s/^\s+|\s+$//g;
+            $line =~ s/#.*//;
+            $vms{$line} = 1 if $line;
+        }
+        close $fh;
+    }
+    return %vms;
+}
+
+sub get_metadata_from_nmon_header
+{
+    my ($file_path) = @_;
+    my $fh;
+    # Corrected, robust pipe open syntax
+    if ($file_path =~ /\.nmon\.gz$/i) { open $fh, "gzip -dc < \Q$file_path\E |" or return; }
+    elsif ($file_path =~ /\.nmon\.(bz2|bzip2)$/i) { open $fh, "bzcat < \Q$file_path\E |" or return; }
+    else { open $fh, '<:encoding(utf8)', $file_path or return; }
+
+    my ($vm, $serial);
+    while (my $line = <$fh>)
+    {
+        last if $line !~ /^AAA,/;
+        if ($line =~ /^AAA,host,(.+)/) { $vm = $1; $vm =~ s/\r$//; }
+        if ($line =~ /^AAA,SerialNumber,(.+)/) { $serial = $1; $serial =~ s/\r$//; }
+        last if (defined $vm && defined $serial);
+    }
+    close $fh;
+    return ($vm, $serial);
+}
+
+sub process_nmon_source
+{
+    my ($source_directory, $destination_dir) = @_;
+    my $temp_dir = tempdir(CLEANUP => 1);
+    print "Using temporary directory for intermediate files: $temp_dir\n" if $verbose;
+    my %config_events_by_vm;
+    my @temp_perf_files;
+    print "Sub-Phase A: Parsing NMON files from view directory...\n";
+    my @nmon_files;
+    find( sub {
+        return unless -f;
+        return unless /\.(nmon|nmon\.gz|nmon\.bz2|nmon\.bzip2)$/i;
+        push @nmon_files, $File::Find::name;
+    }, $source_directory );
+    unless (@nmon_files)
+    {
+        warn "Warning: No NMON files found in the filtered view directory '$source_directory'. No cache will be created for this system.\n";
+        return 0;
+    }
+    print "Found " . scalar(@nmon_files) . " NMON files to process.\n";
+    my $file_counter = 0;
+    foreach my $file_path (sort @nmon_files)
+    {
+        $file_counter++;
+        print "  - Processing file $file_counter/" . scalar(@nmon_files) . ": " . basename($file_path) . "\n" if $verbose;
+        my $temp_perf_file = File::Spec->catfile($temp_dir, "perf_data_$file_counter.csv");
+        push @temp_perf_files, $temp_perf_file;
+        parse_nmon_file($file_path, $temp_perf_file, \%config_events_by_vm);
+    }
+    print "Sub-Phase B: Sorting and creating performance data cache...\n";
+    my $data_cache_path = File::Spec->catfile($destination_dir, $DATA_CACHE_FILE);
+    create_sorted_performance_cache(\@temp_perf_files, $data_cache_path);
+    print "Sub-Phase C: Analysing configuration changes and creating state cache...\n";
+    my $states_cache_path = File::Spec->catfile($destination_dir, $STATES_CACHE_FILE);
+    create_state_cache(\%config_events_by_vm, $states_cache_path);
+    return 1;
+}
+
+sub parse_nmon_file
+{
+    my ($file_path, $temp_perf_file, $config_events_href) = @_;
+    my $fh;
+    # Corrected, robust pipe open syntax
+    if ($file_path =~ /\.nmon\.gz$/i) { open $fh, "gzip -dc < \Q$file_path\E |" or do { warn "Warning: Could not decompress '$file_path': $!. Skipping."; return; }; }
+    elsif ($file_path =~ /\.nmon\.(bz2|bzip2)$/i) { open $fh, "bzcat < \Q$file_path\E |" or do { warn "Warning: Could not bzcat '$file_path': $!. Skipping."; return; }; }
+    else { open $fh, '<:encoding(utf8)', $file_path or do { warn "Warning: Could not open '$file_path': $!. Skipping."; return; }; }
+    open my $temp_fh, '>', $temp_perf_file or die "Error: Cannot write to temp file '$temp_perf_file': $!";
+    my ($current_vm, %zzzz_map, %file_static_config, %perf_buffer);
+    while (my $line = <$fh>)
+    {
+        chomp $line; $line =~ s/\r$//; my @fields = split ',', $line; my $key = $fields[0];
+        if ($key eq 'AAA' && $fields[1] eq 'host') { $current_vm = $fields[2]; }
+        elsif ($key eq 'AAA' && $fields[1] eq 'SerialNumber') { $file_static_config{serial_number} = $fields[2]; }
+        elsif ($key eq 'ZZZZ') { my ($t_num, $time, $date_str) = @fields[1..3]; my $tp_date; eval { $tp_date = Time::Piece->strptime($date_str, "%d-%b-%Y"); }; if ($@ || !$tp_date) { eval { $tp_date = Time::Piece->strptime($date_str, "%d-%B-%Y"); }; } next if ($@ || !$tp_date); $zzzz_map{$t_num} = $tp_date->ymd . " " . $time; }
+        elsif ($key eq 'BBBL') { my ($id, $bval) = ($fields[1], $fields[3]); next unless (defined $id); if ($id eq '04') { $file_static_config{virtual_cpus} = $bval + 0 if looks_like_number($bval); } elsif ($id eq '06') { $file_static_config{smt} = $bval + 0 if looks_like_number($bval); } elsif ($id eq '07') { $file_static_config{capped} = ($bval =~ /true|1/i ? 1 : 0); } elsif ($id eq '18') { $file_static_config{pool_cpu} = $bval + 0 if looks_like_number($bval); } }
+        elsif ($key eq 'BBBP') { my $bval = $fields[3] // ""; if ($bval =~ /"Processor Type:\s*(.+?)"?$/) { $file_static_config{proc_type} = $1; } elsif ($bval =~ /"Processor Version:\s*(.+?)"?$/) { $file_static_config{proc_version} = $1; } elsif ($bval =~ /"Processor Clock Speed:\s*(\d+)/){ $file_static_config{proc_clock} = $1; } elsif ($bval =~ /Shared Pool ID\s*:\s*(\d+)/) { $file_static_config{pool_id} = $1; } }
+        elsif ($key eq 'LPAR') { my $t_num = $fields[1]; if (defined $zzzz_map{$t_num} && defined $current_vm) { my $ts = $zzzz_map{$t_num}; my $physc_val = $fields[2]; my $ent_val = $fields[6]; $perf_buffer{$ts}{physc} = $physc_val if defined $physc_val and looks_like_number($physc_val); if (defined $ent_val && looks_like_number($ent_val)) { my $ts_obj = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); push @{$config_events_href->{$current_vm}}, { ts => $ts_obj->epoch, key => 'entitlement', value => $ent_val + 0 }; } } }
+        elsif ($key eq 'PROC' || $key eq 'CPU_ALL') { my $t_num = $fields[1]; if (defined $zzzz_map{$t_num} && defined $current_vm) { my $ts = $zzzz_map{$t_num}; my $runq_val = ($key eq 'PROC') ? $fields[2] : $fields[5]; $perf_buffer{$ts}{runq} = $runq_val if defined $runq_val and looks_like_number($runq_val); } }
+    }
+    close $fh;
+    foreach my $ts (sort keys %perf_buffer) { my $physc = $perf_buffer{$ts}{physc} // ''; my $runq  = $perf_buffer{$ts}{runq} // ''; if ($physc ne '' || $runq ne '') { print {$temp_fh} "$ts,$current_vm,$physc,$runq\n"; } }
+    close $temp_fh;
+    if (defined $current_vm && %file_static_config) { my @file_ts_epochs = map { Time::Piece->strptime($_, "%Y-%m-%d %H:%M:%S")->epoch } values %zzzz_map; if (@file_ts_epochs) { my $file_start_ts = (sort {$a <=> $b} @file_ts_epochs)[0]; foreach my $key (keys %file_static_config) { push @{$config_events_href->{$current_vm}}, { ts => $file_start_ts, key => $key, value => $file_static_config{$key} }; } } }
+}
+
+sub create_sorted_performance_cache
+{
+    my ($temp_files_aref, $output_file) = @_;
+    return unless @$temp_files_aref;
+    my $sort_command = "sort -t, -k1,1 " . join(" ", @$temp_files_aref);
+    open my $sort_pipe, "-|", $sort_command or die "Error: Could not execute sort command: $!";
+    open my $out_fh, '>', $output_file or die "Error: Could not write to data cache '$output_file': $!";
+    print {$out_fh} "Timestamp,VMName,PhysC,RunQ\n";
+    while (my $line = <$sort_pipe>) { print {$out_fh} $line; }
+    close $sort_pipe; close $out_fh;
+    if ($? != 0) { die "Error: External sort command failed with exit status " . ($? >> 8) . ". Cache may be incomplete.\n"; }
+}
+
+sub create_state_cache
+{
+    my ($config_events_href, $output_file) = @_;
+    my %all_vm_states;
+    foreach my $vm_name (sort keys %$config_events_href)
+    {
+        my %events_by_ts;
+        foreach my $event (@{$config_events_href->{$vm_name}}) { $events_by_ts{$event->{ts}}{$event->{key}} = $event->{value}; }
+        my @sorted_timestamps = sort {$a <=> $b} keys %events_by_ts; next unless @sorted_timestamps;
+        my (%last_known_metadata, $last_fingerprint, $current_state_start_epoch);
+        for (my $i = 0; $i < @sorted_timestamps; $i++)
+        {
+            my $ts = $sorted_timestamps[$i]; my %metadata_before_change = %last_known_metadata;
+            my %snapshot_metadata = %last_known_metadata;
+            foreach my $key (keys %{$events_by_ts{$ts}}) { $snapshot_metadata{$key} = $events_by_ts{$ts}{$key}; }
+            my $current_fingerprint = join "|", map { $snapshot_metadata{$_} // 'U' } sort qw(entitlement smt virtual_cpus pool_cpu capped proc_type proc_version proc_clock serial_number pool_id);
+            if ($i == 0) { $last_fingerprint = $current_fingerprint; $current_state_start_epoch = $ts; }
+            elsif ($current_fingerprint ne $last_fingerprint) { push @{$all_vm_states{$vm_name}}, { start_epoch => $current_state_start_epoch, end_epoch => $ts - 1, metadata => { %metadata_before_change } }; $current_state_start_epoch = $ts; $last_fingerprint = $current_fingerprint; }
+            %last_known_metadata = %snapshot_metadata;
+        }
+        my $final_end_epoch = (sort {$b <=> $a} @sorted_timestamps)[0];
+        if (defined $current_state_start_epoch) { push @{$all_vm_states{$vm_name}}, { start_epoch => $current_state_start_epoch, end_epoch => $final_end_epoch, metadata => \%last_known_metadata }; }
+    }
+    my $json = JSON->new->pretty->canonical; my $json_text = $json->encode(\%all_vm_states);
+    open my $fh, '>:encoding(utf8)', $output_file or die "Error: Could not write to state cache '$output_file': $!";
+    print $fh $json_text;
+    close $fh;
+}
+
+sub process_csv_source
+{
+    my ($pc_file, $rq_file, $cfg_file, $destination_dir) = @_;
+    my $data_cache_path = File::Spec->catfile($destination_dir, $DATA_CACHE_FILE);
+    my $states_cache_path = File::Spec->catfile($destination_dir, $STATES_CACHE_FILE);
+    print "Sub-Phase A: Merging and caching performance data from CSV files...\n";
+    my ($all_vms_href, $min_epoch, $max_epoch) = merge_csv_to_cache($pc_file, $rq_file, $data_cache_path);
+    print "Sub-Phase B: Creating static configuration state cache...\n";
+    create_static_state_cache($all_vms_href, $cfg_file, $min_epoch, $max_epoch, $states_cache_path);
+    return 1;
+}
+
+sub merge_csv_to_cache
+{
+    my ($pc_file, $rq_file, $data_cache_path) = @_;
+    open my $out_fh, '>', $data_cache_path or die "Error: Cannot write to data cache '$data_cache_path': $!";
+    print {$out_fh} "Timestamp,VMName,PhysC,RunQ\n";
+    open my $pc_fh, '<:encoding(utf8)', $pc_file or die "Error: Cannot open PhysC file '$pc_file': $!";
+    my $pc_header = <$pc_fh>; chomp $pc_header; my @pc_vm_names = split ',', $pc_header; shift @pc_vm_names;
+    my %all_vms_found = map { $_ => 1 } @pc_vm_names;
+    my ($rq_fh, %rq_vm_index);
+    if (defined $rq_file && -f $rq_file) { open $rq_fh, '<:encoding(utf8)', $rq_file or die "Error: Cannot open RunQ file '$rq_file': $!"; my $rq_header = <$rq_fh>; chomp $rq_header; my @rq_vm_names = split ',', $rq_header; shift @rq_vm_names; %all_vms_found = (%all_vms_found, map { $_ => 1 } @rq_vm_names); @rq_vm_index{ @rq_vm_names } = 0..$#rq_vm_names; }
+    my ($min_epoch, $max_epoch);
+    while (my $pc_line = <$pc_fh>)
+    {
+        chomp $pc_line; my @pc_vals = split ',', $pc_line; my $ts = shift @pc_vals;
+        my $tp; eval { $tp = Time::Piece->strptime($ts, "%Y-%m-%d %H:%M:%S"); }; next if $@;
+        my $epoch = $tp->epoch; $min_epoch = $epoch if !defined $min_epoch || $epoch < $min_epoch; $max_epoch = $epoch if !defined $max_epoch || $epoch > $max_epoch;
+        my @rq_vals; if ($rq_fh) { my $rq_line = <$rq_fh>; if ($rq_line) { chomp $rq_line; @rq_vals = split ',', $rq_line; shift @rq_vals; } }
+        for my $i (0 .. $#pc_vm_names)
+        {
+            my $vm = $pc_vm_names[$i]; my $physc = (defined $pc_vals[$i] && looks_like_number($pc_vals[$i])) ? $pc_vals[$i] : ''; my $runq = '';
+            if (%rq_vm_index && exists $rq_vm_index{$vm}) { my $rq_idx = $rq_vm_index{$vm}; $runq = (defined $rq_vals[$rq_idx] && looks_like_number($rq_vals[$rq_idx])) ? $rq_vals[$rq_idx] : ''; }
+            if ($physc ne '' || $runq ne '') { print {$out_fh} "$ts,$vm,$physc,$runq\n"; }
+        }
+    }
+    close $pc_fh; close $rq_fh if $rq_fh; close $out_fh;
+    return (\%all_vms_found, $min_epoch, $max_epoch);
+}
+
+sub create_static_state_cache
+{
+    my ($all_vms_href, $cfg_file, $min_epoch, $max_epoch, $output_file) = @_;
+    my %vm_config_data;
+    if (defined $cfg_file && -f $cfg_file)
+    {
+        open my $cfg_fh, '<:encoding(utf8)', $cfg_file or die "Error opening config file '$cfg_file': $!";
+        my $header = <$cfg_fh>; chomp $header; my @headers = map { lc($_) } split ',', $header; my %hmap; @hmap{@headers} = 0..$#headers;
+        while (my $line = <$cfg_fh>) { chomp $line; my @vals = split ',', $line; my $vm_name = $vals[ $hmap{'hostname'} ]; next unless defined $vm_name; $vm_config_data{$vm_name}{smt} = $vals[ $hmap{'smt'} ] if exists $hmap{'smt'}; $vm_config_data{$vm_name}{entitlement} = $vals[ $hmap{'entitledcpu'} ] if exists $hmap{'entitledcpu'}; $vm_config_data{$vm_name}{max_cpu} = $vals[ $hmap{'maxcpu'} ] if exists $hmap{'maxcpu'}; }
+        close $cfg_fh;
+    }
+    my %all_vm_states;
+    foreach my $vm_name (keys %$all_vms_href)
+    {
+        my $vm_config = $vm_config_data{$vm_name} || {};
+        my %metadata = ( entitlement => $vm_config->{entitlement} // 0, smt => $vm_config->{smt} // $DEFAULT_SMT, max_cpu => $vm_config->{max_cpu} // 0 );
+        my $state_obj = { start_epoch => $min_epoch, end_epoch => $max_epoch, metadata => \%metadata, };
+        push @{$all_vm_states{$vm_name}}, $state_obj;
+    }
+    my $json = JSON->new->pretty->canonical; my $json_text = $json->encode(\%all_vm_states);
+    open my $fh, '>:encoding(utf8)', $output_file or die "Error writing state cache '$output_file': $!";
+    print $fh $json_text;
+    close $fh;
+}
+
+sub usage
+{
+    my $script_name = basename($0);
+    return <<END_USAGE;
+Usage: $script_name --srcdir <dir> [options]
+   or: $script_name --physc-data <file> [options]
+
+A high-performance caching tool for the nFit suite. It processes raw NMON
+files or exported CSV data and builds a standardised, persistent cache for
+fast, subsequent analysis by tools like nfit-profile. This tool is now
+multi-system aware and will create a separate cache directory for each
+managed system (serial number) it discovers.
+
+Data Source (choose one):
+  --srcdir <dir>       The top-level source directory to search recursively for NMON files.
+  --physc-data, -pc <file>
+                       Path to an exported CSV file containing PhysC data. This mode is
+                       for analysing pre-processed, offline data sets.
+      --runq-data, -rq <file>   : Optional. Path to a corresponding RunQ data CSV.
+      --config <file>           : Optional. Path to a VM configuration CSV for metadata.
+
+Filtering Options (for NMON source):
+  --mgsys <list>       A comma-separated list of managed system serial numbers to process.
+  --vms <list>         A comma-separated list of VM hostnames to process.
+  --vm-list, -l <file> Path to a text file with one VM hostname per line.
+
+Time Window (for NMON source, based on file modification time):
+  --days <N>           Select files modified in the last N days.
+  --startd <date>      Select files modified on or after this date (YYYY-MM-DD).
+  --endd <date>        Select files modified on or before this date (YYYY-MM-DD).
+                       (--days is mutually exclusive with --startd/--endd).
+
+Cache Location:
+  --stagedir <dir>     Optional. Overrides the default base directory for caches.
+                       By default, caches are created in './stage/<serial_number>/'.
+                       If you provide '--stagedir /my/path', caches will be created in
+                       '/my/path/<serial_number>/'.
+
+Other Options:
+  --cleanup            Authorize the script to delete and recreate target cache
+                       directories if they already exist. Without this flag, the script
+                       will warn and skip any system whose cache directory exists.
+  --verbose, -v        Enable verbose output to see detailed processing steps.
+  --help, -h           Display this help message and exit.
+  --version            Display the script version and exit.
+
+Examples:
+  # Create caches for all managed systems found in an NMON archive from the last 7 days.
+  $script_name --srcdir /nmon/archives/all_systems --days 7
+
+  # Rebuild the cache for only one specific managed system for a specific date range.
+  $script_name --srcdir /nmon/archives --mgsys 12345ABC --startd 2025-06-01 --endd 2025-06-30 --cleanup
+
+END_USAGE
+}
