@@ -749,6 +749,8 @@ $data_source_file = $data_cache_file;
                     my @hybrid_timeseries = synthesize_hybrid_timeseries(\@state_results, "P".clean_perc_label($percentile));
                     # Apply the final decay calculation to get a single hybrid metric
                     my $final_hybrid_metric = calculate_recency_weighted_average(\@hybrid_timeseries, $analysis_ref_obj, $decay_half_life_days_val);
+                    # Store the synthesized time series so the growth prediction engine can use it.
+                    $vm_results_aggregator{$current_vm_name_for_buffer}{'hybrid_timeseries_data'} = \@hybrid_timeseries;
                     # Store the single result in the aggregator
                     $vm_results_aggregator{$current_vm_name_for_buffer}{'hybrid_metric'} = $final_hybrid_metric;
                     $vm_results_aggregator{$current_vm_name_for_buffer}{'source_states'} = \@state_results;
@@ -811,6 +813,7 @@ $data_source_file = $data_cache_file;
             if (@state_results)
             {
                 my @hybrid_timeseries = synthesize_hybrid_timeseries(\@state_results, "P".clean_perc_label($percentile));
+                $vm_results_aggregator{$current_vm_name_for_buffer}{'hybrid_timeseries_data'} = \@hybrid_timeseries;
                 my $final_hybrid_metric = calculate_recency_weighted_average(\@hybrid_timeseries, $analysis_ref_obj, $decay_half_life_days_val);
                 $vm_results_aggregator{$current_vm_name_for_buffer}{'hybrid_metric'} = $final_hybrid_metric;
                 $vm_results_aggregator{$current_vm_name_for_buffer}{'source_states'} = \@state_results;
@@ -959,14 +962,15 @@ $data_source_file = $data_cache_file;
                     {
                         push @timeseries_for_growth, $win_result->{metrics}{$p_label_main};
                     }
+
                 }
-                elsif ($decay_over_states_flag)
+                elsif ($decay_over_states_flag && exists $vm_results_aggregator{$vm_name}{'hybrid_timeseries_data'})
                 {
                     # For hybrid decay, use the daily stamped values from the synthesized time series.
-                    if (exists $vm_results_aggregator{$vm_name}{'hybrid_timeseries_data'})
-                    {
-                        @timeseries_for_growth = map { $_->{value} } @{$vm_results_aggregator{$vm_name}{'hybrid_timeseries_data'}};
-                    }
+                    # The 'source_states' array contains the raw data needed to regenerate the time series.
+                    my @source_states_for_growth = @{$vm_results_aggregator{$vm_name}{'source_states'} || []};
+                    my @hybrid_timeseries_for_growth = synthesize_hybrid_timeseries(\@source_states_for_growth, $p_label_main);
+                    @timeseries_for_growth = map { $_->{value} } @hybrid_timeseries_for_growth;
                 }
 
                 # Call the reusable subroutine to get the growth adjustment values.
@@ -1573,9 +1577,8 @@ sub generate_processing_time_windows
         }
         my $representative_date = Time::Piece->new($current_window_end->epoch);
         push @windows, [Time::Piece->new($current_window_start->epoch), Time::Piece->new($current_window_end->epoch), $representative_date];
-        my $next_window_start_candidate = $current_window_end + ONE_DAY();
-        last if ($next_window_start_candidate > $period_end_obj && $current_window_end >= $period_end_obj);
-        $current_window_start = $next_window_start_candidate;
+        # Move to the start of the next day for the next window
+        $current_window_start = $current_window_end->truncate(to => 'day') + ONE_DAY;
     }
     return @windows;
 }
@@ -2036,13 +2039,41 @@ sub parse_csv_line {
 sub process_vm_buffer {
     my ($vm_buffer_aref, $vm_name, $results_agg_href, $states_by_vm, $windows_aref) = @_;
 
+    # --- Time filter logic ---
+    # This block ensures that granular time filters (--no-weekends, --online, etc.)
+    # are correctly applied to the data before any windowed analysis occurs.
+    my @filtered_vm_buffer;
+    if ($no_weekends || $time_filter_active) {
+        foreach my $dp (@$vm_buffer_aref) {
+            if ($no_weekends) {
+                # Sunday is 1, Saturday is 7 in Time::Piece
+                my $day_of_week = $dp->{tp}->day_of_week;
+                next if ($day_of_week == 1 || $day_of_week == 7);
+            }
+            if ($time_filter_active) {
+                my $line_time = substr($dp->{tp}->hms(':'), 0, 5);
+                my $include_line = 0;
+                if ($time_filter_overnight) {
+                    $include_line = 1 if ($line_time ge $time_filter_start || $line_time lt $time_filter_end);
+                } else {
+                    $include_line = 1 if ($line_time ge $time_filter_start && $line_time lt $time_filter_end);
+                }
+                next unless $include_line;
+            }
+            push @filtered_vm_buffer, $dp;
+        }
+    } else {
+        @filtered_vm_buffer = @$vm_buffer_aref;
+    }
+
     print STDERR "INFO: Processing " . scalar(@$vm_buffer_aref) . " data points for VM '$vm_name' (Windowed Decay Mode)...\n" if $verbose;
 
     my @vm_states = @{$states_by_vm->{$vm_name} || []};
-    return unless @vm_states && @$vm_buffer_aref > 0;
+    # Use the newly filtered buffer for all subsequent logic.
+    return unless @vm_states && @filtered_vm_buffer > 0;
 
-    my $vm_start_obj = $vm_buffer_aref->[0]->{tp};
-    my $vm_end_obj   = $vm_buffer_aref->[-1]->{tp};
+    my $vm_start_obj = $filtered_vm_buffer[0]->{tp};
+    my $vm_end_obj   = $filtered_vm_buffer[-1]->{tp};
 
     my @vm_processing_windows = generate_processing_time_windows(
         $vm_start_obj,
@@ -2054,7 +2085,8 @@ sub process_vm_buffer {
     return unless @vm_processing_windows;
 
     my %window_data_groups;
-    foreach my $dp (@$vm_buffer_aref) {
+    # Use the filtered buffer to group data into windows.
+    foreach my $dp (@filtered_vm_buffer) {
         my $win_idx = get_window_index_for_timestamp($dp->{tp}, \@vm_processing_windows);
         next unless defined $win_idx;
         push @{$window_data_groups{$win_idx}}, $dp;
@@ -2504,12 +2536,19 @@ sub calculate_growth_prediction
     if ($num_hist_periods >= $GROWTH_MIN_HISTORICAL_PERIODS)
     {
         my @values_for_stats = map { $_->[1] } @timeseries_points;
-        my ($mean_val, $stddev_val, $cv_val) = calculate_statistics_for_trend(\@values_for_stats);
+        # Correctly handle the hashref returned by the statistics function.
+        my $stats = calculate_statistics_for_trend(\@values_for_stats);
+        return ($growth_adj_value, $growth_adj_abs_value) unless defined $stats;
+        my $cv_val = $stats->{cv};
 
         # Only proceed if the data is not excessively volatile (low coefficient of variation).
         if (defined $cv_val && $cv_val < $GROWTH_MAX_CV_THRESHOLD)
         {
-            my ($slope, $intercept) = calculate_manual_linear_regression(\@timeseries_points);
+            # Correctly handle the hashref returned by the regression function.
+            my $regression = calculate_manual_linear_regression(\@timeseries_points);
+            return ($growth_adj_value, $growth_adj_abs_value) unless defined $regression;
+            my $slope = $regression->{slope};
+            my $intercept = $regression->{intercept};
 
             # Only apply inflation if there is a clear positive growth trend.
             if (defined $slope && $slope > $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD)
