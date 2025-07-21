@@ -815,6 +815,7 @@ my %per_profile_runq_metrics; # Stores ALL RunQ metrics (e.g. AbsRunQ_P80, AbsRu
 my %per_profile_nfit_raw_results;
 my %pressure_details_for_csv;
 my %seasonal_debug_info;
+my %outlier_warnings;
 
 my %parsed_growth_adj_values;      # Stores GrowthAdj from nfit output
 my %parsed_growth_adj_abs_values;  # Stores GrowthAdjAbs from nfit output
@@ -1065,7 +1066,6 @@ foreach my $system_serial (@target_systems_to_process)
             }
         }
     }
-
 
     # --- Capture the start time for this specific system's analysis ---
     my $system_analysis_start_time = time();
@@ -4002,6 +4002,7 @@ sub calculate_multiplicative_forecast {
     foreach my $vm_name (sort keys %current_baseline_results) {
         my $vm_forecasts = {};
         my %vm_historic_multipliers;
+        my %vm_historic_residuals;
 
         foreach my $active_event_cfg (@active_events) {
             my $active_event_name = $active_event_cfg->{_eventName};
@@ -4033,18 +4034,28 @@ sub calculate_multiplicative_forecast {
             foreach my $profile (@profiles) {
                 my $p_name = $profile->{name};
                 my @multipliers;
+                # array to hold residuals for the current profile.
+                my @residuals;
                 foreach my $hist_event (@event_history) {
-                    my $hist_peak = $hist_event->{results}{HistoricPeak}{$vm_name}{$p_name};
-                    my $hist_base = $hist_event->{results}{HistoricBaseline}{$vm_name}{$p_name};
+                    my $hist_peak = $hist_event->{results}{'HistoricPeak'}{$vm_name}{$p_name};
+                    my $hist_base = $hist_event->{results}{'HistoricBaseline'}{$vm_name}{$p_name};
+                    # --- NEW: Read the PeakResidual from the snapshot.
+                    my $hist_residual = $hist_event->{results}{'PeakResidual'}{$vm_name}{$p_name};
 
                     if (defined $hist_peak && defined $hist_base && $hist_base > 0.001) {
                         push @multipliers, { value => $hist_peak / $hist_base, date  => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d') };
+                    }
+                    # Store the historical residual if it exists.
+                    if (defined $hist_residual && looks_like_number($hist_residual)) {
+                        push @residuals, { value => $hist_residual, date => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d') };
                     }
                 }
                 next unless @multipliers;
 
                 my $event_multiplier = calculate_recency_weighted_average(\@multipliers, $today, 365);
                 $vm_historic_multipliers{$p_name}{$active_event_name} = { 'multiplier' => $event_multiplier, 'history' => \@multipliers };
+                # store the collected historical residuals for this profile.
+                $vm_historic_residuals{$p_name}{$active_event_name} = \@residuals;
             }
         }
 
@@ -4074,25 +4085,47 @@ sub calculate_multiplicative_forecast {
                 $volatility_buffer = calculate_volatility_buffer($primary_event_history_ref, $confidence);
             }
 
-            my $final_recommendation = $current_baseline_val * $final_multiplier * $volatility_buffer;
+            # --- NEW: Forecast the residual using a recency-weighted average of historical residuals.
+            my $forecasted_residual = 0;
+            my @all_residuals_for_profile;
+            if (exists $vm_historic_residuals{$p_name}) {
+                foreach my $event_name (keys %{$vm_historic_residuals{$p_name}}) {
+                    push @all_residuals_for_profile, @{$vm_historic_residuals{$p_name}{$event_name}};
+                }
+            }
+            if (@all_residuals_for_profile) {
+                $forecasted_residual = calculate_recency_weighted_average(\@all_residuals_for_profile, $today, 365) // 0;
+            }
+
+            # --- NEW: Combine all components and apply the optional amplification factor.
+            my $primary_forecast = $current_baseline_val * $final_multiplier * $volatility_buffer;
+            my $combined_forecast = $primary_forecast + $forecasted_residual;
+
+            my $amplification = $event_config->{peak_amplification_factor} // 1.0;
+            my $final_recommendation = $combined_forecast * $amplification;
+
+            # Store the final forecast value for the results table.
 			$vm_forecasts->{$p_name} = $final_recommendation;
 
             # After calculating the multiplier, check if it's still at its default value.
             # This indicates that no valid historical data was found for this specific
             # VM and profile combination.
-            if (abs($final_multiplier - 1.0) < 0.001 && abs($volatility_buffer - 1.0) < 0.001) {
+            if (abs($final_multiplier - 1.0) < 0.001 && abs($volatility_buffer - 1.0) < 0.001 && abs($forecasted_residual) < 0.001) {
                 my $primary_event_name = $active_events[0]->{_eventName};
                 # The warning now includes the VM and Profile name for easy debugging.
-                warn "    - WARNING for VM [$vm_name], Profile [$p_name]: No valid historical multipliers found for event '$primary_event_name'. Forecast will not include seasonal uplift.\n";
+                warn "    - WARNING for VM [$vm_name], Profile [$p_name]: No valid historical multipliers or residuals found for event '$primary_event_name'. Forecast will not include seasonal uplift.\n";
             }
 
+            # Store all calculation components in the debug hash for detailed logging.
             $seasonal_debug_info{$vm_name}{$p_name} = {
-                baseline   => $current_baseline_val,
-                multiplier => $final_multiplier,
-                volatility => $volatility_buffer,
-                forecast   => $final_recommendation,
+                baseline             => $current_baseline_val,
+                multiplier           => $final_multiplier,
+                volatility           => $volatility_buffer,
+                forecasted_residual  => $forecasted_residual,
+                amplification_factor => $amplification,
+                forecast             => $final_recommendation,
+                OutlierWarning       => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings)
             };
-
             $vm_forecasts->{$p_name} = $final_recommendation;
         }
         $final_forecasts{$vm_name} = $vm_forecasts;
@@ -4457,6 +4490,17 @@ sub _get_cache_date_range {
     return ($start_obj, $end_obj);
 }
 
+sub _get_warning_for_vm_forecast {
+    my ($vm_name, $warnings_href) = @_;
+    # This finds the most recent warning for a given VM, as the hash is keyed by snapshot date.
+    foreach my $key (sort { $b cmp $a } keys %$warnings_href) {
+        if (exists $warnings_href->{$key}{$vm_name}) {
+            return $warnings_href->{$key}{$vm_name};
+        }
+    }
+    return undef;
+}
+
 # ==============================================================================
 # Performs a historical analysis and update the snapshot cache.
 # - Efficiently finds and processes ALL historical events found
@@ -4600,7 +4644,7 @@ sub update_seasonal_snapshot {
     my $event_count = scalar(keys %unique_snapshot_keys);
     print STDERR "Identified $event_count historical event instance(s) to snapshot.\n";
 
-    # --- Step 2: Orchestrate nfit.pl Runs for Each Period ---
+    # --- Step 2: Orchestrate nfit Runs for Each Period ---
     my %results_by_snapshot;
     my $analysis_start_time = time();
 
@@ -4610,29 +4654,64 @@ sub update_seasonal_snapshot {
         my $start_str    = $job->{start_obj}->date;
         my $end_str      = $job->{end_obj}->date;
 
+        my $is_peak_period_job = ($job_type eq $peak_key);
+
         print STDERR "\n  - Analysing period for '$snapshot_key' ($job_type) from $start_str to $end_str...\n";
 
         my %period_results;
+        my %residual_results;
+        my %extreme_peak_values_by_vm; # Holds pre-calculated peak values for efficiency.
 
+        # --- Pre-calculation Step for Configurable Extreme Peaks (Optimisation) ---
+        # If this is a peak period and a custom peak profile is defined, we run it
+        # once for all VMs to avoid re-running it inside the main profile loop.
+        if ($is_peak_period_job && defined $event_config->{residual_peak_profile} && $event_config->{residual_peak_profile} ne '') {
+            print STDERR "    - Pre-calculating extreme peak using configured profile...\n";
+            my $extreme_peak_flags = $event_config->{residual_peak_profile};
+
+            my $extreme_cmd = _build_nfit_baseline_command($extreme_peak_flags, $start_str, $end_str, $system_cache_dir);
+
+            my $extreme_output = `$extreme_cmd`;
+            if ($? == 0) {
+                my $p_metric_key_extreme;
+                if ($extreme_peak_flags =~ /-p\s+([0-9.]+)/) {
+                    $p_metric_key_extreme = "P" . clean_perc_label($1);
+                } else {
+                    warn "Warning: 'residual_peak_profile' does not contain a -p flag. Cannot determine which metric to use for peak value.";
+                }
+
+                if ($p_metric_key_extreme) {
+                    my $parsed_extreme = parse_nfit_key_value_output($extreme_output);
+                    foreach my $vm_name (keys %$parsed_extreme) {
+                        my @states = @{$parsed_extreme->{$vm_name}};
+                        my @sanitized_values;
+                        my @absolute_peak_values;
+                        foreach my $state (@states) {
+                            push @sanitized_values, $state->{$p_metric_key_extreme} if (defined $state->{$p_metric_key_extreme} && looks_like_number($state->{$p_metric_key_extreme}));
+                            # The '-k' in the helper ensures 'Peak' is also in the output.
+                            push @absolute_peak_values, $state->{'Peak'} if (defined $state->{'Peak'} && looks_like_number($state->{'Peak'}));
+                        }
+                        if (@sanitized_values) {
+                            # Store both the sanitized value and the absolute peak for later comparison.
+                            $extreme_peak_values_by_vm{$vm_name}{sanitized} = sum0(@sanitized_values) / scalar(@sanitized_values);
+                            $extreme_peak_values_by_vm{$vm_name}{absolute}  = max(@absolute_peak_values) if @absolute_peak_values;
+                        }
+                    }
+                }
+            } else {
+                warn "Warning: The command for 'residual_peak_profile' failed. Will fall back to absolute peak (-k) if possible.";
+            }
+        }
+
+        # --- Main Profile Loop ---
         foreach my $profile (@profiles) {
             my $profile_name = $profile->{name};
-
-            # This print statement provides consistent output for the snapshot workflow.
             print STDERR "    - Running profile: $profile_name\n";
 
-            # For a snapshot, we need a pure historical measurement.
-            # Use the helper function to build a clean command that strips all
-            # decay and growth prediction flags from the profile.
-            my $nfit_cmd = _build_nfit_baseline_command(
-                $profile->{flags},
-                $start_str,
-                $end_str,
-                $system_cache_dir
-            );
-
+            my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir);
             my $nfit_output = `$nfit_cmd`;
             if ($? != 0) {
-                warn "Warning: nfit.pl failed for profile '$profile_name' during snapshot analysis for period $start_str to $end_str. Skipping this profile for this period.\n";
+                warn "Warning: nfit.pl failed for profile '$profile_name' during snapshot analysis for period $start_str to $end_str. Skipping.\n";
                 next;
             }
 
@@ -4640,21 +4719,70 @@ sub update_seasonal_snapshot {
             my $p_metric_key = "P" . clean_perc_label( ($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE );
 
             foreach my $vm_name (keys %$parsed_results) {
-                my @states_for_vm = @{$parsed_results->{$vm_name}};
-                next unless @states_for_vm;
-                my @valid_p_values;
-                foreach my $state (@states_for_vm) {
-                    if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key})) {
-                        push @valid_p_values, $state->{$p_metric_key};
+                my @states = @{$parsed_results->{$vm_name}};
+                next unless @states;
+
+                my @p_values;
+                my @peak_values;
+                foreach my $state (@states) {
+                    push @p_values, $state->{$p_metric_key} if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key}));
+                    if ($is_peak_period_job && !%extreme_peak_values_by_vm) {
+                        push @peak_values, $state->{'Peak'} if (defined $state->{'Peak'} && looks_like_number($state->{'Peak'}));
                     }
                 }
-                if (@valid_p_values) {
-                    my $aggregated_value = sum0(@valid_p_values) / scalar(@valid_p_values);
-                    $period_results{$vm_name}{$profile_name} = $aggregated_value;
+
+                if (@p_values) {
+                    my $aggregated_p_value = sum0(@p_values) / scalar(@p_values);
+                    $period_results{$vm_name}{$profile_name} = $aggregated_p_value;
+
+                    if ($is_peak_period_job) {
+                        my $extreme_peak_for_residual;
+                        # Correctly declare and assign the comparison variable.
+                        my $absolute_peak_for_comparison;
+
+                        if (%extreme_peak_values_by_vm) {
+                            $extreme_peak_for_residual = $extreme_peak_values_by_vm{$vm_name}{sanitized};
+                            $absolute_peak_for_comparison = $extreme_peak_values_by_vm{$vm_name}{absolute};
+                        } else {
+                            # Fallback path if residual_peak_profile was not used
+                            $extreme_peak_for_residual = max(@peak_values) if @peak_values;
+                        }
+
+                        if (defined $extreme_peak_for_residual) {
+                            my $residual = $extreme_peak_for_residual - $aggregated_p_value;
+                            $residual_results{$vm_name}{$profile_name} = ($residual > 0) ? $residual : 0;
+
+                            if (defined $absolute_peak_for_comparison) {
+                                my $ABSOLUTE_DIFFERENCE_THRESHOLD = 0.5;
+                                my $RELATIVE_DIFFERENCE_THRESHOLD = 1.5;
+
+                                my $difference = $absolute_peak_for_comparison - $extreme_peak_for_residual;
+                                my $is_significant = 0;
+                                if ($extreme_peak_for_residual > 0) {
+                                    $is_significant = ($difference > $ABSOLUTE_DIFFERENCE_THRESHOLD) &&
+                                                      ($absolute_peak_for_comparison / $extreme_peak_for_residual > $RELATIVE_DIFFERENCE_THRESHOLD);
+                                }
+
+                                if ($is_significant) {
+                                    $outlier_warnings{$snapshot_key}{$vm_name} = sprintf(
+                                        "NOTE: A significant outlier was detected for this period. The absolute raw peak (%.2f) " .
+                                        "was substantially higher than the sanitised peak (%.2f) used for the residual calculation. " .
+                                        "This may indicate a data anomaly or a brief, extreme event that should be reviewed.",
+                                        $absolute_peak_for_comparison,
+                                        $extreme_peak_for_residual
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+
         $results_by_snapshot{$snapshot_key}{$job_type} = \%period_results;
+        if ($is_peak_period_job) {
+            $results_by_snapshot{$snapshot_key}{'PeakResidual'} = \%residual_results;
+        }
     }
 
     # --- ENHANCED: Report total duration for the analysis phase ---
@@ -5066,9 +5194,18 @@ sub log_multiplicative_seasonal_rationale
             printf {$fh} "  %-${label_width}s : %.4f cores\n", "Current Baseline Value", $s_data->{baseline};
             printf {$fh} "  %-${label_width}s : %.4f\n", "Historical Multiplier", $s_data->{multiplier};
             printf {$fh} "  %-${label_width}s : %.4f\n", "Volatility Buffer", $s_data->{volatility};
-            printf {$fh} "  %-${label_width}s : %s\n", "Calculation", "Baseline * Multiplier * Volatility";
+            printf {$fh} "  %-${label_width}s : %.4f cores\n", "Forecasted Peak Residual", $s_data->{forecasted_residual};
+            printf {$fh} "  %-${label_width}s : %.2f\n", "Peak Amplification Factor", $s_data->{amplification_factor};
+            print {$fh} "  --------------------------------------------------------------------\n";
+            print {$fh} "  Calculation : ((Baseline * Multiplier * Buffer) + Residual) * Amplification\n";
+            print {$fh} "  --------------------------------------------------------------------\n";
             print {$fh} "  --------------------------------------------------------------------\n";
             printf {$fh} "  %-${label_width}s : %.4f cores\n", "Final Forecasted Value", $s_data->{forecast};
+            # --- Print outlier warning if it exists ---
+            if (defined $s_data->{OutlierWarning} && $s_data->{OutlierWarning} ne '') {
+                print {$fh} "\n  --- Workload Volatility Alert ---\n";
+                print {$fh} "  " . $s_data->{OutlierWarning} . "\n";
+            }
             print {$fh} "======================================================================\n\n";
         }
     }
@@ -5140,6 +5277,10 @@ sub _build_nfit_baseline_command {
 
     my $profile_flags = $profile_flags_in; # Work on a copy.
 
+    # --- NEW: Sanitise incoming flags to remove extraneous quotes from config files.
+    # This is the primary fix for the "Unknown option" error.
+    $profile_flags =~ s/^\s*"?|"?\s*$//g;
+
     # A baseline calculation must be a pure measurement of a historical period.
     # We must explicitly remove any flags related to future-looking decay models
     # or growth prediction that might be present in the profile's configuration.
@@ -5150,6 +5291,7 @@ sub _build_nfit_baseline_command {
     $profile_flags =~ s/--decay-over-states\s*//g;
 
     # Construct the base command, ensuring --nmondir is always present.
+    # the '-k' (Peak) flag is always included for statistical history.
     my $base_flags = "-q -k --nmondir \"$system_cache_dir\" $rounding_flags_for_nfit";
 
     # Only add date filters if they are actually defined.
@@ -5168,97 +5310,82 @@ sub _build_nfit_baseline_command {
 
 # ==============================================================================
 # Main orchestrator for the 'predictive_peak' model.
+# This version is enhanced to use the new two-part residual forecasting method.
 # ==============================================================================
 sub calculate_predictive_peak_forecast {
     my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config) = @_;
 
-    # --- Step 1: Get Historical Peak Data ---
-    my $historical_peaks_href = _get_historical_peak_data($system_cache_dir, $event_name, $event_config);
-    return {} unless $historical_peaks_href && %$historical_peaks_href;
+    # --- Step 1: Get Historical Peak and Residual Data ---
+    # Calls the enhanced helper to get a hash containing both data series.
+    my $historical_data_href = _get_historical_peak_data($system_cache_dir, $event_name, $event_config);
 
-    # --- Early check for sufficient history ---
-    my $min_peaks_required = $event_config->{min_historical_peaks} // 3;
-    my $peaks_found = 0;
-    # Get the count from the first profile's data (all will have the same number of points)
-    if (my ($profile_name) = keys %{$historical_peaks_href}) {
-        if (my ($vm_name) = keys %{$historical_peaks_href->{$profile_name}}) {
-            $peaks_found = scalar(@{$historical_peaks_href->{$profile_name}{$vm_name}});
-        }
-    }
-
-    my $prediction_skipped = ($peaks_found < $min_peaks_required);
-    if ($prediction_skipped) {
-        print STDERR "  -> Notice: Prediction skipped (found $peaks_found/$min_peaks_required peaks). Baseline will be used.\n";
-    }
-
-    # --- Step 2: Calculate the Predicted Peak for each profile ---
-    print STDERR " -> Step 2/3: Performing linear regression to predict next peak intensity (predictive peak model forecast).\n";
-
-    my %predicted_peaks;
-    unless ($prediction_skipped) {
-        foreach my $profile_name (keys %{$historical_peaks_href}) {
-            my $vm_peak_series_href = $historical_peaks_href->{$profile_name};
-            my ($predicted_vm_values, $debug_info_for_vms) = _calculate_peak_prediction($vm_peak_series_href, $event_config);
-
-            foreach my $vm_name (keys %{$predicted_vm_values}) {
-                my $predicted_value = $predicted_vm_values->{$vm_name};
-                $predicted_peaks{$vm_name}{$profile_name} = $predicted_value;
-                $seasonal_debug_info{$vm_name}{$profile_name}{'PredictedPeak'} = $predicted_value;
-                $seasonal_debug_info{$vm_name}{$profile_name}{'PredictionDebug'} = $debug_info_for_vms->{$vm_name};
-            }
-        }
-    }
+    # --- Step 2: Calculate the Predicted Peak and Residual for each profile ---
+    # Calls the enhanced prediction engine to get forecasts for both series.
+    print STDERR " -> Step 2/3: Performing linear regression to predict next peak intensity and residual.\n";
+    my ($predicted_components_href, $debug_info_for_vms) =
+        _calculate_peak_prediction($historical_data_href, $event_config);
 
     # --- Step 3: Calculate the Non-Peak Baseline (excluding all historical peaks) ---
+    # This logic remains unchanged.
     my $true_baseline_results_href = _get_true_baseline_results($system_cache_dir, $event_name, $event_config, $full_seasonality_config);
 
     # --- Step 4: Synthesize Final Results ---
+    print STDERR " -> Step 3/3: Synthesizing final forecast from Predicted Peak, Predicted Residual, and Baseline.\n";
     my %final_results;
     foreach my $vm_name (keys %{$true_baseline_results_href}) {
         foreach my $profile (@profiles) {
             my $p_name = $profile->{name};
             my $baseline_val = $true_baseline_results_href->{$vm_name}{$p_name};
-            my $predicted_peak_val = $predicted_peaks{$p_name}{value}{$vm_name};
 
-            my $final_value = 0;
-            my $source = 'N/A';
+            # Get the two predicted components from the prediction engine.
+            my $predicted_peak_val = $predicted_components_href->{$vm_name}{$p_name}{peak};
+            my $predicted_residual_val = $predicted_components_href->{$vm_name}{$p_name}{residual};
 
-            if (defined $baseline_val && defined $predicted_peak_val) {
-                if ($baseline_val > $predicted_peak_val) {
+            # Combine the signal and volatility forecasts. Undefined values are treated as zero.
+            my $combined_prediction;
+            if (defined $predicted_peak_val) {
+                $combined_prediction = ($predicted_peak_val // 0) + ($predicted_residual_val // 0);
+            }
+
+            # The final recommendation is the higher of the baseline or the combined prediction.
+            my ($final_value, $source) = (0, 'N/A');
+            if (defined $baseline_val && defined $combined_prediction) {
+                if ($baseline_val > $combined_prediction) {
                     $final_value = $baseline_val;
                     $source = 'TrueBaseline';
                 } else {
-                    $final_value = $predicted_peak_val;
+                    $final_value = $combined_prediction;
                     $source = 'PeakPrediction';
                 }
-            } elsif (defined $predicted_peak_val) {
-                $final_value = $predicted_peak_val;
+            } elsif (defined $combined_prediction) {
+                $final_value = $combined_prediction;
                 $source = 'PeakPrediction';
             } elsif (defined $baseline_val) {
                 $final_value = $baseline_val;
-                $source = 'TrueBaseline';
+                # This case indicates that prediction failed (e.g., insufficient history).
+                $source = 'BaselineOnly (NoPrediction)';
             }
 
-            $final_results{$vm_name}{$p_name} = $final_value;
+            # Apply the optional amplification factor
+            my $amplification = $event_config->{peak_amplification_factor} // 1.0;
+            my $final_recommendation = $final_value * $amplification;
 
-            # Store debug info for logging and reporting
+            $final_results{$vm_name}{$p_name} = $final_recommendation;
+
+            # Store all components in the debug hash for comprehensive logging.
             $seasonal_debug_info{$vm_name}{$p_name} = {
-                TrueBaseline => $baseline_val,
-                PredictedPeak => $predicted_peak_val,
-                FinalSource => $source,
-                PredictionDebug => $predicted_peaks{$p_name}{debug},
-                PredictionSkipped => $prediction_skipped,
-                PeaksFound => $peaks_found,
-                PeaksRequired => $min_peaks_required
+                TrueBaseline       => $baseline_val,
+                PredictedPeak      => $predicted_peak_val,
+                PredictedResidual  => $predicted_residual_val,
+                CombinedPrediction => $combined_prediction,
+                FinalSource        => $source,
+                AmplificationFactor  => $amplification,
+                FinalForecast        => $final_recommendation,
+                PredictionDebug    => $debug_info_for_vms->{$vm_name}{$p_name},
+                OutlierWarning     => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings)
             };
-            if ($prediction_skipped) {
-                $seasonal_debug_info{$vm_name}{$p_name}{'FinalSource'} = 'BaselineOnly (NoPrediction)';
-            } else {
-                $seasonal_debug_info{$vm_name}{$p_name}{'FinalSource'} = $source;
-            }
         }
     }
-    print STDERR " -> Synthesizing final forecast from Predicted Peak and Baseline.\n";
     return \%final_results;
 }
 
@@ -5376,36 +5503,39 @@ sub _get_true_baseline_results {
 }
 
 # ==============================================================================
-# Helper to read the snapshot cache and return historical peak data series.
+# Helper to read the snapshot cache and return historical data series.
+# This version loads both PeakValue and the new PeakResidual.
 # ==============================================================================
 sub _get_historical_peak_data {
     my ($system_cache_dir, $event_name, $event_config) = @_;
 
-    print STDERR " -> Step 1/3: Loading historical peak data for event '$event_name'.\n";
+    print STDERR " -> Step 1/3: Loading historical peak and residual data for event '$event_name'.\n";
 
     my $snapshots = read_seasonal_snapshot_cache($system_cache_dir);
     my @event_history;
-    foreach my $key (keys %$snapshots) {
+    foreach my $key (sort keys %$snapshots) {
         if ($snapshots->{$key}{eventName} eq $event_name) {
             push @event_history, $snapshots->{$key};
         }
     }
 
-    # Sort by date to ensure chronological order for regression
+    # Sort by date to ensure chronological order for regression.
     @event_history = sort { $a->{periodEndDate} cmp $b->{periodEndDate} } @event_history;
 
     my $max_peaks = $event_config->{max_historical_peaks} // 12;
     if (@event_history > $max_peaks) {
-        @event_history = @event_history[-$max_peaks..-1]; # Keep only the most recent N peaks
+        @event_history = @event_history[-$max_peaks..-1]; # Keep only the most recent N peaks.
     }
 
     my %peaks_by_profile;
+    my %residuals_by_profile; # New hash for residual data.
+
     foreach my $event (@event_history) {
         my $date = $event->{periodEndDate};
-
-        # The key to use for predictive_peak is 'PeakValue'
         my $peak_results = $event->{results}{'PeakValue'} || {};
+        my $residual_results = $event->{results}{'PeakResidual'} || {};
 
+        # Process PeakValue data.
         foreach my $vm (keys %$peak_results) {
             foreach my $profile (keys %{$peak_results->{$vm}}) {
                 my $value = $peak_results->{$vm}{$profile};
@@ -5414,78 +5544,114 @@ sub _get_historical_peak_data {
                 }
             }
         }
+
+        # Process PeakResidual data.
+        foreach my $vm (keys %$residual_results) {
+            foreach my $profile (keys %{$residual_results->{$vm}}) {
+                my $value = $residual_results->{$vm}{$profile};
+                if (defined $value && looks_like_number($value)) {
+                    push @{$residuals_by_profile{$profile}{$vm}}, { value => $value, date => $date };
+                }
+            }
+        }
     }
-    return \%peaks_by_profile;
+
+    # Return a hash containing both data series.
+    return {
+        peaks => \%peaks_by_profile,
+        residuals => \%residuals_by_profile
+    };
 }
 
 # ==============================================================================
 # Core statistical engine for the predictive_peak model.
+# This version orchestrates a dual forecast for both the peak signal and the residual.
 # ==============================================================================
 sub _calculate_peak_prediction {
-    my ($peak_series_aref, $event_config) = @_;
+    my ($historical_data_href, $event_config) = @_;
+
+    my $peak_series_per_profile = $historical_data_href->{peaks} || {};
+    my $residual_series_per_profile = $historical_data_href->{residuals} || {};
+
     my %predictions;
     my %debug_info;
 
-    return (\%predictions, \%debug_info) unless ref($peak_series_aref) eq 'HASH';
+    my $min_peaks = $event_config->{min_historical_peaks} // 3;
 
-    foreach my $vm_name (keys %{$peak_series_aref}) {
-        my @series = @{$peak_series_aref->{$vm_name}};
-        my $min_peaks = $event_config->{min_historical_peaks} // 3;
+    # This anonymous subroutine is a reusable, local prediction engine.
+    # It takes a time series and returns a single predicted next value.
+    my $_predict_next_value = sub {
+        my ($series_aref) = @_;
 
-        if (@series < $min_peaks) {
-            $debug_info{$vm_name} = { status => "Skipped: Insufficient history (" . scalar(@series) . "/$min_peaks)" };
-            next;
-        }
+        return (undef, "Insufficient history")
+            unless (defined $series_aref && ref($series_aref) eq 'ARRAY' && scalar(@$series_aref) >= 2);
 
-        # --- Outlier Trimming ---
-        my @values = map { $_->{value} } @series;
+        # Perform simple outlier trimming by removing the min and max values
+        # if the series is long enough to support it.
+        my @values = map { $_->{value} } @$series_aref;
         @values = sort { $a <=> $b } @values;
-        if (@values > 5) { # Only trim if we have enough data
+        if (@values > 5) {
             shift @values; # Remove lowest
             pop @values;   # Remove highest
         }
 
-        # --- Linear Regression ---
+        # Build points for the linear regression.
         my @points_for_regression;
         for my $i (0..$#values) {
             push @points_for_regression, [$i, $values[$i]];
         }
 
-        my $regression_results = calculate_manual_linear_regression(\@points_for_regression);
-        unless ($regression_results) {
-            $debug_info{$vm_name} = { status => "Skipped: Could not perform regression" };
-            next;
+        my $regression = calculate_manual_linear_regression(\@points_for_regression);
+        unless ($regression) {
+            return (undef, "Regression failed");
         }
 
-        my $slope = $regression_results->{slope};
-        my $intercept = $regression_results->{intercept};
-        my $projected_peak = ($slope * scalar(@values)) + $intercept; # Project one step ahead
+        my $slope = $regression->{slope};
+        my $intercept = $regression->{intercept};
 
-        # --- Uncertainty Buffer ---
-        my @residuals;
-        for my $i (0..$#values) {
-            my $predicted = ($slope * $i) + $intercept;
-            push @residuals, $values[$i] - $predicted;
+        # Project one step into the future.
+        my $projected_value = ($slope * scalar(@values)) + $intercept;
+
+        my $debug_str = sprintf("Success (Slope: %.4f, Points used: %d)", $slope, scalar(@values));
+
+        return ($projected_value, $debug_str);
+    };
+
+    foreach my $profile_name (keys %{$peak_series_per_profile}) {
+        foreach my $vm_name (keys %{$peak_series_per_profile->{$profile_name}}) {
+
+            my $peak_series_aref = $peak_series_per_profile->{$profile_name}{$vm_name} || [];
+
+            # Skip if there is not enough primary peak data to forecast.
+            if (scalar(@$peak_series_aref) < $min_peaks) {
+                $debug_info{$vm_name}{$profile_name} = {
+                    peak_status => "Skipped: Insufficient history (" . scalar(@$peak_series_aref) . "/$min_peaks)",
+                    residual_status => "Skipped: Dependent on peak forecast"
+                };
+                next;
+            }
+
+            # --- Perform the two separate forecasts ---
+            my ($predicted_peak, $peak_debug) = $_predict_next_value->($peak_series_aref);
+
+            my $residual_series_aref = $residual_series_per_profile->{$profile_name}{$vm_name} || [];
+            my ($predicted_residual, $residual_debug) = $_predict_next_value->($residual_series_aref);
+
+            # Store the individual forecast components.
+            $predictions{$vm_name}{$profile_name} = {
+                peak     => $predicted_peak,
+                residual => $predicted_residual,
+            };
+
+            # Store the debug information for logging and rationale.
+            $debug_info{$vm_name}{$profile_name} = {
+                peak_status     => $peak_debug,
+                residual_status => $residual_debug,
+            };
         }
-        my $std_dev_residuals = _calculate_std_dev(\@residuals);
-        my $confidence_factor = 1.96; # ~95% confidence
-        my $buffer = $confidence_factor * $std_dev_residuals;
-
-        my $final_prediction = $projected_peak + $buffer;
-        # Ensure non-negative value
-        $predictions{$vm_name} = max(0, $final_prediction);
-
-        $predictions{$vm_name} = $final_prediction;
-        $debug_info{$vm_name} = {
-            status => "Success",
-            historical_points => scalar(@series),
-            points_after_trim => scalar(@values),
-            slope => sprintf("%.4f", $slope),
-            projected_peak => sprintf("%.4f", $projected_peak),
-            std_dev_residuals => sprintf("%.4f", $std_dev_residuals),
-            uncertainty_buffer => sprintf("%.4f", $buffer),
-        };
     }
+
+    # Return the predictions and diagnostics to the calling function.
     return (\%predictions, \%debug_info);
 }
 
@@ -5570,7 +5736,6 @@ sub find_all_historical_periods {
 
 # ==============================================================================
 # Subroutine to log the rationale for a predictive_peak seasonal forecast.
-# It explains how the Non-Peak Baseline (True Baseline) and Predicted Peak were synthesized.
 # ==============================================================================
 sub log_predictive_peak_rationale {
     my ($fh) = @_;
@@ -5590,36 +5755,84 @@ sub log_predictive_peak_rationale {
 
             my $s_data = $seasonal_debug_info{$vm_name}{$p_name};
             my $profile_desc = parse_profile_name_for_log($p_name);
-            my $label_width = 35;
+            my $label_width = 38;
 
             print {$fh} "======================================================================\n";
             printf {$fh} "%-${label_width}s : %s\n", "Profile Processed", $profile_desc;
             print {$fh} "----------------------------------------------------------------------\n";
 
-            if ($s_data->{PredictionSkipped}) {
-                print {$fh} "CPU Sizing Path: Predictive Peak Forecast (PREDICTION SKIPPED)\n\n";
-                printf {$fh} "  %-${label_width}s : Insufficient historical data.\n", "Reason";
-                printf {$fh} "  %-${label_width}s : %d\n", "Peaks Found", ($s_data->{PeaksFound} // 0);
-                printf {$fh} "  %-${label_width}s : %d\n", "Minimum Peaks Required", ($s_data->{PeaksRequired} // 'N/A');
-                printf {$fh} "  %-${label_width}s : The value shown is the 'Non-Peak Baseline' only.\n", "Recommendation";
-                printf {$fh} "  %-${label_width}s : Run --update-seasonal-snapshot on a larger data cache.\n", "Action";
+            my $predicted_peak_val = $s_data->{PredictedPeak};
+
+            if (!defined $predicted_peak_val) {
+                # This block handles cases where prediction was skipped (e.g., insufficient history).
+                my $debug_info = $s_data->{PredictionDebug}{peak_status} // "Insufficient history";
+                printf {$fh} "  %-${label_width}s : SKIPPED (%s)\n", "Peak Trend Prediction", $debug_info;
+                printf {$fh} "  %-${label_width}s : %.4f cores\n", "1. Non-Peak Baseline", ($s_data->{TrueBaseline} // 0);
                 print {$fh} "  --------------------------------------------------------------------\n";
-                printf {$fh} "  %-${label_width}s : %.4f cores\n", "Final Recommendation (Baseline Only)",
-                    ($results_table{$vm_name}{$p_name} // 0);
+                printf {$fh} "  %-${label_width}s : %.4f cores (Source: Baseline Only)\n", "Final Recommendation", ($s_data->{FinalForecast} // 0);
 
             } else {
-                # This is the existing logic for a successful prediction
-                printf {$fh} "  %-${label_width}s : %.4f cores\n", "1. Non-Peak Baseline", ($s_data->{TrueBaseline} // 0);
-                printf {$fh} "  %-${label_width}s : %.4f cores\n", "2. Predicted Peak (from history)", ($s_data->{PredictedPeak} // 0);
+                # This block logs a successful, multi-step forecast.
+                printf {$fh} "  1. %-${label_width}s : %.4f cores\n", "Non-Peak Baseline (Floor)", ($s_data->{TrueBaseline} // 0);
+                printf {$fh} "  2. %-${label_width}s : %.4f cores\n", "Predicted Peak (from trend)", $predicted_peak_val;
+                printf {$fh} "  3. %-${label_width}s : %.4f cores\n", "Predicted Peak Residual", ($s_data->{PredictedResidual} // 0);
+                printf {$fh} "  4. %-${label_width}s : %.2f\n", "Peak Amplification Factor", ($s_data->{AmplificationFactor} // 1.0);
                 print {$fh} "  --------------------------------------------------------------------\n";
-                printf {$fh} "  %-${label_width}s : %.4f cores (Source: %s)\n", "Final Recommendation (Higher of 1/2)",
-                    ($results_table{$vm_name}{$p_name} // 0),
+                printf {$fh} "  Calculation : MAX( Baseline, (Predicted Peak + Predicted Residual) * Amplification )\n";
+                print {$fh} "  --------------------------------------------------------------------\n";
+                printf {$fh} "  %-${label_width}s : %.4f cores (Source: %s)\n", "Final Forecasted Value",
+                    ($s_data->{FinalForecast} // 0),
                     ($s_data->{FinalSource} // 'N/A');
+            }
+
+            # --- Print outlier warning if it exists ---
+            if (defined $s_data->{OutlierWarning} && $s_data->{OutlierWarning} ne '') {
+                print {$fh} "\n  --- Workload Volatility Alert ---\n";
+                print {$fh} "  " . $s_data->{OutlierWarning} . "\n";
             }
 
             print {$fh} "======================================================================\n\n";
         }
     }
+}
+
+# ==============================================================================
+# Calculate linear regression (slope, intercept, R-squared) manually
+# ==============================================================================
+sub calculate_manual_linear_regression
+{
+    my ($points_aref) = @_;
+    my $n = scalar @{$points_aref};
+
+    return undef if $n < 2;
+
+    my ($sum_x, $sum_y, $sum_xy, $sum_x_squared, $sum_y_squared) = (0, 0, 0, 0, 0);
+
+    foreach my $point (@{$points_aref})
+    {
+        my ($x_val, $y_val) = @{$point};
+        $sum_x += $x_val;
+        $sum_y += $y_val;
+        $sum_xy += $x_val * $y_val;
+        $sum_x_squared += $x_val**2;
+        $sum_y_squared += $y_val**2;
+    }
+
+    my $denominator_slope = ($n * $sum_x_squared) - ($sum_x**2);
+
+    if (abs($denominator_slope) > $FLOAT_EPSILON)
+    {
+        my $slope_calc = (($n * $sum_xy) - ($sum_x * $sum_y)) / $denominator_slope;
+        my $intercept_calc = ($sum_y - ($slope_calc * $sum_x)) / $n;
+        return {
+            slope     => $slope_calc,
+            intercept => $intercept_calc,
+            n_points  => $n,
+        };
+    }
+
+    # Cannot reliably determine a linear trend.
+    return undef;
 }
 
 # --- usage_wrapper ---
