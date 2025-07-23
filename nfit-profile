@@ -483,7 +483,7 @@ if (scalar @profiles == 0)
 # Define the order of columns for the CSV output
 @output_header_cols_csv = (
     "VM", "TIER", "Hint", "Pattern", "Pressure", "PressureDetail", "SMT",
-    "Serial", "SystemType", "Pool Name", "Pool ID", $PEAK_PROFILE_NAME
+    "Serial", "SystemType", "Pool Name", "Pool ID", "RunQ_Modifier", $PEAK_PROFILE_NAME
 );
 
 # Add profile names as column headers (these will contain the RunQ-modified PhysC values)
@@ -803,6 +803,7 @@ $common_nfit_flags_base .= $rounding_flags_for_nfit; # Add rounding to common fl
 
 # --- Main Logic: Run nfit Profiles ---
 my %results_table; # Stores PhysC values from nfit for each profile: $results_table{vm_name}{profile_name}
+my %runq_modifier_values;
 my %hint_tier_for_csv;
 my %hint_pattern_for_csv;
 my %hint_pressure_for_csv;
@@ -901,11 +902,23 @@ foreach my $system_serial (@target_systems_to_process)
         }
         print STDERR "Analysis Type: $analysis_type_desc\n";
 
+        my $report_type_for_log = 'standard'; # Default for non-seasonal runs
+        if (defined $apply_seasonality_event && $apply_seasonality_event ne '') {
+            $report_type_for_log = $apply_seasonality_event;
+        }
 
-        # Sanitise the serial number for use in a filename.
-        my $log_suffix = $system_identifier;
-        $log_suffix =~ s/[^a-zA-Z0-9_.-]//g;
-        $log_file_path_for_run = "/tmp/nfit-profile.$log_suffix.log";
+        # Generate a timestamp string e.g., "20250723-084500"
+        my $timestamp_str = localtime->strftime('%Y%m%d-%H%M%S');
+        # Get the current Process ID (PID) for uniqueness
+        my $pid = $$;
+
+        # Sanitise system identifiers for use in the filename.
+        my $log_suffix_system = $system_identifier;
+        $log_suffix_system =~ s/[^a-zA-Z0-9_.-]//g;
+        my $log_suffix_report = $report_type_for_log;
+        $log_suffix_report =~ s/[^a-zA-Z0-9_.-]//g;
+
+        $log_file_path_for_run = "/tmp/nfit-profile.$log_suffix_system.$log_suffix_report.$timestamp_str.$pid.log";
     }
     else
     {
@@ -1440,6 +1453,9 @@ foreach my $system_serial (@target_systems_to_process)
                 my $base_physc = $results_table{$vm_name}{$profile_name} // "N/A";
 
 				my ($adjusted_physc, $debug_info_ref, $final_val_for_csv);
+
+                # Store the final additive value for CSV reporting. Default to 0 if not present.
+                $runq_modifier_values{$vm_name}{$profile_name} = $debug_info_ref->{'FinalAdditive'} // 0;
 
 				my $event_config = defined($apply_seasonality_event) ? ($seasonality_config->{$apply_seasonality_event} // {}) : {};
 				my $model_type = $event_config->{model} // '';
@@ -3890,10 +3906,20 @@ sub parse_seasonality_config {
 }
 
 # ==============================================================================
-# Main function to calculate the multiplicative seasonal forecast.
+# SUBROUTINE: calculate_multiplicative_forecast
+# PURPOSE:    Calculates a forecast using the multiplicative seasonal model.
+#             This version is enhanced to use the 'unclippedPeakEstimate' from
+#             the snapshot cache if it exists, providing a more accurate
+#             seasonal multiplier based on corrected historical data.
+# DETAILS:
 # This function is a pure calculation engine. It takes a pre-calculated baseline
 # and applies the seasonal forecast logic to it. It returns the final results
 # to the main script for unified reporting and logging.
+# ARGS:
+#   (as per existing implementation)
+# RETURNS:
+#   - A hash reference containing the final forecasted results.
+#   - A hash reference containing historical data for verbose reporting.
 # ==============================================================================
 sub calculate_multiplicative_forecast {
     my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href) = @_;
@@ -4037,9 +4063,15 @@ sub calculate_multiplicative_forecast {
                 # array to hold residuals for the current profile.
                 my @residuals;
                 foreach my $hist_event (@event_history) {
-                    my $hist_peak = $hist_event->{results}{'HistoricPeak'}{$vm_name}{$p_name};
+                    my $hist_results = $hist_event->{results};
+
+                    # Preferentially use the unclipped peak estimate if available.
+                    my $hist_peak = $hist_results->{HistoricPeak}{$vm_name}{$p_name};
+                    if (exists $hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate}) {
+                        $hist_peak = $hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate};
+                    }
+
                     my $hist_base = $hist_event->{results}{'HistoricBaseline'}{$vm_name}{$p_name};
-                    # --- NEW: Read the PeakResidual from the snapshot.
                     my $hist_residual = $hist_event->{results}{'PeakResidual'}{$vm_name}{$p_name};
 
                     if (defined $hist_peak && defined $hist_base && $hist_base > 0.001) {
@@ -4502,7 +4534,12 @@ sub _get_warning_for_vm_forecast {
 }
 
 # ==============================================================================
-# Performs a historical analysis and update the snapshot cache.
+# SUBROUTINE: update_seasonal_snapshot
+# PURPOSE:    Performs a historical analysis for a given seasonal event,
+#             invokes nfit.pl with clipping detection enabled, and saves the
+#             enriched results (including Peak, Baseline, Residual, and
+#             ClippingInfo) to the persistent snapshot cache.
+# DETAILS:
 # - Efficiently finds and processes ALL historical events found
 #   within the data cache in a single pass.
 # - It is model-aware. It can discover all historical occurrences
@@ -4513,6 +4550,13 @@ sub _get_warning_for_vm_forecast {
 #   event models and orchestrates calls to nfit for each required period.
 # - Explicitly disables growth prediction during historical analysis,
 #   ensuring snapshots reflect actual past performance.
+# ARGS:
+#   1. $system_cache_dir (string): Path to the target cache directory.
+#   2. $system_identifier (string): The canonical name of the system.
+#   3. $event_name (string): The name of the event being snapshotted.
+#   4. $event_config (hash ref): The configuration for the event.
+# RETURNS:
+#   - None. Writes directly to the snapshot cache file.
 # ==============================================================================
 sub update_seasonal_snapshot {
     my ($system_cache_dir, $system_identifier, $event_name, $event_config) = @_;
@@ -4660,6 +4704,7 @@ sub update_seasonal_snapshot {
 
         my %period_results;
         my %residual_results;
+        my %clipping_info_results;
         my %extreme_peak_values_by_vm; # Holds pre-calculated peak values for efficiency.
 
         # --- Pre-calculation Step for Configurable Extreme Peaks (Optimisation) ---
@@ -4708,7 +4753,7 @@ sub update_seasonal_snapshot {
             my $profile_name = $profile->{name};
             print STDERR "    - Running profile: $profile_name\n";
 
-            my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir);
+            my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir, 1);
             my $nfit_output = `$nfit_cmd`;
             if ($? != 0) {
                 warn "Warning: nfit.pl failed for profile '$profile_name' during snapshot analysis for period $start_str to $end_str. Skipping.\n";
@@ -4722,9 +4767,13 @@ sub update_seasonal_snapshot {
                 my @states = @{$parsed_results->{$vm_name}};
                 next unless @states;
 
+                # For snapshots, we use the final (or only) state's results.
+                my $final_state_data = $states[-1];
+
                 my @p_values;
                 my @peak_values;
                 foreach my $state (@states) {
+                    # The existing parse_nfit_key_value_output is generic and will have already parsed the new clipping keys into the $state hash.
                     push @p_values, $state->{$p_metric_key} if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key}));
                     if ($is_peak_period_job && !%extreme_peak_values_by_vm) {
                         push @peak_values, $state->{'Peak'} if (defined $state->{'Peak'} && looks_like_number($state->{'Peak'}));
@@ -4736,6 +4785,24 @@ sub update_seasonal_snapshot {
                     $period_results{$vm_name}{$profile_name} = $aggregated_p_value;
 
                     if ($is_peak_period_job) {
+                        # --- Clipping Data Capture ---
+                        # This logic only applies to the PEAK period job.
+                        # It checks for the new clipping metrics from the nfit.pl output.
+                        if (exists $final_state_data->{IsClipped}) {
+                            my $unmet_demand = $final_state_data->{UnmetDemand} // 0;
+                            $clipping_info_results{$vm_name}{$profile_name} = {
+                                isClipped           => $final_state_data->{IsClipped},
+                                clippingConfidence  => $final_state_data->{ClipConfidence},
+                                capacityLimit       => $final_state_data->{MaxCPU}, # MaxCPU from nfit output
+                                unmetDemandEstimate => $unmet_demand,
+                                unclippedPeakEstimate => $aggregated_p_value + $unmet_demand,
+                                platformSpecificMarkers => {
+                                    aix_runq_saturation => $final_state_data->{RunQSatScore}
+                                }
+                            };
+                        }
+
+                        # --- Residual Calculation ---
                         my $extreme_peak_for_residual;
                         # Correctly declare and assign the comparison variable.
                         my $absolute_peak_for_comparison;
@@ -4782,6 +4849,7 @@ sub update_seasonal_snapshot {
         $results_by_snapshot{$snapshot_key}{$job_type} = \%period_results;
         if ($is_peak_period_job) {
             $results_by_snapshot{$snapshot_key}{'PeakResidual'} = \%residual_results;
+            $results_by_snapshot{$snapshot_key}{'ClippingInfo'} = \%clipping_info_results;
         }
     }
 
@@ -4897,6 +4965,11 @@ sub _write_standard_csv_report {
             }
         }
         push @data_row_csv, $serial_out, $systype_out, $poolname_out, $poolid_out;
+
+        # Add the RunQ modifier value. We will apply it to the G3-95W15 profile as a representative value.
+        my $modifier_val = $runq_modifier_values{$vm_name}{'G3-95W15'} // "0.000";
+        my $modifier_val_formatted = (looks_like_number($modifier_val)) ? sprintf("%.3f", $modifier_val) : $modifier_val;
+        push @data_row_csv, $modifier_val_formatted;
 
         # --- Apply consistent 3-decimal-place formatting to all numeric results ---
         my $peak_val = $results_table{$vm_name}{$PEAK_PROFILE_NAME} // "";
@@ -5267,13 +5340,23 @@ sub determine_seasonal_analysis_path {
 }
 
 # ==============================================================================
-# Helper subroutine to construct the specific nfit command for calculating
-# a baseline for a seasonal model. It ensures a consistent command is built
-# and that any conflicting decay or growth flags from the profile are removed.
-# A baseline must be a pure measurement, not a forecast.
+# SUBROUTINE: _build_nfit_baseline_command
+# PURPOSE:    Constructs the specific nfit command for calculating a baseline
+#             for a seasonal model. It ensures a consistent command is built
+#             and that any conflicting decay or growth flags from the profile
+#             are removed. A baseline must be a pure measurement.
+# ARGS:
+#   1. $profile_flags_in (string): The raw flags from the profile config.
+#   2. $baseline_start_str (string): The start date for the analysis.
+#   3. $baseline_end_str (string): The end date for the analysis.
+#   4. $system_cache_dir (string): Path to the target cache directory.
+#   5. $enable_clipping_detection (boolean, optional): If true, adds the
+#      --enable-clipping-detection flag to the command.
+# RETURNS:
+#   - The fully constructed nfit.pl command string.
 # ==============================================================================
 sub _build_nfit_baseline_command {
-    my ($profile_flags_in, $baseline_start_str, $baseline_end_str, $system_cache_dir) = @_;
+    my ($profile_flags_in, $baseline_start_str, $baseline_end_str, $system_cache_dir, $enable_clipping_detection) = @_;
 
     my $profile_flags = $profile_flags_in; # Work on a copy.
 
@@ -5304,6 +5387,11 @@ sub _build_nfit_baseline_command {
 
     # Assemble the final, correct command.
     my $command = "$nfit_script_path $base_flags $vm_filter_arg $smt_flag $profile_flags";
+
+    # Add clipping detection if requested
+    if ($enable_clipping_detection) {
+        $command .= " --enable-clipping-detection";
+    }
 
     return $command;
 }
@@ -5503,8 +5591,19 @@ sub _get_true_baseline_results {
 }
 
 # ==============================================================================
-# Helper to read the snapshot cache and return historical data series.
-# This version loads both PeakValue and the new PeakResidual.
+# SUBROUTINE: _get_historical_peak_data
+# PURPOSE:    Reads the snapshot cache for a given event and returns time series
+#             data for historical peaks and residuals. This version is enhanced
+#             to use the 'unclippedPeakEstimate' from the ClippingInfo block
+#             if it exists, ensuring the returned data is corrected for
+#             historical saturation.
+# ARGS:
+#   1. $system_cache_dir (string): Path to the target cache directory.
+#   2. $event_name (string): The name of the event to retrieve data for.
+#   3. $event_config (hash ref): The configuration for the event.
+# RETURNS:
+#   - A hash reference containing two keys, 'peaks' and 'residuals', each
+#     pointing to a hash of historical data series, structured by profile and VM.
 # ==============================================================================
 sub _get_historical_peak_data {
     my ($system_cache_dir, $event_name, $event_config) = @_;
@@ -5532,6 +5631,7 @@ sub _get_historical_peak_data {
 
     foreach my $event (@event_history) {
         my $date = $event->{periodEndDate};
+        my $hist_results = $event->{results};
         my $peak_results = $event->{results}{'PeakValue'} || {};
         my $residual_results = $event->{results}{'PeakResidual'} || {};
 
@@ -5539,6 +5639,9 @@ sub _get_historical_peak_data {
         foreach my $vm (keys %$peak_results) {
             foreach my $profile (keys %{$peak_results->{$vm}}) {
                 my $value = $peak_results->{$vm}{$profile};
+                if (exists $hist_results->{ClippingInfo}{$vm}{$profile}{unclippedPeakEstimate}) {
+                    $value = $hist_results->{ClippingInfo}{$vm}{$profile}{unclippedPeakEstimate};
+                }
                 if (defined $value && looks_like_number($value)) {
                     push @{$peaks_by_profile{$profile}{$vm}}, { value => $value, date => $date };
                 }

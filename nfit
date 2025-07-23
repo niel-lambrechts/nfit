@@ -80,6 +80,12 @@ my $GROWTH_MAX_CV_THRESHOLD             = 0.50; # Max Coefficient of Variation (
 my $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD = 0.01; # Min slope (units/period) to consider as actual growth for inflation
 my $GROWTH_MAX_PROJECTION_HISTORY_RATIO = 2.0;  # Max ratio of projection duration to history duration used for trend
 
+# --- Clipping Detection Configuration ---
+my $CLIPPING_DEFINITE_THRESHOLD = 0.95; # P99.75 > 95% of max_capacity = definite clip
+my $CLIPPING_POTENTIAL_THRESHOLD = 0.90; # P99.75 > 90% of max_capacity = potential clip
+my $PCR_LOW_CONFIDENCE_THRESHOLD = 0.4;  # Peak Curvature Ratio below this adds confidence
+my $PCR_HIGH_CONFIDENCE_THRESHOLD = 0.2; # Peak Curvature Ratio below this adds high confidence
+
 # --- Argument Parsing ---
 my $physc_csv_file;
 my $physc_csv_dirname;
@@ -129,6 +135,7 @@ my $show_states_flag = 0;
 my $include_states_selector = 'all'; # Default value
 my $mgsys_filter;
 my $reset_cache = 0;
+my $enable_clipping_detection = 0;
 
 GetOptions(
     'physc-data|pc=s'     => \$physc_csv_file,
@@ -171,6 +178,8 @@ GetOptions(
     'show-states'               => \$show_states_flag,
     'include-states=s'          => \$include_states_selector,
     'reset-cache'               => \$reset_cache,
+    # Clipping
+    'enable-clipping-detection' => \$enable_clipping_detection,
     # General Options
     'help|h'              => \$help,
     'verbose|v'           => \$verbose,
@@ -1006,6 +1015,27 @@ $data_source_file = $data_cache_file;
             $output_string .= sprintf(" PoolID=%s", $last_state_metadata->{pool_id} // '');
 
             $final_metrics{'StateCount'} = $vm_results_aggregator{$vm_name}{'state_count'} if exists $vm_results_aggregator{$vm_name}{'state_count'};
+
+            # Add the new clipping metrics if they exist in the final calculated metrics.
+            # This ensures they are only added if --enable-clipping-detection was used.
+            if (exists $final_metrics{'IsClipped'}) {
+                $output_string .= sprintf(" IsClipped=%d", $final_metrics{'IsClipped'});
+                # Remove the key so it's not printed again in the generic loop below.
+                delete $final_metrics{'IsClipped'};
+            }
+            if (exists $final_metrics{'ClipConfidence'}) {
+                $output_string .= sprintf(" ClipConfidence=%.2f", $final_metrics{'ClipConfidence'});
+                delete $final_metrics{'ClipConfidence'};
+            }
+            if (exists $final_metrics{'UnmetDemand'}) {
+                $output_string .= sprintf(" UnmetDemand=%.4f", $final_metrics{'UnmetDemand'});
+                delete $final_metrics{'UnmetDemand'};
+            }
+            if (exists $final_metrics{'RunQSatScore'} && $final_metrics{'RunQSatScore'} ne 'N/A') {
+                $output_string .= sprintf(" RunQSatScore=%s", $final_metrics{'RunQSatScore'});
+                delete $final_metrics{'RunQSatScore'};
+            }
+
             my @keys_out = sort keys %final_metrics;
             foreach my $key (@keys_out)
             {
@@ -2373,19 +2403,19 @@ sub synthesize_hybrid_timeseries {
     return @timeseries_points;
 }
 
-# --- get_metrics_for_each_state ---
-# A modular subroutine for the non-windowed and hybrid analysis paths.
-# It takes a VM's buffered data and its known states, and returns an array
-# containing the calculated metrics for each state that had data.
-#
-# Args:
+# ==============================================================================
+# SUBROUTINE: get_metrics_for_each_state
+# PURPOSE:    A modular subroutine for the non-windowed and hybrid analysis paths.
+#             It takes a VM's buffered data and its known states, and returns
+#             an array containing the calculated metrics for each state,
+#             now including clipping detection metrics if enabled.
+# ARGS:
 #   1. $vm_buffer_aref (array ref): A buffer of all data points for a single VM.
 #   2. $vm_name (string): The name of the VM being processed.
 #   3. $states_for_vm_aref (array ref): The array of state objects for this VM.
-#
-# Returns:
+# RETURNS:
 #   - An array of hashes, where each hash is { metrics => \%metrics, state_obj => $state }
-#
+# ==============================================================================
 sub get_metrics_for_each_state
 {
     my ($vm_buffer_aref, $vm_name, $states_for_vm_aref) = @_;
@@ -2454,12 +2484,15 @@ sub get_metrics_for_each_state
 
         next unless @filtered_data_for_state;
 
-        # Calculate metrics using the filtered data and the existing, robust subroutine
         # --- Start of: single-pass data processing ---
         my @physc_avgs;
         my ($physc_sma_q, $physc_ema_s) = ([], undef);
         my $peak_physc = 0;
         my (@norm_runq_raw, @abs_runq_raw);
+
+        # NEW: Buffers for raw data for clipping detection
+        my (@raw_physc_for_clipping, @raw_runq_for_clipping);
+
         my $smt_for_period = $state_obj->{metadata}{smt} // $DEFAULT_SMT;
 
         # This single loop calculates rolling averages, finds the peak, and populates RunQ arrays.
@@ -2470,6 +2503,10 @@ sub get_metrics_for_each_state
 
             # Find Peak PhysC
             $peak_physc = $dp->{physc} if (defined $dp->{physc} && $dp->{physc} > $peak_physc);
+
+            # NEW: Buffer raw values for the clipping detection engine
+            push @raw_physc_for_clipping, $dp->{physc} if (defined $dp->{physc});
+            push @raw_runq_for_clipping, $dp->{runq} if (defined $dp->{runq});
 
             # Populate RunQ arrays if applicable
             if (defined $dp->{runq} && defined $dp->{physc} && $dp->{physc} >= $ACTIVE_PHYSC_THRESHOLD) {
@@ -2488,13 +2525,33 @@ sub get_metrics_for_each_state
             \@norm_runq_raw,
             \@abs_runq_raw
         );
-        # --- End: Single-pass data processing ---
+
+        # --- NEW: Clipping Detection Integration ---
+        # If the feature is enabled, call the new detection engine.
+        if ($enable_clipping_detection) {
+            my $max_cap = $state_obj->{metadata}{max_capacity};
+            my $clipping_results_href = _calculate_clipping_metrics(
+                \@raw_physc_for_clipping,
+                \@raw_runq_for_clipping,
+                $max_cap,
+                $smt_for_period
+            );
+
+            # Merge the clipping results into the main metrics hash.
+            # Use clear, simple keys for the final output string.
+            $metrics->{IsClipped}       = $clipping_results_href->{isClipped};
+            $metrics->{ClipConfidence}  = $clipping_results_href->{clippingConfidence};
+            $metrics->{UnmetDemand}     = $clipping_results_href->{unmetDemandEstimate};
+            $metrics->{RunQSatScore}    = $clipping_results_href->{platformMarkers}{aix_runq_saturation} // 'N/A';
+        }
+        # --- End of Clipping Integration ---
 
         push @state_results, { metrics => $metrics, state_obj => $state_obj };
     }
 
     return @state_results;
 }
+
 
 # --- calculate_growth_prediction ---
 # Performs trend analysis on a time series of metric values and calculates
@@ -2584,6 +2641,125 @@ sub calculate_growth_prediction
 
     return ($growth_adj_value, $growth_adj_abs_value);
 }
+
+# ==============================================================================
+# SUBROUTINE: _calculate_clipping_metrics
+# PURPOSE:    Implements the Multi-Stage Confidence Pipeline to detect CPU
+#             clipping and estimate latent demand from a buffer of raw
+#             performance data.
+# ARGS:
+#   1. $raw_physc_aref (array ref): A buffer of raw, high-frequency PhysC values.
+#   2. $raw_runq_aref (array ref): A buffer of raw, high-frequency RunQ values.
+#   3. $max_capacity (numeric): The authoritative max_capacity for the state.
+#   4. $smt (numeric): The SMT value for the state, for RunQ context.
+# RETURNS:
+#   - A hash reference containing the clipping analysis results:
+#     {
+#       isClipped => 0|1,
+#       clippingConfidence => 0.0-1.0,
+#       clippingSeverity => 'none'|'low'|'moderate'|'high',
+#       unmetDemandEstimate => 0.0,
+#       platformMarkers => { aix_runq_saturation => 0.0-1.0 }
+#     }
+# ==============================================================================
+sub _calculate_clipping_metrics
+{
+    my ($raw_physc_aref, $raw_runq_aref, $max_capacity, $smt) = @_;
+
+    my %results = (
+        isClipped           => 0,
+        clippingConfidence  => 0.0,
+        clippingSeverity    => 'none',
+        unmetDemandEstimate => 0.0,
+        platformMarkers     => {},
+    );
+
+    # The pipeline requires a valid capacity limit and sufficient data points.
+    return \%results unless (defined $max_capacity && $max_capacity > 0.1 && @$raw_physc_aref > 10);
+
+    # --- Stage I & II: Raw Detection & Shape Analysis ---
+    # To perform the analysis, we need several key percentiles from the raw data.
+    # We calculate them once here for efficiency.
+    my @sorted_physc = sort { $a <=> $b } @$raw_physc_aref;
+    my $p99_9 = calculate_percentile(\@sorted_physc, 99.9);
+    my $p95   = calculate_percentile(\@sorted_physc, 95);
+    my $p90   = calculate_percentile(\@sorted_physc, 90);
+    my $p50   = calculate_percentile(\@sorted_physc, 50);
+
+    return \%results unless (defined $p99_9 && defined $p95 && defined $p50);
+
+    my $saturation_level = $p99_9 / $max_capacity;
+
+    # Calculate Peak Curvature Ratio (PCR)
+    my $pcr_numerator   = $p99_9 - $p95;
+    my $pcr_denominator = $p95 - $p50;
+    my $pcr = ($pcr_denominator > $FLOAT_EPSILON) ? ($pcr_numerator / $pcr_denominator) : 999;
+
+    # --- Stage III: Platform Validation (AIX RunQ) ---
+    my $runq_saturation_score = 0.0;
+    if (@$raw_runq_aref) {
+        my @sorted_runq = sort { $a <=> $b } @$raw_runq_aref;
+        my $runq_p95 = calculate_percentile(\@sorted_runq, 95);
+
+        # A simple model for RunQ saturation: the ratio of P95 RunQ to the number
+        # of logical CPUs (SMT). A score > 1.0 indicates queuing.
+        if (defined $runq_p95 && defined $smt && $smt > 0) {
+            $runq_saturation_score = $runq_p95 / $smt;
+            $results{platformMarkers}{aix_runq_saturation} = sprintf("%.2f", $runq_saturation_score);
+        }
+    }
+
+    # --- Stage IV: Final Clipping Confidence Score ---
+    my $confidence = 0.0;
+
+    # Base confidence from saturation level
+    if ($saturation_level >= $CLIPPING_DEFINITE_THRESHOLD) {
+        $confidence += 0.6; # High base confidence for definite saturation
+    } elsif ($saturation_level >= $CLIPPING_POTENTIAL_THRESHOLD) {
+        $confidence += 0.3; # Moderate base confidence for potential saturation
+    }
+
+    # Add confidence from shape analysis (low PCR)
+    if ($pcr < $PCR_HIGH_CONFIDENCE_THRESHOLD) {
+        $confidence += 0.35; # High confidence for very flat peaks
+    } elsif ($pcr < $PCR_LOW_CONFIDENCE_THRESHOLD) {
+        $confidence += 0.15; # Moderate confidence for somewhat flat peaks
+    }
+
+    # Boost confidence if platform markers confirm pressure
+    if ($runq_saturation_score > 1.5) {
+        $confidence += 0.2; # Significant boost for high RunQ
+    }
+
+    # Cap confidence at 1.0
+    $results{clippingConfidence} = min(1.0, $confidence);
+
+    # --- Latent Demand Estimation ---
+    if ($results{clippingConfidence} > 0.65) {
+        $results{isClipped} = 1;
+
+        # Estimate unmet demand as a function of confidence and saturation severity.
+        # This is a simple model: the more confident we are, and the closer to the
+        # ceiling the workload is, the higher the estimated latent demand.
+        my $severity_factor = ($saturation_level - $CLIPPING_POTENTIAL_THRESHOLD) * 10; # Normalise 0.9-1.0 range
+        $severity_factor = max(0, min(1.0, $severity_factor));
+
+        # The unmet demand is a fraction of the P90 value, scaled by our confidence and severity.
+        $results{unmetDemandEstimate} = $p90 * $results{clippingConfidence} * $severity_factor * 0.25; # 0.25 is a tuning factor
+
+        # Determine severity string for reporting
+        if ($results{clippingConfidence} > 0.9) {
+            $results{clippingSeverity} = 'high';
+        } elsif ($results{clippingConfidence} > 0.75) {
+            $results{clippingSeverity} = 'moderate';
+        } else {
+            $results{clippingSeverity} = 'low';
+        }
+    }
+
+    return \%results;
+}
+
 
 # --- usage ---
 # Generates and returns the usage/help message for the script.

@@ -504,34 +504,126 @@ sub create_sorted_performance_cache
     if ($? != 0) { die "Error: External sort command failed with exit status " . ($? >> 8) . ". Cache may be incomplete.\n"; }
 }
 
+# ==============================================================================
+# SUBROUTINE: create_state_cache
+# PURPOSE:    Analyses all collected configuration events, identifies distinct
+#             configuration states over time for each VM, enriches them with
+#             calculated metrics like max_capacity, and writes the final
+#             data structure to a canonical JSON cache file.
+# ARGS:
+#   1. $config_events_href (hash ref): A hash where keys are VM names and
+#      values are array refs of event hashes ({ts, key, value}).
+#   2. $output_file (string): The full path to the output JSON cache file.
+# RETURNS:
+#   - None. Dies on file writing error.
+# ==============================================================================
 sub create_state_cache
 {
     my ($config_events_href, $output_file) = @_;
+
+    # This hash will store the final array of state objects for each VM.
     my %all_vm_states;
+
+    # Process each VM that was discovered during the NMON parsing phase.
     foreach my $vm_name (sort keys %$config_events_href)
     {
+        # --- Step 1: Collate all configuration change events by timestamp ---
+        # This creates a timeline, grouping all changes that occurred at the
+        # exact same second.
         my %events_by_ts;
-        foreach my $event (@{$config_events_href->{$vm_name}}) { $events_by_ts{$event->{ts}}{$event->{key}} = $event->{value}; }
-        my @sorted_timestamps = sort {$a <=> $b} keys %events_by_ts; next unless @sorted_timestamps;
-        my (%last_known_metadata, $last_fingerprint, $current_state_start_epoch);
+        foreach my $event (@{$config_events_href->{$vm_name}})
+        {
+            $events_by_ts{$event->{ts}}{$event->{key}} = $event->{value};
+        }
+
+        my @sorted_timestamps = sort {$a <=> $b} keys %events_by_ts;
+        next unless @sorted_timestamps; # Skip VMs with no configuration events.
+
+        # --- Step 2: Walk the timeline to identify distinct states ---
+        # A "state" is a period of time where the VM's configuration is stable.
+        # A new state begins whenever a key configuration attribute changes.
+        my %last_known_metadata;
+        my $last_fingerprint;
+        my $current_state_start_epoch;
+
         for (my $i = 0; $i < @sorted_timestamps; $i++)
         {
-            my $ts = $sorted_timestamps[$i]; my %metadata_before_change = %last_known_metadata;
+            my $ts = $sorted_timestamps[$i];
+
+            # Preserve the metadata from *before* the current event for the closing state.
+            my %metadata_before_change = %last_known_metadata;
+
+            # Apply the changes from the current timestamp to create the new metadata snapshot.
             my %snapshot_metadata = %last_known_metadata;
-            foreach my $key (keys %{$events_by_ts{$ts}}) { $snapshot_metadata{$key} = $events_by_ts{$ts}{$key}; }
-            my $current_fingerprint = join "|", map { $snapshot_metadata{$_} // 'U' } sort qw(entitlement smt virtual_cpus pool_cpu capped proc_type proc_version proc_clock serial_number pool_id);
-            if ($i == 0) { $last_fingerprint = $current_fingerprint; $current_state_start_epoch = $ts; }
-            elsif ($current_fingerprint ne $last_fingerprint) { push @{$all_vm_states{$vm_name}}, { start_epoch => $current_state_start_epoch, end_epoch => $ts - 1, metadata => { %metadata_before_change } }; $current_state_start_epoch = $ts; $last_fingerprint = $current_fingerprint; }
+            foreach my $key (keys %{$events_by_ts{$ts}})
+            {
+                $snapshot_metadata{$key} = $events_by_ts{$ts}{$key};
+            }
+
+            # Create a "fingerprint" of the configuration. A change in this
+            # fingerprint signifies a new state.
+            my $current_fingerprint = join "|", map { $snapshot_metadata{$_} // 'U' }
+                sort qw(entitlement smt virtual_cpus pool_cpu capped
+                        proc_type proc_version proc_clock serial_number pool_id);
+
+            if ($i == 0)
+            {
+                # For the very first event, establish the initial state.
+                $last_fingerprint = $current_fingerprint;
+                $current_state_start_epoch = $ts;
+            }
+            elsif ($current_fingerprint ne $last_fingerprint)
+            {
+                # If the fingerprint has changed, the previous state has ended.
+                # Save the completed state.
+                push @{$all_vm_states{$vm_name}}, {
+                    start_epoch => $current_state_start_epoch,
+                    end_epoch   => $ts - 1, # The state ends one second before the change.
+                    metadata    => { %metadata_before_change }
+                };
+
+                # The new state starts at the current timestamp.
+                $current_state_start_epoch = $ts;
+                $last_fingerprint = $current_fingerprint;
+            }
+
             %last_known_metadata = %snapshot_metadata;
         }
+
+        # After the loop, save the final, currently active state.
         my $final_end_epoch = (sort {$b <=> $a} @sorted_timestamps)[0];
-        if (defined $current_state_start_epoch) { push @{$all_vm_states{$vm_name}}, { start_epoch => $current_state_start_epoch, end_epoch => $final_end_epoch, metadata => \%last_known_metadata }; }
+        if (defined $current_state_start_epoch)
+        {
+            push @{$all_vm_states{$vm_name}}, {
+                start_epoch => $current_state_start_epoch,
+                end_epoch   => $final_end_epoch,
+                metadata    => \%last_known_metadata
+            };
+        }
     }
-    my $json = JSON->new->pretty->canonical; my $json_text = $json->encode(\%all_vm_states);
-    open my $fh, '>:encoding(utf8)', $output_file or die "Error: Could not write to state cache '$output_file': $!";
+
+    # --- Step 3: Enrich all generated states with calculated metrics ---
+    # This is the integration point for our new clipping detection logic.
+    foreach my $vm_name (keys %all_vm_states)
+    {
+        foreach my $state_obj (@{$all_vm_states{$vm_name}})
+        {
+            # Calculate and add the max_capacity to the metadata hash for this state.
+            my $metadata = $state_obj->{metadata};
+            $metadata->{max_capacity} = _calculate_max_capacity($metadata);
+        }
+    }
+
+    # --- Step 4: Serialize the final data structure to a pretty-printed JSON file ---
+    my $json = JSON->new->pretty->canonical;
+    my $json_text = $json->encode(\%all_vm_states);
+
+    open my $fh, '>:encoding(utf8)', $output_file
+        or die "Error: Could not write to state cache '$output_file': $!";
     print $fh $json_text;
     close $fh;
 }
+
 
 sub process_csv_source
 {
@@ -596,6 +688,42 @@ sub create_static_state_cache
     open my $fh, '>:encoding(utf8)', $output_file or die "Error writing state cache '$output_file': $!";
     print $fh $json_text;
     close $fh;
+}
+
+# ==============================================================================
+# SUBROUTINE: _calculate_max_capacity
+# PURPOSE: Calculates the maximum potential CPU for an LPAR based on its
+#          configuration state (capped status, virtual CPUs, and pool size).
+# ARGS:
+#   1. A hash reference containing the LPAR's metadata.
+# RETURNS:
+#   - The calculated max_capacity value (numeric).
+# ==============================================================================
+sub _calculate_max_capacity
+{
+    my ($metadata_href) = @_;
+
+    my $is_capped = $metadata_href->{capped} // 0;
+    my $entitlement = $metadata_href->{entitlement} // 0;
+    my $virtual_cpus = $metadata_href->{virtual_cpus} // 0;
+    my $pool_cpu = $metadata_href->{pool_cpu} // 0;
+
+    # For a capped LPAR, the maximum is strictly its entitlement.
+    if ($is_capped)
+    {
+        return $entitlement;
+    }
+
+    # For an uncapped LPAR, the maximum is the lesser of its virtual CPUs
+    # or the total physical CPUs in its shared pool (if the pool size is known).
+    # If pool_cpu is zero or undefined, the effective limit is its virtual CPUs.
+    if ($pool_cpu > 0 && $virtual_cpus > 0)
+    {
+        return min($virtual_cpus, $pool_cpu);
+    }
+
+    # Fallback for uncapped LPARs where pool size is not available.
+    return $virtual_cpus;
 }
 
 sub usage
