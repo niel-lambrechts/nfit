@@ -61,6 +61,14 @@ my $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD = 2.0; # NormRunQ P90 above thi
 my $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD = 1.8;       # AbsRunQ P90 / (MaxCPU * SMT) above this indicates RunQ pressure
 my $RUNQ_ADDITIVE_TOLERANCE_FACTOR = 1.8;               # Tolerate AbsRunQ up to this Factor x Base_Profile_PhysC's LCPU capacity
 
+# Internal constants for growth heuristics (not user-configurable initially)
+my $GROWTH_MIN_HISTORICAL_PERIODS       = 5;    # Min number of windowed periods to attempt trend
+my $GROWTH_MAX_CV_THRESHOLD             = 0.50; # Max Coefficient of Variation (StdDev/Mean); if > this, data too volatile
+my $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD = 0.01; # Min slope (units/period) to consider as actual growth for inflation
+my $GROWTH_MAX_PROJECTION_HISTORY_RATIO = 2.0;  # Max ratio of projection duration to history duration used for trend
+my $DEFAULT_GROWTH_PROJECTION_DAYS         = 90;
+my $DEFAULT_MAX_GROWTH_INFLATION_PERCENT   = 25;
+
 # Max_Additive_CPU Sliding Scale Thresholds (caps additive CPU based on current entitlement)
 my $MAX_ADD_ENT_THRESH1 = 1.0; my $MAX_ADD_ABS_VAL1 = 1.0;    # If Ent < 1.0, max add = 1.0 core
 my $MAX_ADD_ENT_THRESH2 = 2.0; my $MAX_ADD_PERC_VAL2 = 1.0;   # If Ent < 2.0, max add = 100% of Ent
@@ -1110,7 +1118,7 @@ foreach my $system_serial (@target_systems_to_process)
         if ($is_multiplicative_forecast_run) {
             # For a multiplicative run, this main profile loop's only purpose is to
             # gather the absolute Peak value. The other profile results will be
-            # recalculated later for the baseline. To prevent warnings from nfit.pl,
+            # recalculated later for the baseline. To prevent warnings from nfit,
             # we disable growth prediction for this initial data-gathering run.
             if ($profile_specific_flags_for_nfit_run =~ /--enable-growth-prediction/) {
                 print STDERR "  - INFO: Disabling growth prediction for initial Peak gathering run.\n" if ($verbose);
@@ -1120,7 +1128,7 @@ foreach my $system_serial (@target_systems_to_process)
         elsif ($nfit_decay_over_states) {
             # The --decay-over-states model is incompatible with the standard --decay
             # and --runq-decay flags, which control intra-window EMA smoothing.
-            # To prevent nfit.pl from receiving conflicting instructions, we strip them here.
+            # To prevent nfit from receiving conflicting instructions, we strip them here.
             # The --enable-growth-prediction flag is compatible and is intentionally left in place.
             if ($profile_specific_flags_for_nfit_run =~ /--decay\s/ || $profile_specific_flags_for_nfit_run =~ /--runq-decay\s/) {
                 print STDERR "  - INFO: Overriding profile's --decay/--runq-decay flags for seasonal recency_decay model.\n" if ($verbose);
@@ -1246,7 +1254,7 @@ foreach my $system_serial (@target_systems_to_process)
             warn "Warning: '$nfit_script_path' cmd failed for profile '$profile_name' (exit $exit_status). Command was: $command. Output: $raw_nfit_output. Skip.\n";
             if ($LOG_FH)
             {
-                print {$LOG_FH} "ERROR: nfit.pl execution FAILED for profile '$profile_name' on VM(s) '". ($target_vm_name // "All") ."'.\n";
+                print {$LOG_FH} "ERROR: nfit execution FAILED for profile '$profile_name' on VM(s) '". ($target_vm_name // "All") ."'.\n";
                 print {$LOG_FH} "  Command: $command\n";
                 print {$LOG_FH} "  Exit Status: $exit_status\n";
                 my $short_output = substr($raw_nfit_output, 0, 1000) . (length($raw_nfit_output) > 1000 ? "..." : ""); # Log first 1KB of output
@@ -1314,10 +1322,11 @@ foreach my $system_serial (@target_systems_to_process)
                 $per_profile_runq_metrics{$vm_name}{$profile_name} = $most_recent_state;
             }
 
-            # The value in the results table is overwritten with each profile, but the one
-            # from the final profile (or whichever is last) is sufficient, as the Peak for
-            # a given period is constant across all profiles.
-            if (defined $most_recent_state->{'Peak'}) {
+            # --- Peak Value Capture ---
+            # CRITICAL: Only capture the Peak value from the mandatory, unfiltered P-99W1
+            # profile run. This prevents it from being overwritten by subsequent,
+            # time-filtered profiles (e.g., -online, -batch), or influence by a user defined profile.
+            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT && defined $most_recent_state->{'Peak'}) {
                 $results_table{$vm_name}{$PEAK_PROFILE_NAME} = $most_recent_state->{'Peak'};
             }
         }
@@ -2230,7 +2239,45 @@ sub log_profile_rationale
         }
     }
 
-    printf {$fh} "Initial Base PhysC for Profile              : %s cores (Aggregated/Direct value from nfit states)\n", ($base_physc_for_profile // $na);
+    my $nfit_growth_adj_to_display = "0.0000";
+    my $first_nfit_state = (ref($raw_nfit_states_aref) eq 'ARRAY' && @$raw_nfit_states_aref) ? $raw_nfit_states_aref->[0] : {};
+    if (defined $first_nfit_state->{GrowthAdj} && looks_like_number($first_nfit_state->{GrowthAdj})) {
+        $nfit_growth_adj_to_display = sprintf("%.4f", $first_nfit_state->{GrowthAdj});
+    }
+
+    printf {$fh} "Initial Base PhysC for Profile              : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
+
+    # Check if any GrowthDebug keys exist to print the rationale block
+    if (exists $first_nfit_state->{'GrowthDebug_num_hist_periods'}) {
+        my $gd = { map { $_ =~ /^GrowthDebug_(.*)$/ ? ($1 => $first_nfit_state->{$_}) : () } keys %$first_nfit_state };
+
+        # Helper for consistent boolean/skipped formatting
+        my $format_check_result = sub {
+            my $val = shift;
+            return "Skipped" if (!defined $val || $val eq 'Skipped');
+            return $val ? "Passed" : "Failed";
+        };
+
+        print {$fh} "  - nfit GrowthAdj Applied : +$nfit_growth_adj_to_display cores\n";
+        print {$fh} "  - Rationale for GrowthAdj (from nfit):\n";
+        printf {$fh} "    1. Data Eligibility : %s historical periods found (Min: %d).\n", $gd->{num_hist_periods}, $GROWTH_MIN_HISTORICAL_PERIODS; # Note: You may need to pass this constant or hardcode it
+        printf {$fh} "    2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", $gd->{stats_cv}, $GROWTH_MAX_CV_THRESHOLD, ($gd->{cv_check_passed} ? "Passed" : "Failed");
+        printf {$fh} "    3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.2f. [Result: %s]\n", $gd->{slope}, $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed});
+
+        # Use string comparison 'eq' for the check, as the value can be "Skipped", 0, or 1.
+        if (defined $gd->{slope_check_passed} && $gd->{slope_check_passed} eq '1') {
+            # Safely format projected value, printing "N/A" as a string if it's not numeric.
+            my $proj_val_str = looks_like_number($gd->{projected_val}) ? sprintf("%.4f", $gd->{projected_val}) : "N/A";
+            printf {$fh} "        4. Projection       : Trend projected to %s cores over %d days.\n", $proj_val_str, $DEFAULT_GROWTH_PROJECTION_DAYS;
+
+            # Safely format inflation percentage and handle the ternary operator for capping status.
+            my $inflation_str = looks_like_number($gd->{inflation_perc}) ? sprintf("%.2f", $gd->{inflation_perc}) : "N/A";
+            my $capping_msg = (defined $gd->{was_capped} && $gd->{was_capped} eq '1') ? "CAPPED" : "not capped";
+            printf {$fh} "        5. Inflation        : Calculated inflation is %s%%. This was %s to the max of %d%%.\n", $inflation_str, $capping_msg, $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
+        }
+        print {$fh} "\n";
+    }
+
     printf {$fh} "Final nfit-profile Recommendation           : %s cores (Unrounded: %s)\n", ($final_csv_value_for_profile // $na), $final_recommendation_unrounded_str;
     printf {$fh} "Net Adjustment by nfit-profile              : %s\n", $net_change_str;
     print {$fh} "======================================================================\n\n";
@@ -2463,19 +2510,38 @@ sub log_profile_rationale
     $final_recommendation_unrounded_str;    # This is unrounded from calc
     print  {$fh} "  Key Decision Path & Justification:\n";
 
-    # --- Correctly source nfit's GrowthAdj from the state data ---
-    my $nfit_growth_adj_to_display = "0.0000"; # Default value
-    if (ref($raw_nfit_states_aref) eq 'ARRAY' && @$raw_nfit_states_aref)
-    {
-        # If nfit did its own aggregation (i.e., --enable-windowed-decay was on),
-        # it returns one state/result line which contains the final GrowthAdj.
-        # We display that value. Otherwise, this is not applicable at the nfit level.
-        $nfit_growth_adj_to_display = $raw_nfit_states_aref->[0]->{GrowthAdj} // "0.0000";
+    # --- Source nfit's GrowthAdj and print detailed rationale if available ---
+    if (defined $first_nfit_state->{GrowthAdj} && looks_like_number($first_nfit_state->{GrowthAdj})) {
+        $nfit_growth_adj_to_display = sprintf("%.4f", $first_nfit_state->{GrowthAdj});
     }
 
-    printf {$fh} "    - Initial Base PhysC                    : %s cores (Aggregated from nfit states. Includes nfit's GrowthAdj: %s)\n",
-    ($base_physc_for_profile // $na),
-    $nfit_growth_adj_to_display;
+    printf {$fh} "    - Initial Base PhysC                    : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
+
+    if (exists $first_nfit_state->{'GrowthDebug_num_hist_periods'}) {
+        my $gd = { map { $_ =~ /^GrowthDebug_(.*)$/ ? ($1 => $first_nfit_state->{$_}) : () } keys %$first_nfit_state };
+
+        my $format_check_result = sub {
+            my $val = shift;
+            return "Skipped" if (!defined $val || $val eq 'Skipped');
+            return $val ? "Passed" : "Failed";
+        };
+
+        printf {$fh} "    - nfit GrowthAdj Applied                : +%s cores\n", $nfit_growth_adj_to_display;
+        printf {$fh} "    - Rationale for GrowthAdj (from nfit):\n";
+        # Use growth parameters reported by nfit if available, otherwise use this script's defaults.
+        my $proj_days = $first_nfit_state->{GrowthParam_projection_days} // $DEFAULT_GROWTH_PROJECTION_DAYS;
+        my $max_inf   = $first_nfit_state->{GrowthParam_max_inflation_perc} // $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
+
+        printf {$fh} "        1. Data Eligibility : %s historical periods found (Min: %d).\n", $gd->{num_hist_periods}, $GROWTH_MIN_HISTORICAL_PERIODS;
+        printf {$fh} "        2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", $gd->{stats_cv}, $GROWTH_MAX_CV_THRESHOLD, $format_check_result->($gd->{cv_check_passed});
+        printf {$fh} "        3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.2f. [Result: %s]\n", $gd->{slope}, $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed});
+
+        if (defined $gd->{slope_check_passed} && $gd->{slope_check_passed} ne 'N/A') {
+            printf {$fh} "        4. Projection       : Trend projected to %s cores over %d days.\n", $gd->{projected_val}, $proj_days;
+            my $capping_msg = ($gd->{was_capped} eq '1') ? "CAPPED" : "not capped";
+            printf {$fh} "        5. Inflation        : Calculated inflation is %s%%. This was %s to the max of %d%%.\n", $gd->{inflation_perc}, $capping_msg, $max_inf;
+        }
+    }
 
     my $downsizing_summary_reason_footer = $calc_debug_info_ref->{'DownsizingReason'} // "N/A";
 # Let us not abbreviate this, at least not for now.
@@ -2564,7 +2630,7 @@ sub parse_and_collate_percentiles
             else
             {
                 # If it's not a simple number, it might be an invalid value.
-                # nfit.pl will ultimately validate it. For now, include as is.
+                # nfit will ultimately validate it. For now, include as is.
                 # Alternatively, one could issue a warning here:
                 # warn "Warning: Non-standard percentile string '$p_str' found in list '$existing_perc_list_str'. Passing to nfit as is.\n";
                 $final_percs_map{$p_str} = 1;
@@ -2719,6 +2785,17 @@ sub load_profile_definitions
     {
         if (defined $p_ref->{flags} && $p_ref->{flags} ne '')
         {
+            # --- Mandate that the special P-99W1 profile is unfiltered ---
+            if ($p_ref->{name} eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                # Check for any time-filtering flags. The regex looks for the flags as distinct words.
+                if ($p_ref->{flags} =~ /\s-(?:online|batch|no-weekends)\b/) {
+                    die "ERROR: The mandatory profile '[$MANDATORY_PEAK_PROFILE_FOR_HINT]' in '$filepath' must not contain any time-filtering flags " .
+                        "(-online, -batch, -no-weekends).\n" .
+                        "       This profile is used to determine the true, unfiltered Peak value for the entire dataset.\n" .
+                        "       Please remove the time-filtering flag from this specific profile definition.\n";
+                }
+            }
+
             # runq_behavior is already defaulted or set during parsing
             push @valid_profiles, $p_ref;
         }
@@ -3624,7 +3701,7 @@ sub get_nfit_output_dp_from_flags
         # If -r or -u is present but no increment value, nfit uses its default increment.
         if (!(defined $increment_val_str && $increment_val_str ne ""))
         {
-            # nfit's default increment is $DEFAULT_ROUND_INCREMENT (from nfit.pl, assumed here to be same as nfit-profile's)
+            # nfit's default increment is $DEFAULT_ROUND_INCREMENT (from nfit, assumed here to be same as nfit-profile's)
             # For robustness, it's better if nfit-profile knows nfit's default or this is coordinated.
             # Using nfit-profile's default as a proxy.
             return get_decimal_places($DEFAULT_ROUND_INCREMENT);
@@ -3635,7 +3712,7 @@ sub get_nfit_output_dp_from_flags
         }
     }
     # If no -r or -u flag, nfit typically outputs with more precision (e.g., 4 decimal places by default internally).
-    # nfit.pl version 2.28.0.4 defaults to 4 DP if no rounding.
+    # nfit version 2.28.0.4 defaults to 4 DP if no rounding.
     return 4;
 }
 
@@ -4536,7 +4613,7 @@ sub _get_warning_for_vm_forecast {
 # ==============================================================================
 # SUBROUTINE: update_seasonal_snapshot
 # PURPOSE:    Performs a historical analysis for a given seasonal event,
-#             invokes nfit.pl with clipping detection enabled, and saves the
+#             invokes nfit with clipping detection enabled, and saves the
 #             enriched results (including Peak, Baseline, Residual, and
 #             ClippingInfo) to the persistent snapshot cache.
 # DETAILS:
@@ -4756,7 +4833,7 @@ sub update_seasonal_snapshot {
             my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir, 1);
             my $nfit_output = `$nfit_cmd`;
             if ($? != 0) {
-                warn "Warning: nfit.pl failed for profile '$profile_name' during snapshot analysis for period $start_str to $end_str. Skipping.\n";
+                warn "Warning: nfit failed for profile '$profile_name' during snapshot analysis for period $start_str to $end_str. Skipping.\n";
                 next;
             }
 
@@ -4787,7 +4864,7 @@ sub update_seasonal_snapshot {
                     if ($is_peak_period_job) {
                         # --- Clipping Data Capture ---
                         # This logic only applies to the PEAK period job.
-                        # It checks for the new clipping metrics from the nfit.pl output.
+                        # It checks for the new clipping metrics from the nfit output.
                         if (exists $final_state_data->{IsClipped}) {
                             my $unmet_demand = $final_state_data->{UnmetDemand} // 0;
                             $clipping_info_results{$vm_name}{$profile_name} = {
@@ -4916,10 +4993,14 @@ sub _write_standard_csv_report {
         my @new_cols = ("SeasonalMultiplier", "Baseline_PhysC");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
-
     } elsif ($is_recency_decay_run_flag) {
         # Add columns for the Recency-Decay model
-        my @new_cols = ("AnalysisRefDate", "GrowthAdj_Cores");
+        my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max");
+        splice @header_for_this_report, $ent_idx, 0, @new_cols;
+        $formula_col_offset = scalar(@new_cols);
+    } elsif ($nfit_decay_over_states) {
+        # Also add columns for the standard (non-seasonal) Hybrid State-Time Decay model
+        my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
     } elsif ($is_predictive_peak_run_flag) {
@@ -4998,21 +5079,25 @@ sub _write_standard_csv_report {
             }
             push @data_row_csv, $seasonal_multiplier_for_row, $baseline_physc_for_row;
 
-        } elsif ($is_recency_decay_run_flag) {
-            my $analysis_ref_date_for_row = $nfit_analysis_reference_date_str // "N/A";
-            my $growth_adj_for_row = "N/A";
-
-            # nfit's decay model returns a single aggregated result line containing the GrowthAdj.
-            my $raw_results_ref = $per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
-            if (ref($raw_results_ref) eq 'ARRAY' && @$raw_results_ref) {
-                my $result_line = $raw_results_ref->[0]; # The single aggregated result
-                if (defined $result_line->{GrowthAdj} && looks_like_number($result_line->{GrowthAdj})) {
-                    my $growth_val = $result_line->{GrowthAdj};
-                    # Only show positive growth for clarity; zero/negative is not an "uplift".
-                    $growth_adj_for_row = ($growth_val > 0.001) ? sprintf("%.3f", $growth_val) : "0.000";
+        } elsif ($is_recency_decay_run_flag || $nfit_decay_over_states) {
+            # --- Calculate Min/Max GrowthAdj across all profiles for this VM ---
+            my @growth_adjs;
+            foreach my $profile (@profiles) {
+                my $raw_results_ref = $per_profile_nfit_raw_results{$vm_name}{$profile->{name}};
+                if (ref($raw_results_ref) eq 'ARRAY' && @$raw_results_ref) {
+                    my $result_line = $raw_results_ref->[0];
+                    if (defined $result_line->{GrowthAdj} && looks_like_number($result_line->{GrowthAdj})) {
+                        my $growth_val = $result_line->{GrowthAdj};
+                        # Collect all positive growth adjustments
+                        push @growth_adjs, $growth_val if $growth_val > 0.001;
+                    }
                 }
             }
-            push @data_row_csv, $analysis_ref_date_for_row, $growth_adj_for_row;
+
+            my $min_adj_str = @growth_adjs ? sprintf("%.3f", min(@growth_adjs)) : "0.000";
+            my $max_adj_str = @growth_adjs ? sprintf("%.3f", max(@growth_adjs)) : "0.000";
+
+            push @data_row_csv, $min_adj_str, $max_adj_str;
         } elsif ($is_predictive_peak_run_flag) {
             # Retrieve the debug info for the specific VM being processed in the loop.
             my $s_data = $seasonal_debug_info{$vm_name}{'P-99W1'} || {};
@@ -5353,7 +5438,7 @@ sub determine_seasonal_analysis_path {
 #   5. $enable_clipping_detection (boolean, optional): If true, adds the
 #      --enable-clipping-detection flag to the command.
 # RETURNS:
-#   - The fully constructed nfit.pl command string.
+#   - The fully constructed nfit command string.
 # ==============================================================================
 sub _build_nfit_baseline_command {
     my ($profile_flags_in, $baseline_start_str, $baseline_end_str, $system_cache_dir, $enable_clipping_detection) = @_;

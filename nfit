@@ -983,12 +983,32 @@ $data_source_file = $data_cache_file;
                 }
 
                 # Call the reusable subroutine to get the growth adjustment values.
-                my ($growth_adj, $growth_adj_abs) = calculate_growth_prediction(\@timeseries_for_growth, $final_metrics{$p_label_main});
+                my $growth_result = calculate_growth_prediction(\@timeseries_for_growth, $final_metrics{$p_label_main});
+                my ($growth_adj, $growth_adj_abs, $growth_rationale_ref);
+
+                if (defined $growth_result && ref($growth_result) eq 'HASH') {
+                    $growth_adj     = $growth_result->{growth_adj};
+                    $growth_adj_abs = $growth_result->{growth_adj_abs};
+                    $growth_rationale_ref = $growth_result->{rationale};
+                } else {
+                    # Fallback for safety, though it shouldn't be needed
+                    ($growth_adj, $growth_adj_abs) = (0.0, 0.0);
+                }
 
                 # Apply the adjustments to the final metrics hash.
                 $final_metrics{"GrowthAdj"} = $growth_adj;
                 $final_metrics{"GrowthAdjAbs"} = $growth_adj_abs;
                 $final_metrics{$p_label_main} += $growth_adj if (defined $final_metrics{$p_label_main} && looks_like_number($final_metrics{$p_label_main}));
+
+                # Add the new rationale keys to the output metrics
+                if (defined $growth_rationale_ref) {
+                    foreach my $key (keys %{$growth_rationale_ref}) {
+                        $final_metrics{"GrowthDebug_$key"} = $growth_rationale_ref->{$key};
+                        # Also report the actual parameters used in the calculation for the caller's rationale log.
+                        $final_metrics{"GrowthParam_projection_days"} = $growth_projection_days;
+                        $final_metrics{"GrowthParam_max_inflation_perc"} = $max_growth_inflation_percent;
+                    }
+                }
             }
 
             # Step 3: Common Printing Logic for All Aggregated Modes.
@@ -2553,26 +2573,49 @@ sub get_metrics_for_each_state
 }
 
 
-# --- calculate_growth_prediction ---
-# Performs trend analysis on a time series of metric values and calculates
-# a growth adjustment factor based on a linear regression projection. This
-# function is now self-contained and used by all aggregated analysis modes.
+# ==============================================================================
+# SUBROUTINE: calculate_growth_prediction
+# PURPOSE:    Performs trend analysis on a time series of metric values and
+#             calculates a growth adjustment factor based on a linear
+#             regression projection. This function is a vital part of the
+#             engine's forecasting capability.
 #
-# Args:
-#   1. $timeseries_values_aref (array ref): An array of the numeric metric values over time.
-#   2. $baseline_val (float): The final aggregated metric value, used as the base for inflation.
+# ARGS:
+#   1. $timeseries_values_aref (array ref): An array of the numeric metric
+#                                           values over time (e.g., from each
+#                                           processing window).
+#   2. $baseline_val (float): The final aggregated metric value, which serves
+#                             as the base for any calculated inflation.
 #
-# Returns:
-#   - A list: ($growth_adj_value, $growth_adj_abs_value)
-#
+# RETURNS:
+#   - A hash reference containing the results and a detailed rationale:
+#     {
+#       growth_adj     => The final calculated growth adjustment value (float),
+#       growth_adj_abs => The absolute value of the adjustment (float),
+#       rationale      => A hash ref with debug info for logging by consumers
+#                         like nfit-profile.pl.
+#     }
+# ==============================================================================
 sub calculate_growth_prediction
 {
     my ($timeseries_values_aref, $baseline_val) = @_;
 
+    # --- Pre-declare all rationale variables to ensure correct scope ---
+    # Initialise to default values to handle cases where the logic exits early.
     my ($growth_adj_value, $growth_adj_abs_value) = (0.0, 0.0);
+    my ($stats, $cv_val, $regression, $slope, $projected_val, $inflation_perc);
+    my $num_hist_periods = 0;
+    # Use explicit strings for check results to provide clearer rationale.
+    my $cv_check_passed = "Skipped";
+    my $slope_check_passed = "Skipped";
+    my $was_capped = "N/A";
 
     # Growth calculation is only possible if there is a positive baseline to inflate.
-    return ($growth_adj_value, $growth_adj_abs_value) unless (defined $baseline_val && looks_like_number($baseline_val) && $baseline_val > $FLOAT_EPSILON);
+    return {
+        growth_adj     => 0.0,
+        growth_adj_abs => 0.0,
+        rationale      => { num_hist_periods => 0, stats_cv => "N/A", cv_check_passed => "Skipped (No baseline)" }
+    } unless (defined $baseline_val && looks_like_number($baseline_val) && $baseline_val > $FLOAT_EPSILON);
 
     my @timeseries_points;
     my $time_idx = 0;
@@ -2587,59 +2630,85 @@ sub calculate_growth_prediction
         }
     }
 
-    my $num_hist_periods = scalar(@timeseries_points);
+    $num_hist_periods = scalar(@timeseries_points);
 
     # Ensure there are enough data points to establish a meaningful trend.
     if ($num_hist_periods >= $GROWTH_MIN_HISTORICAL_PERIODS)
     {
         my @values_for_stats = map { $_->[1] } @timeseries_points;
-        # Correctly handle the hashref returned by the statistics function.
-        my $stats = calculate_statistics_for_trend(\@values_for_stats);
-        return ($growth_adj_value, $growth_adj_abs_value) unless defined $stats;
-        my $cv_val = $stats->{cv};
+        $stats = calculate_statistics_for_trend(\@values_for_stats);
 
-        # Only proceed if the data is not excessively volatile (low coefficient of variation).
-        if (defined $cv_val && $cv_val < $GROWTH_MAX_CV_THRESHOLD)
+        # Only proceed if statistics could be calculated.
+        if (defined $stats && defined $stats->{cv})
         {
-            # Correctly handle the hashref returned by the regression function.
-            my $regression = calculate_manual_linear_regression(\@timeseries_points);
-            return ($growth_adj_value, $growth_adj_abs_value) unless defined $regression;
-            my $slope = $regression->{slope};
-            my $intercept = $regression->{intercept};
+            $cv_val = $stats->{cv};
+            # Check if the data is not excessively volatile.
+            $cv_check_passed = ($cv_val < $GROWTH_MAX_CV_THRESHOLD);
 
-            # Only apply inflation if there is a clear positive growth trend.
-            if (defined $slope && $slope > $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD)
+            if ($cv_check_passed)
             {
-                # Project the value N days into the future.
-                # Note: For the Hybrid model, which provides daily data points, the projection
-                # period logic is simplified as each period is one day. For the standard
-                # windowed model, it's scaled by the window size. This logic handles both.
-                my $projection_periods = ($process_window_unit_str eq 'weeks')
-                ? ($growth_projection_days / 7) * (1 / $process_window_size_val)
-                : ($growth_projection_days / $process_window_size_val);
-
-                # For the daily data from the Hybrid model, we need to adjust the projection period.
-                # The simplest way is to check the number of points relative to a known time span,
-                # but for now, we assume the projection is in units matching the time series points.
-                if (scalar(@$timeseries_values_aref) > $num_hist_periods * 1.5) # Heuristic for daily data
+                $regression = calculate_manual_linear_regression(\@timeseries_points);
+                if (defined $regression && defined $regression->{slope})
                 {
-                    $projection_periods = $growth_projection_days;
-                }
+                    $slope = $regression->{slope};
+                    # Check if there is a clear positive growth trend.
+                    $slope_check_passed = ($slope > $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD);
 
-                my $projected_val = $slope * ($num_hist_periods - 1 + $projection_periods) + $intercept;
+                    if ($slope_check_passed)
+                    {
+                        # Project the value N days into the future, scaled by the window size.
+                        my $projection_periods = ($process_window_unit_str eq 'weeks')
+                        ? ($growth_projection_days / 7) * (1 / $process_window_size_val)
+                        : ($growth_projection_days / $process_window_size_val);
 
-                if ($projected_val > $baseline_val)
-                {
-                    my $inflation_perc = (($projected_val - $baseline_val) / $baseline_val) * 100;
-                    $inflation_perc = $max_growth_inflation_percent if $inflation_perc > $max_growth_inflation_percent;
-                    $growth_adj_value = ($baseline_val * $inflation_perc / 100);
-                    $growth_adj_abs_value = $growth_adj_value;
+                        # The Hybrid model provides daily data points, so its projection period is simpler.
+                        if (scalar(@$timeseries_values_aref) > $num_hist_periods * 1.5) # Heuristic for daily data
+                        {
+                            $projection_periods = $growth_projection_days;
+                        }
+
+                        my $intercept = $regression->{intercept}; # Retrieve intercept from regression result
+                        $projected_val = $slope * ($num_hist_periods - 1 + $projection_periods) + $intercept;
+
+                        if ($projected_val > $baseline_val)
+                        {
+                            $inflation_perc = (($projected_val - $baseline_val) / $baseline_val) * 100;
+                            $was_capped = ($inflation_perc > $max_growth_inflation_percent);
+
+                            # Cap the inflation to the configured maximum percentage.
+                            if ($was_capped) {
+                                $inflation_perc = $max_growth_inflation_percent;
+                            }
+
+                            # Calculate the final adjustment values.
+                            $growth_adj_value = ($baseline_val * $inflation_perc / 100);
+                            $growth_adj_abs_value = $growth_adj_value;
+                        }
+                    }
                 }
             }
         }
     }
 
-    return ($growth_adj_value, $growth_adj_abs_value);
+    # --- Assemble the final rationale hash ---
+    # All variables used here were pre-declared, ensuring this is always safe to execute.
+    my %growth_rationale = (
+        num_hist_periods => $num_hist_periods,
+        stats_cv         => defined($cv_val) ? sprintf("%.4f", $cv_val) : "N/A",
+        cv_check_passed  => $cv_check_passed,
+        slope            => defined($slope) ? sprintf("%.4f", $slope) : "N/A",
+        slope_check_passed => $slope_check_passed,
+        projected_val    => defined($projected_val) ? sprintf("%.4f", $projected_val) : "N/A",
+        inflation_perc   => defined($inflation_perc) ? sprintf("%.2f", $inflation_perc) : "N/A",
+        was_capped       => $was_capped,
+    );
+
+    # --- Return the final result as a single hash reference ---
+    return {
+        growth_adj     => $growth_adj_value,
+        growth_adj_abs => $growth_adj_abs_value,
+        rationale      => \%growth_rationale
+    };
 }
 
 # ==============================================================================
