@@ -31,6 +31,13 @@ use Fcntl qw(:flock);
 use File::Basename qw(dirname);
 use Cwd 'abs_path';
 
+# --- Force STDERR to be unbuffered for real-time progress updates ---
+# This is critical for the --force-progress flag to work correctly when
+# this script is called from another process like nfit-profile.
+select STDERR;
+$| = 1;
+select STDOUT;
+
 # --- Version ---
 my $VERSION = '5.25.199.0';
 
@@ -117,6 +124,7 @@ my $help           = 0;
 my $show_version   = 0;
 my $verbose   = 0;
 my $quiet   = 0;
+my $show_progress_flag = 0;
 
 # Windowed Decay options
 my $enable_windowed_decay = 0;
@@ -185,6 +193,7 @@ GetOptions(
     'verbose|v'           => \$verbose,
     'version'             => \$show_version,
     'q|quiet'             => \$quiet,
+    'show-progress'       => \$show_progress_flag,
 ) or die usage();
 
 # --- Validation ---
@@ -480,6 +489,10 @@ my $cachedir = (defined $nmon_dir) ? $nmon_dir : (defined $physc_csv_file ? dirn
 my $stage_id_file_for_l2 = File::Spec->catfile($cachedir, '.nfit_stage_id');
 my $canonical_key = generate_canonical_key(); # Generate the key for this specific run.
 
+# --- START DEBUGGING DUMP ---
+# print STDERR "DEBUG [nfit]: Generated L2 Cache Key:\n>>>$canonical_key<<<\n";
+# --- END DEBUGGING DUMP ---
+
 my $shown_cache_msg = 0;
 my @processing_windows;
 my $script_start_time = time();
@@ -515,11 +528,19 @@ if (-f $results_cache_path) {
 
 unless ($results_cache_is_stale)
 {
-    my $cached_result = lookup_cached_result($canonical_key, $results_cache_path);
-    if (defined $cached_result)
+    my $cached_result_aref = lookup_cached_result($canonical_key, $results_cache_path);
+    # A valid cached result must be a defined array reference.
+    if (defined $cached_result_aref && ref($cached_result_aref) eq 'ARRAY')
     {
         print STDERR "L2 Cache HIT. Returning cached result.\n" if $verbose;
-        print STDOUT $cached_result . "\n";
+
+        # Re-encode each result object from the array back into a JSON string,
+        # and print each on its own line for the consumer.
+        my $json_encoder = JSON->new->utf8;
+        my @json_lines_for_stdout = map { $json_encoder->encode($_) } @$cached_result_aref;
+
+        print STDOUT join("\n", @json_lines_for_stdout) . "\n";
+
         exit 0; # Exit immediately with the cached result.
     }
 }
@@ -544,7 +565,7 @@ unless (-f $states_cache_file && -f $data_cache_file)
 }
 
 # --- Load Configuration States from JSON Cache ---
-print STDERR "Loading cached configuration states from: $states_cache_file\n";
+print STDERR "Cache Location: $states_cache_file\n";
 eval {
     # Read the entire JSON file into a string.
     local $/;
@@ -732,12 +753,13 @@ $data_source_file = $data_cache_file;
             my $state_count = scalar(@states_for_buffered_vm);
             $vm_results_aggregator{$current_vm_name_for_buffer}{'state_count'} = $state_count;
 
-            if (-t STDERR) {
+            if (-t STDERR || $show_progress_flag) {
                 # Terminal output: single, updating line with state count
                 my $state_label = sprintf("(%d %s)", $state_count, $state_count == 1 ? "state" : "states");
                 if (exists $target_vms_lookup{$current_vm_name_for_buffer}) {
                     $vm_progress_counter++;
                     printf STDERR "\r  -> Profiling VM %d/%d: %-35s %-12s", $vm_progress_counter, $total_vms_for_progress, $current_vm_name_for_buffer, $state_label;
+                    STDERR->flush();
                 }
             }
 
@@ -860,231 +882,147 @@ $data_source_file = $data_cache_file;
     }
     push @output_header_cols, @metric_keys_in_order;
 
+    # This will hold the raw Perl hashes for caching
+    my @result_objects;
+
     # This is the conditional block that handles output for all three modes.
     # Path A: Output for standard Non-Windowed (State-by-State) Mode.
     if (!$enable_windowed_decay && !$decay_over_states_flag)
     {
-        # This logic is preserved to print one result line per configuration state.
         foreach my $vm_name (sort keys %vm_results_aggregator)
         {
             next unless (exists $vm_results_aggregator{$vm_name}{'states'} && ref($vm_results_aggregator{$vm_name}{'states'}) eq 'ARRAY');
 
             my @states_for_this_vm = @{$vm_results_aggregator{$vm_name}{'states'}};
-            my $total_states_for_vm = scalar(@states_for_this_vm);
 
             foreach my $result (@states_for_this_vm)
             {
                 my $state_obj = $result->{state_obj};
                 my $md        = $result->{state_obj}{metadata};
 
-                my $state_prefix = sprintf("%s:State-%d_of_%d (%s_to_%s)",
-                    $vm_name, $state_obj->{state_id}, $total_states_for_vm,
-                    $state_obj->{start_time}->strftime('%Y-%m-%d'),
-                    $state_obj->{end_time}->strftime('%Y-%m-%d')
-                );
-                my @output_parts = ($state_prefix);
-                push @output_parts, sprintf("Entitlement=%.2f", $md->{entitlement} // 0);
-                push @output_parts, sprintf("MaxCPU=%.2f", $md->{max_cpu} // 0);
-                push @output_parts, sprintf("SMT=%d", $md->{smt} // 0);
-                push @output_parts, sprintf("Processor=%s", $md->{processor_state} // 'N/A');
-                push @output_parts, sprintf("SerialNumber=%s", $md->{serial_number} // '');
-                push @output_parts, sprintf("PoolID=%s", $md->{pool_id} // '');
+                my $metrics = $result->{metrics};
 
-                my @metric_keys = sort keys %{$result->{metrics}};
-                foreach my $key (@metric_keys)
-                {
-                    my $val = $result->{metrics}{$key};
-                    my $val_str = defined($val) && looks_like_number($val) ? sprintf("%.${output_dp}f", apply_rounding($val, $round_increment, $rounding_method)) : "N/A";
-                    push @output_parts, "$key=$val_str";
+                my %output_hash = (
+                    vmName       => $vm_name,
+                    analysisType => 'state_based',
+                    state => {
+                        id           => $state_obj->{state_id},
+                        durationDays => ($state_obj->{duration_days} // 0) + 0,
+                        startTimeISO => $state_obj->{start_time}->datetime . 'Z',
+                        endTimeISO   => $state_obj->{end_time}->datetime . 'Z',
+                    },
+                    metadata => {
+                        platform     => 'AIX',
+                        serialNumber => $md->{serial_number},
+                        poolId       => defined $md->{pool_id} && looks_like_number($md->{pool_id}) ? $md->{pool_id} + 0 : undef,
+                        processor    => $md->{processor_state},
+                        configuration => {
+                            entitlement => defined $md->{entitlement} ? ($md->{entitlement} + 0) : undef,
+                            maxCpu      => defined $md->{max_cpu} ? ($md->{max_cpu} + 0) : undef,
+                            smt         => defined $md->{smt} ? ($md->{smt} + 0) : undef,
+                            virtualCpus => defined $md->{virtual_cpus} ? ($md->{virtual_cpus} + 0) : undef,
+                            capped      => ($md->{capped} // 0) == 1 ? \1 : \0,
+                            poolCpu     => defined $md->{pool_cpu} ? ($md->{pool_cpu} + 0) : undef
+                        },
+                    },
+                    metrics => { physc => {}, runq => { normalized => {}, absolute => {} }, clipping => {} },
+                );
+
+                foreach my $key (keys %$metrics) {
+                    my $value = $metrics->{$key};
+                    my $rounded_value = defined($value) && looks_like_number($value) ? apply_rounding($value, $round_increment, $rounding_method) : undef;
+
+                    if ($key =~ /^P(\d+\.?\d*)$/) { $output_hash{metrics}{physc}{$key} = $rounded_value; }
+                    elsif ($key eq 'Peak') { $output_hash{metrics}{physc}{$key} = $rounded_value; }
+                    elsif ($key =~ /^NormRunQ_(P\d+\.?\d*)$/) { $output_hash{metrics}{runq}{normalized}{$1} = $rounded_value; }
+                    elsif ($key =~ /^AbsRunQ_(P\d+\.?\d*)$/) { $output_hash{metrics}{runq}{absolute}{$1} = $rounded_value; }
+                    elsif ($key eq 'IsClipped') { $output_hash{metrics}{clipping}{isClipped} = $value + 0 if defined $value; }
+                    elsif ($key eq 'ClipConfidence') { $output_hash{metrics}{clipping}{confidence} = $rounded_value; }
+                    elsif ($key eq 'UnmetDemand') { $output_hash{metrics}{clipping}{unmetDemand} = $rounded_value; }
+                    elsif ($key eq 'RunQSatScore') { $output_hash{metrics}{clipping}{runqSaturationScore} = $rounded_value; }
                 }
-                push @final_output_lines, join(" ", @output_parts);
-            }
+
+                push @result_objects, \%output_hash;
+
+           }
         }
     }
     else # Path B & C: Unified Output for ALL Aggregated Modes (Windowed Decay AND Hybrid)
     {
         # This block handles output for both --enable-windowed-decay and --decay-over-states
+
         foreach my $vm_name (sort keys %vm_results_aggregator)
         {
-            my %final_metrics;
+            # This block now builds a single, rich hash for the final JSON output
+            my %output_hash = (
+                vmName       => $vm_name,
+                analysisType => ($enable_windowed_decay ? 'windowed_decay_aggregated' : 'hybrid_decay_aggregated'),
+                metadata     => { platform => 'AIX' },
+                metrics      => { physc => {}, runq => { normalized => {}, absolute => {} }, growth => {}, clipping => {} },
+                debug        => { growthRationale => {}, growthParams => {} }
+            );
+
             my $last_state_metadata;
+            my %final_metrics = %{aggregate_decay_metrics(\%vm_results_aggregator, $vm_name, $analysis_ref_obj, $decay_half_life_days_val)};
 
-            # Step 1: Populate the base metrics depending on the analysis mode.
-            if ($enable_windowed_decay)
-            {
-                # --- Aggregate base metrics for Standard Windowed Decay mode ---
-                my %all_keys;
-                foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
-                    foreach my $key (keys %{$win_result->{metrics}}) { $all_keys{$key} = 1; }
-                }
-                foreach my $metric_key (sort keys %all_keys) {
-                    my @metric_values_across_windows;
-                    foreach my $win_result (values %{$vm_results_aggregator{$vm_name}{time_windows}}) {
-                        if (defined $win_result->{metrics}{$metric_key}) {
-                            push @metric_values_across_windows, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
-                        }
-                    }
-                    if ($metric_key ne 'Peak') {
-                        $final_metrics{$metric_key} = calculate_recency_weighted_average(\@metric_values_across_windows, $analysis_ref_obj, $decay_half_life_days_val);
-                    } else {
-                        my @values = map { $_->{value} } grep { defined $_->{value} && looks_like_number($_->{value}) } @metric_values_across_windows;
-                        $final_metrics{$metric_key} = @values ? max(@values) : "N/A";
-                    }
-                }
-            }
-            elsif ($decay_over_states_flag)
-            {
-                # --- Populate base metrics for the Hybrid State-Time Decay mode ---
-                my $p_label = "P" . clean_perc_label($percentile);
-                $final_metrics{$p_label} = $vm_results_aggregator{$vm_name}{'hybrid_metric'} // "N/A";
-
-                my $source_states_aref = $vm_results_aggregator{$vm_name}{'source_states'};
-                if ($calculate_peak) {
-                    my @all_peaks;
-                    if ($source_states_aref && @$source_states_aref) {
-                        foreach my $state_res (@$source_states_aref) {
-                            if (defined $state_res->{metrics}{'Peak'}) {
-                                push @all_peaks, $state_res->{metrics}{'Peak'};
-                            }
-                        }
-                    }
-                    $final_metrics{'Peak'} = @all_peaks ? max(@all_peaks) : "N/A";
-                }
-                if ($source_states_aref && @$source_states_aref) {
-                    my $last_state_metrics = $source_states_aref->[-1]{metrics};
-                    foreach my $p (@runq_norm_percentiles_to_calc) { my $key = "NormRunQ_P".clean_perc_label($p); $final_metrics{$key} = $last_state_metrics->{$key} // "N/A"; }
-                    foreach my $p (@runq_abs_percentiles_to_calc)  { my $key = "AbsRunQ_P".clean_perc_label($p);  $final_metrics{$key} = $last_state_metrics->{$key} // "N/A"; }
-                }
+            if ($enable_growth_prediction) {
+                 apply_growth_prediction_to_metrics(\%vm_results_aggregator, $vm_name, \%final_metrics);
             }
 
-            # Step 2: If enabled, calculate and apply growth prediction to the base metrics.
-            if ($enable_growth_prediction)
-            {
-                my $p_label_main = "P" . clean_perc_label($percentile);
-                my @timeseries_for_growth;
-
-                if ($enable_windowed_decay)
-                {
-                    # For standard decay, build the time series from the per-window results.
-                    my @sorted_windows = sort { $a->{date_obj}->epoch <=> $b->{date_obj}->epoch } values %{$vm_results_aggregator{$vm_name}{time_windows}};
-                    foreach my $win_result (@sorted_windows)
-                    {
-                        push @timeseries_for_growth, $win_result->{metrics}{$p_label_main};
-                    }
-
-                }
-                elsif ($decay_over_states_flag && exists $vm_results_aggregator{$vm_name}{'hybrid_timeseries_data'})
-                {
-                    # For hybrid decay, use the daily stamped values from the synthesized time series.
-                    # The 'source_states' array contains the raw data needed to regenerate the time series.
-                    my @source_states_for_growth = @{$vm_results_aggregator{$vm_name}{'source_states'} || []};
-                    my @hybrid_timeseries_for_growth = synthesize_hybrid_timeseries(\@source_states_for_growth, $p_label_main);
-                    @timeseries_for_growth = map { $_->{value} } @hybrid_timeseries_for_growth;
-                }
-
-                # Call the reusable subroutine to get the growth adjustment values.
-                my $growth_result = calculate_growth_prediction(\@timeseries_for_growth, $final_metrics{$p_label_main});
-                my ($growth_adj, $growth_adj_abs, $growth_rationale_ref);
-
-                if (defined $growth_result && ref($growth_result) eq 'HASH') {
-                    $growth_adj     = $growth_result->{growth_adj};
-                    $growth_adj_abs = $growth_result->{growth_adj_abs};
-                    $growth_rationale_ref = $growth_result->{rationale};
-                } else {
-                    # Fallback for safety, though it shouldn't be needed
-                    ($growth_adj, $growth_adj_abs) = (0.0, 0.0);
-                }
-
-                # Apply the adjustments to the final metrics hash.
-                $final_metrics{"GrowthAdj"} = $growth_adj;
-                $final_metrics{"GrowthAdjAbs"} = $growth_adj_abs;
-                $final_metrics{$p_label_main} += $growth_adj if (defined $final_metrics{$p_label_main} && looks_like_number($final_metrics{$p_label_main}));
-
-                # Add the new rationale keys to the output metrics
-                if (defined $growth_rationale_ref) {
-                    foreach my $key (keys %{$growth_rationale_ref}) {
-                        $final_metrics{"GrowthDebug_$key"} = $growth_rationale_ref->{$key};
-                        # Also report the actual parameters used in the calculation for the caller's rationale log.
-                        $final_metrics{"GrowthParam_projection_days"} = $growth_projection_days;
-                        $final_metrics{"GrowthParam_max_inflation_perc"} = $max_growth_inflation_percent;
-                    }
-                }
-            }
-
-            # Step 3: Common Printing Logic for All Aggregated Modes.
+            # Step 3: Populate the output hash with metadata and metrics.
             my ($last_state_obj) = grep { $_->{vm_name} eq $vm_name } reverse @sorted_states_to_process;
             next unless $last_state_obj;
 
-            # Get the most recent metadata for the VM.
-            if (exists $config_states_by_vm{$vm_name} && @{$config_states_by_vm{$vm_name}})
-            {
-                $last_state_metadata = $config_states_by_vm{$vm_name}[-1]{metadata};
-            }
-            else
-            {
-                $last_state_metadata = {};
+            $last_state_metadata = $last_state_obj->{metadata} || {};
+            $output_hash{metadata}{serialNumber} = $last_state_metadata->{serial_number};
+            $output_hash{metadata}{poolId} = defined $last_state_metadata->{pool_id} && looks_like_number($last_state_metadata->{pool_id}) ? $last_state_metadata->{pool_id} + 0 : undef;
+            $output_hash{metadata}{processor} = $last_state_metadata->{processor_state};
+            $output_hash{metadata}{configuration} = {
+                entitlement => defined $last_state_metadata->{entitlement} ? ($last_state_metadata->{entitlement} + 0) : undef,
+                maxCpu      => defined $last_state_metadata->{max_cpu} ? ($last_state_metadata->{max_cpu} + 0) : undef,
+                smt         => defined $last_state_metadata->{smt} ? ($last_state_metadata->{smt} + 0) : undef
+            };
+            $output_hash{state}{stateCount} = $vm_results_aggregator{$vm_name}{'state_count'} if exists $vm_results_aggregator{$vm_name}{'state_count'};
+
+            foreach my $key (keys %final_metrics) {
+                my $value = $final_metrics{$key};
+                my $rounded_value = defined($value) && looks_like_number($value) ? apply_rounding($value, $round_increment, $rounding_method) : undef;
+
+                if ($key =~ /^P(\d+\.?\d*)$/) { $output_hash{metrics}{physc}{$key} = $rounded_value; }
+                elsif ($key eq 'Peak') { $output_hash{metrics}{physc}{$key} = $rounded_value; }
+                elsif ($key =~ /^NormRunQ_(P\d+\.?\d*)$/) { $output_hash{metrics}{runq}{normalized}{$1} = $rounded_value; }
+                elsif ($key =~ /^AbsRunQ_(P\d+\.?\d*)$/) { $output_hash{metrics}{runq}{absolute}{$1} = $rounded_value; }
+                elsif ($key eq 'GrowthAdj') { $output_hash{metrics}{growth}{adjustment} = $rounded_value; }
+                elsif ($key eq 'GrowthAdjAbs') { $output_hash{metrics}{growth}{adjustmentAbsolute} = $rounded_value; }
+                elsif ($key =~ /^GrowthDebug_(.*)$/) { $output_hash{debug}{growthRationale}{$1} = $value; }
+                elsif ($key =~ /^GrowthParam_(.*)$/) { $output_hash{debug}{growthParams}{$1} = $value + 0; }
+                elsif ($key eq 'IsClipped') { $output_hash{metrics}{clipping}{isClipped} = $value + 0 if defined $value; }
+                elsif ($key eq 'ClipConfidence') { $output_hash{metrics}{clipping}{confidence} = $rounded_value; }
+                elsif ($key eq 'UnmetDemand') { $output_hash{metrics}{clipping}{unmetDemand} = $rounded_value; }
+                elsif ($key eq 'RunQSatScore') { $output_hash{metrics}{clipping}{runqSaturationScore} = $rounded_value; }
             }
 
-            # Build and buffer the final output line.
-            my $output_string = "$vm_name:";
-            $output_string .= sprintf(" Entitlement=%.2f", $last_state_metadata->{entitlement} // 0);
-            $output_string .= sprintf(" MaxCPU=%.2f", $last_state_metadata->{max_cpu} // 0);
-            $output_string .= sprintf(" SMT=%s", $last_state_metadata->{smt} // '');
-            $output_string .= sprintf(" Processor=%s", $last_state_metadata->{processor_state} // 'N/A');
-            $output_string .= sprintf(" SerialNumber=%s", $last_state_metadata->{serial_number} // '');
-            $output_string .= sprintf(" PoolID=%s", $last_state_metadata->{pool_id} // '');
-
-            $final_metrics{'StateCount'} = $vm_results_aggregator{$vm_name}{'state_count'} if exists $vm_results_aggregator{$vm_name}{'state_count'};
-
-            # Add the new clipping metrics if they exist in the final calculated metrics.
-            # This ensures they are only added if --enable-clipping-detection was used.
-            if (exists $final_metrics{'IsClipped'}) {
-                $output_string .= sprintf(" IsClipped=%d", $final_metrics{'IsClipped'});
-                # Remove the key so it's not printed again in the generic loop below.
-                delete $final_metrics{'IsClipped'};
-            }
-            if (exists $final_metrics{'ClipConfidence'}) {
-                $output_string .= sprintf(" ClipConfidence=%.2f", $final_metrics{'ClipConfidence'});
-                delete $final_metrics{'ClipConfidence'};
-            }
-            if (exists $final_metrics{'UnmetDemand'}) {
-                $output_string .= sprintf(" UnmetDemand=%.4f", $final_metrics{'UnmetDemand'});
-                delete $final_metrics{'UnmetDemand'};
-            }
-            if (exists $final_metrics{'RunQSatScore'} && $final_metrics{'RunQSatScore'} ne 'N/A') {
-                $output_string .= sprintf(" RunQSatScore=%s", $final_metrics{'RunQSatScore'});
-                delete $final_metrics{'RunQSatScore'};
-            }
-
-            my @keys_out = sort keys %final_metrics;
-            foreach my $key (@keys_out)
-            {
-                my $val = $final_metrics{$key};
-                my $val_str = defined($val) && looks_like_number($val) ? sprintf("%.${output_dp}f", apply_rounding($val, $round_increment, $rounding_method)) : "N/A";
-                $output_string .= " $key=$val_str";
-            }
-            push @final_output_lines, $output_string;
+            push @result_objects, \%output_hash;
         }
     }
 
-}
-
-# --- L2 Cache Save and Final Output ---
-if (@final_output_lines)
-{
-    my $final_output_string = join("\n", @final_output_lines);
-
-    # If we are in a cacheable context (a staged directory), save the result.
-    if (-f $stage_id_file_for_l2)
+    # --- L2 Cache Save and Final Output ---
+    my $json_encoder = JSON->new->utf8;
+    if (@result_objects)
     {
-        my $results_cache_path = File::Spec->catfile($cachedir, $L2_RESULTS_CACHE_FILE);
-        my $l2_lock_file_path  = File::Spec->catfile($cachedir, $CACHE_LOCK_FILE);
-        print STDERR "L2 Results Cache MISS (caching new result).\n" if $verbose;
-        save_result_to_cache($canonical_key, $final_output_string, $results_cache_path, $l2_lock_file_path);
-    }
+        # For STDOUT, create the line-by-line JSON output that nfit-profile expects.
+        my @json_lines_for_stdout = map { $json_encoder->encode($_) } @result_objects;
+        my $final_output_string = join("\n", @json_lines_for_stdout);
 
-    # Print the final, complete output to STDOUT.
-    print STDOUT $final_output_string . "\n";
+        if (-f $stage_id_file_for_l2)
+        {
+            my $results_cache_path = File::Spec->catfile($cachedir, $L2_RESULTS_CACHE_FILE);
+            my $l2_lock_file_path  = File::Spec->catfile($cachedir, $CACHE_LOCK_FILE);
+            print STDERR "L2 Results Cache MISS (caching new result).\n" if $verbose;
+            save_result_to_cache($canonical_key, \@result_objects, $results_cache_path, $l2_lock_file_path);
+        }
+        print STDOUT $final_output_string . "\n";
+    }
 }
 
 my $script_end_time = time();
@@ -2270,7 +2208,7 @@ sub generate_canonical_key
 
 # ==============================================================================
 # Subroutine to look up a result from the L2 cache file.
-# Returns: The cached result as a single string, or undef if not found.
+# Returns: An array reference of result hashes, or undef if not found.
 # ==============================================================================
 sub lookup_cached_result
 {
@@ -2278,34 +2216,29 @@ sub lookup_cached_result
 
     return undef unless (-f $cache_file && -s $cache_file);
 
-    open my $fh, '<:encoding(utf8)', $cache_file
-        or warn "Warning: Could not open results cache '$cache_file' for reading: $!" and return undef;
+    # Read the entire file content as a single string.
+    my $json_text = do {
+        open my $fh, '<:encoding(utf8)', $cache_file or do {
+            warn "Warning: Could not open results cache '$cache_file' for reading: $!";
+            return undef;
+        };
+        local $/;
+        my $content = <$fh>;
+        close $fh;
+        $content;
+    };
 
-    my $in_target_block = 0;
-    my @result_lines;
-
-    while (my $line = <$fh>)
-    {
-        chomp $line;
-        if ($in_target_block)
-        {
-            if ($line eq '--END--')
-            {
-                # Found the end of our block, return the collected result.
-                close $fh;
-                return join("\n", @result_lines);
-            }
-            push @result_lines, $line;
-        }
-        elsif ($line eq "[$key]")
-        {
-            # Found the start of our target block.
-            $in_target_block = 1;
-        }
+    # Decode the single JSON object from the file.
+    my $json_decoder = JSON->new->allow_nonref;
+    my $cache_data = eval { decode_json($json_text) };
+    if ($@ || !defined($cache_data) || ref($cache_data) ne 'HASH') {
+        print STDERR "Warning: Results cache '$cache_file' is invalid. Resetting.\n";
+        unlink $cache_file or warn "Warning: Could not remove corrupt cache file '$cache_file': $!";
+        return undef;
     }
 
-    close $fh;
-    return undef; # Reached end of file without finding the block or its end.
+    # The value is now an array reference of hashes.
+    return $cache_data->{$key};
 }
 
 # ==============================================================================
@@ -2313,8 +2246,9 @@ sub lookup_cached_result
 # ==============================================================================
 sub save_result_to_cache
 {
-    my ($key, $result_string, $cache_file, $lock_file) = @_;
+    my ($key, $result_objects_aref, $cache_file, $lock_file) = @_;
 
+    # This subroutine now performs a safe read-modify-write of the entire JSON cache file.
     # Acquire an exclusive lock to prevent race conditions when writing.
     open my $lock_fh, '>', $lock_file or do {
         warn "Warning: Could not create lock file '$lock_file' for writing cache: $!. Skipping cache write.";
@@ -2325,20 +2259,36 @@ sub save_result_to_cache
         close $lock_fh;
         return;
     };
+    # Read the existing cache file into a Perl hash.
+    my $cache_data = {};
+    if (-f $cache_file && -s $cache_file) {
+        my $json_text = do {
+            open my $read_fh, '<:encoding(utf8)', $cache_file;
+            local $/;
+            <$read_fh>;
+        };
+        my $json_decoder = JSON->new->allow_nonref;
+        my $decoded = eval { $json_decoder->decode($json_text) };
+        # If the file is valid JSON hash, use it. Otherwise, start fresh.
+        $cache_data = $decoded if (ref($decoded) eq 'HASH');
+    }
 
-    # Open the results cache in append mode.
-    open my $fh, '>>:encoding(utf8)', $cache_file or do {
-        warn "Warning: Could not open results cache '$cache_file' for appending: $!. Skipping cache write.";
-        close $lock_fh; # Release lock
+    # Add or update the result for the current key with the array of result objects.
+    $cache_data->{$key} = $result_objects_aref;
+
+    # Encode the entire updated hash back to a pretty-printed JSON string.
+    my $json_encoder = JSON->new->pretty->canonical;
+    my $output_json = $json_encoder->encode($cache_data);
+
+    # Overwrite the cache file with the new content.
+    open my $write_fh, '>:encoding(utf8)', $cache_file or do {
+        warn "Warning: Could not open results cache '$cache_file' for writing: $!";
+        close $lock_fh;
         return;
     };
 
-    # Write the canonical key, the result, and the delimiter.
-    print {$fh} "[$key]\n";
-    print {$fh} $result_string . "\n"; # result_string already has newlines from the buffer
-    print {$fh} "--END--\n";
-
-    close $fh;
+    print $write_fh $output_json;
+    close $write_fh;
     close $lock_fh; # Releases the lock automatically on close.
 }
 
@@ -2829,6 +2779,93 @@ sub _calculate_clipping_metrics
     return \%results;
 }
 
+sub aggregate_decay_metrics {
+    my ($results_agg_href, $vm_name, $analysis_ref_obj, $decay_hl_days_val) = @_;
+    my %final_metrics;
+
+    if ($enable_windowed_decay) {
+        # Aggregate base metrics for Standard Windowed Decay mode
+        my %all_keys;
+        foreach my $win_result (values %{$results_agg_href->{$vm_name}{time_windows}}) {
+            foreach my $key (keys %{$win_result->{metrics}}) { $all_keys{$key} = 1; }
+        }
+        foreach my $metric_key (sort keys %all_keys) {
+            my @metric_values_across_windows;
+            foreach my $win_result (values %{$results_agg_href->{$vm_name}{time_windows}}) {
+                if (defined $win_result->{metrics}{$metric_key}) {
+                    push @metric_values_across_windows, { value => $win_result->{metrics}{$metric_key}, date => $win_result->{date_obj} };
+                }
+            }
+            if ($metric_key ne 'Peak') {
+                $final_metrics{$metric_key} = calculate_recency_weighted_average(\@metric_values_across_windows, $analysis_ref_obj, $decay_hl_days_val);
+            } else {
+                my @values = map { $_->{value} } grep { defined $_->{value} && looks_like_number($_->{value}) } @metric_values_across_windows;
+                $final_metrics{$metric_key} = @values ? max(@values) : "N/A";
+            }
+        }
+    } elsif ($decay_over_states_flag) {
+        # Populate base metrics for the Hybrid State-Time Decay mode
+        my $p_label = "P" . clean_perc_label($percentile);
+        $final_metrics{$p_label} = $results_agg_href->{$vm_name}{'hybrid_metric'} // "N/A";
+
+        my $source_states_aref = $results_agg_href->{$vm_name}{'source_states'};
+        if ($calculate_peak) {
+            my @all_peaks;
+            if ($source_states_aref && @$source_states_aref) {
+                foreach my $state_res (@$source_states_aref) {
+                    if (defined $state_res->{metrics}{'Peak'}) {
+                        push @all_peaks, $state_res->{metrics}{'Peak'};
+                    }
+                }
+            }
+            $final_metrics{'Peak'} = @all_peaks ? max(@all_peaks) : "N/A";
+        }
+        if ($source_states_aref && @$source_states_aref) {
+            my $last_state_metrics = $source_states_aref->[-1]{metrics};
+            foreach my $p (@runq_norm_percentiles_to_calc) { my $key = "NormRunQ_P".clean_perc_label($p); $final_metrics{$key} = $last_state_metrics->{$key} // "N/A"; }
+            foreach my $p (@runq_abs_percentiles_to_calc)  { my $key = "AbsRunQ_P".clean_perc_label($p);  $final_metrics{$key} = $last_state_metrics->{$key} // "N/A"; }
+        }
+    }
+    return \%final_metrics;
+}
+
+sub apply_growth_prediction_to_metrics {
+    my ($results_agg_href, $vm_name, $final_metrics_href) = @_;
+
+    my $p_label_main = "P" . clean_perc_label($percentile);
+    my @timeseries_for_growth;
+
+    if ($enable_windowed_decay) {
+        # For standard decay, build the time series from the per-window results.
+        my @sorted_windows = sort { $a->{date_obj}->epoch <=> $b->{date_obj}->epoch } values %{$results_agg_href->{$vm_name}{time_windows}};
+        foreach my $win_result (@sorted_windows) {
+            push @timeseries_for_growth, $win_result->{metrics}{$p_label_main};
+        }
+    } elsif ($decay_over_states_flag && exists $results_agg_href->{$vm_name}{'hybrid_timeseries_data'}) {
+        my @source_states_for_growth = @{$results_agg_href->{$vm_name}{'source_states'} || []};
+        my @hybrid_timeseries_for_growth = synthesize_hybrid_timeseries(\@source_states_for_growth, $p_label_main);
+        @timeseries_for_growth = map { $_->{value} } @hybrid_timeseries_for_growth;
+    }
+
+    my $growth_result = calculate_growth_prediction(\@timeseries_for_growth, $final_metrics_href->{$p_label_main});
+    if (defined $growth_result && ref($growth_result) eq 'HASH') {
+        my $growth_adj = $growth_result->{growth_adj};
+        # Apply the adjustments to the final metrics hash.
+        $final_metrics_href->{"GrowthAdj"} = $growth_adj;
+        $final_metrics_href->{"GrowthAdjAbs"} = $growth_result->{growth_adj_abs};
+        if (defined $final_metrics_href->{$p_label_main} && looks_like_number($final_metrics_href->{$p_label_main})) {
+            $final_metrics_href->{$p_label_main} += $growth_adj;
+        }
+
+        if (defined $growth_result->{rationale}) {
+            foreach my $key (keys %{$growth_result->{rationale}}) {
+                $final_metrics_href->{"GrowthDebug_$key"} = $growth_result->{rationale}{$key};
+            }
+            $final_metrics_href->{"GrowthParam_projection_days"} = $growth_projection_days;
+            $final_metrics_href->{"GrowthParam_max_inflation_perc"} = $max_growth_inflation_percent;
+        }
+    }
+}
 
 # --- usage ---
 # Generates and returns the usage/help message for the script.

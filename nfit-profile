@@ -4,7 +4,7 @@
 # AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
 # PURPOSE  : Runs 'nfit' multiple times with user-defined profiles.
 #            Applies RunQ modifiers, generates hints, logs rationale, and aggregates to CSV.
-# REQUIRES : Perl, nfit, Time::Piece, List::Util, IO::File, version
+# REQUIRES : Perl, nfit, Time::Piece, List::Util, IPC::Open3, version
 
 use strict;
 use warnings;
@@ -18,7 +18,8 @@ use Time::Piece;
 use Time::Seconds;
 use List::Util qw(sum sum0 min max uniq); # sum0 is available from List::Util 1.33+
 use Scalar::Util qw(looks_like_number);
-use IO::File;
+use IPC::Open3;
+use IO::Select;
 use version;
 use JSON;
 use Fcntl qw(:DEFAULT :flock);
@@ -43,6 +44,11 @@ my $DEFAULT_SMT_VALUE_PROFILE = 8;
 my $DEFAULT_RUNQ_NORM_PERCS = "50,90"; # Global default for nfit-profile if not in profile's flags
 my $DEFAULT_RUNQ_ABS_PERCS  = "90";    # Global default for nfit-profile if not in profile's flags
 my $DEFAULT_NFIT_RUNQ_AVG_METHOD = "ema";
+
+# This profile's CPU value is used for MaxCPU pressure checks,
+# and its RunQ metrics will now be used for global RunQ pressure hints.
+my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1";
+
 my $DEFAULT_PERCENTILE = 95;
 
 # Windowed Decay Defaults (for when nfit-profile instructs nfit to use its internal decay)
@@ -132,6 +138,7 @@ my $POOL_CONSTRAINT_CONFIDENCE_FACTOR = 0.80; # Reduction factor for additive CP
 
 my $LOG_FILE_PATH = "/tmp/nfit-profile.log"; # Default log file path
 my $CACHE_STATES_FILE = ".nfit.cache.states";
+my $log_file_path_for_run = $LOG_FILE_PATH;
 
 # --- Profile Definitions (Loaded from file) ---
 my @profiles;
@@ -268,7 +275,7 @@ if (defined $mgsys_filter && !defined $nmon_dir)
     $nmon_dir = $DEFAULT_BASE_STAGE_DIR;
     # Only print the info message if it's a regular run, not a staging/snapshotting run.
     if (!$update_seasonal_snapshot_event) {
-        print STDERR "INFO: --mgsys used without --nmondir. Defaulting base cache path to: '$nmon_dir'\n";
+        print STDERR "Cache Path (default): '$nmon_dir'\n";
     }
 }
 
@@ -330,7 +337,7 @@ if (defined $nfit_runq_avg_method_str)
     {
         die "Error: --runq-avg-method must be 'none', 'sma', or 'ema'. Got '$nfit_runq_avg_method_str'.\n";
     }
-    print STDERR "Instructing nfit to use RunQ averaging method: $nfit_runq_avg_method_str.\n";
+    print STDERR "RunQ Averaging Method: $nfit_runq_avg_method_str.\n";
 }
 
 # --- Excel Formula Validation ---
@@ -455,6 +462,7 @@ print STDERR "Dispatcher will process " . scalar(@target_systems_to_process) . "
 
 # --- Load Profile Definitions ---
 # The log file will now be created inside the main processing loop for each system.
+print STDERR "Profile Definitions:\n";
 my $profiles_config_path_to_load;
 if (defined $profiles_config_file_arg)
 {
@@ -479,7 +487,7 @@ else # Attempt to find default profiles config
         die "Error: Default profiles config '$DEFAULT_PROFILES_CONFIG_FILE' not found in '$script_dir/etc/' or '$script_dir/'. Use --profiles-config.\n";
     }
 }
-print STDERR "Loading profile definitions from: $profiles_config_path_to_load\n";
+print STDERR "  - Profile configurations: $profiles_config_path_to_load\n";
 @profiles = load_profile_definitions($profiles_config_path_to_load);
 if (scalar @profiles == 0)
 {
@@ -498,10 +506,6 @@ if (scalar @profiles == 0)
 push @output_header_cols_csv, map { $_->{name} } @profiles;
 # Add entitlement and formula placeholder columns
 push @output_header_cols_csv, ("Current - ENT", "NFIT - ENT", "NETT", "NETT%");
-
-# This profile's CPU value is used for MaxCPU pressure checks,
-# and its RunQ metrics will now be used for global RunQ pressure hints.
-my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1";
 
 # --- Ensure the Mandatory P-99W1 Profile is Defined ---
 # This check occurs after profiles are loaded.
@@ -522,7 +526,7 @@ unless ($mandatory_profile_is_present)
     "       Please add a profile named \"$MANDATORY_PEAK_PROFILE_FOR_HINT\" to your profiles configuration.\n";
 }
 
-print STDERR "Loaded " . scalar(@profiles) . " profiles.\n";
+print STDERR "  - Loaded " . scalar(@profiles) . " profiles.\n";
 
 # --- Load Seasonality Definitions ---
 my $seasonality_config_path;
@@ -542,7 +546,7 @@ if (defined $seasonality_config_file_arg && -f $seasonality_config_file_arg) {
 }
 
 if ($seasonality_config_path) {
-    print STDERR "Loading seasonality definitions from: $seasonality_config_path\n";
+    print STDERR "Seasonality Definitions: $seasonality_config_path\n";
     # Replace Config::Tiny->read() with our custom, dependency-free parser.
     $seasonality_config = parse_seasonality_config($seasonality_config_path);
     unless (defined $seasonality_config) {
@@ -550,7 +554,7 @@ if ($seasonality_config_path) {
         die "Error: Could not parse seasonality config file '$seasonality_config_path'.\n";
     }
     my $event_count = scalar(keys %$seasonality_config);
-    print STDERR "Loaded $event_count seasonal event definitions.\n";
+    print STDERR "  - Loaded $event_count seasonal event definitions.\n";
 } elsif ($apply_seasonality_event || $update_seasonal_snapshot_event) {
     # It's an error to request seasonality if the config file doesn't exist.
     die "Error: Seasonality feature requested, but the configuration file '$DEFAULT_SEASONALITY_CONFIG_FILE' was not found in '$script_dir/etc/' or '$script_dir/'.\n";
@@ -593,7 +597,7 @@ if (defined $vm_config_file_arg) # User specified a VM config file
     {
         $vm_config_file_path = $vm_config_file_arg;
         $vm_config_found = 1;
-        print STDERR "Using specified VM configuration file: $vm_config_file_path\n";
+        print STDERR "VM Configurations: $vm_config_file_path\n";
     }
     else
     {
@@ -631,7 +635,7 @@ elsif (!defined $apply_seasonality_event)
 
 if ($vm_config_found)
 {
-    print STDERR "Loading VM configuration data (manual parse)...\n";
+#    print STDERR "Loading VM configuration data (manual parse)...\n";
     open my $cfg_fh, '<:encoding(utf8)', $vm_config_file_path or die "Error: Cannot open VM config file '$vm_config_file_path': $!\n";
     my $hdr = <$cfg_fh>; # Read header line
     unless (defined $hdr)
@@ -659,15 +663,15 @@ if ($vm_config_found)
     my $has_smt_col = exists $hmap{'smt'}; # Check if SMT column exists
     unless (exists $hmap{'maxcpu'})
     {
-        warn "Warning: 'maxcpu' column not found in VM config. Final MaxCPU capping logic will be affected.\n";
+        warn "  - 'maxcpu' column not found in VM configuration file. This can affect MaxCPU capping logic.\n";
     }
     if ($has_smt_col)
     {
-        print STDERR "Found 'SMT' column in VM configuration file.\n";
+        print STDERR "  - Found 'SMT' column in VM configuration file.\n";
     }
     else
     {
-        print STDERR "Info: 'SMT' column not found in VM configuration file. Will use default SMT: $default_smt_arg for RunQ calculations.\n";
+        print STDERR "  - Info: 'SMT' column not found in VM configuration file. Using default SMT: $default_smt_arg for RunQ calculations.\n";
     }
 
     foreach my $rc (@req_cols)
@@ -751,7 +755,7 @@ if ($vm_config_found)
         }
     }
     close $cfg_fh;
-    print STDERR "Finished loading VM config data for " . scalar(keys %vm_config_data) . " VMs.\n";
+    print STDERR "  - Loaded configurations for " . scalar(keys %vm_config_data) . " VMs.\n\n";
 }
 else # VM config file not found or not specified
 {
@@ -881,7 +885,6 @@ foreach my $system_serial (@target_systems_to_process)
         }
     }
 
-    my $log_file_path_for_run;
     if ($system_identifier && $system_identifier ne '.')
     {
         print STDERR "\n--- Processing Managed System: $system_identifier ---\n";
@@ -1245,7 +1248,15 @@ foreach my $system_serial (@target_systems_to_process)
         my $command = "$nfit_script_path $base_flags $nfit_windowing_decay_flags $vm_filter_arg $smt_flag $profile_specific_flags_for_nfit_run $nfit_runq_related_flags_for_command";
 
         # Execute and process the command
-        my $raw_nfit_output = `$command`;
+        my $raw_nfit_output = '';
+        # Use open3 to capture STDOUT, but let STDERR pass through to the terminal
+        # This avoids ambiguity with undef being a "false" value.
+        my $stderr_arg = ">&=" . fileno(STDERR);
+        my $pid = open3(undef, my $stdout_nfit, $stderr_arg, "$command --show-progress");
+        while(my $line = <$stdout_nfit>) {
+             $raw_nfit_output .= $line;
+        }
+        waitpid($pid, 0);
 
         my $exit_status = $? >> 8;
 
@@ -1264,7 +1275,7 @@ foreach my $system_serial (@target_systems_to_process)
         }
 
         # --- ASSIMILATION LOGIC ---
-        my $parsed_nfit_results = parse_nfit_key_value_output($raw_nfit_output);
+        my $parsed_nfit_results = parse_nfit_json_output($raw_nfit_output);
 
         foreach my $vm_name (sort keys %{$parsed_nfit_results})
         {
@@ -1280,8 +1291,9 @@ foreach my $system_serial (@target_systems_to_process)
             my $p_metric_key = "P" . clean_perc_label($profile_physc_perc_val_num // $DEFAULT_PERCENTILE);
             my @valid_p_values;
             foreach my $state (@states_for_vm) {
-                if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key})) {
-                    push @valid_p_values, $state->{$p_metric_key};
+                my $metric_val = $state->{metrics}{physc}{$p_metric_key};
+                if (defined $metric_val && looks_like_number($metric_val)) {
+                    push @valid_p_values, $metric_val;
                 }
             }
 
@@ -1299,19 +1311,27 @@ foreach my $system_serial (@target_systems_to_process)
             # This version correctly captures the Peak value from both standard and
             # aggregated decay model outputs.
             # ==============================================================================
-            # --- Data Capture for Sizing Hints and Modifiers ---
-            my $most_recent_state = $states_for_vm[-1]; # The last (or only) state in the time-sorted list
 
-            # For hints, we always use the MOST RECENT state from the P-99W1 profile run.
-            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT)
-            {
+            # The last (or only) state in the time-sorted list
+            my $most_recent_state = $states_for_vm[-1];
+
+            # For hints, we always use the MOST RECENT state from the P-99W1 profile run
+            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                my $metrics = $most_recent_state->{metrics};
+                my $runq_norm = $metrics->{runq}{normalized} || {};
+                my $runq_abs = $metrics->{runq}{absolute} || {};
+
+                # Store all parsed metrics from the most recent state for later use
+                $per_profile_runq_metrics{$vm_name}{$profile_name} = $most_recent_state;
 
                 # Capture RunQ metrics from the most recent state for global hints
-                $per_profile_runq_metrics{$vm_name}{$profile_name} = $most_recent_state;
                 my %first_capture_target_keys = ( 'NormRunQ_P50' => 1, 'NormRunQ_P90' => 1, 'AbsRunQ_P90'  => 1 );
                 foreach my $key (keys %first_capture_target_keys) {
                     if (!$primary_runq_metrics_captured_for_vm{$vm_name}{$key}) {
-                        $results_table{$vm_name}{$key} = $most_recent_state->{$key} // "N/A";
+                        my $value;
+                        if ($key =~ /NormRunQ_P(\d+)/) { $value = $runq_norm->{"P$1"}; }
+                        elsif ($key =~ /AbsRunQ_P(\d+)/) { $value = $runq_abs->{"P$1"}; }
+                        $results_table{$vm_name}{$key} = defined($value) ? $value : "N/A";
                         $primary_runq_metrics_captured_for_vm{$vm_name}{$key} = 1;
                         $source_profile_for_global_runq{$vm_name} //= $profile_name;
                     }
@@ -1326,8 +1346,9 @@ foreach my $system_serial (@target_systems_to_process)
             # CRITICAL: Only capture the Peak value from the mandatory, unfiltered P-99W1
             # profile run. This prevents it from being overwritten by subsequent,
             # time-filtered profiles (e.g., -online, -batch), or influence by a user defined profile.
-            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT && defined $most_recent_state->{'Peak'}) {
-                $results_table{$vm_name}{$PEAK_PROFILE_NAME} = $most_recent_state->{'Peak'};
+            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                my $peak_val = $most_recent_state->{metrics}{physc}{'Peak'};
+                $results_table{$vm_name}{$PEAK_PROFILE_NAME} = $peak_val if defined $peak_val;
             }
         }
 
@@ -1380,9 +1401,17 @@ foreach my $system_serial (@target_systems_to_process)
 
             if (ref($p99w1_results_aref) eq 'ARRAY' && @$p99w1_results_aref) {
                 my $last_state_data = $p99w1_results_aref->[-1];
-                if (defined $last_state_data->{'MaxCPU'} && looks_like_number($last_state_data->{'MaxCPU'}) && $last_state_data->{'MaxCPU'} > 0) { $maxcpu_for_hint = $last_state_data->{'MaxCPU'}; }
-                if (defined $last_state_data->{'SMT'} && looks_like_number($last_state_data->{'SMT'}) && $last_state_data->{'SMT'} > 0) { $smt_for_hint = $last_state_data->{'SMT'}; }
-                if (defined $last_state_data->{'Entitlement'} && looks_like_number($last_state_data->{'Entitlement'})) { $ent_for_hint = $last_state_data->{'Entitlement'}; }
+                my $config = $last_state_data->{metadata}{configuration} || {};
+
+				if (defined $config->{maxCpu} && looks_like_number($config->{maxCpu}) && $config->{maxCpu} > 0) {
+                    $maxcpu_for_hint = $config->{maxCpu};
+                }
+				if (defined $config->{smt} && looks_like_number($config->{smt}) && $config->{smt} > 0) {
+                    $smt_for_hint = $config->{smt};
+                }
+				if (defined $config->{entitlement} && looks_like_number($config->{entitlement})) {
+                    $ent_for_hint = $config->{entitlement};
+                }
             }
 
             my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, undef, undef, undef) =
@@ -1427,9 +1456,17 @@ foreach my $system_serial (@target_systems_to_process)
 
 			if (ref($p99w1_results_aref) eq 'ARRAY' && @$p99w1_results_aref) {
 				my $last_state_data = $p99w1_results_aref->[-1];
-				if (defined $last_state_data->{'MaxCPU'} && looks_like_number($last_state_data->{'MaxCPU'}) && $last_state_data->{'MaxCPU'} > 0) { $maxcpu_for_hint = $last_state_data->{'MaxCPU'}; }
-				if (defined $last_state_data->{'SMT'} && looks_like_number($last_state_data->{'SMT'}) && $last_state_data->{'SMT'} > 0) { $smt_for_hint = $last_state_data->{'SMT'}; }
-				if (defined $last_state_data->{'Entitlement'} && looks_like_number($last_state_data->{'Entitlement'})) { $ent_for_hint = $last_state_data->{'Entitlement'}; }
+                my $config = $last_state_data->{metadata}{configuration} || {};
+
+				if (defined $config->{maxCpu} && looks_like_number($config->{maxCpu}) && $config->{maxCpu} > 0) {
+                    $maxcpu_for_hint = $config->{maxCpu};
+                }
+				if (defined $config->{smt} && looks_like_number($config->{smt}) && $config->{smt} > 0) {
+                    $smt_for_hint = $config->{smt};
+                }
+				if (defined $config->{entitlement} && looks_like_number($config->{entitlement})) {
+                    $ent_for_hint = $config->{entitlement};
+                }
 			}
 
 			if ($maxcpu_for_hint == 0 && defined $cfg_for_hint && defined $cfg_for_hint->{maxcpu} && $cfg_for_hint->{maxcpu} > 0) { $maxcpu_for_hint = $cfg_for_hint->{maxcpu}; }
@@ -1481,16 +1518,21 @@ foreach my $system_serial (@target_systems_to_process)
 					my $abs_runq_key_to_use = ($runq_perc_behavior_mode eq 'match' && $profile->{flags} =~ /-p\s+([0-9.]+)/)
 					? "AbsRunQ_P" . clean_perc_label($1)
 					: "AbsRunQ_P90";
+                    my $abs_runq_perc_label = ($abs_runq_key_to_use =~ /P(.*)/) ? "P$1" : undef;
 
 					my $all_runq_metrics_for_vm = $per_profile_runq_metrics{$vm_name} || {};
 					my $runq_source_profile_name = $source_profile_for_global_runq{$vm_name} // $MANDATORY_PEAK_PROFILE_FOR_HINT;
+                    my $runq_source_metrics = $all_runq_metrics_for_vm->{$runq_source_profile_name}{metrics}{runq} || {};
+                    my $norm_metrics = $runq_source_metrics->{normalized} || {};
+                    my $abs_metrics = $runq_source_metrics->{absolute} || {};
+
 					($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
 						$base_physc,
-						$all_runq_metrics_for_vm->{$runq_source_profile_name}{'NormRunQ_P25'} // "N/A",
-						$all_runq_metrics_for_vm->{$runq_source_profile_name}{'NormRunQ_P50'} // "N/A",
-						$all_runq_metrics_for_vm->{$runq_source_profile_name}{'NormRunQ_P75'} // "N/A",
-						$all_runq_metrics_for_vm->{$runq_source_profile_name}{'NormRunQ_P90'} // "N/A",
-						$all_runq_metrics_for_vm->{$runq_source_profile_name}{$abs_runq_key_to_use} // "N/A",
+						$norm_metrics->{'P25'} // "N/A",
+						$norm_metrics->{'P50'} // "N/A",
+						$norm_metrics->{'P75'} // "N/A",
+						$norm_metrics->{'P90'} // "N/A",
+						$abs_metrics->{$abs_runq_perc_label} // "N/A",
 						$abs_runq_key_to_use,
 						$smt_for_hint,
 						$ent_for_hint,
@@ -1609,7 +1651,7 @@ foreach my $system_serial (@target_systems_to_process)
 
 } # End foreach system
 
-print STDERR "Finished nfit profile runs. Generating CSV output and rationale log...\n";
+print STDERR "\nnFit profiling completed.\n";
 
 # --- Collect unique serials that were part of the output ---
 my %serials_in_output_map;
@@ -1630,13 +1672,13 @@ my $excel_row_num_counter = 1; # Excel rows are 1-based; header is row 1, so fir
 # All seasonal models now handle their own output from within the main system loop.
 
 # --- Script Footer ---
-my $final_message = "Analysis complete.";
+my $final_message = "\n";
 if (@generated_files) {
     # Use List::Util::uniqstr if available, otherwise a simple hash works.
     my %seen;
     my @unique_files = grep { !$seen{$_}++ } @generated_files;
 
-    $final_message .= "\nOutput file(s) created in the '$output_dir/' directory:\n";
+    $final_message .= "\nOutput:\n";
     foreach my $file (@unique_files) {
         $final_message .= "  - $file\n";
     }
@@ -1645,6 +1687,7 @@ if (@generated_files) {
 } else {
     $final_message .= " No output files were generated.";
 }
+$final_message .= "Rationale Log:\n  - $log_file_path_for_run\n";
 print STDERR "$final_message\n";
 
 # --- Report final script duration summary to STDERR ---
@@ -2206,30 +2249,35 @@ sub log_profile_rationale
         printf {$fh} "  - nfit reported the following configuration states for this profile:\n";
 
         my $first_result = $raw_nfit_states_aref->[0];
-        my $is_aggregated = ($first_result->{'State_ID'} // '') eq 'Aggregated';
+        my $is_aggregated = ($first_result->{analysisType} || '') =~ /aggregated/;
 
         if ($is_aggregated) {
+            my $config = $first_result->{metadata}{configuration} || {};
+            my $metric_val = $first_result->{metrics}{physc}{$p_metric_key};
             # Special logging for aggregated decay-model results
             printf {$fh} "    - %-38s: Ent=%.2f, MaxCPU=%.2f, SMT=%d, %s=%.4f\n",
-                $first_result->{'State_ID'},
-                $first_result->{'Entitlement'} // 0,
-                $first_result->{'MaxCPU'} // 0,
-                $first_result->{'SMT'} // 0,
+                "Aggregated Result",
+                $config->{entitlement} // 0,
+                $config->{maxCpu} // 0,
+                $config->{smt} // 0,
                 $p_metric_key,
-                $first_result->{$p_metric_key} // 0;
-			my $state_count = $first_result->{'StateCount'} // 1;
+                defined($metric_val) ? $metric_val : 0;
+			my $state_count = $first_result->{state}{stateCount} // 1;
             printf {$fh} "    - Aggregation Method                    : Time-weighted decay model applied across %d configuration states.\n", $state_count;
         } else {
             # Standard logging for non-aggregated results
             foreach my $state_res (@$raw_nfit_states_aref) {
-                my $state_id_str = $state_res->{'State_ID'} // 'N/A';
+                my $state_id_str = $state_res->{state}{id} // 'N/A';
+                my $config = $state_res->{metadata}{configuration} || {};
+                my $metric_val = $state_res->{metrics}{physc}{$p_metric_key};
+
                 printf {$fh} "    - %-26s: Ent=%.2f, MaxCPU=%.2f, SMT=%d, %s=%s\n",
                     $state_id_str,
-                    $state_res->{'Entitlement'} // 0,
-                    $state_res->{'MaxCPU'} // 0,
-                    $state_res->{'SMT'} // 0,
+                    $config->{entitlement} // 0,
+                    $config->{maxCpu} // 0,
+                    $config->{smt} // 0,
                     $p_metric_key,
-                    $state_res->{$p_metric_key} // $na;
+                    defined($metric_val) ? sprintf("%.4f", $metric_val) : $na;
             }
             if (@$raw_nfit_states_aref > 1) {
                 printf {$fh} "    - Aggregation Method                     : Simple Average of %d states was used.\n", scalar(@$raw_nfit_states_aref);
@@ -2241,15 +2289,15 @@ sub log_profile_rationale
 
     my $nfit_growth_adj_to_display = "0.0000";
     my $first_nfit_state = (ref($raw_nfit_states_aref) eq 'ARRAY' && @$raw_nfit_states_aref) ? $raw_nfit_states_aref->[0] : {};
-    if (defined $first_nfit_state->{GrowthAdj} && looks_like_number($first_nfit_state->{GrowthAdj})) {
-        $nfit_growth_adj_to_display = sprintf("%.4f", $first_nfit_state->{GrowthAdj});
+    if (defined $first_nfit_state->{metrics}{growth}{adjustment} && looks_like_number($first_nfit_state->{metrics}{growth}{adjustment})) {
+        $nfit_growth_adj_to_display = sprintf("%.4f", $first_nfit_state->{metrics}{growth}{adjustment});
     }
 
     printf {$fh} "Initial Base PhysC for Profile              : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
 
     # Check if any GrowthDebug keys exist to print the rationale block
-    if (exists $first_nfit_state->{'GrowthDebug_num_hist_periods'}) {
-        my $gd = { map { $_ =~ /^GrowthDebug_(.*)$/ ? ($1 => $first_nfit_state->{$_}) : () } keys %$first_nfit_state };
+    if ($first_nfit_state->{debug}{growthRationale}) {
+        my $gd = $first_nfit_state->{debug}{growthRationale};
 
         # Helper for consistent boolean/skipped formatting
         my $format_check_result = sub {
@@ -2511,14 +2559,16 @@ sub log_profile_rationale
     print  {$fh} "  Key Decision Path & Justification:\n";
 
     # --- Source nfit's GrowthAdj and print detailed rationale if available ---
-    if (defined $first_nfit_state->{GrowthAdj} && looks_like_number($first_nfit_state->{GrowthAdj})) {
-        $nfit_growth_adj_to_display = sprintf("%.4f", $first_nfit_state->{GrowthAdj});
+    my $growth_metrics = $first_nfit_state->{metrics}{growth} || {};
+    if (defined $growth_metrics->{adjustment} && looks_like_number($growth_metrics->{adjustment})) {
+        $nfit_growth_adj_to_display = sprintf("%.4f", $growth_metrics->{adjustment});
     }
 
     printf {$fh} "    - Initial Base PhysC                    : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
 
-    if (exists $first_nfit_state->{'GrowthDebug_num_hist_periods'}) {
-        my $gd = { map { $_ =~ /^GrowthDebug_(.*)$/ ? ($1 => $first_nfit_state->{$_}) : () } keys %$first_nfit_state };
+    if ($first_nfit_state->{debug}{growthRationale}) {
+        my $gd = $first_nfit_state->{debug}{growthRationale} || {};
+        my $gp = $first_nfit_state->{debug}{growthParams} || {};
 
         my $format_check_result = sub {
             my $val = shift;
@@ -2529,8 +2579,8 @@ sub log_profile_rationale
         printf {$fh} "    - nfit GrowthAdj Applied                : +%s cores\n", $nfit_growth_adj_to_display;
         printf {$fh} "    - Rationale for GrowthAdj (from nfit):\n";
         # Use growth parameters reported by nfit if available, otherwise use this script's defaults.
-        my $proj_days = $first_nfit_state->{GrowthParam_projection_days} // $DEFAULT_GROWTH_PROJECTION_DAYS;
-        my $max_inf   = $first_nfit_state->{GrowthParam_max_inflation_perc} // $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
+        my $proj_days = $gp->{projection_days} // $DEFAULT_GROWTH_PROJECTION_DAYS;
+        my $max_inf   = $gp->{max_inflation_perc} // $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
 
         printf {$fh} "        1. Data Eligibility : %s historical periods found (Min: %d).\n", $gd->{num_hist_periods}, $GROWTH_MIN_HISTORICAL_PERIODS;
         printf {$fh} "        2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", $gd->{stats_cv}, $GROWTH_MAX_CV_THRESHOLD, $format_check_result->($gd->{cv_check_passed});
@@ -3446,9 +3496,14 @@ sub generate_sizing_hint
         exists $per_profile_runq_metrics_ref->{$vm} &&
         exists $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT})
     {
-        my $p99w1_runq_metrics = $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
-        $p99w1_abs_runq_p90_val_str = $p99w1_runq_metrics->{'AbsRunQ_P90'} // $na_str_hint;
-        $p99w1_norm_runq_p90_val_str = $p99w1_runq_metrics->{'NormRunQ_P90'} // $na_str_hint;
+        my $p99w1_metrics_block = $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT}->{metrics};
+
+        if (defined $p99w1_metrics_block && ref($p99w1_metrics_block) eq 'HASH') {
+            my $abs_runq_metrics = $p99w1_metrics_block->{runq}{absolute} || {};
+            my $norm_runq_metrics = $p99w1_metrics_block->{runq}{normalized} || {};
+            $p99w1_abs_runq_p90_val_str = $abs_runq_metrics->{'P90'} // $na_str_hint;
+            $p99w1_norm_runq_p90_val_str = $norm_runq_metrics->{'P90'} // $na_str_hint;
+        }
     }
     push @global_pressure_rationale_lines, sprintf("  Input %s AbsRunQ P90     : %s threads (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
     push @global_pressure_rationale_lines, sprintf("  Input %s NormRunQ P90    : %s (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_norm_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
@@ -3538,13 +3593,14 @@ sub generate_sizing_hint
     push @global_pressure_rationale_lines, "  4. Pool Context:";
 
     # Get Pool ID from nfit's dynamic data, and Pool Name from the optional config file
-    my $pool_id_from_nmon = (defined $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT}{'PoolID'}) ? $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT}{'PoolID'} : 0;
+    my $pool_id_from_nmon = $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT}->{metadata}{poolId} // 0;
     my $pool_name_from_config = (defined $config_ref && defined $config_ref->{pool_name}) ? $config_ref->{pool_name} : undef;
 
     # A non-default pool is one where the ID is not 0.
     my $is_non_default_pool = (looks_like_number($pool_id_from_nmon) && $pool_id_from_nmon != 0);
 
-    push @global_pressure_rationale_lines, sprintf("     - Pool ID (from NMON)     : %s", $pool_id_from_nmon);
+    # Pool ID is now directly from the JSON output of nfit
+    push @global_pressure_rationale_lines, sprintf("     - Pool ID                 : %s", $pool_id_from_nmon);
     push @global_pressure_rationale_lines, sprintf("     - Pool Name (from config) : %s", $pool_name_from_config // "N/A");
     push @global_pressure_rationale_lines, sprintf("     - Is Non-Default Pool     : %s", $is_non_default_pool ? "TRUE" : "FALSE");
 
@@ -3566,6 +3622,12 @@ sub generate_sizing_hint
 
     # --- Tiering logic (remains unchanged) ---
     my $initial_tier_range_str = "3/4";
+    if ($results_ref->{$vm}{'P-99W1'} > $results_ref->{$vm}{'G3-95W15'} * $HIGH_PEAK_RATIO_THRESHOLD) {
+        $shape_descriptor = "Very Peaky";
+    }
+    elsif ($results_ref->{$vm}{'P-99W1'} > $results_ref->{$vm}{'G3-95W15'} * $LOW_PEAK_RATIO_THRESHOLD) {
+        $shape_descriptor = "Moderately Peaky";
+    }
     if ($shape_descriptor eq "Very Peaky") { $initial_tier_range_str = "1/2"; }
     elsif ($shape_descriptor eq "Moderately Peaky") { $initial_tier_range_str = "2/3"; }
     my $adjusted_tier_str = $initial_tier_range_str;
@@ -3744,45 +3806,31 @@ sub clean_perc_label
     return $label;
 }
 
-# Parses the new rich key-value output from nfit v3.
-# Handles the "VMName:StateString Key=Val Key=Val..." format.
-# Returns a hash where keys are VM names, and values are arrays of state-result hashes.
-sub parse_nfit_key_value_output
+# --- parse_nfit_json_output ---
+# Parses the multi-line JSON output from nfit. Each line is a distinct JSON object.
+# Returns a hash where keys are VM names and values are arrays of the parsed JSON objects (as Perl hashes).
+sub parse_nfit_json_output
 {
     my ($raw_output) = @_;
     my %parsed_data;
+    my $json_decoder = JSON->new->utf8;
     my @lines = split /\n/, $raw_output;
 
     foreach my $line (@lines)
     {
+        next if $line =~ /^\s*$/; # Skip empty lines
 
-        next if $line =~ /^\s*$/;
-        next if $line =~ /^#/;
-        next if $line =~ /^VM_Name,State_ID/;
-        next unless $line =~ /:/;
-
-        my ($vm_name, $data_string) = split /:/, $line, 2;
-        $vm_name =~ s/^\s+|\s+$//g;
-
-        next unless (defined $vm_name && $vm_name ne '' && defined $data_string);
-        $data_string =~ s/^\s+|\s+$//g;
-
-        my @parts = split /\s+/, $data_string;
-        my %state_data_hash;
-        my @state_id_parts;
-
-        foreach my $part (@parts) {
-            if ($part =~ /^([^=]+)=(.+)$/) {
-                $state_data_hash{$1} = $2;
-            } else {
-                push @state_id_parts, $part;
-            }
+        my $decoded_hash = eval { $json_decoder->decode($line) };
+        if ($@ || !ref($decoded_hash) eq 'HASH') {
+            warn "Warning: Could not decode JSON line from nfit: $line. Error: $@";
+            next;
         }
 
-        my $state_id_str = join(' ', @state_id_parts);
-        $state_data_hash{'State_ID'} = ($state_id_str ne '') ? $state_id_str : 'Aggregated';
+        my $vm_name = $decoded_hash->{vmName};
+        if ($vm_name) {
+            push @{$parsed_data{$vm_name}}, $decoded_hash;
+        }
 
-        push @{$parsed_data{$vm_name}}, \%state_data_hash;
     }
 
     return \%parsed_data;
@@ -3983,17 +4031,13 @@ sub parse_seasonality_config {
 }
 
 # ==============================================================================
-# SUBROUTINE: calculate_multiplicative_forecast
+# SUBROUTINE: calculate_multiplicative_forecast (NEW ROBUST DESIGN)
 # PURPOSE:    Calculates a forecast using the multiplicative seasonal model.
-#             This version is enhanced to use the 'unclippedPeakEstimate' from
-#             the snapshot cache if it exists, providing a more accurate
-#             seasonal multiplier based on corrected historical data.
-# DETAILS:
-# This function is a pure calculation engine. It takes a pre-calculated baseline
-# and applies the seasonal forecast logic to it. It returns the final results
-# to the main script for unified reporting and logging.
-# ARGS:
-#   (as per existing implementation)
+#             This version implements a robust, multi-stage forecast. It
+#             intelligently determines the most appropriate recent baseline and
+#             applies a recency-weighted seasonal multiplier derived from
+#             historical, saturation-corrected peak data. It also includes
+#             logic for volatility, residual peak forecasting, and compounding.
 # RETURNS:
 #   - A hash reference containing the final forecasted results.
 #   - A hash reference containing historical data for verbose reporting.
@@ -4001,133 +4045,154 @@ sub parse_seasonality_config {
 sub calculate_multiplicative_forecast {
     my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href) = @_;
 
-    print STDERR "Executing multiplicative forecast for primary event '$event_name' on system '$system_identifier'.\n";
+    # This subroutine implements a robust, multi-stage forecast for multiplicative seasonal events.
+    # It intelligently determines the most appropriate recent baseline and applies a recency-weighted
+    # seasonal multiplier derived from historical, saturation-corrected peak data.
 
-    # This model requires its own, fresh baseline based on recent, stable data.
-    # It does NOT use the main results table that was passed in, as that may cover
-    # a long and non-representative period. The initial table was only needed to
-    # gather the Peak value before this function was called.
+    print STDERR "\n--- Applying Multiplicative Seasonal Forecast ---\n";
+    print STDERR "Executing robust forecast for event '$event_name' on system '$system_identifier'.\n";
 
-    # --- Step 1: Calculate a fresh 'CurrentBaseline' based on the configuration ---
-    # The baseline period is defined as the 'baseline_period_days' immediately
-    # preceding the *next* upcoming instance of the seasonal event.
-    my $today = gmtime();
-    my ($next_peak_start_obj, $next_peak_end_obj) = determine_event_period($event_config);
+    # --- Configuration Constants ---
+    # The number of days of stable, non-peak activity to use for the baseline.
+    my $baseline_days_config = $event_config->{baseline_period_days} // 16;
+    # A baseline must have at least this many clean days to be considered statistically valid.
+    my $MIN_BASELINE_DAYS = 7;
+    # Placeholder for future enhancement: A trend adjustment factor could be applied here.
+    my $trend_adjustment_factor = 1.0;
 
-    unless (defined $next_peak_start_obj && ref($next_peak_start_obj) eq 'Time::Piece') {
-        warn "Warning: Could not determine the upcoming peak period for event '$event_name'. Cannot calculate a forecast.\n";
-        return ({}, {}); # Return empty hash refs
+    # --- Step 1: Get Key Dates and Historical Data ---
+    my $data_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
+    my (undef, $cache_end_date_obj) = _get_cache_date_range($data_cache_file);
+
+    unless ($cache_end_date_obj) {
+        warn "Warning: Could not determine data cache end date. Cannot proceed with forecast.\n";
+        return ({}, {});
     }
 
-    # Read the baseline duration from the config, with a sensible default.
-    my $baseline_days = $event_config->{baseline_period_days} // 30;
+    my $all_historical_snapshots = read_seasonal_snapshot_cache($system_cache_dir);
+    my @event_history_initial;
+    my ($most_recent_peak_snapshot, $most_recent_peak_end_obj);
 
-    # The baseline ends the second before the next peak starts.
-    my $current_baseline_end_obj = $next_peak_start_obj - ONE_SECOND;
-    my $current_baseline_start_obj = $current_baseline_end_obj->truncate(to => 'day') - (($baseline_days - 1) * 86400);
-
-    my $current_baseline_start_str = $current_baseline_start_obj->strftime('%Y-%m-%d');
-    my $current_baseline_end_str = $current_baseline_end_obj->strftime('%Y-%m-%d');
-
-    print "  - Calculating Current Baseline for stable period (preceding next peak): $current_baseline_start_str to $current_baseline_end_str...\n";
-
-    my %current_baseline_results;
-    foreach my $profile (@profiles) {
-        my $profile_name = $profile->{name};
-
-        # Add a consistent progress message for the baseline calculation phase.
-        print STDERR "    - Running profile: $profile_name (for Current Baseline)\n";
-
-        # Build the nfit command using the dedicated helper function.
-        # This ensures consistency and correctly strips unwanted flags.
-        my $nfit_cmd = _build_nfit_baseline_command(
-            $profile->{flags},
-            $current_baseline_start_str,
-            $current_baseline_end_str,
-            $system_cache_dir
-        );
-
-        # IMPORTANT: The baseline calculation should include standard growth prediction
-        # if the profile is configured for it, as this represents the true current trend.
-        # Therefore, we do NOT strip the growth flags here.
-
-        my $nfit_output = `$nfit_cmd`;
-        if ($? != 0) {
-            warn "Warning: nfit failed for profile '$profile_name' during baseline calculation. Skipping this profile for the forecast.\n";
-            next;
+    # Find all historical peaks for this event and identify the most recent one.
+    foreach my $key (sort { $b cmp $a } keys %$all_historical_snapshots) {
+        if ($key =~ /^$event_name-/) {
+            my $snapshot = $all_historical_snapshots->{$key};
+            push @event_history_initial, $snapshot;
+            if (!$most_recent_peak_snapshot) {
+                $most_recent_peak_snapshot = $snapshot;
+                $most_recent_peak_end_obj = Time::Piece->strptime($snapshot->{periodEndDate}, '%Y-%m-%d');
+            }
         }
+    }
 
-        my $parsed_results = parse_nfit_key_value_output($nfit_output);
-        my $p_metric_key = "P" . clean_perc_label( ($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE );
+    # --- Step 2: Two-Tiered Baseline Strategy ---
+    my %current_baseline_results;
+    my $baseline_source_log = "N/A";
+    my @event_history_final = @event_history_initial; # Start with all available history.
 
-        foreach my $vm_name (keys %$parsed_results) {
-            my @states_for_vm = @{$parsed_results->{$vm_name}};
-            next unless @states_for_vm;
+    # --- Path A (Ideal): Attempt to calculate a "Post-Peak" baseline ---
+    # The ideal baseline is the N days of data ending on the last day of the cache.
+    my $post_peak_baseline_start_obj = $cache_end_date_obj->truncate(to => 'day') - (($baseline_days_config - 1) * 86400);
 
-            my @valid_p_values;
-            foreach my $state (@states_for_vm) {
-                if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key})) {
-                    push @valid_p_values, $state->{$p_metric_key};
+    # Check if this ideal baseline period is contaminated by the most recent historical peak.
+    my $is_contaminated = 0;
+    if ($most_recent_peak_end_obj) {
+        $is_contaminated = ($post_peak_baseline_start_obj <= $most_recent_peak_end_obj);
+    }
+    # Also check if the clean period is long enough to be statistically valid.
+    my $clean_days_available = $is_contaminated ?
+        ($cache_end_date_obj->epoch - $most_recent_peak_end_obj->epoch) / 86400 - 1 :
+        $baseline_days_config;
+
+    if (!$is_contaminated && $clean_days_available >= $MIN_BASELINE_DAYS) {
+        $baseline_source_log = "Post-Peak (calculated from " . $post_peak_baseline_start_obj->date . " to " . $cache_end_date_obj->date . ")";
+        print STDERR "  - Baseline Strategy: Using ideal Post-Peak baseline.\n";
+
+        my $start_str = $post_peak_baseline_start_obj->strftime('%Y-%m-%d');
+        my $end_str   = $cache_end_date_obj->strftime('%Y-%m-%d');
+
+        foreach my $profile (@profiles) {
+            # This is a contextual baseline, so is_generic is 0.
+            my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir, 0, 0);
+            my $nfit_output = '';
+            my $pid_nfit = open3(undef, my $stdout_nfit, undef, $nfit_cmd);
+            while (my $line = <$stdout_nfit>) { $nfit_output .= $line; }
+            waitpid($pid_nfit, 0);
+            next if $?; # Skip if nfit command failed
+
+            my $parsed = parse_nfit_json_output($nfit_output);
+            my $p_key  = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
+
+            foreach my $vm (keys %$parsed) {
+                my @vals = map { $_->{metrics}{physc}{$p_key} } @{$parsed->{$vm}};
+                my @valid_vals = grep { defined $_ && looks_like_number($_) } @vals;
+                if (@valid_vals) {
+                    $current_baseline_results{$vm}{$profile->{name}} = sum0(@valid_vals) / scalar(@valid_vals);
                 }
             }
-            if (@valid_p_values) {
-                my $aggregated_value = sum0(@valid_p_values) / scalar(@valid_p_values);
-                $current_baseline_results{$vm_name}{$profile_name} = $aggregated_value;
-            }
         }
     }
+    # --- Path B (Fallback): Re-use the "Pre-Peak" baseline from the most recent snapshot ---
+    elsif ($most_recent_peak_snapshot) {
+        $baseline_source_log = "Pre-Peak (re-used from snapshot ending " . $most_recent_peak_snapshot->{periodEndDate} . ")";
+        print STDERR "  - Baseline Strategy: Post-Peak baseline contaminated or too short. Falling back to re-use Pre-Peak baseline.\n";
+        %current_baseline_results = %{$most_recent_peak_snapshot->{results}{HistoricBaseline} || {}};
+        # If we re-use this baseline, we must exclude its corresponding peak from the multiplier calculation.
+        shift @event_history_final;
+    }
 
-    # --- Step 2: Read historical snapshots ---
-    my $historical_snapshots = read_seasonal_snapshot_cache($system_cache_dir);
+    unless (%current_baseline_results) {
+        warn "Warning: Could not determine a valid baseline. Cannot proceed with forecast.\n";
+        return ({}, {});
+    }
 
-    # --- Step 3: Detect all active events and calculate compound multiplier ---
-    my @event_period_dates = determine_event_period($event_config);
-    my $forecast_date_obj = (defined $event_period_dates[0] && ref($event_period_dates[0]) eq 'Time::Piece') ? $event_period_dates[0] : $today;
-
+    # --- Step 3: Detect Active Events for Compounding ---
+    my $today_for_recency = gmtime();
+    my ($next_event_start, $next_event_end) = determine_event_period($event_config);
+    my $forecast_date_obj = (defined $next_event_start && ref($next_event_start) eq 'Time::Piece') ? $next_event_start : $today_for_recency;
     my @active_events = detect_active_events($forecast_date_obj, $full_seasonality_config);
 
-    # Initialise return structures
+    # --- Step 4: Calculate Recency-Weighted Multiplier & Final Forecast ---
     my %final_forecasts;
-    my %historic_data_for_csv;
+    my %historic_data_for_csv; # For verbose reporting
 
     if (!@active_events) {
-        print STDERR "  - No active seasonal events found for the forecast period. Nothing to do.\n";
-        return (\%final_forecasts, \%historic_data_for_csv); # Return empty structures
+        print STDERR "  - No active seasonal events found for the forecast period. Using baseline as forecast.\n";
+        # If no events are active, the forecast is simply the baseline.
+        foreach my $vm_name (keys %current_baseline_results) {
+            foreach my $profile (@profiles) {
+                $final_forecasts{$vm_name}{$profile->{name}} = $current_baseline_results{$vm_name}{$profile->{name}};
+            }
+        }
+        return (\%final_forecasts, \%historic_data_for_csv);
     }
 
     my $is_compound_run = (scalar(@active_events) > 1);
     my @dampening_factors;
-
     print "  - Detected " . scalar(@active_events) . " active event(s): " . join(", ", map { $_->{_eventName} } @active_events) . "\n";
     if ($is_compound_run) { print "  - Compounding mode enabled.\n"; }
 
-    # --- Step 4: For each VM, calculate the forecast ---
+    # Main processing loop: iterate through each VM that has a valid baseline.
     foreach my $vm_name (sort keys %current_baseline_results) {
         my $vm_forecasts = {};
         my %vm_historic_multipliers;
         my %vm_historic_residuals;
 
+        # First, gather all historical data for all active events for this VM.
         foreach my $active_event_cfg (@active_events) {
             my $active_event_name = $active_event_cfg->{_eventName};
             my $min_years = $active_event_cfg->{min_historical_years} // 1;
 
-            my @event_history;
-            foreach my $key (sort keys %$historical_snapshots) {
-                if ($key =~ /^$active_event_name-/) {
-                    push @event_history, $historical_snapshots->{$key};
-                }
+            my @history_for_this_event;
+            foreach my $hist_event (@event_history_final) {
+                 if ($hist_event->{eventName} eq $active_event_name) {
+                     push @history_for_this_event, $hist_event;
+                 }
             }
 
-            if (scalar(@event_history) < $min_years) {
-                warn "  - WARNING for VM '$vm_name': Insufficient history for active event '$active_event_name' (found " . scalar(@event_history) . ", need $min_years). It will be excluded from compounding.\n";
+            if (scalar(@history_for_this_event) < $min_years) {
+                warn "  - WARNING for VM '$vm_name': Insufficient history for active event '$active_event_name' (found " . scalar(@history_for_this_event) . ", need $min_years). It will be excluded from compounding.\n";
                 next;
-            }
-
-            # Populate historic data for CSV from the MOST RECENT snapshot
-            if ($active_event_name eq $event_name && @event_history) {
-                 my $most_recent_snapshot = (sort { $b->{periodEndDate} cmp $a->{periodEndDate} } @event_history)[0];
-                 $historic_data_for_csv{$vm_name}{'HistoricPeak'} = $most_recent_snapshot->{results}{HistoricPeak}{$vm_name} || {};
-                 $historic_data_for_csv{$vm_name}{'HistoricBaseline'} = $most_recent_snapshot->{results}{HistoricBaseline}{$vm_name} || {};
             }
 
             if (defined $active_event_cfg->{interaction_dampening_factor}) {
@@ -4137,39 +4202,32 @@ sub calculate_multiplicative_forecast {
             foreach my $profile (@profiles) {
                 my $p_name = $profile->{name};
                 my @multipliers;
-                # array to hold residuals for the current profile.
                 my @residuals;
-                foreach my $hist_event (@event_history) {
+                foreach my $hist_event (@history_for_this_event) {
                     my $hist_results = $hist_event->{results};
-
-                    # Preferentially use the unclipped peak estimate if available.
                     my $hist_peak = $hist_results->{HistoricPeak}{$vm_name}{$p_name};
-                    if (exists $hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate}) {
+                    if (defined $hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate} && looks_like_number($hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate})) {
                         $hist_peak = $hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate};
                     }
-
-                    my $hist_base = $hist_event->{results}{'HistoricBaseline'}{$vm_name}{$p_name};
-                    my $hist_residual = $hist_event->{results}{'PeakResidual'}{$vm_name}{$p_name};
+                    my $hist_base = $hist_results->{HistoricBaseline}{$vm_name}{$p_name};
+                    my $hist_residual = $hist_results->{PeakResidual}{$vm_name}{$p_name};
 
                     if (defined $hist_peak && defined $hist_base && $hist_base > 0.001) {
-                        push @multipliers, { value => $hist_peak / $hist_base, date  => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d') };
+                        push @multipliers, { value => $hist_peak / $hist_base, date => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d') };
                     }
-                    # Store the historical residual if it exists.
                     if (defined $hist_residual && looks_like_number($hist_residual)) {
                         push @residuals, { value => $hist_residual, date => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d') };
                     }
                 }
                 next unless @multipliers;
 
-                my $event_multiplier = calculate_recency_weighted_average(\@multipliers, $today, 365);
+                my $event_multiplier = calculate_recency_weighted_average(\@multipliers, $today_for_recency, 365);
                 $vm_historic_multipliers{$p_name}{$active_event_name} = { 'multiplier' => $event_multiplier, 'history' => \@multipliers };
-                # store the collected historical residuals for this profile.
                 $vm_historic_residuals{$p_name}{$active_event_name} = \@residuals;
             }
         }
 
-        my $primary_event_cfg = $active_events[0];
-
+        # Now, synthesize the final forecast for each profile.
         foreach my $profile (@profiles) {
             my $p_name = $profile->{name};
             my $current_baseline_val = $current_baseline_results{$vm_name}{$p_name};
@@ -4186,15 +4244,14 @@ sub calculate_multiplicative_forecast {
                 $final_multiplier = 1 + (($final_multiplier - 1) * $dampening_to_apply);
             }
 
-            # *** Volatility Buffer Calculation ***
             my $volatility_buffer = 1.0;
+            my $primary_event_cfg = (grep { $_->{_eventName} eq $event_name } @active_events)[0] || $active_events[0];
             if (($primary_event_cfg->{volatility_adjustment} // 0) == 1 && exists $vm_historic_multipliers{$p_name}{$primary_event_cfg->{_eventName}}) {
                 my $primary_event_history_ref = $vm_historic_multipliers{$p_name}{$primary_event_cfg->{_eventName}}{'history'};
                 my $confidence = $primary_event_cfg->{seasonal_confidence_level} // '0.95';
                 $volatility_buffer = calculate_volatility_buffer($primary_event_history_ref, $confidence);
             }
 
-            # --- NEW: Forecast the residual using a recency-weighted average of historical residuals.
             my $forecasted_residual = 0;
             my @all_residuals_for_profile;
             if (exists $vm_historic_residuals{$p_name}) {
@@ -4203,31 +4260,21 @@ sub calculate_multiplicative_forecast {
                 }
             }
             if (@all_residuals_for_profile) {
-                $forecasted_residual = calculate_recency_weighted_average(\@all_residuals_for_profile, $today, 365) // 0;
+                $forecasted_residual = calculate_recency_weighted_average(\@all_residuals_for_profile, $today_for_recency, 365) // 0;
             }
 
-            # --- NEW: Combine all components and apply the optional amplification factor.
-            my $primary_forecast = $current_baseline_val * $final_multiplier * $volatility_buffer;
+            my $trend_adjusted_baseline = $current_baseline_val * $trend_adjustment_factor;
+            my $primary_forecast = $trend_adjusted_baseline * $final_multiplier * $volatility_buffer;
             my $combined_forecast = $primary_forecast + $forecasted_residual;
-
             my $amplification = $event_config->{peak_amplification_factor} // 1.0;
             my $final_recommendation = $combined_forecast * $amplification;
 
-            # Store the final forecast value for the results table.
-			$vm_forecasts->{$p_name} = $final_recommendation;
+            $vm_forecasts->{$p_name} = $final_recommendation;
 
-            # After calculating the multiplier, check if it's still at its default value.
-            # This indicates that no valid historical data was found for this specific
-            # VM and profile combination.
-            if (abs($final_multiplier - 1.0) < 0.001 && abs($volatility_buffer - 1.0) < 0.001 && abs($forecasted_residual) < 0.001) {
-                my $primary_event_name = $active_events[0]->{_eventName};
-                # The warning now includes the VM and Profile name for easy debugging.
-                warn "    - WARNING for VM [$vm_name], Profile [$p_name]: No valid historical multipliers or residuals found for event '$primary_event_name'. Forecast will not include seasonal uplift.\n";
-            }
-
-            # Store all calculation components in the debug hash for detailed logging.
             $seasonal_debug_info{$vm_name}{$p_name} = {
                 baseline             => $current_baseline_val,
+                baseline_source      => $baseline_source_log,
+                trend_factor         => $trend_adjustment_factor,
                 multiplier           => $final_multiplier,
                 volatility           => $volatility_buffer,
                 forecasted_residual  => $forecasted_residual,
@@ -4235,9 +4282,16 @@ sub calculate_multiplicative_forecast {
                 forecast             => $final_recommendation,
                 OutlierWarning       => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings)
             };
-            $vm_forecasts->{$p_name} = $final_recommendation;
         }
         $final_forecasts{$vm_name} = $vm_forecasts;
+    }
+
+    # Populate data for the verbose historic_snapshot.csv file.
+    if ($most_recent_peak_snapshot) {
+        foreach my $vm_name (keys %{$most_recent_peak_snapshot->{results}{HistoricPeak}}) {
+            $historic_data_for_csv{$vm_name}{'HistoricPeak'} = $most_recent_peak_snapshot->{results}{HistoricPeak}{$vm_name} || {};
+            $historic_data_for_csv{$vm_name}{'HistoricBaseline'} = $most_recent_peak_snapshot->{results}{HistoricBaseline}{$vm_name} || {};
+        }
     }
 
     # Return both the forecasts and the historical data for verbose reporting.
@@ -4793,7 +4847,16 @@ sub update_seasonal_snapshot {
 
             my $extreme_cmd = _build_nfit_baseline_command($extreme_peak_flags, $start_str, $end_str, $system_cache_dir);
 
-            my $extreme_output = `$extreme_cmd`;
+            my $extreme_output = '';
+            # Use open3 to capture STDOUT, but let STDERR pass through to the terminal
+            # This avoids ambiguity with undef being a "false" value.
+            my $stderr_arg = ">&=" . fileno(STDERR);
+            my $pid_extreme = open3(undef, my $stdout_extreme, $stderr_arg, "$extreme_cmd --show-progress");
+            while(my $line = <$stdout_extreme>) {
+                $extreme_output .= $line;
+            }
+            waitpid($pid_extreme, 0);
+
             if ($? == 0) {
                 my $p_metric_key_extreme;
                 if ($extreme_peak_flags =~ /-p\s+([0-9.]+)/) {
@@ -4803,15 +4866,17 @@ sub update_seasonal_snapshot {
                 }
 
                 if ($p_metric_key_extreme) {
-                    my $parsed_extreme = parse_nfit_key_value_output($extreme_output);
+                    my $parsed_extreme = parse_nfit_json_output($extreme_output);
                     foreach my $vm_name (keys %$parsed_extreme) {
                         my @states = @{$parsed_extreme->{$vm_name}};
                         my @sanitized_values;
                         my @absolute_peak_values;
                         foreach my $state (@states) {
-                            push @sanitized_values, $state->{$p_metric_key_extreme} if (defined $state->{$p_metric_key_extreme} && looks_like_number($state->{$p_metric_key_extreme}));
+                            my $metric_val = $state->{metrics}{physc}{$p_metric_key_extreme};
+                            push @sanitized_values, $metric_val if (defined $metric_val && looks_like_number($metric_val));
                             # The '-k' in the helper ensures 'Peak' is also in the output.
-                            push @absolute_peak_values, $state->{'Peak'} if (defined $state->{'Peak'} && looks_like_number($state->{'Peak'}));
+                            my $peak_val = $state->{metrics}{physc}{'Peak'};
+                            push @absolute_peak_values, $peak_val if (defined $peak_val && looks_like_number($peak_val));
                         }
                         if (@sanitized_values) {
                             # Store both the sanitized value and the absolute peak for later comparison.
@@ -4831,13 +4896,21 @@ sub update_seasonal_snapshot {
             print STDERR "    - Running profile: $profile_name\n";
 
             my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir, 1);
-            my $nfit_output = `$nfit_cmd`;
+            my $nfit_output = '';
+            # Use open3 to capture STDOUT, but let STDERR pass through to the terminal
+            my $stderr_arg = ">&=" . fileno(STDERR);
+            my $pid_nfit = open3(undef, my $stdout_nfit, $stderr_arg, "$nfit_cmd --show-progress");
+            while(my $line = <$stdout_nfit>) {
+                $nfit_output .= $line;
+            }
+            waitpid($pid_nfit, 0);
+
             if ($? != 0) {
                 warn "Warning: nfit failed for profile '$profile_name' during snapshot analysis for period $start_str to $end_str. Skipping.\n";
                 next;
             }
 
-            my $parsed_results = parse_nfit_key_value_output($nfit_output);
+            my $parsed_results = parse_nfit_json_output($nfit_output);
             my $p_metric_key = "P" . clean_perc_label( ($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE );
 
             foreach my $vm_name (keys %$parsed_results) {
@@ -4850,31 +4923,36 @@ sub update_seasonal_snapshot {
                 my @p_values;
                 my @peak_values;
                 foreach my $state (@states) {
-                    # The existing parse_nfit_key_value_output is generic and will have already parsed the new clipping keys into the $state hash.
-                    push @p_values, $state->{$p_metric_key} if (defined $state->{$p_metric_key} && looks_like_number($state->{$p_metric_key}));
+                    # The existing parse_nfit_json_output is generic and will have already parsed the new clipping keys into the $state hash.
+                    my $metric_val = $state->{metrics}{physc}{$p_metric_key};
+                    push @p_values, $metric_val if (defined $metric_val && looks_like_number($metric_val));
+
                     if ($is_peak_period_job && !%extreme_peak_values_by_vm) {
-                        push @peak_values, $state->{'Peak'} if (defined $state->{'Peak'} && looks_like_number($state->{'Peak'}));
+                        my $peak_val = $state->{metrics}{physc}{'Peak'};
+                        push @peak_values, $peak_val if (defined $peak_val && looks_like_number($peak_val));
                     }
                 }
 
                 if (@p_values) {
                     my $aggregated_p_value = sum0(@p_values) / scalar(@p_values);
+                    my $true_peak_value = (@peak_values) ? max(@peak_values) : $aggregated_p_value; # Fallback to percentile if peak is missing
                     $period_results{$vm_name}{$profile_name} = $aggregated_p_value;
 
                     if ($is_peak_period_job) {
                         # --- Clipping Data Capture ---
                         # This logic only applies to the PEAK period job.
                         # It checks for the new clipping metrics from the nfit output.
-                        if (exists $final_state_data->{IsClipped}) {
-                            my $unmet_demand = $final_state_data->{UnmetDemand} // 0;
+                        my $clipping_metrics = $final_state_data->{metrics}{clipping};
+                        if (defined $clipping_metrics && ref($clipping_metrics) eq 'HASH' && exists $clipping_metrics->{isClipped}) {
+                            my $unmet_demand = $clipping_metrics->{unmetDemand} // 0;
                             $clipping_info_results{$vm_name}{$profile_name} = {
-                                isClipped           => $final_state_data->{IsClipped},
-                                clippingConfidence  => $final_state_data->{ClipConfidence},
-                                capacityLimit       => $final_state_data->{MaxCPU}, # MaxCPU from nfit output
+                                isClipped           => $clipping_metrics->{isClipped},
+                                clippingConfidence  => $clipping_metrics->{confidence},
+                                capacityLimit       => $final_state_data->{metadata}{configuration}{maxCpu},
                                 unmetDemandEstimate => $unmet_demand,
-                                unclippedPeakEstimate => $aggregated_p_value + $unmet_demand,
+                                unclippedPeakEstimate => $true_peak_value + $unmet_demand,
                                 platformSpecificMarkers => {
-                                    aix_runq_saturation => $final_state_data->{RunQSatScore}
+                                    aix_runq_saturation => $clipping_metrics->{runqSaturationScore}
                                 }
                             };
                         }
@@ -4893,7 +4971,7 @@ sub update_seasonal_snapshot {
                         }
 
                         if (defined $extreme_peak_for_residual) {
-                            my $residual = $extreme_peak_for_residual - $aggregated_p_value;
+                            my $residual = $extreme_peak_for_residual - $true_peak_value;
                             $residual_results{$vm_name}{$profile_name} = ($residual > 0) ? $residual : 0;
 
                             if (defined $absolute_peak_for_comparison) {
@@ -4977,7 +5055,7 @@ sub _write_standard_csv_report {
     push @generated_files, $output_filename;
 
     open my $out_fh, '>', $output_filename or die "FATAL: Cannot open output file '$output_filename': $!";
-    print STDERR "Analysis complete. Writing '$report_type' report to: $output_filename\n";
+#    print STDERR "Analysis complete. Writing '$report_type' report to: $output_filename\n";
 
     # Create a local copy of the header to modify for this specific report.
     my @header_for_this_report = @output_header_cols_csv;
@@ -5038,11 +5116,19 @@ sub _write_standard_csv_report {
 
         my ($serial_out, $systype_out, $poolname_out, $poolid_out, $ent_out) = ('', '', '', '', '');
         if (defined $cfg_csv) {
-            $serial_out = $cfg_csv->{serial} // ''; $systype_out = $cfg_csv->{systemtype} // ''; $poolname_out = $cfg_csv->{pool_name} // ''; $poolid_out = $cfg_csv->{pool_id} // ''; $ent_out = $cfg_csv->{entitlement} // '';
+            $serial_out = $cfg_csv->{serial} // '';
+            $systype_out = $cfg_csv->{systemtype} // '';
+            $poolname_out = $cfg_csv->{pool_name} // '';
+            $poolid_out = $cfg_csv->{pool_id} // '';
+            $ent_out = $cfg_csv->{entitlement} // '';
         } else {
-            my $last_state_data = ($per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} // [])->[-1];
-            if ($last_state_data) {
-                $serial_out = $last_state_data->{'SerialNumber'} // ''; $poolid_out = $last_state_data->{'PoolID'} // ''; $ent_out = $last_state_data->{'Entitlement'} // '';
+            my $last_state_data_ref = ($per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} // [])->[-1];
+            if ($last_state_data_ref && ref($last_state_data_ref) eq 'HASH') {
+                my $metadata = $last_state_data_ref->{metadata} || {};
+                my $config = $metadata->{configuration} || {};
+                $serial_out = $metadata->{serialNumber} // '';
+                $poolid_out = $metadata->{poolId} // '';
+                $ent_out = $config->{entitlement} // '';
             }
         }
         push @data_row_csv, $serial_out, $systype_out, $poolname_out, $poolid_out;
@@ -5084,12 +5170,10 @@ sub _write_standard_csv_report {
             my @growth_adjs;
             foreach my $profile (@profiles) {
                 my $raw_results_ref = $per_profile_nfit_raw_results{$vm_name}{$profile->{name}};
-                if (ref($raw_results_ref) eq 'ARRAY' && @$raw_results_ref) {
-                    my $result_line = $raw_results_ref->[0];
-                    if (defined $result_line->{GrowthAdj} && looks_like_number($result_line->{GrowthAdj})) {
-                        my $growth_val = $result_line->{GrowthAdj};
-                        # Collect all positive growth adjustments
-                        push @growth_adjs, $growth_val if $growth_val > 0.001;
+                if (ref($raw_results_ref) eq 'ARRAY' && @$raw_results_ref && $raw_results_ref->[0]{metrics}{growth}) {
+                    my $growth_val = $raw_results_ref->[0]{metrics}{growth}{adjustment};
+                    if (defined $growth_val && looks_like_number($growth_val)) {
+                       push @growth_adjs, $growth_val if $growth_val > 0.001;
                     }
                 }
             }
@@ -5437,11 +5521,13 @@ sub determine_seasonal_analysis_path {
 #   4. $system_cache_dir (string): Path to the target cache directory.
 #   5. $enable_clipping_detection (boolean, optional): If true, adds the
 #      --enable-clipping-detection flag to the command.
+#   6. $is_generic_baseline: if true, all decay and time filters are stripped.
+#   7. $allow_growth_prediction: if true, growth predictions will be enabled.
 # RETURNS:
 #   - The fully constructed nfit command string.
 # ==============================================================================
 sub _build_nfit_baseline_command {
-    my ($profile_flags_in, $baseline_start_str, $baseline_end_str, $system_cache_dir, $enable_clipping_detection) = @_;
+    my ($profile_flags_in, $baseline_start_str, $baseline_end_str, $system_cache_dir, $enable_clipping_detection, $is_generic_baseline, $allow_growth_prediction) = @_;
 
     my $profile_flags = $profile_flags_in; # Work on a copy.
 
@@ -5449,13 +5535,25 @@ sub _build_nfit_baseline_command {
     # This is the primary fix for the "Unknown option" error.
     $profile_flags =~ s/^\s*"?|"?\s*$//g;
 
-    # A baseline calculation must be a pure measurement of a historical period.
-    # We must explicitly remove any flags related to future-looking decay models
-    # or growth prediction that might be present in the profile's configuration.
-    $profile_flags =~ s/--enable-growth-prediction\s*//g;
-    $profile_flags =~ s/--growth-projection-days\s+\d+\s*//g;
-    $profile_flags =~ s/--max-growth-inflation-percent\s+\d+\s*//g;
+    # A baseline is a historical measurement, not a forecast. Growth prediction
+    # should almost always be stripped, EXCEPT for the multiplicative model's
+    # "CurrentBaseline", which needs to reflect the true current trend.
+    unless ($allow_growth_prediction) {
+        $profile_flags =~ s/--enable-growth-prediction\s*//g;
+        $profile_flags =~ s/--growth-projection-days\s+\d+\s*//g;
+        $profile_flags =~ s/--max-growth-inflation-percent\s+\d+\s*//g;
+    }
+
+    # The --enable-windowed-decay Model is a trending analysis:
+    # Applying a trending model on top of a period that is supposed to be a static baseline measurement would be logically incorrect.
     $profile_flags =~ s/--enable-windowed-decay\s*//g;
+
+    if ($is_generic_baseline) {
+        $profile_flags =~ s/--(?:online|batch|no-weekends)\b\s*//g;
+        $profile_flags =~ s/--decay\s+[\w-]+\s*//g;
+        $profile_flags =~ s/--runq-decay\s+[\w-]+\s*//g;
+        $profile_flags =~ s/--avg-method\s+\w+\s*//g;
+    }
     $profile_flags =~ s/--decay-over-states\s*//g;
 
     # Construct the base command, ensuring --nmondir is always present.
@@ -5564,8 +5662,7 @@ sub calculate_predictive_peak_forecast {
 
 # ==============================================================================
 # Helper to run nfit and get a "True/Non-Peak Baseline" by excluding all historical peak periods.
-# NOTE: This version includes a detailed debug statement inside the day-expansion
-# loop to conclusively diagnose issues with Time::Piece date handling.
+#
 # ==============================================================================
 sub _get_true_baseline_results {
     my ($system_cache_dir, $event_name, $event_config, $full_seasonality_config) = @_;
@@ -5608,8 +5705,7 @@ sub _get_true_baseline_results {
                 $current += ONE_DAY;
 
                 $days_processed++;
-                # This progress bar may still be buggy if the root cause is a bad date range,
-                # but the DEBUG line above will reveal the truth.
+
                 my $current_perc = int(($days_processed / $total_days_to_process) * 100);
                 if ($current_perc > $last_reported_perc) {
                     printf STDERR "\r    Expanding days: %d%% (%d/%d)", $current_perc, $days_processed, $total_days_to_process;
@@ -5657,21 +5753,44 @@ sub _get_true_baseline_results {
     my $profile_num = 0;
     foreach my $profile (@profiles) {
         $profile_num++;
-        print STDERR "    - Running profile $profile_num/$profile_count: $profile->{name} (for Non-Peak Baseline)\n";
-        my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, undef, undef, $system_cache_dir);
+        print STDERR "    - Establishing Generic Non-Peak Baseline for profile $profile_num/$profile_count: $profile->{name}\n";
 
-        my $nfit_output = `$nfit_cmd`;
+        # For a "True Baseline", we need a generic, unfiltered result. Enable generic baseline (no decay or time filters)
+        my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, undef, undef, $system_cache_dir, 0, 1);
+
+        my $nfit_output = '';
+        # Use open3 to capture STDOUT, but let STDERR pass through to the terminal
+        my $stderr_arg = ">&=" . fileno(STDERR);
+        my $pid_nfit = open3(undef, my $stdout_nfit, $stderr_arg, "$nfit_cmd --show-progress");
+        while(my $line = <$stdout_nfit>) {
+            $nfit_output .= $line;
+        }
+        waitpid($pid_nfit, 0);
+
         next if $?;
 
-        my $parsed = parse_nfit_key_value_output($nfit_output);
+        my $parsed = parse_nfit_json_output($nfit_output);
         my $p_key = "P" . clean_perc_label( ($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE );
 
         foreach my $vm (keys %$parsed) {
-            my $val = $parsed->{$vm}[-1]{$p_key};
-            $baseline_results{$vm}{$profile->{name}} = $val if defined $val;
+            # For aggregated/decay runs, nfit returns a single JSON object per VM
+            my @states_for_vm = @{$parsed->{$vm}};
+            next unless @states_for_vm;
+
+            my @valid_p_values;
+            foreach my $state_hash (@states_for_vm) {
+                my $metric_val = $state_hash->{metrics}{physc}{$p_key};
+                if (defined $metric_val && looks_like_number($metric_val)) {
+                    push @valid_p_values, $metric_val;
+                }
+            }
+
+            if (@valid_p_values) {
+                my $aggregated_value = sum0(@valid_p_values) / scalar(@valid_p_values);
+                $baseline_results{$vm}{$profile->{name}} = $aggregated_value;
+            }
         }
     }
-
     return \%baseline_results;
 }
 
