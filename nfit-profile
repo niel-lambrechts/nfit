@@ -5954,17 +5954,9 @@ sub _generate_seasonal_snapshot_for_period {
 
 # ==============================================================================
 # SUBROUTINE: update_monthly_history
-# PURPOSE:    Orchestrates the creation and updating of the unified, model-
-#             agnostic monthly history cache (`.nfit.history.json`). This is
-#             the primary data generation process for all predictive models.
-# DETAILS:
-#   - It is time-driven, not event-driven. It automatically discovers and
-#     processes all completed months within the data cache that have not
-#     yet been recorded in the history file.
-#   - It respects the '--min-history-days' setting for processing partial months.
-#   - For each month, it generates two distinct sets of historical data:
-#     1. A generic, comprehensive 'MonthlyWorkloadAnalysis'.
-#     2. Specific 'SeasonalEventSnapshots' for any forecasting models.
+# PURPOSE:    Orchestrates a Two-Phase strategy to create and update the
+#             unified monthly history cache (`.nfit.history.json`). This is the
+#             primary data generation process for all predictive models.
 # ==============================================================================
 sub update_monthly_history {
     my ($system_cache_dir, $system_identifier, $seasonality_config, $min_days_for_history) = @_;
@@ -5980,94 +5972,133 @@ sub update_monthly_history {
     }
     print STDERR "Data cache spans from " . $cache_start_obj->date . " to " . $cache_end_obj->date . "\n";
 
-    print STDERR "Pre-computing all historical event periods from configuration to prevent baseline contamination...\n";
-    my @all_historical_peaks = find_all_historical_periods($seasonality_config, $data_cache_file);
-    print STDERR "Pre-computation complete.\n";
-
     my $existing_history = read_unified_history($system_cache_dir);
     my @months_to_process;
 
-    print STDERR "Scanning cache for unprocessed months...\n";
+    # --- Planning Stage: Discover unprocessed or partially processed months ---
+    print STDERR "Scanning cache for unprocessed or incomplete months...\n";
     my $iterator_month = Time::Piece->new($cache_start_obj->epoch)->truncate(to => 'month');
     while ($iterator_month <= $cache_end_obj) {
         my $month_key = $iterator_month->strftime('%Y-%m');
-        print STDERR "  - Checking month: $month_key...\r";
 
         my $month_start_obj = Time::Piece->new($iterator_month->epoch);
-        my $month_end_obj = Time::Piece->new($month_start_obj->epoch)->add_months(1) - ONE_DAY;
+        my $month_end_obj   = Time::Piece->new($month_start_obj->epoch)->add_months(1) - ONE_DAY;
 
         my $effective_start_obj = ($cache_start_obj > $month_start_obj) ? $cache_start_obj : $month_start_obj;
         my $effective_end_obj   = ($cache_end_obj   < $month_end_obj)   ? $cache_end_obj   : $month_end_obj;
 
-        my $days_in_period = 0;
-        if ($effective_start_obj <= $effective_end_obj) {
-             my $delta_seconds = $effective_end_obj->epoch - $effective_start_obj->epoch;
-             $days_in_period = int($delta_seconds / 86400) + 1;
-        }
+        my $days_in_period = ($effective_start_obj <= $effective_end_obj)
+            ? (int(($effective_end_obj->epoch - $effective_start_obj->epoch) / 86400) + 1)
+            : 0;
 
-        # --- Intelligent reprocessing of a month (only if the new data covers a longer time-frame) ---
         if (exists $existing_history->{$month_key}) {
-            # History exists, now check if the new data is more complete.
             my $stored_days = $existing_history->{$month_key}{Metadata}{ProcessedDays} // 0;
-
             if ($days_in_period > $stored_days) {
-                # New data is more complete, so we will re-process this month.
-                print STDERR "\n  - INFO: Found more complete data for $month_key ($days_in_period > $stored_days days). Queueing for reprocessing.";
+                 print STDERR "  - INFO: Found more complete data for $month_key ($days_in_period > $stored_days days). Queueing for reprocessing.\n";
             } else {
-                # Existing data is sufficient, skip.
                 $iterator_month = $iterator_month->add_months(1);
-                next;
+                next; # Skip, history is up-to-date for this month
             }
         }
 
-        # Only add to queue if it meets the minimum day threshold
         if ($days_in_period >= $min_days_for_history) {
-            push @months_to_process, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj };
+            push @months_to_process, {
+                key     => $month_key,
+                start_obj => $effective_start_obj,
+                end_obj   => $effective_end_obj,
+                days    => $days_in_period
+            };
         }
         $iterator_month = $iterator_month->add_months(1);
     }
-    print STDERR "\nScan complete.\n";
+    print STDERR "Scan complete.\n";
 
     unless (@months_to_process) {
-        print STDERR "No new months found to process. History is up to date.\n";
+        print STDERR "No new months to process. History is up to date.\n";
         return;
     }
 
-    print STDERR "Identified " . scalar(@months_to_process) . " new month(s) to add to history: " . join(", ", map { $_->{key} } @months_to_process) . "\n";
+    print STDERR "Identified " . scalar(@months_to_process) . " month(s) to process: " . join(", ", map { $_->{key} } @months_to_process) . "\n";
 
-    foreach my $month_job (@months_to_process) {
+    # --- Execution Stage: Two-Phase Priming ---
+    my @all_historical_peaks = find_all_historical_periods($seasonality_config, $data_cache_file);
+
+    # Phase 1: Generate the foundational monthly workload analysis.
+    _generate_monthly_workload_history($system_cache_dir, \@months_to_process, $existing_history);
+
+    # Phase 2: Generate the model-specific seasonal snapshots.
+    _generate_seasonal_snapshot_history($system_cache_dir, \@months_to_process, $seasonality_config, \@all_historical_peaks);
+}
+
+# ==============================================================================
+# SUBROUTINE: _generate_monthly_workload_history (Phase 1)
+# PURPOSE:    Processes a list of months to generate and save the generic,
+#             model-agnostic `MonthlyWorkloadAnalysis` for each one.
+# ==============================================================================
+sub _generate_monthly_workload_history {
+    my ($system_cache_dir, $months_to_process_aref, $existing_history_href) = @_;
+
+    print "\n--- Phase 1: Generating Monthly Workload Analysis ---\n";
+    foreach my $month_job (@$months_to_process_aref) {
+        my $month_key = $month_job->{key};
+        my $start_str = $month_job->{start_obj}->strftime('%Y-%m-%d');
+        my $end_str   = $month_job->{end_obj}->strftime('%Y-%m-%d');
+
+        print "  - Processing Month: $month_key (Period: $start_str to $end_str)\n";
+
+        my $workload_analysis = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str);
+
+        # Prepare the full entry for this month, preserving existing snapshots if reprocessing
+        my %month_history_entry = %{$existing_history_href->{$month_key} || {}};
+        $month_history_entry{MonthlyWorkloadAnalysis} = $workload_analysis;
+        $month_history_entry{Metadata} = {
+            ProcessedStartDate => $start_str,
+            ProcessedEndDate   => $end_str,
+            ProcessedDays      => $month_job->{days},
+            LastUpdated        => localtime()->datetime(),
+        };
+
+        print "    - Writing analysis for $month_key to history cache...\n";
+        write_unified_history($system_cache_dir, $month_key, \%month_history_entry);
+    }
+}
+
+# ==============================================================================
+# SUBROUTINE: _generate_seasonal_snapshot_history (Phase 2)
+# PURPOSE:    Processes a list of months to generate model-specific snapshots.
+#             Implements intelligent caching to avoid redundant `nfit` calls
+#             for events that share peak/baseline periods. Includes critical logic
+#             to prevent baseline contamination from preceding peaks.
+# ==============================================================================
+sub _generate_seasonal_snapshot_history {
+    my ($system_cache_dir, $months_to_process_aref, $seasonality_config, $all_historical_peaks_aref) = @_;
+
+    print "\n--- Phase 2: Generating Seasonal Event Snapshots ---\n";
+    foreach my $month_job (@$months_to_process_aref) {
         my $month_key   = $month_job->{key};
         my $start_obj   = $month_job->{start_obj};
         my $end_obj     = $month_job->{end_obj};
-        my $start_str   = $start_obj->strftime('%Y-%m-%d');
-        my $end_str     = $end_obj->strftime('%Y-%m-%d');
 
-        print STDERR "\n--- Processing Month: $month_key ---\n";
-        my %month_history_entry;
+        print "  - Discovering events for month: $month_key...\n";
 
-        print STDERR "  - Generating MonthlyWorkloadAnalysis for period $start_str to $end_str...\n";
-        my $workload_analysis_href = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str);
-        $month_history_entry{'MonthlyWorkloadAnalysis'} = $workload_analysis_href;
-
-        # --- Part B: Discover and generate SeasonalEventSnapshots ---
-        print STDERR "  - Discovering seasonal events within $month_key...\n";
         my %seasonal_snapshots_for_month;
+        my %calculation_cache; # In-memory cache for this month's run
 
-        foreach my $event_name (keys %$seasonality_config) {
+        foreach my $event_name (sort keys %$seasonality_config) {
             next if $event_name eq 'Global';
             my $event_config = $seasonality_config->{$event_name};
-            # Pass the start of the month as the context for the check
+            next if (($event_config->{model} // '') eq 'recency_decay'); # Skip non-priming models
+
             my ($peak_start, $peak_end) = determine_event_period($event_config, $start_obj);
 
-            # --- FIX: Check for OVERLAP, not just full containment ---
             if ($peak_start && $peak_end && $peak_start <= $end_obj && $peak_end >= $start_obj) {
-                print STDERR "    - Found active event: '$event_name'. Generating snapshot...\n";
+                print "    - Found active event: '$event_name'\n";
 
                 my $baseline_days = $event_config->{baseline_period_days} // 16;
                 my $potential_baseline_start = $peak_start - ($baseline_days * ONE_DAY);
 
                 my $latest_preceding_peak_end;
-                foreach my $p (@all_historical_peaks) {
+                foreach my $p (@{$all_historical_peaks_aref}) {
                     if ($p->[1] < $peak_start && (!defined $latest_preceding_peak_end || $p->[1] > $latest_preceding_peak_end)) {
                         $latest_preceding_peak_end = $p->[1];
                     }
@@ -6077,41 +6108,72 @@ sub update_monthly_history {
                 if (defined $latest_preceding_peak_end && $potential_baseline_start <= $latest_preceding_peak_end) {
                     $baseline_start_obj = $latest_preceding_peak_end + ONE_DAY;
                     my $available_days = ($peak_start->epoch - $baseline_start_obj->epoch) / ONE_DAY;
-                    print STDERR "      - WARNING: Baseline for this event truncated to " . int($available_days) . " days to avoid overlap.\n";
+                    print "      - WARNING: Baseline for this event truncated to " . int($available_days) . " day(s) to avoid overlap with a preceding peak.\n";
                 }
 
                 my $baseline_end_obj = $peak_start - ONE_SECOND;
 
-                my $snapshot_results = _generate_seasonal_snapshot_for_period(
-                    $system_cache_dir,
-                    $event_config,
-                    $event_name,
-                    $peak_start,
-                    $peak_end,
-                    $baseline_start_obj,
-                    $baseline_end_obj
-                );
+                # --- FIX: Make the cache key model-specific ---
+                my $model_type_for_key = $event_config->{model} // 'unknown';
+                my $cache_key = $peak_start->date . ":" . $peak_end->date . ":" . $baseline_start_obj->date . ":" . $model_type_for_key;
 
-                $seasonal_snapshots_for_month{$event_name} = $snapshot_results if $snapshot_results;
+                my $snapshot_results;
+                if (exists $calculation_cache{$cache_key}) {
+                    print "      - INFO: Reusing cached calculations for identical time period and model type.\n";
+                    $snapshot_results = $calculation_cache{$cache_key};
+                } else {
+                    $snapshot_results = _generate_seasonal_snapshot_for_period(
+                        $system_cache_dir, $event_config, $event_name,
+                        $peak_start, $peak_end,
+                        $baseline_start_obj, $baseline_end_obj
+                    );
+                    $calculation_cache{$cache_key} = $snapshot_results; # Cache the result
+                }
+
+                if ($snapshot_results) {
+                    $snapshot_results->{eventName} = $event_name;
+                    $seasonal_snapshots_for_month{$event_name} = $snapshot_results;
+                }
             }
         }
-        $month_history_entry{'SeasonalEventSnapshots'} = \%seasonal_snapshots_for_month;
-        # Meta-data for time-period of data
-        my $days_in_processed_period = 0;
-        if ($start_obj <= $end_obj) {
-            my $delta_seconds = $end_obj->epoch - $start_obj->epoch;
-            $days_in_processed_period = int($delta_seconds / 86400) + 1;
-        }
-        $month_history_entry{'Metadata'} = {
-            ProcessedStartDate => $start_str,
-            ProcessedEndDate   => $end_str,
-            ProcessedDays      => $days_in_processed_period,
-            LastUpdated        => localtime()->datetime(),
-        };
 
-        print STDERR "  - Writing history for month $month_key to cache...\n";
-        write_unified_history($system_cache_dir, $month_key, \%month_history_entry);
+        if (scalar keys %seasonal_snapshots_for_month > 0) {
+            print "    - Writing snapshots for $month_key to history cache...\n";
+            my $history_data = read_unified_history($system_cache_dir);
+            $history_data->{$month_key}{SeasonalEventSnapshots} = \%seasonal_snapshots_for_month;
+            $history_data->{$month_key}{Metadata}{LastUpdated} = localtime()->datetime();
+            _write_full_history($system_cache_dir, $history_data);
+        }
     }
+}
+
+# ==============================================================================
+# SUBROUTINE: _write_full_history
+# PURPOSE:    A simple wrapper for writing the entire history data structure.
+#             This is a simplified version of write_unified_history for clarity.
+# ==============================================================================
+sub _write_full_history {
+    my ($system_cache_dir, $history_data_href) = @_;
+
+    my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
+    my $lock_file    = File::Spec->catfile($system_cache_dir, '.nfit.history.lock');
+
+    open my $lock_fh, '>', $lock_file or die "Cannot create lock file '$lock_file': $!";
+    flock($lock_fh, LOCK_EX) or die "Cannot acquire lock on '$lock_file': $!";
+
+    eval {
+        my $json = JSON->new->pretty->canonical;
+        my $json_text = $json->encode($history_data_href);
+        open my $fh, '>:encoding(utf8)', $history_file or die "Could not open '$history_file' for writing: $!";
+        print $fh $json_text;
+        close $fh;
+    };
+    if ($@) {
+        warn "An error occurred while writing to unified history cache '$history_file': $@";
+    }
+
+    close $lock_fh;
+    unlink $lock_file;
 }
 
 # ==============================================================================
