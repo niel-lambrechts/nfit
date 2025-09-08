@@ -63,9 +63,12 @@ my $LOW_PEAK_RATIO_THRESHOLD  = 2.0;   # For "Moderately Peaky" shape
 my $LIMIT_THRESHOLD_PERC = 0.98;       # P99W1 vs MaxCPU for pressure detection
 
 # RunQ Modifier Thresholds (for calculate_runq_modified_physc)
-my $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD = 2.0; # NormRunQ P90 above this may indicate workload pressure
-my $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD = 1.8;       # AbsRunQ P90 / (MaxCPU * SMT) above this indicates RunQ pressure
-my $RUNQ_ADDITIVE_TOLERANCE_FACTOR = 1.8;               # Tolerate AbsRunQ up to this Factor x Base_Profile_PhysC's LCPU capacity
+my $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD = 2.0; # NormRunQ P90 above this may indicate workload pressure (NOT adaptive)
+my $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD = 1.5;       # AbsRunQ P90 / (MaxCPU * SMT) above this indicates RunQ pressure (ADAPTIVE)
+my $RUNQ_ADDITIVE_TOLERANCE_FACTOR = 1.8;               # Tolerate AbsRunQ up to this Factor x Base_Profile_PhysC's LCPU capacity (NOT adaptive)
+my $ENTITLEMENT_BURST_ALLOWANCE_FACTOR = 0.25;          # Allow uncapped VMs to burst 25% over their entitlement before pressure is assessed
+my $BURST_ALLOWANCE_MIN_FACTOR = 0.0;
+my $BURST_ALLOWANCE_MAX_FACTOR = 0.5;                   # Clamp at 50%
 
 # Internal constants for growth heuristics (not user-configurable initially)
 my $GROWTH_MIN_HISTORICAL_PERIODS       = 5;    # Min number of windowed periods to attempt trend
@@ -111,9 +114,9 @@ my $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY = 0.33; # e.g., 15% * 0.33 
 # --- Enhanced Efficiency Factor Constants (for calculate_runq_modified_physc) ---
 my $VOLATILITY_CAUTION_THRESHOLD = 2.5; # If NormRunQ P90/P50 ratio >= this, skip efficiency reduction
 my $NORM_P50_THRESHOLD_FOR_EFFICIENCY_CONSIDERATION = 0.5; # NormRunQ P50 must be below this to consider efficiency
-my $MAX_EFFICIENCY_REDUCTION_PERCENTAGE  = 0.15; # Max % a profile can be reduced by efficiency logic
+my $MAX_EFFICIENCY_REDUCTION_PERCENTAGE  = 0.15; # Max % a profile can be reduced by efficiency logic (ADAPTIVE)
 my $MIN_P50_DENOMINATOR_FOR_VOLATILITY = 0.1;    # Min P50 value to avoid division by zero in volatility calc
-my $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC = 0.75; # Base, SMT-dependent adjustments in calc sub
+my $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC = 0.75; # Base, SMT-dependent adjustments in calc sub (ADAPTIVE)
 
 # --- Hot Thread Workload (HTW) Additive Dampening Heuristics ---
 # These constants are used to detect and dampen additive CPU for workloads
@@ -140,6 +143,7 @@ my $LOG_FILE_PATH = "/tmp/nfit-profile.log";        # Default log file path
 my $log_file_path_for_run = $LOG_FILE_PATH;
 
 my $CACHE_STATES_FILE = ".nfit.cache.states";
+my $DATA_CACHE_FILE   = ".nfit.cache.data";
 my $UNIFIED_HISTORY_FILE = ".nfit.history.json";    # Unified history file
 
 # --- Profile Definitions (Loaded from file) ---
@@ -992,6 +996,16 @@ foreach my $system_serial (@target_systems_to_process)
         print {$LOG_FH} "======================================================================\n\n";
     }
 
+    # --- Adaptive Threshold Initialisation for this system ---
+    # This block is self-contained and does not mutate global variables.
+    # It detects the interval and gets the appropriate thresholds for this system's run.
+    my $data_cache_for_interval_detection = File::Spec->catfile($current_cache_path, $DATA_CACHE_FILE);
+    my $detected_interval_secs = detect_sampling_interval($data_cache_for_interval_detection);
+
+    # The set_adaptive_thresholds function returns the new values, which are stored
+    # in local variables. This avoids modifying the global defaults.
+    my ($adaptive_runq_saturation_thresh, $adaptive_target_norm_runq, $adaptive_max_efficiency_reduction) = set_adaptive_thresholds($detected_interval_secs, $log_fh_for_system);
+
     # --- Seasonality Engine: Main Controller ---
     # This block determines if a seasonal model should be applied and orchestrates the analysis.
     # This block handles all three modes:
@@ -1073,7 +1087,8 @@ foreach my $system_serial (@target_systems_to_process)
                 $system_identifier,
                 $effective_event_name,
                 $effective_config,
-                $seasonality_config
+                $seasonality_config,
+                $adaptive_runq_saturation_thresh
             );
             # Overwrite the main results table with the forecast
             %results_table = %$forecast_results;
@@ -1097,7 +1112,8 @@ foreach my $system_serial (@target_systems_to_process)
                     'config_ref'  => $cfg_for_hint,
                     'max_cpu_for_vm_numeric' => $maxcpu_for_hint,
                     'smt_used_for_vm_numeric' => $smt_for_hint,
-                    'per_profile_runq_metrics_ref' => {} # No RunQ metrics available in this path
+                    'per_profile_runq_metrics_ref' => {}, # No RunQ metrics available in this path
+                    'adaptive_saturation_thresh' => $adaptive_runq_saturation_thresh
                 );
 
                 $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
@@ -1491,7 +1507,9 @@ foreach my $system_serial (@target_systems_to_process)
                     'config_ref' => $cfg_for_hint,
                     'max_cpu_for_vm_numeric' => $maxcpu_for_hint,
                     'smt_used_for_vm_numeric' => $smt_for_hint,
-                    'per_profile_runq_metrics_ref' => \%per_profile_runq_metrics
+                    'per_profile_runq_metrics_ref' => \%per_profile_runq_metrics,
+                    'adaptive_saturation_thresh' => $adaptive_runq_saturation_thresh # Pass the adaptive value
+
                 );
             $hint_tier_for_csv{$vm_name} = $hint_type_tier;
             $hint_pattern_for_csv{$vm_name} = $hint_pattern_shape;
@@ -1550,7 +1568,8 @@ foreach my $system_serial (@target_systems_to_process)
                     'config_ref' => $cfg_for_hint,
                     'max_cpu_for_vm_numeric' => $maxcpu_for_hint,
                     'smt_used_for_vm_numeric' => $smt_for_hint,
-                    'per_profile_runq_metrics_ref' => \%per_profile_runq_metrics
+                    'per_profile_runq_metrics_ref' => \%per_profile_runq_metrics,
+                    'adaptive_saturation_thresh' => $adaptive_runq_saturation_thresh
                 );
 
             # Store all hint components in global hashes for the final report.
@@ -1607,7 +1626,11 @@ foreach my $system_serial (@target_systems_to_process)
                         (defined $cfg_for_hint->{pool_id} && $cfg_for_hint->{pool_id} != 0),
                         $profile_runq_behavior,
                         $p99w1_has_abs_pressure,
-                        $p99w1_has_norm_pressure
+                        $p99w1_has_norm_pressure,
+                        # Pass the adaptive thresholds
+                        $adaptive_runq_saturation_thresh,
+                        $adaptive_target_norm_runq,
+                        $adaptive_max_efficiency_reduction
                     );
 
                     # Calculate and store the final net modifier (additive or reductive) for this specific profile.
@@ -1658,7 +1681,8 @@ foreach my $system_serial (@target_systems_to_process)
                     $debug_info_ref,
                     $final_val_for_csv,
                     $nfit_growth_adjustments{$vm_name}{$profile_name} // 0, # Pass the growth adj
-                    $nfit_growth_adjustments{$vm_name}{$profile_name} // 0   # Pass it again for Abs
+                    $nfit_growth_adjustments{$vm_name}{$profile_name} // 0, # Pass it again for Abs
+                    $adaptive_runq_saturation_thresh # Pass the adaptive value
                 );
             }
         }
@@ -2242,7 +2266,8 @@ sub log_profile_rationale
         $calc_debug_info_ref,
         $final_csv_value_for_profile,
         $nfit_growth_adj_for_log,
-        $nfit_growth_adj_abs_for_log
+        $nfit_growth_adj_abs_for_log,
+        $adaptive_runq_saturation_thresh
     ) = @_;
 
     # Ensure script doesn't die if log handle isn't valid
@@ -2464,14 +2489,19 @@ sub log_profile_rationale
 	printf {$fh} "  3. Pressure Assessment Summary:\n";
     # Enhanced line for Overall LPAR RunQ Pressure
     my $abs_runq_source_str = "$runq_metrics_source_profile_name_for_this_calc " . ($calc_debug_info_ref->{AbsRunQKeyUsed} // '');
-    my $lpar_pressure_reason = sprintf("Ratio %.2f <= %.2f", ($calc_debug_info_ref->{'RunQPressure_P90_Val'} // 0), $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD);
+
+    # Correctly retrieve the rationale string from the debug info hash
+    my $pressure_basis_str = $calc_debug_info_ref->{'PressureBasisRationale'} // "MaxCPU";
+    my $lpar_pressure_reason;
+
     if (($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True") {
-        $lpar_pressure_reason = sprintf("Ratio %.2f > %.2f", ($calc_debug_info_ref->{'RunQPressure_P90_Val'} // 0), $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD);
+        $lpar_pressure_reason = sprintf("Ratio %.2f > %.2f (Pressure detected)", ($calc_debug_info_ref->{'RunQPressure_P90_Val'} // 0), $adaptive_runq_saturation_thresh);
+    } else {
+        $lpar_pressure_reason = sprintf("Ratio %.2f <= %.2f (No pressure detected)", ($calc_debug_info_ref->{'RunQPressure_P90_Val'} // 0), $adaptive_runq_saturation_thresh);
     }
-    printf {$fh} "     - Overall LPAR RunQ Pressure           : %s (Source: %s; Reason: %s)\n",
-        (($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True" ? "True" : "False"),
-        $abs_runq_source_str,
-        $lpar_pressure_reason;
+    printf {$fh} "     - Overall LPAR RunQ Pressure           : %s (Source: %s)\n", (($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True" ? "True" : "False"), $abs_runq_source_str;
+    printf {$fh} "         Basis for Pressure Calc          : %s\n", $pressure_basis_str;
+    printf {$fh} "         Reason for Pressure Flag         : %s\n", $lpar_pressure_reason;
 
     # Enhanced line for Normalised Workload Pressure
     my $norm_runq_source_str = "$runq_metrics_source_profile_name_for_this_calc";
@@ -2522,9 +2552,12 @@ sub log_profile_rationale
             printf {$fh} "        - Base PhysC for Profile            : %s cores\n", ($calc_debug_info_ref->{'EffPBase'} // $na);
             printf {$fh} "        - AbsRunQ Metric Used               : %s (value: %s threads)\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
             printf {$fh} "        - SMT Value                         : %s\n", ($calc_debug_info_ref->{'EffSMTValue'} // $na);
-            printf {$fh} "        - Target NormRunQ for SMT%-11s: %.2f (internal heuristic for optimal queue/LCPU)\n",
-            ($calc_debug_info_ref->{'EffSMTValue'} // $na),
-            ($calc_debug_info_ref->{'EffTargetNormRunQ'} // $na);
+            my $smt_txt = defined $calc_debug_info_ref->{'EffSMTValue'}
+                          ? $calc_debug_info_ref->{'EffSMTValue'} : $na;
+            my $tgt_val = $calc_debug_info_ref->{'EffTargetNormRunQ'};
+            my $tgt_txt = (defined $tgt_val && looks_like_number($tgt_val))
+                          ? sprintf('%.2f', $tgt_val) : $na;
+            printf {$fh} "        - Target NormRunQ for SMT%-11s: %s (internal heuristic for optimal queue/LCPU)\n", $smt_txt, $tgt_txt;
             printf {$fh} "        - Raw Efficient PhysC Target        : AbsRunQ / (SMT * Target NormRunQ)\n";
             printf {$fh} "                                              %s / (%s * %.2f) = %s cores\n",
             ($abs_runq_value_used_for_calc // $na),
@@ -2607,6 +2640,13 @@ sub log_profile_rationale
                 ? $calc_debug_info_ref->{'HotThreadWLDampenedAdditiveFrom'}
                 : ($calc_debug_info_ref->{'CappedRawAdditive'} // $na) # Show original value before HTW if HTW was applied
             ), ($calc_debug_info_ref->{'MaxAdditiveCap'} // $na);
+
+            printf {$fh} "    Details of LCPU Calculations:\n";
+            # Log enhanced burst and small entitlement handling details
+            printf {$fh} "  Pressure Basis Rationale                   : %s\n", ($calc_debug_info_ref->{'PressureBasisRationale'} // "N/A");
+            printf {$fh} "  Burst Allowance Used                       : %s\n", ($calc_debug_info_ref->{'BurstAllowanceUsed'} // "N/A");
+            printf {$fh} "  Small Entitlement Handler Active           : %s\n", ($calc_debug_info_ref->{'SmallEntitlementHandler'} // "No");
+            printf {$fh} "  Effective LCPUs for Pressure Calc          : %s\n", ($calc_debug_info_ref->{'EffectiveLCPUsForPressure'} // "N/A");
 
             if (defined $calc_debug_info_ref->{'HotThreadWLDampeningApplied'} && $calc_debug_info_ref->{'HotThreadWLDampeningApplied'} eq "True")
             {
@@ -2952,6 +2992,50 @@ sub load_profile_definitions
     return @valid_profiles;
 }
 
+# --- calculate_graduated_burst ---
+# Returns graduated burst allowance based on entitlement size
+# Small entitlements get higher burst allowance to reflect real-world burst capability
+sub calculate_graduated_burst {
+    my ($entitlement) = @_;
+
+    if ($entitlement < 0.25) {
+        return 0.50;  # 50% burst for micro-partitions
+    } elsif ($entitlement < 0.50) {
+        return 0.40;  # 40% burst for very small
+    } elsif ($entitlement < 1.00) {
+        return 0.30;  # 30% burst for small
+    } else {
+        return 0.25;  # 25% standard burst
+    }
+}
+
+# --- calculate_structural_availability_factor ---
+# For small entitlements, estimates the effective availability of vCPU threads
+# based on entitlement size. Scales from 0.5 at Ent=0.1 to 0.95 at Ent=0.9
+sub calculate_structural_availability_factor {
+    my ($entitlement) = @_;
+
+    # Ensure entitlement is in valid range
+    return 0.5 if $entitlement <= 0.1;
+    return 0.95 if $entitlement >= 0.9;
+
+    # Linear scaling: 0.5 + (0.45 * entitlement)
+    return 0.5 + (0.45 * $entitlement);
+}
+
+# --- apply_minimum_lcpu_floor ---
+# Applies a minimum LCPU floor based on SMT level
+# Prevents unrealistic near-zero LCPU calculations for micro-partitions
+sub apply_minimum_lcpu_floor {
+    my ($effective_lcpus, $smt_used) = @_;
+
+    # Ensure at least 1 full hardware thread for micro-partitions
+    # Scale slightly with SMT to be platform-aware
+    my $min_floor = max(1, int($smt_used / 4));  # At SMT=8, floor=2; at SMT=4, floor=1
+
+    return max($min_floor, $effective_lcpus);
+}
+
 # --- calculate_runq_modified_physc (with enhanced efficiency logic and detailed debug output) ---
 # Calculates the final PhysC value for a profile after applying efficiency factors
 # and RunQ-driven additive CPU adjustments.
@@ -2974,7 +3058,11 @@ sub calculate_runq_modified_physc
         $is_in_non_default_pool,
         $profile_runq_behavior_setting,
         $p99w1_overall_vm_has_abs_runq_pressure,
-        $p99w1_overall_vm_has_norm_runq_pressure
+        $p99w1_overall_vm_has_norm_runq_pressure,
+        # NEW: Adaptive threshold parameters
+        $adaptive_runq_saturation_thresh,
+        $adaptive_target_norm_runq,
+        $adaptive_max_efficiency_reduction
     ) = @_;
 
     my %debug_info;
@@ -3006,7 +3094,7 @@ sub calculate_runq_modified_physc
     $debug_info{'EffPEfficientTarget'} = $na_str;
     $debug_info{'EffComparisonBaseVsTargetMet'} = undef;
     $debug_info{'EffPotentialReduction'} = $na_str;
-    $debug_info{'EffMaxAllowableReductionPerc'} = $MAX_EFFICIENCY_REDUCTION_PERCENTAGE * 100;
+    $debug_info{'EffMaxAllowableReductionPerc'} = $adaptive_max_efficiency_reduction * 100;
     $debug_info{'EffReductionCapReason'} = "Default reduction cap applied.";
     $debug_info{'EffMaxAllowableReductionCores'} = $na_str;
     $debug_info{'EffActualReductionCores'} = $na_str;
@@ -3101,7 +3189,8 @@ sub calculate_runq_modified_physc
     elsif ($profile_runq_behavior_setting eq 'additive_only') {
         $debug_info{'DownsizingReason'} = "Skipped CPU Downsizing: Profile runq_behavior=additive_only";
     }
-    elsif (defined $curr_ent_numeric && $curr_ent_numeric > 0 && defined $eff_p_base_numeric && $eff_p_base_numeric > $curr_ent_numeric) {
+    elsif (defined $curr_ent_numeric && $curr_ent_numeric > 0 && defined $eff_p_base_numeric && ($eff_p_base_numeric > $curr_ent_numeric)) {
+        # NOTE: restored original sign: skip only when BasePhysC > Entitlement
         $debug_info{'DownsizingReason'} = sprintf("Skipped CPU Downsizing: Base PhysC (%.4f) > Entitlement (%.2f)", $eff_p_base_numeric, $curr_ent_numeric);
     }
     elsif ($max_cpu_for_lpar_numeric > 0 && defined $eff_p_base_numeric && $eff_p_base_numeric > ($max_cpu_for_lpar_numeric * $BASE_PHYSC_VS_MAXCPU_THRESH_FOR_CONSTRAINT_GUARD)) {
@@ -3109,8 +3198,8 @@ sub calculate_runq_modified_physc
         if (defined $abs_runq_p_numeric && $smt_used > 0) {
             $temp_runq_pressure_val = $abs_runq_p_numeric / ($max_cpu_for_lpar_numeric * $smt_used);
         }
-        if ($temp_runq_pressure_val > ($RUNQ_PRESSURE_P90_SATURATION_THRESHOLD * $RUNQ_PRESSURE_FOR_CONSTRAINT_GUARD_FACTOR)) {
-            $debug_info{'DownsizingReason'} = sprintf("Skipped CPU Downsizing: High existing constraint. Base PhysC (%.4f) > %.0f%% of MaxCPU (%.2f) AND RunQ Pressure (%.2f) is high.",
+        if ($temp_runq_pressure_val > ($adaptive_runq_saturation_thresh * $RUNQ_PRESSURE_FOR_CONSTRAINT_GUARD_FACTOR)) {
+            $debug_info{'DownsizingReason'} = sprintf("Skipped CPU Downsizing: High existing constraint. Base PhysC (%.4f) > %.0f%% of MaxCPU (%.2f) AND RunQ Pressure (%.2f) > guardrail.",
                 $eff_p_base_numeric, $BASE_PHYSC_VS_MAXCPU_THRESH_FOR_CONSTRAINT_GUARD*100, $max_cpu_for_lpar_numeric, $temp_runq_pressure_val);
         } else {
             $analytical_efficiency_path_attempted = 1;
@@ -3143,16 +3232,12 @@ sub calculate_runq_modified_physc
         }
         else
         {
-            my $target_norm_runq_eff_calc = $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC;
-            if    ($smt_used >= 8) { $target_norm_runq_eff_calc = 0.80; }
-            elsif ($smt_used >= 4) { $target_norm_runq_eff_calc = 0.75; }
-            else                   { $target_norm_runq_eff_calc = 0.60; }
-            $debug_info{'EffTargetNormRunQ'} = sprintf("%.2f", $target_norm_runq_eff_calc);
-
+            my $target_norm_runq_eff_calc = $adaptive_target_norm_runq;
             my $p_efficient_target_raw = ($smt_used * $target_norm_runq_eff_calc > 0.0001)
                 ? ($abs_runq_p_numeric / ($smt_used * $target_norm_runq_eff_calc))
                 : $eff_p_base_numeric + 1;
             $debug_info{'EffPEfficientTargetRaw'} = sprintf("%.4f", $p_efficient_target_raw);
+            $debug_info{'EffTargetNormRunQ'} = sprintf("%.2f", $target_norm_runq_eff_calc);
 
             my $base_physc_weight = $BLEND_WEIGHT_BASE_DEFAULT_LOW_P50;
             my $efficient_target_weight = 1.0 - $base_physc_weight;
@@ -3182,15 +3267,15 @@ sub calculate_runq_modified_physc
                 my $potential_reduction_cores = $eff_p_base_numeric - $blended_efficient_target;
                 $debug_info{'EffPotentialReduction'} = sprintf("%.4f", $potential_reduction_cores);
 
-                my $current_max_reduction_perc_val = $MAX_EFFICIENCY_REDUCTION_PERCENTAGE;
+                my $current_max_reduction_perc_val = $adaptive_max_efficiency_reduction;
                 my $reduction_cap_reason_template = "Volatility (%.2f) low, using full reduction cap of %.1f%%.";
 
                 if ($volatility_ratio > $VOLATILITY_MODERATE_HIGH_CAP_THRESH) {
-                    $current_max_reduction_perc_val = $MAX_EFFICIENCY_REDUCTION_PERCENTAGE * $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY;
+                    $current_max_reduction_perc_val = $adaptive_max_efficiency_reduction * $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY;
                     $reduction_cap_reason_template = "Volatility (%.2f) moderately high (>%.2f), reduction cap limited to %.1f%%.";
                     $debug_info{'EffReductionCapReason'} = sprintf($reduction_cap_reason_template, $volatility_ratio, $VOLATILITY_MODERATE_HIGH_CAP_THRESH, $current_max_reduction_perc_val * 100);
                 } elsif ($volatility_ratio > $VOLATILITY_MODERATE_LOW_CAP_THRESH) {
-                    $current_max_reduction_perc_val = $MAX_EFFICIENCY_REDUCTION_PERCENTAGE * $REDUCTION_CAP_SCALE_FOR_MODERATE_VOLATILITY;
+                    $current_max_reduction_perc_val = $adaptive_max_efficiency_reduction * $REDUCTION_CAP_SCALE_FOR_MODERATE_VOLATILITY;
                     $reduction_cap_reason_template = "Volatility (%.2f) moderate (>%.2f), reduction cap limited to %.1f%%.";
                     $debug_info{'EffReductionCapReason'} = sprintf($reduction_cap_reason_template, $volatility_ratio, $VOLATILITY_MODERATE_LOW_CAP_THRESH, $current_max_reduction_perc_val * 100);
                 } else {
@@ -3278,13 +3363,119 @@ sub calculate_runq_modified_physc
     # Section D: Tactical Additive CPU (ALWAYS RUNS; no early return)
     # =========================
     my $runq_pressure_p_val = 0;
+    my $effective_lcpus_for_pressure_calc = 0;
+    my $pressure_basis_rationale = "N/A";
+
+    # --- Calculate graduated burst allowance based on entitlement size ---
+    my $burst_allowance_raw;
+    if ($curr_ent_numeric > 0 && $curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
+        # Use graduated burst for small uncapped LPARs
+        $burst_allowance_raw = calculate_graduated_burst($curr_ent_numeric);
+    } else {
+        # Use standard burst factor for larger entitlements or capped LPARs
+        $burst_allowance_raw = $ENTITLEMENT_BURST_ALLOWANCE_FACTOR;
+    }
+    my $burst_allowance_clamped = max($BURST_ALLOWANCE_MIN_FACTOR, min($BURST_ALLOWANCE_MAX_FACTOR, $burst_allowance_raw));
+    my $burst_was_clamped = (abs($burst_allowance_raw - $burst_allowance_clamped) > 1e-9);
+
     if ($max_cpu_for_lpar_numeric > 0 && $smt_used > 0)
     {
-        $runq_pressure_p_val = (defined $abs_runq_p_numeric ? $abs_runq_p_numeric : 0) / ($max_cpu_for_lpar_numeric * $smt_used);
+        # 1. Calculate the MaxCPU-based capacity candidate
+        my $l_conf = $max_cpu_for_lpar_numeric * $smt_used;
+
+        # 2. For uncapped VMs (where MaxCPU > Entitlement), use enhanced calculation
+        if ($curr_ent_numeric > 0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
+
+            # Special handling for small entitlements < 1
+            if ($curr_ent_numeric < 1.0) {
+                # Calculate structural availability based on hardware thread allocation behaviour
+                my $structural_factor = calculate_structural_availability_factor($curr_ent_numeric);
+                my $l_structural = 1.0 * $smt_used * $structural_factor;
+
+                # Calculate burst-tolerant entitlement with graduated burst
+                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
+
+                # Use the maximum of structural and burst calculations for small entitlements
+                # This acknowledges hardware thread availability whilst remaining conservative
+                my $l_small_ent = max($l_structural, $l_ent_burst);
+
+                # Choose the minimum of MaxCPU capacity and small entitlement calculation
+                $effective_lcpus_for_pressure_calc = min($l_conf, $l_small_ent);
+
+                # Apply minimum floor for safety
+                my $pre_floor_value = $effective_lcpus_for_pressure_calc;
+                $effective_lcpus_for_pressure_calc = apply_minimum_lcpu_floor($effective_lcpus_for_pressure_calc, $smt_used);
+
+                # Build detailed rationale string
+                $pressure_basis_rationale = sprintf(
+                    "Small Entitlement Handler (Ent=%.2f): max(Structural: 1vCPU×%d SMT×%.2f factor=%.1f, Burst: %.2f×(1+%.2f)×%d SMT=%.1f) capped by MaxCPU×SMT=%.0f → %.0f LCPUs",
+                    $curr_ent_numeric,
+                    $smt_used, $structural_factor, $l_structural,
+                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
+                    $l_conf,
+                    $effective_lcpus_for_pressure_calc
+                );
+
+                if ($pre_floor_value < $effective_lcpus_for_pressure_calc) {
+                    $pressure_basis_rationale .= sprintf(" [Floor applied: raised from %.1f to %d LCPUs]",
+                        $pre_floor_value, $effective_lcpus_for_pressure_calc);
+                }
+
+                if ($burst_was_clamped) {
+                    $pressure_basis_rationale .= sprintf(" [Burst %.2f→%.2f]", $burst_allowance_raw, $burst_allowance_clamped);
+                }
+
+            } else {
+                # Standard calculation for entitlements >= 1
+                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
+
+                # Choose the minimum of the two candidates
+                $effective_lcpus_for_pressure_calc = min($l_conf, $l_ent_burst);
+
+                # Build the detailed rationale string showing the comparison
+                $pressure_basis_rationale = sprintf("Burst-Tolerant Entitlement (min(%.2f vCPU×SMT=%d=%.0f, %.2f ENT×(1+%.2f burst)×SMT=%d=%.0f) → %.0f LCPUs)",
+                    $max_cpu_for_lpar_numeric, $smt_used, $l_conf,
+                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
+                    $effective_lcpus_for_pressure_calc
+                );
+                if ($burst_was_clamped) {
+                    $pressure_basis_rationale .= sprintf(" [Note: Original burst factor %.2f was clamped to %.2f]", $burst_allowance_raw, $burst_allowance_clamped);
+                }
+            }
+        } else {
+            # For capped VMs, the basis is simply MaxCPU-based capacity
+            if ($max_cpu_for_lpar_numeric > 0) {
+                $effective_lcpus_for_pressure_calc = $l_conf;
+                $pressure_basis_rationale = sprintf("MaxCPU basis (%.2f vCPU * %d SMT = %.0f LCPUs)",
+                    $max_cpu_for_lpar_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
+            } elsif ($curr_ent_numeric > 0) {
+                $effective_lcpus_for_pressure_calc = $curr_ent_numeric * $smt_used;
+                $pressure_basis_rationale = sprintf("Entitlement fallback (%.2f ENT * %d SMT = %.0f LCPUs)",
+                    $curr_ent_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
+            } else {
+                $effective_lcpus_for_pressure_calc = 0;
+                $pressure_basis_rationale = "No valid capacity basis (MaxCPU/Entitlement missing)";
+            }
+        }
+
+        if ($effective_lcpus_for_pressure_calc > 0) {
+            my $absq = (defined $abs_runq_p_numeric && looks_like_number($abs_runq_p_numeric)) ? $abs_runq_p_numeric : 0;
+            $runq_pressure_p_val = $absq / $effective_lcpus_for_pressure_calc;
+        } else {
+            $runq_pressure_p_val = 0; # Safe default if no capacity basis is found
+            $pressure_basis_rationale = "No valid capacity basis found (MaxCPU/Entitlement missing or zero)";
+        }
     }
     $debug_info{'RunQPressure_P90_Val'} = sprintf("%.4f", $runq_pressure_p_val);
-    my $is_runq_pressure = ($runq_pressure_p_val > $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD);
+    my $is_runq_pressure = ($runq_pressure_p_val > $adaptive_runq_saturation_thresh);
+    $debug_info{'PressureBasisRationale'} = $pressure_basis_rationale;
+    $debug_info{'BurstAllowanceUsed'} = sprintf("%.2f%% (graduated for Ent=%.2f)" ,
+        $burst_allowance_clamped * 100, $curr_ent_numeric);
+    $debug_info{'SmallEntitlementHandler'} = ($curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric)
+        ? "Yes" : "No";
     $debug_info{'IsRunQPressure'} = $is_runq_pressure ? "True" : "False";
+    # Log the enhanced burst and small entitlement details
+    $debug_info{'EffectiveLCPUsForPressure'} = sprintf("%.1f", $effective_lcpus_for_pressure_calc);
 
     my $is_workload_pressure_calc = 0;
     my $workload_pressure_reason_str_calc = "Workload pressure conditions not met or inputs N/A.";
@@ -3333,19 +3524,21 @@ sub calculate_runq_modified_physc
 
     if ($apply_additive_logic && defined $smt_used && $smt_used > 0)
     {
-        my $effective_lcpus_at_original_base = (defined $eff_p_base_numeric ? $eff_p_base_numeric : 0) * $smt_used;
-        $debug_info{'EffectiveLCPUsAtBase'} = sprintf("%.4f", $effective_lcpus_at_original_base);
-        my $capacity_threshold_for_excess = $RUNQ_ADDITIVE_TOLERANCE_FACTOR * $effective_lcpus_at_original_base;
+        # The tolerance calculation for excess threads must use the same entitlement-aware
+        # LCPU basis that was used to detect the pressure in the first place.
+        $debug_info{'EffectiveLCPUsAtBase'} = sprintf("%.4f", $effective_lcpus_for_pressure_calc); # Log the correct basis
+        my $capacity_threshold_for_excess = $RUNQ_ADDITIVE_TOLERANCE_FACTOR * $effective_lcpus_for_pressure_calc;
         my $excess_threads = (defined $abs_runq_p_numeric ? $abs_runq_p_numeric : 0) - $capacity_threshold_for_excess;
 
         if ($excess_threads > 0)
         {
-            $debug_info{'ExcessThreads'} = sprintf("%.4f (AbsRunQ %s %.2f > Tolerated Capacity %.2f based on %.1f x %.4f LCPUs)",
+            $debug_info{'ExcessThreads'} = sprintf("%.4f (AbsRunQ %s %.2f > Tolerated Capacity %.2f based on %.1f x %.4f LCPUs from %s)",
                 $excess_threads,
                 $debug_info{AbsRunQKeyUsed}, ($abs_runq_p_numeric // 0.0),
                 $capacity_threshold_for_excess,
                 $RUNQ_ADDITIVE_TOLERANCE_FACTOR,
-                $effective_lcpus_at_original_base);
+                $effective_lcpus_for_pressure_calc,
+                ($pressure_basis_rationale =~ /Burst-Tolerant/ ? "Entitlement+Burst" : "MaxCPU"));
             $raw_additive_cpu = $excess_threads / $smt_used if $smt_used > 0;
 
             if ($curr_ent_numeric < $MAX_ADD_ENT_THRESH1)       { $max_additive_cap_sliding = $MAX_ADD_ABS_VAL1; }
@@ -3475,8 +3668,9 @@ sub calculate_runq_modified_physc
         }
         else
         {
-            $debug_info{'ExcessThreads'} = sprintf("0.0000 (No excess above tolerated capacity of %.2f; AbsRunQ %s was %.2f)",
+            $debug_info{'ExcessThreads'} = sprintf("0.0000 (No excess above tolerated capacity of %.2f from %s; AbsRunQ %s was %.2f)",
                 $capacity_threshold_for_excess,
+                ($pressure_basis_rationale =~ /Burst-Tolerant/ ? "Entitlement+Burst" : "MaxCPU"),
                 $debug_info{AbsRunQKeyUsed}, ($abs_runq_p_numeric // $na_str));
             $raw_additive_cpu = 0.0;
             $capped_raw_additive_val = 0.0;
@@ -3569,6 +3763,7 @@ sub generate_sizing_hint
     my $max_cpu_for_vm_numeric       = $args{'max_cpu_for_vm_numeric'} // 0;
     my $smt_used_for_vm_numeric      = $args{'smt_used_for_vm_numeric'} // 0;
     my $per_profile_runq_metrics_ref = $args{'per_profile_runq_metrics_ref'};
+    my $adaptive_saturation_thresh   = $args{'adaptive_saturation_thresh'};
 
     # $MANDATORY_PEAK_PROFILE_FOR_HINT should be globally available or passed.
     # Example: my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1"; (defined outside)
@@ -3579,6 +3774,16 @@ sub generate_sizing_hint
     # ... (initial part of rationale logging: Inputs like MaxCPU, SMT etc. - as in previous version) ...
     push @global_pressure_rationale_lines, sprintf("  Input LPAR MaxCPU            : %.2f cores", $max_cpu_for_vm_numeric);
     push @global_pressure_rationale_lines, sprintf("  Input SMT for VM             : %d", $smt_used_for_vm_numeric);
+    # Determine if small entitlement handler would be active
+    my $vm_entitlement = $config_ref->{'entitlement'} // 0;
+    my $is_small_ent_handler = ($vm_entitlement > 0 && $vm_entitlement < 1.0 &&
+                                 $max_cpu_for_vm_numeric > $vm_entitlement) ? "Yes" : "No";
+    my $burst_used = ($vm_entitlement < 1.0 && $is_small_ent_handler eq "Yes") ?
+                     calculate_graduated_burst($vm_entitlement) : 0.25;
+
+    push @global_pressure_rationale_lines, sprintf("  Small Entitlement Handler    : %s", $is_small_ent_handler);
+    push @global_pressure_rationale_lines, sprintf("  Burst Allowance Factor       : %.0f%% (Ent=%.2f)",
+                                                   $burst_used * 100, $vm_entitlement);
 
     # --- VIO Server Check ---
     my $is_vio_server = 0;
@@ -3676,7 +3881,7 @@ sub generate_sizing_hint
         $calculated_abs_runq_pressure_ratio = $p99w1_abs_runq_p90_num / $lpar_max_lcpu_capacity;
     }
     my $absrunq_cond_met_str = "FALSE";
-    if ($calculated_abs_runq_pressure_ratio > $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD)
+    if ($calculated_abs_runq_pressure_ratio > $adaptive_saturation_thresh)
     {
         $p99w1_has_absolute_runq_pressure = 1; # Set the specific flag
         $absrunq_cond_met_str = "TRUE";
@@ -3685,8 +3890,8 @@ sub generate_sizing_hint
     push @global_pressure_rationale_lines, sprintf("     - %s AbsRunQ P90      : %s threads", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str);
     push @global_pressure_rationale_lines, sprintf("     - LPAR Max LCPU Capacity  : (%.2f MaxCPU * %d SMT) = %.2f threads", $max_cpu_for_vm_numeric, $smt_used_for_vm_numeric, $lpar_max_lcpu_capacity);
     push @global_pressure_rationale_lines, sprintf("     - Calculated Ratio        : %.4f", $calculated_abs_runq_pressure_ratio);
-    push @global_pressure_rationale_lines, sprintf("     - Threshold               : > %.2f", $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD);
-    push @global_pressure_rationale_lines, sprintf("     - Condition Met           : (%.4f > %.2f) -> %s", $calculated_abs_runq_pressure_ratio, $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD, $absrunq_cond_met_str);
+    push @global_pressure_rationale_lines, sprintf("     - Threshold               : > %.2f", $adaptive_saturation_thresh);
+    push @global_pressure_rationale_lines, sprintf("     - Condition Met           : (%.4f > %.2f) -> %s", $calculated_abs_runq_pressure_ratio, $adaptive_saturation_thresh, $absrunq_cond_met_str);
     push @global_pressure_rationale_lines, sprintf("     - %s Specific Absolute RunQ Pressure Flag: %s", $MANDATORY_PEAK_PROFILE_FOR_HINT, $absrunq_cond_met_str);
     push @global_pressure_rationale_lines, "";
 
@@ -5332,7 +5537,7 @@ sub _build_nfit_baseline_command {
 # This version is enhanced to use the new two-part residual forecasting method.
 # ==============================================================================
 sub calculate_predictive_peak_forecast {
-    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config) = @_;
+    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $adaptive_runq_saturation_thresh) = @_;
 
     # --- Step 1: Get Historical Peak and Residual Data ---
     # Calls the enhanced helper to get a hash containing both data series.
@@ -6625,6 +6830,188 @@ sub _generate_monthly_workload_analysis {
     }
 
     return \%analysis_results;
+}
+
+# ==============================================================================
+# SUBROUTINE: detect_sampling_interval
+# Robustly detects the NMON sampling interval from the .nfit.cache.data file.
+# It reads the start of the cache, isolates timestamps for the first VM found,
+# calculates the time difference between consecutive samples, and finds the mode
+# of these deltas to determine the most likely interval.
+#
+# Note: This version introduces jitter bucketing: Before counting the frequency,
+#  it checks if a delta is close to a standard interval (60, 300, 600, 900 seconds)
+#  within a tolerance ($EPS = 3). If it is, it snaps the value to that standard
+#  interval before incrementing the count.
+# Returns:
+#   - The detected interval in seconds (e.g., 60, 300), or undef on failure.
+sub detect_sampling_interval {
+    my ($data_cache_file) = @_;
+
+    my $SAMPLES_TO_GATHER       = 50;
+    my $MAX_LINES_TO_SCAN       = 5000;
+    my $MIN_SAMPLES_FOR_DETECTION = 5;   # required count in a single interval bucket
+    my @STD = (60, 300, 600, 900);
+    my $EPS = 3;                          # jitter tolerance (seconds)
+
+    return undef unless (-f $data_cache_file && -s $data_cache_file);
+
+    open my $fh, '<:encoding(utf8)', $data_cache_file or do {
+        warn "Warning: Could not open data cache '$data_cache_file' for interval detection: $!";
+        return undef;
+    };
+
+    <$fh>; # Skip header
+
+    my $target_vm_for_detection;
+    my @timestamps;
+    my $lines_scanned = 0;
+
+    while (my $line = <$fh>) {
+        $lines_scanned++;
+        last if $lines_scanned > $MAX_LINES_TO_SCAN;
+
+        my ($ts_str, $vm_name) = ($line =~ /^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}),([^,]+)/);
+        next unless ($ts_str && $vm_name);
+
+        $target_vm_for_detection //= $vm_name;
+        next unless $vm_name eq $target_vm_for_detection;
+
+        eval {
+            push @timestamps, Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S")->epoch;
+        };
+        last if @timestamps >= $SAMPLES_TO_GATHER;
+    }
+    close $fh;
+
+    # Need enough timestamps to produce at least MIN_SAMPLES_FOR_DETECTION deltas
+    return undef if @timestamps < ($MIN_SAMPLES_FOR_DETECTION + 1);
+
+    @timestamps = sort { $a <=> $b } @timestamps;
+
+    my %delta_counts;
+    for (my $i = 1; $i < @timestamps; $i++) {
+        my $delta = $timestamps[$i] - $timestamps[$i-1];
+        next unless ($delta > 10 && $delta < 1810);
+
+        # Jitter bucketing: snap near-standards to the standard value
+        my $bucket = $delta;
+        my $best_d = $EPS + 1;
+        for my $s (@STD) {
+            my $d = abs($delta - $s);
+            if ($d < $best_d) { $best_d = $d; $bucket = ($d <= $EPS) ? $s : $bucket; }
+        }
+        $delta_counts{$bucket}++;
+    }
+
+    return undef unless %delta_counts;
+
+    # Find max frequency
+    my $max_count = 0;
+    foreach my $delta (keys %delta_counts) {
+        $max_count = $delta_counts{$delta} if $delta_counts{$delta} > $max_count;
+    }
+
+    # Require minimum evidence in the winning bucket
+    return undef if $max_count < $MIN_SAMPLES_FOR_DETECTION;
+
+    # Collect all tied winners
+    my @tied_deltas = grep { $delta_counts{$_} == $max_count } keys %delta_counts;
+
+    # Deterministic tie-break: closest to a standard, then smallest delta
+    if (@tied_deltas > 1) {
+        my %distances;
+        for my $delta (@tied_deltas) {
+            my $min_dist = 1e9;
+            foreach my $std (@STD) {
+                my $dist = abs($delta - $std);
+                $min_dist = $dist if $dist < $min_dist;
+            }
+            $distances{$delta} = $min_dist;
+        }
+        @tied_deltas = sort { $distances{$a} <=> $distances{$b} || $a <=> $b } @tied_deltas;
+    }
+
+    return $tied_deltas[0];
+}
+
+# ==============================================================================
+# --- set_adaptive_thresholds ---
+# Takes a detected sampling interval, snaps it to a standard value (e.g., 1, 5, 10 min),
+# calculates the adaptive thresholds for saturation and efficiency, and logs the rationale.
+# This function does NOT modify global state; it returns the calculated values.
+#
+# Returns:
+#   - A list of three values:
+#     1. The new saturation threshold (float).
+#     2. The new target for efficiency calculation (float).
+#     3. The new max downsizing percentage (as a factor, e.g., 0.05 for 5%).
+sub set_adaptive_thresholds {
+    my ($raw_interval_seconds, $log_fh) = @_;
+
+    # --- Baseline (1-min) thresholds ---
+    my $sat_thresh = $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD;
+    my $target_norm_runq = $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC;
+    my $max_downsize_perc_factor = $MAX_EFFICIENCY_REDUCTION_PERCENTAGE;
+
+    my $snapped_minutes = 1.0;
+    my $detection_method_log = "cache-based detection using mode of deltas with epsilon bucketing";
+    my $log_message;
+
+    if (!defined $raw_interval_seconds) {
+        $log_message = "No reliable interval found; defaulting to 1.0 min; thresholds at 1-min baseline.";
+    } else {
+        # Snap the detected raw seconds to the nearest standard interval with a tolerance
+        my $epsilon = 5; # Allow +/- 5 seconds
+        if    (abs($raw_interval_seconds - 60) <= $epsilon)  { $snapped_minutes = 1; }
+        elsif (abs($raw_interval_seconds - 300) <= $epsilon) { $snapped_minutes = 5; }
+        elsif (abs($raw_interval_seconds - 600) <= $epsilon) { $snapped_minutes = 10; }
+        elsif (abs($raw_interval_seconds - 900) <= $epsilon) { $snapped_minutes = 15; }
+        else {
+             # If it doesn't snap cleanly, default to 1 min but log the anomaly.
+            $log_message = sprintf("Unusual interval %ds detected; did not snap to a standard value. Defaulting to 1.0 min.", $raw_interval_seconds);
+            $snapped_minutes = 1.0;
+        }
+    }
+
+    if ($snapped_minutes > 1) {
+        # It's a non-default interval, so calculate the adaptive thresholds.
+        my $k    = $snapped_minutes;
+        my $base = $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD; # Follow the global 1-min baseline
+        my $beta = 0.4; # Decay exponent, could be made configurable in the future
+        # General formula: 1 + (base-1) * k^(-beta)
+        # This removes the hard-coded '0.8' and derives it from the baseline (1.8 - 1.0)
+        $sat_thresh = 1 + (($base - 1.0) * ($k**-$beta));
+        # Downsizing thresholds: Use the lookup table for conservatism
+        my %downsize_targets = ( 5 => 0.75, 10 => 0.72, 15 => 0.70 );
+        my %downsize_caps    = ( 5 => 5,    10 => 5,    15 => 5 ); # Cap is 5% for all coarser intervals
+
+        $target_norm_runq = $downsize_targets{$k} // $target_norm_runq;
+        # NOTE: The cap is stored as a percentage and converted to a factor here.
+        my $cap_perc = $downsize_caps{$k};
+        if (defined $cap_perc) {
+            $max_downsize_perc_factor = $cap_perc / 100.0;
+        }
+
+        $log_message = sprintf("Sampling interval detected %.1fs -> snapped to %.1f min.", $raw_interval_seconds, $snapped_minutes) if defined $raw_interval_seconds;
+    } elsif (!defined $log_message) {
+         $log_message = sprintf("Sampling interval detected %.1fs -> snapped to 1.0 min. Using baseline thresholds.", $raw_interval_seconds) if defined $raw_interval_seconds;
+    }
+
+
+    # --- Rationale Logging ---
+    if ($log_fh) {
+        print {$log_fh} "----------------------------------------------------------------------\n";
+        print {$log_fh} "Adaptive Threshold Calculation\n";
+        print {$log_fh} "  - Method                   : $detection_method_log\n";
+        print {$log_fh} "  - Status                   : $log_message\n";
+        print {$log_fh} "  - Saturation Threshold     : " . sprintf("%.2f", $sat_thresh) . " x LCPU\n";
+        print {$log_fh} "  - Downsizing Target        : " . sprintf("%.2f", $target_norm_runq) . " / LCPU\n";
+        print {$log_fh} "  - Downsizing Cap           : " . sprintf("%.1f%%", $max_downsize_perc_factor * 100) . "\n";
+        print {$log_fh} "----------------------------------------------------------------------\n";
+    }
+
+    return ($sat_thresh, $target_norm_runq, $max_downsize_perc_factor);
 }
 
 # --- usage_wrapper ---
