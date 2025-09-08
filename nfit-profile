@@ -117,6 +117,9 @@ my $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY = 0.33; # e.g., 15% * 0.33 
 my $STD_NORM_P90_THRESH = 0.5; # NormRunQ P90 must be below this to be considered non-concurrent.
 my $STD_IQRC_THRESH     = 0.3; # Volatility must be below this (very steady).
 my $STD_DAMPENING_FACTOR_FOR_UNCAPPED = 0.50; # Apply a 50% dampening factor to the strategic downsizing signal for these workloads.
+my $STD_LCPU_TIER1_MAX = 8;     # For small VMs (less dampening)
+my $STD_LCPU_TIER2_MAX = 32;    # For medium VMs (base dampening)
+                                # VMs > TIER2_MAX are large (more dampening)
 
 # --- Enhanced Efficiency Factor Constants (for calculate_runq_modified_physc) ---
 my $VOLATILITY_CAUTION_THRESHOLD = 2.5; # If NormRunQ P90/P50 ratio >= this, skip efficiency reduction
@@ -2540,10 +2543,13 @@ sub log_profile_rationale
             printf {$fh} "      - Condition Met (NormP90 < %.1f)       : %s\n", $STD_NORM_P90_THRESH, ($normP90_for_this_calc // $na);
             printf {$fh} "      - Condition Met (IQRC < %.1f)          : %s\n", $STD_IQRC_THRESH, ($calc_debug_info_ref->{'NormRunQ_IQRC_Val'} // $na);
             print  {$fh} "  - Strategic Signal Calculation (RunQ_Uncapped):\n";
-            my $actual_reduction = $calc_debug_info_ref->{'EffActualReductionCores'} // 'N/A';
             my $runq_uncapped_val = $calc_debug_info_ref->{'RunQ_Uncapped'} // 'N/A';
-            printf {$fh} "      - Potential Downsizing                : %.4f cores\n", (looks_like_number($actual_reduction) ? $actual_reduction : 0);
-            printf {$fh} "      - Dampening Factor Applied            : %.0f%%\n", ($STD_DAMPENING_FACTOR_FOR_UNCAPPED * 100);
+            my $potential_downsizing = (looks_like_number($calc_debug_info_ref->{'EffActualReductionCores'}) ? $calc_debug_info_ref->{'EffActualReductionCores'} : 0);
+            printf {$fh} "      - Potential Downsizing                : %.4f cores\n", $potential_downsizing;
+            printf {$fh} "      - Dampening Tier                      : %s\n", ($calc_debug_info_ref->{'STDDampeningTier'} // 'N/A');
+            printf {$fh} "      - Base Dampening Factor               : %.0f%%\n", ($STD_DAMPENING_FACTOR_FOR_UNCAPPED * 100);
+            my $final_dampening = $calc_debug_info_ref->{'STDFinalDampeningFactor'} // $STD_DAMPENING_FACTOR_FOR_UNCAPPED;
+            printf {$fh} "      - Final Dampening Factor Applied      : %.0f%%\n", ($final_dampening * 100);
             printf {$fh} "      - Final RunQ_Uncapped Value           : %.4f cores\n", (looks_like_number($runq_uncapped_val) ? $runq_uncapped_val : 0);
         } else {
             # Standard logging for all other downsizing scenarios.
@@ -3186,7 +3192,116 @@ sub calculate_runq_modified_physc
     $debug_info{'NormRunQ_P25_Val'} = (defined $norm_p25_numeric) ? sprintf("%.2f", $norm_p25_numeric) : $na_str;
     $debug_info{'NormRunQ_P50_Val'} = (defined $norm_p50_numeric) ? sprintf("%.2f", $norm_p50_numeric) : $na_str;
     $debug_info{'NormRunQ_P75_Val'} = (defined $norm_p75_numeric) ? sprintf("%.2f", $norm_p75_numeric) : $na_str;
-    $debug_info{'NormRunQ_IQRC_Val'} = (defined $normrunq_iqrc_val) ? sprintf("%.3f", $normrunq_iqrc_val) : $na_str;
+
+    # Calculate Effective LCPUs for Pressure
+    my $effective_lcpus_for_pressure_calc = 0;
+    my $pressure_basis_rationale = "N/A";
+
+    # --- Calculate graduated burst allowance based on entitlement size ---
+    my $burst_allowance_raw;
+    if ($curr_ent_numeric > 0 && $curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
+        # Use graduated burst for small uncapped LPARs
+        $burst_allowance_raw = calculate_graduated_burst($curr_ent_numeric);
+    } else {
+        # Use standard burst factor for larger entitlements or capped LPARs
+        $burst_allowance_raw = $ENTITLEMENT_BURST_ALLOWANCE_FACTOR;
+    }
+    my $burst_allowance_clamped = max($BURST_ALLOWANCE_MIN_FACTOR, min($BURST_ALLOWANCE_MAX_FACTOR, $burst_allowance_raw));
+    my $burst_was_clamped = (abs($burst_allowance_raw - $burst_allowance_clamped) > 1e-9);
+
+    my $runq_pressure_p_val = ($effective_lcpus_for_pressure_calc > 0) ? (($abs_runq_p_numeric // 0) / $effective_lcpus_for_pressure_calc) : 0;
+    $debug_info{'RunQPressure_P90_Val'} = sprintf("%.4f", $runq_pressure_p_val);
+    $debug_info{'PressureBasisRationale'} = $pressure_basis_rationale;
+
+    if ($max_cpu_for_lpar_numeric > 0 && $smt_used > 0)
+    {
+        # 1. Calculate the MaxCPU-based capacity candidate
+        my $l_conf = $max_cpu_for_lpar_numeric * $smt_used;
+
+        # 2. For uncapped VMs (where MaxCPU > Entitlement), use enhanced calculation
+        if ($curr_ent_numeric > 0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
+
+            # Special handling for small entitlements < 1
+            if ($curr_ent_numeric < 1.0) {
+                # Calculate structural availability based on hardware thread allocation behaviour
+                my $structural_factor = calculate_structural_availability_factor($curr_ent_numeric);
+                my $l_structural = 1.0 * $smt_used * $structural_factor;
+
+                # Calculate burst-tolerant entitlement with graduated burst
+                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
+
+                # Use the maximum of structural and burst calculations for small entitlements
+                # This acknowledges hardware thread availability whilst remaining conservative
+                my $l_small_ent = max($l_structural, $l_ent_burst);
+
+                # Choose the minimum of MaxCPU capacity and small entitlement calculation
+                $effective_lcpus_for_pressure_calc = min($l_conf, $l_small_ent);
+
+                # Apply minimum floor for safety
+                my $pre_floor_value = $effective_lcpus_for_pressure_calc;
+                $effective_lcpus_for_pressure_calc = apply_minimum_lcpu_floor($effective_lcpus_for_pressure_calc, $smt_used);
+
+                # Build detailed rationale string
+                $pressure_basis_rationale = sprintf(
+                    "Small Entitlement Handler (Ent=%.2f): max(Structural: 1vCPU×%d SMT×%.2f factor=%.1f, Burst: %.2f×(1+%.2f)×%d SMT=%.1f) capped by MaxCPU×SMT=%.0f → %.0f LCPUs",
+                    $curr_ent_numeric,
+                    $smt_used, $structural_factor, $l_structural,
+                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
+                    $l_conf,
+                    $effective_lcpus_for_pressure_calc
+                );
+
+                if ($pre_floor_value < $effective_lcpus_for_pressure_calc) {
+                    $pressure_basis_rationale .= sprintf(" [Floor applied: raised from %.1f to %d LCPUs]",
+                        $pre_floor_value, $effective_lcpus_for_pressure_calc);
+                }
+
+                if ($burst_was_clamped) {
+                    $pressure_basis_rationale .= sprintf(" [Burst %.2f→%.2f]", $burst_allowance_raw, $burst_allowance_clamped);
+                }
+
+            } else {
+                # Standard calculation for entitlements >= 1
+                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
+
+                # Choose the minimum of the two candidates
+                $effective_lcpus_for_pressure_calc = min($l_conf, $l_ent_burst);
+
+                # Build the detailed rationale string showing the comparison
+                $pressure_basis_rationale = sprintf("Burst-Tolerant Entitlement (min(%.2f vCPU×SMT=%d=%.0f, %.2f ENT×(1+%.2f burst)×SMT=%d=%.0f) → %.0f LCPUs)",
+                    $max_cpu_for_lpar_numeric, $smt_used, $l_conf,
+                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
+                    $effective_lcpus_for_pressure_calc
+                );
+                if ($burst_was_clamped) {
+                    $pressure_basis_rationale .= sprintf(" [Note: Original burst factor %.2f was clamped to %.2f]", $burst_allowance_raw, $burst_allowance_clamped);
+                }
+            }
+        } else {
+            # For capped VMs, the basis is simply MaxCPU-based capacity
+            if ($max_cpu_for_lpar_numeric > 0) {
+                $effective_lcpus_for_pressure_calc = $l_conf;
+                $pressure_basis_rationale = sprintf("MaxCPU basis (%.2f vCPU * %d SMT = %.0f LCPUs)",
+                    $max_cpu_for_lpar_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
+            } elsif ($curr_ent_numeric > 0) {
+                $effective_lcpus_for_pressure_calc = $curr_ent_numeric * $smt_used;
+                $pressure_basis_rationale = sprintf("Entitlement fallback (%.2f ENT * %d SMT = %.0f LCPUs)",
+                    $curr_ent_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
+            } else {
+                $effective_lcpus_for_pressure_calc = 0;
+                $pressure_basis_rationale = "No valid capacity basis (MaxCPU/Entitlement missing)";
+            }
+        }
+
+        if ($effective_lcpus_for_pressure_calc > 0) {
+            my $absq = (defined $abs_runq_p_numeric && looks_like_number($abs_runq_p_numeric)) ? $abs_runq_p_numeric : 0;
+            $runq_pressure_p_val = $absq / $effective_lcpus_for_pressure_calc;
+        } else {
+            $runq_pressure_p_val = 0; # Safe default if no capacity basis is found
+            $pressure_basis_rationale = "No valid capacity basis found (MaxCPU/Entitlement missing or zero)";
+        }
+    }
+   $debug_info{'NormRunQ_IQRC_Val'} = (defined $normrunq_iqrc_val) ? sprintf("%.3f", $normrunq_iqrc_val) : $na_str;
 
     # =========================
     # Section C: Strategic Efficiency / Downsizing (ALWAYS RUNS)
@@ -3336,11 +3451,26 @@ sub calculate_runq_modified_physc
         if ($is_std_pattern) {
             # PATTERN MATCHED: This is likely an inefficient workload.
             # Do NOT apply tactical downsizing, but DO populate a dampened strategic signal.
-            my $actual_reduction = $debug_info{'EffActualReductionCores'};
 
-            # note: handle potential "N/A" string
-            my $actual_reduction_num = (defined $actual_reduction && looks_like_number($actual_reduction)) ? ($actual_reduction + 0) : 0;
-            my $dampened_reduction = $actual_reduction_num * $STD_DAMPENING_FACTOR_FOR_UNCAPPED;
+            my $actual_reduction_num = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'}))
+                ? ($debug_info{'EffActualReductionCores'} + 0) : 0;
+
+            # --- Graduated Dampening Logic ---
+            my $l_eff_for_tiering = $effective_lcpus_for_pressure_calc;
+            my $graduated_dampening_factor = $STD_DAMPENING_FACTOR_FOR_UNCAPPED; # Default to base
+            my $tier_rationale = "Medium VM (Tier 2)";
+
+            if ($l_eff_for_tiering <= $STD_LCPU_TIER1_MAX) {
+                $graduated_dampening_factor = min(0.8, $STD_DAMPENING_FACTOR_FOR_UNCAPPED + 0.3);
+                $tier_rationale = "Small VM (Tier 1)";
+            } elsif ($l_eff_for_tiering > $STD_LCPU_TIER2_MAX) {
+                $graduated_dampening_factor = max(0.2, $STD_DAMPENING_FACTOR_FOR_UNCAPPED - 0.3);
+                $tier_rationale = "Large VM (Tier 3)";
+            }
+            $debug_info{'STDDampeningTier'} = sprintf("%s, L_eff=%.1f", $tier_rationale, $l_eff_for_tiering);
+            $debug_info{'STDFinalDampeningFactor'} = $graduated_dampening_factor;
+
+            my $dampened_reduction = $actual_reduction_num * $graduated_dampening_factor;
 
             $debug_info{'RunQ_Uncapped'} = sprintf("%.4f", -$dampened_reduction);
             $skip_downsizing_reason = sprintf(
@@ -3374,117 +3504,11 @@ sub calculate_runq_modified_physc
     # =========================
     # Section D: Tactical Additive CPU (ALWAYS RUNS; no early return)
     # =========================
-    my $runq_pressure_p_val = 0;
-    my $effective_lcpus_for_pressure_calc = 0;
-    my $pressure_basis_rationale = "N/A";
-
-    # --- Calculate graduated burst allowance based on entitlement size ---
-    my $burst_allowance_raw;
-    if ($curr_ent_numeric > 0 && $curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
-        # Use graduated burst for small uncapped LPARs
-        $burst_allowance_raw = calculate_graduated_burst($curr_ent_numeric);
-    } else {
-        # Use standard burst factor for larger entitlements or capped LPARs
-        $burst_allowance_raw = $ENTITLEMENT_BURST_ALLOWANCE_FACTOR;
-    }
-    my $burst_allowance_clamped = max($BURST_ALLOWANCE_MIN_FACTOR, min($BURST_ALLOWANCE_MAX_FACTOR, $burst_allowance_raw));
-    my $burst_was_clamped = (abs($burst_allowance_raw - $burst_allowance_clamped) > 1e-9);
-
-    if ($max_cpu_for_lpar_numeric > 0 && $smt_used > 0)
-    {
-        # 1. Calculate the MaxCPU-based capacity candidate
-        my $l_conf = $max_cpu_for_lpar_numeric * $smt_used;
-
-        # 2. For uncapped VMs (where MaxCPU > Entitlement), use enhanced calculation
-        if ($curr_ent_numeric > 0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
-
-            # Special handling for small entitlements < 1
-            if ($curr_ent_numeric < 1.0) {
-                # Calculate structural availability based on hardware thread allocation behaviour
-                my $structural_factor = calculate_structural_availability_factor($curr_ent_numeric);
-                my $l_structural = 1.0 * $smt_used * $structural_factor;
-
-                # Calculate burst-tolerant entitlement with graduated burst
-                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
-
-                # Use the maximum of structural and burst calculations for small entitlements
-                # This acknowledges hardware thread availability whilst remaining conservative
-                my $l_small_ent = max($l_structural, $l_ent_burst);
-
-                # Choose the minimum of MaxCPU capacity and small entitlement calculation
-                $effective_lcpus_for_pressure_calc = min($l_conf, $l_small_ent);
-
-                # Apply minimum floor for safety
-                my $pre_floor_value = $effective_lcpus_for_pressure_calc;
-                $effective_lcpus_for_pressure_calc = apply_minimum_lcpu_floor($effective_lcpus_for_pressure_calc, $smt_used);
-
-                # Build detailed rationale string
-                $pressure_basis_rationale = sprintf(
-                    "Small Entitlement Handler (Ent=%.2f): max(Structural: 1vCPU×%d SMT×%.2f factor=%.1f, Burst: %.2f×(1+%.2f)×%d SMT=%.1f) capped by MaxCPU×SMT=%.0f → %.0f LCPUs",
-                    $curr_ent_numeric,
-                    $smt_used, $structural_factor, $l_structural,
-                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
-                    $l_conf,
-                    $effective_lcpus_for_pressure_calc
-                );
-
-                if ($pre_floor_value < $effective_lcpus_for_pressure_calc) {
-                    $pressure_basis_rationale .= sprintf(" [Floor applied: raised from %.1f to %d LCPUs]",
-                        $pre_floor_value, $effective_lcpus_for_pressure_calc);
-                }
-
-                if ($burst_was_clamped) {
-                    $pressure_basis_rationale .= sprintf(" [Burst %.2f→%.2f]", $burst_allowance_raw, $burst_allowance_clamped);
-                }
-
-            } else {
-                # Standard calculation for entitlements >= 1
-                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
-
-                # Choose the minimum of the two candidates
-                $effective_lcpus_for_pressure_calc = min($l_conf, $l_ent_burst);
-
-                # Build the detailed rationale string showing the comparison
-                $pressure_basis_rationale = sprintf("Burst-Tolerant Entitlement (min(%.2f vCPU×SMT=%d=%.0f, %.2f ENT×(1+%.2f burst)×SMT=%d=%.0f) → %.0f LCPUs)",
-                    $max_cpu_for_lpar_numeric, $smt_used, $l_conf,
-                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
-                    $effective_lcpus_for_pressure_calc
-                );
-                if ($burst_was_clamped) {
-                    $pressure_basis_rationale .= sprintf(" [Note: Original burst factor %.2f was clamped to %.2f]", $burst_allowance_raw, $burst_allowance_clamped);
-                }
-            }
-        } else {
-            # For capped VMs, the basis is simply MaxCPU-based capacity
-            if ($max_cpu_for_lpar_numeric > 0) {
-                $effective_lcpus_for_pressure_calc = $l_conf;
-                $pressure_basis_rationale = sprintf("MaxCPU basis (%.2f vCPU * %d SMT = %.0f LCPUs)",
-                    $max_cpu_for_lpar_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
-            } elsif ($curr_ent_numeric > 0) {
-                $effective_lcpus_for_pressure_calc = $curr_ent_numeric * $smt_used;
-                $pressure_basis_rationale = sprintf("Entitlement fallback (%.2f ENT * %d SMT = %.0f LCPUs)",
-                    $curr_ent_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
-            } else {
-                $effective_lcpus_for_pressure_calc = 0;
-                $pressure_basis_rationale = "No valid capacity basis (MaxCPU/Entitlement missing)";
-            }
-        }
-
-        if ($effective_lcpus_for_pressure_calc > 0) {
-            my $absq = (defined $abs_runq_p_numeric && looks_like_number($abs_runq_p_numeric)) ? $abs_runq_p_numeric : 0;
-            $runq_pressure_p_val = $absq / $effective_lcpus_for_pressure_calc;
-        } else {
-            $runq_pressure_p_val = 0; # Safe default if no capacity basis is found
-            $pressure_basis_rationale = "No valid capacity basis found (MaxCPU/Entitlement missing or zero)";
-        }
-    }
-    $debug_info{'RunQPressure_P90_Val'} = sprintf("%.4f", $runq_pressure_p_val);
-    my $is_runq_pressure = ($runq_pressure_p_val > $adaptive_runq_saturation_thresh);
-    $debug_info{'PressureBasisRationale'} = $pressure_basis_rationale;
     $debug_info{'BurstAllowanceUsed'} = sprintf("%.2f%% (graduated for Ent=%.2f)" ,
         $burst_allowance_clamped * 100, $curr_ent_numeric);
     $debug_info{'SmallEntitlementHandler'} = ($curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric)
         ? "Yes" : "No";
+    my $is_runq_pressure = ($runq_pressure_p_val > $adaptive_runq_saturation_thresh);
     $debug_info{'IsRunQPressure'} = $is_runq_pressure ? "True" : "False";
     # Log the enhanced burst and small entitlement details
     $debug_info{'EffectiveLCPUsForPressure'} = sprintf("%.1f", $effective_lcpus_for_pressure_calc);
