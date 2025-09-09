@@ -24,7 +24,7 @@ use version;
 use JSON;
 use Fcntl qw(:DEFAULT :flock);
 use constant ONE_SECOND => 1;
-use Data::Dumper;
+#use Data::Dumper;
 
 # --- Store original ARGV for logging ---
 my @original_argv = @ARGV;
@@ -116,7 +116,7 @@ my $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY = 0.33; # e.g., 15% * 0.33 
 # and should still be considered for strategic (but not tactical) downsizing.
 my $STD_NORM_P90_THRESH = 0.5; # NormRunQ P90 must be below this to be considered non-concurrent.
 my $STD_IQRC_THRESH     = 0.3; # Volatility must be below this (very steady).
-my $STD_DAMPENING_FACTOR_FOR_UNCAPPED = 0.50; # Apply a 50% dampening factor to the strategic downsizing signal for these workloads.
+my $STD_PHYSC_STABILITY_THRESH = 0.15; # PhysC P90/P50 ratio must be less than 1.15.
 my $STD_LCPU_TIER1_MAX = 8;     # For small VMs (less dampening)
 my $STD_LCPU_TIER2_MAX = 32;    # For medium VMs (base dampening)
                                 # VMs > TIER2_MAX are large (more dampening)
@@ -126,7 +126,7 @@ my $VOLATILITY_CAUTION_THRESHOLD = 2.5; # If NormRunQ P90/P50 ratio >= this, ski
 my $NORM_P50_THRESHOLD_FOR_EFFICIENCY_CONSIDERATION = 0.5; # NormRunQ P50 must be below this to consider efficiency
 my $MAX_EFFICIENCY_REDUCTION_PERCENTAGE  = 0.15; # Max % a profile can be reduced by efficiency logic (ADAPTIVE)
 my $MIN_P50_DENOMINATOR_FOR_VOLATILITY = 0.1;    # Min P50 value to avoid division by zero in volatility calc
-my $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC = 0.75; # Base, SMT-dependent adjustments in calc sub (ADAPTIVE)
+my $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC = 0.8; # Base, SMT-dependent adjustments in calc sub (ADAPTIVE)
 
 # --- Hot Thread Workload (HTW) Additive Dampening Heuristics ---
 # These constants are used to detect and dampen additive CPU for workloads
@@ -1640,7 +1640,9 @@ foreach my $system_serial (@target_systems_to_process)
                         # Pass the adaptive thresholds
                         $adaptive_runq_saturation_thresh,
                         $adaptive_target_norm_runq,
-                        $adaptive_max_efficiency_reduction
+                        $adaptive_max_efficiency_reduction,
+                        \%results_table, # Pass reference to the complete results table
+                        $vm_name         # Pass the current VM name for lookups
                     );
 
                     # Calculate and store the final net modifier (additive or reductive) for this specific profile.
@@ -2536,27 +2538,35 @@ sub log_profile_rationale
 		my $physc_after_downsizing_B_log = $calc_debug_info_ref->{'DownsizedPhysC'} // $na;
 
         if ($downsizing_reason_B_log =~ /Single-Threaded Dominant \(STD\) Workload Pattern Detected/) {
-            # Custom, detailed logging for the STD heuristic path.
+            # --- Path 1: STD Pattern was detected ---
             printf {$fh} "  - Overall Status                          : Tactical Downsizing Skipped (Entitlement Floor Guard)\n";
             printf {$fh} "  - Guardrail Rationale                     : Base PhysC (%.4f) > Entitlement (%.2f)\n", ($eff_p_base_numeric // 0), ($curr_ent_numeric // 0);
-            printf {$fh} "  - Heuristic Override                      : Single-Thread-Dominated (STD) workload pattern was detected.\n";
-            printf {$fh} "      - Condition Met (NormP90 < %.1f)       : %s\n", $STD_NORM_P90_THRESH, ($normP90_for_this_calc // $na);
-            printf {$fh} "      - Condition Met (IQRC < %.1f)          : %s\n", $STD_IQRC_THRESH, ($calc_debug_info_ref->{'NormRunQ_IQRC_Val'} // $na);
+            printf {$fh} "  - Heuristic Override                      : High-Confidence STD workload pattern was detected.\n";
+            printf {$fh} "      - Confidence Checks                   : %s\n", ($calc_debug_info_ref->{'STDConfidenceChecks'} // 'N/A');
             print  {$fh} "  - Strategic Signal Calculation (RunQ_Uncapped):\n";
             my $runq_uncapped_val = $calc_debug_info_ref->{'RunQ_Uncapped'} // 'N/A';
             my $potential_downsizing = (looks_like_number($calc_debug_info_ref->{'EffActualReductionCores'}) ? $calc_debug_info_ref->{'EffActualReductionCores'} : 0);
             printf {$fh} "      - Potential Downsizing                : %.4f cores\n", $potential_downsizing;
             printf {$fh} "      - Dampening Tier                      : %s\n", ($calc_debug_info_ref->{'STDDampeningTier'} // 'N/A');
-            printf {$fh} "      - Base Dampening Factor               : %.0f%%\n", ($STD_DAMPENING_FACTOR_FOR_UNCAPPED * 100);
-            my $final_dampening = $calc_debug_info_ref->{'STDFinalDampeningFactor'} // $STD_DAMPENING_FACTOR_FOR_UNCAPPED;
+            my $final_dampening = $calc_debug_info_ref->{'STDFinalDampeningFactor'} // 0;
             printf {$fh} "      - Final Dampening Factor Applied      : %.0f%%\n", ($final_dampening * 100);
             printf {$fh} "      - Final RunQ_Uncapped Value           : %.4f cores\n", (looks_like_number($runq_uncapped_val) ? $runq_uncapped_val : 0);
+
+        } elsif ($downsizing_reason_B_log =~ /workload does not match STD pattern/) {
+            # --- Path 2: Bursting, but STD Pattern was NOT detected ---
+            printf {$fh} "  - Overall Status                          : Tactical Downsizing Skipped (Entitlement Floor Guard)\n";
+            printf {$fh} "  - Guardrail Rationale                     : Base PhysC (%.4f) > Entitlement (%.2f)\n", ($eff_p_base_numeric // 0), ($curr_ent_numeric // 0);
+            printf {$fh} "  - Heuristic Assessment                    : Workload does NOT match STD pattern. No override applied.\n";
+            printf {$fh} "      - Confidence Checks                   : %s\n", ($calc_debug_info_ref->{'STDConfidenceChecks'} // 'N/A');
+
         } else {
-            # Standard logging for all other downsizing scenarios.
+            # --- Path 3: Standard logging for all other downsizing scenarios ---
             printf {$fh} "  - Overall Status                          : %s\n", $downsizing_reason_B_log;
         }
+
         printf {$fh} "  - Final Downsizing Factor                 : %s\n", $downsizing_factor_B_log;
 
+## --- END NEW BLOCK: Enhanced Section C Rationale Logging ---
         # Conditionally print detailed analytical breakdown for downsizing
         if ($downsizing_reason_B_log =~ /^Analytical/ &&
             defined $calc_debug_info_ref->{'EffPEfficientTarget'} && # Internal keys can remain Eff...
@@ -3090,7 +3100,9 @@ sub calculate_runq_modified_physc
         # NEW: Adaptive threshold parameters
         $adaptive_runq_saturation_thresh,
         $adaptive_target_norm_runq,
-        $adaptive_max_efficiency_reduction
+        $adaptive_max_efficiency_reduction,
+        $results_table_ref, # Pass reference to the complete results table
+        $vm_name_for_lookup # Pass the current VM name for lookups
     ) = @_;
 
     my %debug_info;
@@ -3210,8 +3222,6 @@ sub calculate_runq_modified_physc
     my $burst_was_clamped = (abs($burst_allowance_raw - $burst_allowance_clamped) > 1e-9);
 
     my $runq_pressure_p_val = ($effective_lcpus_for_pressure_calc > 0) ? (($abs_runq_p_numeric // 0) / $effective_lcpus_for_pressure_calc) : 0;
-    $debug_info{'RunQPressure_P90_Val'} = sprintf("%.4f", $runq_pressure_p_val);
-    $debug_info{'PressureBasisRationale'} = $pressure_basis_rationale;
 
     if ($max_cpu_for_lpar_numeric > 0 && $smt_used > 0)
     {
@@ -3301,7 +3311,9 @@ sub calculate_runq_modified_physc
             $pressure_basis_rationale = "No valid capacity basis found (MaxCPU/Entitlement missing or zero)";
         }
     }
-   $debug_info{'NormRunQ_IQRC_Val'} = (defined $normrunq_iqrc_val) ? sprintf("%.3f", $normrunq_iqrc_val) : $na_str;
+    $debug_info{'NormRunQ_IQRC_Val'} = (defined $normrunq_iqrc_val) ? sprintf("%.3f", $normrunq_iqrc_val) : $na_str;
+    $debug_info{'RunQPressure_P90_Val'} = sprintf("%.4f", $runq_pressure_p_val);
+    $debug_info{'PressureBasisRationale'} = $pressure_basis_rationale;
 
     # =========================
     # Section C: Strategic Efficiency / Downsizing (ALWAYS RUNS)
@@ -3442,45 +3454,64 @@ sub calculate_runq_modified_physc
     } elsif ($profile_runq_behavior_setting eq 'additive_only') {
        $skip_downsizing_reason = "Profile runq_behavior=additive_only.";
     } elsif (defined $curr_ent_numeric && $curr_ent_numeric > 0 && defined $eff_p_base_numeric && ($eff_p_base_numeric > $curr_ent_numeric)) {
-        # --- Entitlement Floor Guard with Single Threaded Dominated (STD) Workload Heuristic Check ---
-        # Condition: VM is bursting above its entitlement.
+        # --- Enhanced STD Pattern Detection with Multiple Confidence Boosters ---
 
+        # 1. Dynamically determine the source profile for PhysC stability metrics
+        my ($pattern) = (($hint_tier_for_csv{$vm_name_for_lookup} // 'G') =~ /^([A-Z])/);
+        my %pattern_to_profile_map = ('O' => 'O3-95W15', 'B' => 'B3-95W15', 'G' => 'G3-95W15', 'P' => 'G3-95W15');
+        my $source_profile_base = $pattern_to_profile_map{$pattern} // 'G3-95W15';
+
+        my $p50_profile_name = $source_profile_base; $p50_profile_name =~ s/-95W/-50W/;
+
+        # 2. Look up PhysC P50 (from the new profile) and P95 (from the base profile)
+        my $physc_p50 = $results_table_ref->{$vm_name_for_lookup}{$p50_profile_name};
+        my $physc_p95 = $results_table_ref->{$vm_name_for_lookup}{$source_profile_base};
+
+        # 3. Calculate PhysC stability using the P95/P50 ratio
+        my $physc_stability_ratio = (defined $physc_p50 && $physc_p50 > 0.01) ? (($physc_p95 // 0) / $physc_p50) : 999;
+        my $is_physc_stable = ($physc_stability_ratio < (1.0 + $STD_PHYSC_STABILITY_THRESH));
+
+        # 4. Core STD pattern detection (all 3 conditions must be met)
         my $is_std_pattern = (defined $norm_p90_numeric && $norm_p90_numeric < $STD_NORM_P90_THRESH) &&
-                             (defined $normrunq_iqrc_val && $normrunq_iqrc_val < $STD_IQRC_THRESH);
+                             (defined $normrunq_iqrc_val && $normrunq_iqrc_val < $STD_IQRC_THRESH) &&
+                             $is_physc_stable;
+
+        $debug_info{'STDConfidenceChecks'} = sprintf("NormP90<%.1f(%.2f), IQRC<%.1f(%.3f), PhysC_Stable(P95/P50)<%.2f(%.2f)",
+            $STD_NORM_P90_THRESH, ($norm_p90_numeric // 0),
+            $STD_IQRC_THRESH, ($normrunq_iqrc_val // 0),
+            (1.0 + $STD_PHYSC_STABILITY_THRESH), $physc_stability_ratio
+        );
 
         if ($is_std_pattern) {
-            # PATTERN MATCHED: This is likely an inefficient workload.
-            # Do NOT apply tactical downsizing, but DO populate a dampened strategic signal.
+            # PATTERN MATCHED: This is a high-confidence inefficient workload.
+            my $actual_reduction_num = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'})) ? ($debug_info{'EffActualReductionCores'} + 0) : 0;
 
-            my $actual_reduction_num = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'}))
-                ? ($debug_info{'EffActualReductionCores'} + 0) : 0;
+            # 5. Impact-based dampening
+            my $spinning_thread_impact_ratio = 1.0 / max(1, $effective_lcpus_for_pressure_calc);
+            my $graduated_dampening_factor;
+            my $tier_rationale;
 
-            # --- Graduated Dampening Logic ---
-            my $l_eff_for_tiering = $effective_lcpus_for_pressure_calc;
-            my $graduated_dampening_factor = $STD_DAMPENING_FACTOR_FOR_UNCAPPED; # Default to base
-            my $tier_rationale = "Medium VM (Tier 2)";
-
-            if ($l_eff_for_tiering <= $STD_LCPU_TIER1_MAX) {
-                $graduated_dampening_factor = min(0.8, $STD_DAMPENING_FACTOR_FOR_UNCAPPED + 0.3);
-                $tier_rationale = "Small VM (Tier 1)";
-            } elsif ($l_eff_for_tiering > $STD_LCPU_TIER2_MAX) {
-                $graduated_dampening_factor = max(0.2, $STD_DAMPENING_FACTOR_FOR_UNCAPPED - 0.3);
-                $tier_rationale = "Large VM (Tier 3)";
+            if ($spinning_thread_impact_ratio >= 0.20) { # High impact
+                $graduated_dampening_factor = 0.85;
+                $tier_rationale = sprintf("High Impact (%.1f%% of VM capacity)", $spinning_thread_impact_ratio * 100);
+            } elsif ($spinning_thread_impact_ratio >= 0.10) { # Medium impact
+                $graduated_dampening_factor = 0.70;
+                $tier_rationale = sprintf("Medium Impact (%.1f%% of VM capacity)", $spinning_thread_impact_ratio * 100);
+            } else { # Low impact
+                $graduated_dampening_factor = 0.30;
+                $tier_rationale = sprintf("Low Impact (%.1f%% of VM capacity)", $spinning_thread_impact_ratio * 100);
             }
-            $debug_info{'STDDampeningTier'} = sprintf("%s, L_eff=%.1f", $tier_rationale, $l_eff_for_tiering);
-            $debug_info{'STDFinalDampeningFactor'} = $graduated_dampening_factor;
 
             my $dampened_reduction = $actual_reduction_num * $graduated_dampening_factor;
-
             $debug_info{'RunQ_Uncapped'} = sprintf("%.4f", -$dampened_reduction);
-            $skip_downsizing_reason = sprintf(
-                "Single-Threaded Dominant (STD) Workload Pattern Detected (NormP90<%.1f, IQRC<%.1f). Skipping tactical downsizing, updating strategic RunQ_Uncapped with %.0f%% dampening.",
-                $STD_NORM_P90_THRESH, $STD_IQRC_THRESH, $STD_DAMPENING_FACTOR_FOR_UNCAPPED * 100
-            );
+
+            $skip_downsizing_reason = "Single-Threaded Dominant (STD) Workload Pattern Detected. Tactical downsizing skipped; updating strategic RunQ_Uncapped recommendation.";
+            $debug_info{'STDDampeningTier'} = sprintf("%s, L_eff=%.1f", $tier_rationale, $effective_lcpus_for_pressure_calc);
+            $debug_info{'STDFinalDampeningFactor'} = $graduated_dampening_factor;
+
         } else {
-            # PATTERN NOT MATCHED: This is a genuine, volatile burst. Block all downsizing.
-            $skip_downsizing_reason = sprintf("Base PhysC (%.4f) > Entitlement (%.2f) and workload pattern does not suggest inefficiency.", $eff_p_base_numeric, $curr_ent_numeric);
-            # Ensure RunQ_Uncapped is zero for these legitimate bursts.
+            # PATTERN NOT MATCHED: This is a genuine burst. Block all downsizing.
+            $skip_downsizing_reason = sprintf("Base PhysC (%.4f) > Entitlement (%.2f) and workload does not match STD pattern.", $eff_p_base_numeric, $curr_ent_numeric);
             $debug_info{'RunQ_Uncapped'} = "0.0000";
         }
     }
