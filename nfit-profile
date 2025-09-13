@@ -96,7 +96,7 @@ my $RUNQ_PRESSURE_FOR_CONSTRAINT_GUARD_FACTOR = 0.80;      # And RunQ Pressure >
 
 # Dynamic Blending Weights for Efficient Target (P_efficient_target_raw vs. BasePhysC)
 my $NORM_P50_LOW_THRESH_FOR_BLEND1 = 0.25;       # If NormP50 < this, give more weight to raw target
-my $BLEND_WEIGHT_BASE_FOR_LOW_P50_1 = 0.60;      #   60% Base / 40% Raw Target
+my $BLEND_WEIGHT_BASE_FOR_LOW_P50_1 = 0.70;      #   70% Base / 30% Raw Target
 my $NORM_P50_MODERATE_THRESH_FOR_BLEND2 = 0.40;  # If NormP50 < this (but >= BLEND1), moderate blend
 my $BLEND_WEIGHT_BASE_FOR_LOW_P50_2 = 0.75;      #   75% Base / 25% Raw Target (original idea)
 # If NormP50 >= MODERATE_THRESH_FOR_BLEND2 (but still low enough for efficiency consideration),
@@ -106,9 +106,12 @@ my $BLEND_WEIGHT_BASE_DEFAULT_LOW_P50 = 0.85;
 # Volatility-Sensitive Cap for MAX_EFFICIENCY_REDUCTION_PERCENTAGE
 # These thresholds are for Volatility Ratio (P90/P50)
 my $VOLATILITY_MODERATE_LOW_CAP_THRESH = 1.2;  # Volatility above this starts to reduce the reduction cap
+my $VOLATILITY_MODERATE_MEDIUM_CAP_THRESH = 1.5; # Intermediate threshold
 my $VOLATILITY_MODERATE_HIGH_CAP_THRESH = 1.8; # Volatility above this reduces cap more significantly
+
 # Factors to scale down MAX_EFFICIENCY_REDUCTION_PERCENTAGE
 my $REDUCTION_CAP_SCALE_FOR_MODERATE_VOLATILITY = 0.66; # e.g., 15% * 0.66 = ~10% max cut
+my $REDUCTION_CAP_SCALE_FOR_MODERATE_MEDIUM_VOLATILITY = 0.50; # e.g., 15% * 0.50 = 7.5% max cut
 my $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY = 0.33; # e.g., 15% * 0.33 = ~5% max cut
 
 # --- Single-Thread-Dominated (STD) Workload Heuristics ---
@@ -121,10 +124,16 @@ my $STD_LCPU_TIER1_MAX = 8;     # For small VMs (less dampening)
 my $STD_LCPU_TIER2_MAX = 32;    # For medium VMs (base dampening)
                                 # VMs > TIER2_MAX are large (more dampening)
 
+# --- Dispatch-Bound Workload (DBW) Anomaly Heuristics ---
+# Detects workloads with very low CPU usage but extremely high dispatch contention.
+my $DBW_LOW_UTIL_FACTOR = 0.5; # BasePhysC must be less than 50% of Entitlement.
+my $DBW_DSR_THRESHOLD = 10.0;  # Dispatch Stress Ratio must be > 10.0.
+my $DBW_MEDIAN_PRESSURE_THRESHOLD = 1.5; # NormRunQ P50 must be > 1.5.
+
 # --- Enhanced Efficiency Factor Constants (for calculate_runq_modified_physc) ---
 my $VOLATILITY_CAUTION_THRESHOLD = 2.5; # If NormRunQ P90/P50 ratio >= this, skip efficiency reduction
 my $NORM_P50_THRESHOLD_FOR_EFFICIENCY_CONSIDERATION = 0.5; # NormRunQ P50 must be below this to consider efficiency
-my $MAX_EFFICIENCY_REDUCTION_PERCENTAGE  = 0.15; # Max % a profile can be reduced by efficiency logic (ADAPTIVE)
+my $MAX_EFFICIENCY_REDUCTION_PERCENTAGE  = 0.25; # Max % a profile can be reduced by efficiency logic (ADAPTIVE)
 my $MIN_P50_DENOMINATOR_FOR_VOLATILITY = 0.1;    # Min P50 value to avoid division by zero in volatility calc
 my $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC = 0.8; # Base, SMT-dependent adjustments in calc sub (ADAPTIVE)
 
@@ -148,6 +157,16 @@ my $ADDITIVE_CPU_SAFETY_CAP_FACTOR_OF_BASE = 2.0; # Max additive CPU as a multip
 my $ADDITIVE_CPU_SAFETY_CAP_ABSOLUTE = 0.5;       # Absolute maximum additive CPU in cores
 
 my $POOL_CONSTRAINT_CONFIDENCE_FACTOR = 0.80; # Reduction factor for additive CPU if VM is in a non-default pool
+
+# --- Built-in default Target NormRunQ values for the adaptive heuristic ---
+my %DEFAULT_RUNQ_TARGETS = (
+    'P'  => 0.25,
+    'O1' => 0.30, 'O2' => 0.40, 'O3' => 0.50, 'O4' => 0.65,
+    'G1' => 0.80, 'G2' => 0.90, 'G3' => 1.00, 'G4' => 1.10,
+    'B1' => 1.20, 'B2' => 1.30, 'B3' => 1.40, 'B4' => 1.50,
+);
+my %custom_runq_targets;
+my %tier_override_for_csv;
 
 my $LOG_FILE_PATH = "/tmp/nfit-profile.log";        # Default log file path
 my $log_file_path_for_run = $LOG_FILE_PATH;
@@ -511,6 +530,9 @@ if (scalar @profiles == 0)
 {
     die "Error: No profiles loaded from '$profiles_config_path_to_load'.\n";
 }
+
+# load custom VM tiers
+my %vm_tier_overrides = %{parse_vm_tier_overrides("$script_dir/etc/nfit.vms.cfg")};
 
 # --- Generate CSV header columns ---
 
@@ -1373,22 +1395,21 @@ foreach my $system_serial (@target_systems_to_process)
             next unless @states_for_vm; # Skip if no data for this VM
 
             my $p_metric_key = "P" . clean_perc_label($profile_physc_perc_val_num // $DEFAULT_PERCENTILE);
+
             my @valid_p_values;
             foreach my $state (@states_for_vm) {
                 my $metric_val = $state->{metrics}{physc}{$p_metric_key};
                 my $growth_adj = $state->{metrics}{growth}{adjustment};
 
-                # Store the growth adjustment for this specific profile run
+                # Store the growth adjustment for later use, at the end of the calculation.
                 if (defined $growth_adj && looks_like_number($growth_adj)) {
                     $nfit_growth_adjustments{$vm_name}{$profile_name} = $growth_adj;
                 }
 
-                # The base value for the RunQ modifier logic must be the value *before* growth.
+                # FIX: Use the pure, unadjusted metric value from nfit.
+                # Do not subtract the growth adjustment here. This ensures the
+                # results_table contains clean data for all subsequent logic.
                 if (defined $metric_val && looks_like_number($metric_val)) {
-                    my $pre_growth_val = $metric_val - ($growth_adj // 0);
-                    push @valid_p_values, $pre_growth_val;
-                }
-                elsif (defined $metric_val && looks_like_number($metric_val)) {
                     push @valid_p_values, $metric_val;
                 }
             }
@@ -1508,7 +1529,7 @@ foreach my $system_serial (@target_systems_to_process)
 				if (defined $config->{entitlement} && looks_like_number($config->{entitlement})) {
                     $ent_for_hint = $config->{entitlement};
                 }
-            }
+        }
 
             my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, undef, undef, undef) =
                 generate_sizing_hint(
@@ -1550,6 +1571,8 @@ foreach my $system_serial (@target_systems_to_process)
 			my $smt_for_hint = $default_smt_arg;
 			my $maxcpu_for_hint = 0;
 			my $ent_for_hint = 0; # Initialize entitlement
+			my $vcpu_for_hint = 0;    # NEW: For EVR calculation
+			my $poolcpu_for_hint = 0; # NEW: For adaptive pool constraint
 			my $p99w1_results_aref = $per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
 
 			if (ref($p99w1_results_aref) eq 'ARRAY' && @$p99w1_results_aref) {
@@ -1564,6 +1587,12 @@ foreach my $system_serial (@target_systems_to_process)
                 }
 				if (defined $config->{entitlement} && looks_like_number($config->{entitlement})) {
                     $ent_for_hint = $config->{entitlement};
+                }
+				if (defined $config->{virtualCpus} && looks_like_number($config->{virtualCpus}) && $config->{virtualCpus} > 0) {
+                    $vcpu_for_hint = $config->{virtualCpus};
+                }
+				if (defined $config->{poolCpu} && looks_like_number($config->{poolCpu}) && $config->{poolCpu} > 0) {
+                    $poolcpu_for_hint = $config->{poolCpu};
                 }
 			}
 
@@ -1592,9 +1621,21 @@ foreach my $system_serial (@target_systems_to_process)
             # This now prints the "Section G" block under the new VM header
             print {$log_fh_for_system} $pressure_rationale_text . "\n" if ($log_fh_for_system && $pressure_rationale_text);
 
+            # Capture the pure, unadjusted P-99W1 value before the modification loop begins.
+            my $pure_p99w1_physc_for_vm = $results_table{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} // 0;
+
+            # Determine the definitive tier for this VM, checking for a user override first.
+            my $auto_detected_hint = $hint_tier_for_csv{$vm_name};
+            my $final_tier_for_vm = $vm_tier_overrides{$vm_name} // $auto_detected_hint;
+
+            # If a user override was used, store it for the CSV report's "TIER" column.
+            if (exists $vm_tier_overrides{$vm_name}) {
+                $tier_override_for_csv{$vm_name} = $vm_tier_overrides{$vm_name};
+            }
+
             # --- Apply Modifiers and Log Rationale (per profile) ---
             foreach my $profile (@profiles) {
-                my $profile_name = $profile->{name};
+               my $profile_name = $profile->{name};
                 my $base_physc = $results_table{$vm_name}{$profile_name} // "N/A";
 
                 my ($adjusted_physc, $debug_info_ref, $final_val_for_csv);
@@ -1639,11 +1680,15 @@ foreach my $system_serial (@target_systems_to_process)
                         $p99w1_has_abs_pressure,
                         $p99w1_has_norm_pressure,
                         # Pass the adaptive thresholds
+                        $vcpu_for_hint,    # NEW: Pass VCPUs
+                        $poolcpu_for_hint, # NEW: Pass PoolCPU
                         $adaptive_runq_saturation_thresh,
                         $adaptive_target_norm_runq,
                         $adaptive_max_efficiency_reduction,
                         \%results_table, # Pass reference to the complete results table
-                        $vm_name         # Pass the current VM name for lookups
+                        $vm_name,         # Pass the current VM name for lookups
+                        $pure_p99w1_physc_for_vm,   # Pass the pure, unadjusted P-99W1 value
+                        $final_tier_for_vm          # Pass the definitive workload tier
                     );
 
                     # Calculate and store the final net modifier (additive or reductive) for this specific profile.
@@ -2343,8 +2388,8 @@ sub log_profile_rationale
     }
 
     print {$fh} "\n======================================================================\n";
-    printf {$fh} "VM Name                                     : %s\n", $vm_name;
-    printf {$fh} "Profile Processed                           : %s\n", $profile_description_log;
+    printf {$fh} "VM Name                                      : %s\n", $vm_name;
+    printf {$fh} "Profile Processed                            : %s\n", $profile_description_log;
     print {$fh} "----------------------------------------------------------------------\n";
 
 	if ($model_type eq 'recency_decay') {
@@ -2366,17 +2411,17 @@ sub log_profile_rationale
 		: "N/A";
 
 		print {$fh} "======================================================================\n";
-		printf {$fh} "VM Name                         : %s\n", $vm_name;
-		printf {$fh} "Profile Processed               : %s\n", $profile_desc;
+		printf {$fh} "VM Name                             : %s\n", $vm_name;
+		printf {$fh} "Profile Processed                   : %s\n", $profile_desc;
 		print {$fh} "----------------------------------------------------------------------\n";
 		print {$fh} "CPU Sizing Path: Recency-Anchored Decay (Seasonal: '$apply_seasonality_event')\n\n";
 		print {$fh} "  - This model solves the 'Start-of-Month' problem and includes nfit's\n";
 		print {$fh} "    standard growth prediction.\n\n";
-		printf {$fh} "  - Analysis Reference Date       : %s\n", ($nfit_analysis_reference_date_str // "N/A");
-		printf {$fh} "  - Base Value (Recency-Anchored) : %.4f cores\n", $base_val_unrounded if (looks_like_number($base_val_unrounded));
-		printf {$fh} "  - Growth Adjustment             : +%.4f cores\n", $growth_adj;
+		printf {$fh} "  - Analysis Reference Date         : %s\n", ($nfit_analysis_reference_date_str // "N/A");
+		printf {$fh} "  - Base Value (Recency-Anchored)   : %.4f cores\n", $base_val_unrounded if (looks_like_number($base_val_unrounded));
+		printf {$fh} "  - Growth Adjustment               : +%.4f cores\n", $growth_adj;
 		print {$fh} "  --------------------------------------------------------------------\n";
-		printf {$fh} "  - Final nfit Value (Unrounded)  : %s cores\n", ($base_physc_for_profile // "N/A");
+		printf {$fh} "  - Final nfit Value (Unrounded)    : %s cores\n", ($base_physc_for_profile // "N/A");
 		print {$fh} "======================================================================\n\n";
 		return;
 	}
@@ -2393,7 +2438,7 @@ sub log_profile_rationale
             my $config = $first_result->{metadata}{configuration} || {};
             my $metric_val = $first_result->{metrics}{physc}{$p_metric_key};
             # Special logging for aggregated decay-model results
-            printf {$fh} "    - %-38s: Ent=%.2f, MaxCPU=%.2f, SMT=%d, %s=%.4f\n",
+            printf {$fh} "    - %-39s: Ent=%.2f, MaxCPU=%.2f, SMT=%d, %s=%.4f\n",
                 "Aggregated Result",
                 $config->{entitlement} // 0,
                 $config->{maxCpu} // 0,
@@ -2401,7 +2446,7 @@ sub log_profile_rationale
                 $p_metric_key,
                 defined($metric_val) ? $metric_val : 0;
 			my $state_count = $first_result->{state}{stateCount} // 1;
-            printf {$fh} "    - Aggregation Method                    : Time-weighted decay model applied across %d configuration states.\n", $state_count;
+            printf {$fh} "    - Aggregation Method                     : Time-weighted decay model applied across %d configuration states.\n", $state_count;
         } else {
             # Standard logging for non-aggregated results
             foreach my $state_res (@$raw_nfit_states_aref) {
@@ -2418,9 +2463,9 @@ sub log_profile_rationale
                     defined($metric_val) ? sprintf("%.4f", $metric_val) : $na;
             }
             if (@$raw_nfit_states_aref > 1) {
-                printf {$fh} "    - Aggregation Method                     : Simple Average of %d states was used.\n", scalar(@$raw_nfit_states_aref);
+                printf {$fh} "    - Aggregation Method                      : Simple Average of %d states was used.\n", scalar(@$raw_nfit_states_aref);
             } else {
-                printf {$fh} "    - Aggregation Method                     : Direct value from a single state was used.\n";
+                printf {$fh} "    - Aggregation Method                      : Direct value from a single state was used.\n";
             }
         }
     }
@@ -2431,7 +2476,7 @@ sub log_profile_rationale
         $nfit_growth_adj_to_display = sprintf("%.4f", $first_nfit_state->{metrics}{growth}{adjustment});
     }
 
-    printf {$fh} "Initial Base PhysC for Profile              : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
+    printf {$fh} "Initial Base PhysC for Profile               : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
 
     # Check if any GrowthDebug keys exist to print the rationale block
     if ($first_nfit_state->{debug}{growthRationale}) {
@@ -2444,44 +2489,44 @@ sub log_profile_rationale
             return $val ? "Passed" : "Failed";
         };
 
-        print {$fh} "  - nfit GrowthAdj Applied : +$nfit_growth_adj_to_display cores\n";
+        print {$fh} "  - nfit GrowthAdj Applied                   : +$nfit_growth_adj_to_display cores\n";
         print {$fh} "  - Rationale for GrowthAdj (from nfit):\n";
         printf {$fh} "    1. Data Eligibility : %s historical periods found (Min: %d).\n", $gd->{num_hist_periods}, $GROWTH_MIN_HISTORICAL_PERIODS; # Note: You may need to pass this constant or hardcode it
         printf {$fh} "    2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", $gd->{stats_cv}, $GROWTH_MAX_CV_THRESHOLD, ($gd->{cv_check_passed} ? "Passed" : "Failed");
-        printf {$fh} "        3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.2f. [Result: %s]\n", ($gd->{slope} // 'N/A'), $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed} // 'Skipped');
+        printf {$fh} "    3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.2f. [Result: %s]\n", ($gd->{slope} // 'N/A'), $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed} // 'Skipped');
 
         # Use string comparison 'eq' for the check, as the value can be "Skipped", 0, or 1.
         if (defined $gd->{slope_check_passed} && $gd->{slope_check_passed} eq '1') {
             # Safely format projected value, printing "N/A" as a string if it's not numeric.
             my $proj_val_str = looks_like_number($gd->{projected_val}) ? sprintf("%.4f", $gd->{projected_val}) : "N/A";
-            printf {$fh} "        4. Projection       : Trend projected to %s cores over %d days.\n", $proj_val_str, $DEFAULT_GROWTH_PROJECTION_DAYS;
+            printf {$fh} "        4. Projection                    : Trend projected to %s cores over %d days.\n", $proj_val_str, $DEFAULT_GROWTH_PROJECTION_DAYS;
 
             # Safely format inflation percentage and handle the ternary operator for capping status.
             my $inflation_str = looks_like_number($gd->{inflation_perc}) ? sprintf("%.2f", $gd->{inflation_perc}) : "N/A";
             my $capping_msg = (defined $gd->{was_capped} && $gd->{was_capped} eq '1') ? "CAPPED" : "not capped";
-            printf {$fh} "        5. Inflation        : Calculated inflation is %s%%. This was %s to the max of %d%%.\n", $inflation_str, $capping_msg, $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
+        printf {$fh} "        5. Inflation                         : Calculated inflation is %s%%. This was %s to the max of %d%%.\n", $inflation_str, $capping_msg, $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
         }
         print {$fh} "\n";
     }
 
-    printf {$fh} "Final nfit-profile Recommendation           : %s cores (Unrounded: %s)\n", ($final_csv_value_for_profile // $na), $final_recommendation_unrounded_str;
-    printf {$fh} "Net Adjustment by nfit-profile              : %s\n", $net_change_str;
+    printf {$fh} "Final nfit-profile Recommendation            : %s cores (Unrounded: %s)\n", ($final_csv_value_for_profile // $na), $final_recommendation_unrounded_str;
+    printf {$fh} "Net Adjustment by nfit-profile               : %s\n", $net_change_str;
     print {$fh} "======================================================================\n\n";
 
     # --- Section B: Key Inputs & Configuration ---
 
     print {$fh} "Section B: Key Inputs & Configuration for Modifier Logic\n";
-    printf {$fh} "  1. Key RunQ Metrics (source: %s, state: %s):\n",
+    printf {$fh} "  1. Key RunQ Metrics (source: %s, state: %s)\n",
     $runq_metrics_source_profile_name_for_this_calc,
     "Most Recent";
-    printf {$fh} "     - AbsRunQ for Upsizing (%s)   : %s threads\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
-    printf {$fh} "     - NormRunQ P25                         : %s\n", ($calc_debug_info_ref->{'NormRunQ_P25_Val'} // $na);
-    printf {$fh} "     - NormRunQ P50                         : %s\n", ($normP50_for_this_calc // ($calc_debug_info_ref->{'NormRunQ_P50_Val'} // $na) );
-    printf {$fh} "     - NormRunQ P75                         : %s\n", ($calc_debug_info_ref->{'NormRunQ_P75_Val'} // $na);
-    printf {$fh} "     - NormRunQ P90                         : %s\n", ($normP90_for_this_calc // $na);
+    printf {$fh} "     - AbsRunQ for Upsizing (%s)    : %s threads\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
+    printf {$fh} "     - NormRunQ P25                          : %s\n", ($calc_debug_info_ref->{'NormRunQ_P25_Val'} // $na);
+    printf {$fh} "     - NormRunQ P50                          : %s\n", ($normP50_for_this_calc // ($calc_debug_info_ref->{'NormRunQ_P50_Val'} // $na) );
+    printf {$fh} "     - NormRunQ P75                          : %s\n", ($calc_debug_info_ref->{'NormRunQ_P75_Val'} // $na);
+    printf {$fh} "     - NormRunQ P90                          : %s\n", ($normP90_for_this_calc // $na);
 
     my $iqrc_val_for_log_A_sec = $calc_debug_info_ref->{'NormRunQ_IQRC_Val'} // $na;
-    printf {$fh} "     - NormRunQ IQRC (Volatility)           : %s", $iqrc_val_for_log_A_sec;
+    printf {$fh} "     - NormRunQ IQRC (Volatility)            : %s", $iqrc_val_for_log_A_sec;
     my $iqrc_interpretation_log_A_sec = $na;
     if ($iqrc_val_for_log_A_sec ne $na && $iqrc_val_for_log_A_sec =~ /^-?[0-9.]+$/)
     {
@@ -2497,14 +2542,14 @@ sub log_profile_rationale
 
     my $is_runq_pressure_C_log_sec = ($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True";
     my $is_workload_pressure_C_log_sec = ($calc_debug_info_ref->{'IsWorkloadPressure'} // "False") eq "True";
-    printf {$fh} "  2. VM Configuration & Profile Behavior:\n";
-    printf {$fh} "     - SMT                                  : %s\n", ($smt_val // $na);
+    printf {$fh} "  2. VM Configuration & Profile Behavior\n";
+    printf {$fh} "     - SMT                                   : %s\n", ($smt_val // $na);
 	my $entitlement_display_A_log_sec = (defined $entitlement_val && looks_like_number($entitlement_val)) ? $entitlement_val : $na;
-    printf {$fh} "     - Current Entitlement                  : %s cores\n", $entitlement_display_A_log_sec;
+    printf {$fh} "     - Current Entitlement                   : %s cores\n", $entitlement_display_A_log_sec;
     my $lpar_max_cpu_display_A_log_sec = ($lpar_max_cpu_cfg_val_from_config > 0) ? sprintf("%.2f", $lpar_max_cpu_cfg_val_from_config) : $na;
-    printf {$fh} "     - LPAR MaxCPU                          : %s cores\n", $lpar_max_cpu_display_A_log_sec;
-    printf {$fh} "     - Profile RunQ Behaviour               : %s\n", ($profile_rq_behavior // $na);
-	printf {$fh} "  3. Pressure Assessment Summary:\n";
+    printf {$fh} "     - LPAR MaxCPU                           : %s cores\n", $lpar_max_cpu_display_A_log_sec;
+    printf {$fh} "     - Profile RunQ Behaviour                : %s\n", ($profile_rq_behavior // $na);
+	printf {$fh} "  3. Pressure Assessment Summary\n";
     # Enhanced line for Overall LPAR RunQ Pressure
     my $abs_runq_source_str = "$runq_metrics_source_profile_name_for_this_calc " . ($calc_debug_info_ref->{AbsRunQKeyUsed} // '');
 
@@ -2517,13 +2562,13 @@ sub log_profile_rationale
     } else {
         $lpar_pressure_reason = sprintf("Ratio %.2f <= %.2f (No pressure detected)", ($calc_debug_info_ref->{'RunQPressure_P90_Val'} // 0), $adaptive_runq_saturation_thresh);
     }
-    printf {$fh} "     - Overall LPAR RunQ Pressure           : %s (Source: %s)\n", (($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True" ? "True" : "False"), $abs_runq_source_str;
-    printf {$fh} "         Basis for Pressure Calc            : %s\n", $pressure_basis_str;
-    printf {$fh} "         Reason for Pressure Flag           : %s\n", $lpar_pressure_reason;
+    printf {$fh} "     - Overall LPAR RunQ Pressure            : %s (Source: %s)\n", (($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True" ? "True" : "False"), $abs_runq_source_str;
+    printf {$fh} "         Basis for Pressure Calc             : %s\n", $pressure_basis_str;
+    printf {$fh} "         Reason for Pressure Flag            : %s\n", $lpar_pressure_reason;
 
     # Enhanced line for Normalised Workload Pressure
     my $norm_runq_source_str = "$runq_metrics_source_profile_name_for_this_calc";
-    printf {$fh} "     - Normalised Workload Pressure         : %s (Source: %s; Reason: %s)\n\n",
+    printf {$fh} "     - Normalised Workload Pressure          : %s (Source: %s; Reason: %s)\n\n",
         (($calc_debug_info_ref->{'IsWorkloadPressure'} // "False") eq "True" ? "True" : "False"),
         $norm_runq_source_str,
         ($calc_debug_info_ref->{'WorkloadPressureReason'} // "N/A");
@@ -2542,34 +2587,35 @@ sub log_profile_rationale
 
         if ($downsizing_reason_B_log =~ /Single-Threaded Dominant \(STD\) Workload Pattern Detected/) {
             # --- Path 1: STD Pattern was detected ---
-            printf {$fh} "  - Overall Status                          : Tactical Downsizing Skipped (Entitlement Floor Guard)\n";
-            printf {$fh} "  - Guardrail Rationale                     : Base PhysC (%.4f) > Entitlement (%.2f)\n", ($eff_p_base_numeric // 0), ($curr_ent_numeric // 0);
-            printf {$fh} "  - Heuristic Override                      : High-Confidence STD workload pattern was detected.\n";
-            printf {$fh} "      - Confidence Checks                   : %s\n", ($calc_debug_info_ref->{'STDConfidenceChecks'} // 'N/A');
+            printf {$fh} "  - Overall Status                           : Tactical Downsizing Skipped (Entitlement Floor Guard)\n";
+            printf {$fh} "  - Guardrail Rationale                      : Base PhysC (%.4f) > Entitlement (%.2f)\n", ($eff_p_base_numeric // 0), ($curr_ent_numeric // 0);
+            printf {$fh} "  - Heuristic Override                       : High-Confidence STD workload pattern was detected.\n";
+            printf {$fh} "      - Confidence Checks                    : %s\n", ($calc_debug_info_ref->{'STDConfidenceChecks'} // 'N/A');
             print  {$fh} "  - Strategic Signal Calculation (RunQ_Strategic):\n";
             my $runq_uncapped_val = $calc_debug_info_ref->{'RunQ_Strategic'} // 'N/A';
             my $potential_downsizing = (looks_like_number($calc_debug_info_ref->{'EffActualReductionCores'}) ? $calc_debug_info_ref->{'EffActualReductionCores'} : 0);
-            printf {$fh} "      - Potential Downsizing                : %.4f cores\n", $potential_downsizing;
-            printf {$fh} "      - Dampening Tier                      : %s\n", ($calc_debug_info_ref->{'STDDampeningTier'} // 'N/A');
+            printf {$fh} "      - Potential Downsizing                 : %.4f cores\n", $potential_downsizing;
+            printf {$fh} "      - Dampening Tier                       : %s\n", ($calc_debug_info_ref->{'STDDampeningTier'} // 'N/A');
             my $final_dampening = $calc_debug_info_ref->{'STDFinalDampeningFactor'} // 0;
-            printf {$fh} "      - Final Dampening Factor Applied      : %.0f%%\n", ($final_dampening * 100);
-            printf {$fh} "      - Final RunQ_Strategic Value          : %.4f cores\n", (looks_like_number($runq_uncapped_val) ? $runq_uncapped_val : 0);
+            printf {$fh} "      - Final Dampening Factor Applied       : %.0f%%\n", ($final_dampening * 100);
+            printf {$fh} "      - Final RunQ_Strategic Value           : %.4f cores\n", (looks_like_number($runq_uncapped_val) ? $runq_uncapped_val : 0);
 
         } elsif ($downsizing_reason_B_log =~ /workload does not match STD pattern/) {
             # --- Path 2: Bursting, but STD Pattern was NOT detected ---
-            printf {$fh} "  - Overall Status                          : Tactical Downsizing Skipped (Entitlement Floor Guard)\n";
-            printf {$fh} "  - Guardrail Rationale                     : Base PhysC (%.4f) > Entitlement (%.2f)\n", ($eff_p_base_numeric // 0), ($curr_ent_numeric // 0);
-            printf {$fh} "  - Heuristic Assessment                    : Workload does NOT match STD pattern. No override applied.\n";
-            printf {$fh} "      - Confidence Checks                   : %s\n", ($calc_debug_info_ref->{'STDConfidenceChecks'} // 'N/A');
+            printf {$fh} "  - Overall Status                           : Tactical Downsizing Skipped (Entitlement Floor Guard)\n";
+            printf {$fh} "  - Guardrail Rationale                      : Base PhysC (%.4f) > Entitlement (%.2f)\n", ($eff_p_base_numeric // 0), ($curr_ent_numeric // 0);
+            printf {$fh} "  - Heuristic Assessment                     : Workload does NOT match STD pattern. No override applied.\n";
+            printf {$fh} "      - Confidence Checks                    : %s\n", ($calc_debug_info_ref->{'STDConfidenceChecks'} // 'N/A');
 
         } else {
             # --- Path 3: Standard logging for all other downsizing scenarios ---
-            printf {$fh} "  - Overall Status                          : %s\n", $downsizing_reason_B_log;
+            printf {$fh} "  - Overall Status                           : %s\n", $downsizing_reason_B_log;
         }
 
-        printf {$fh} "  - Final Downsizing Factor                 : %s\n", $downsizing_factor_B_log;
+        printf {$fh} "  - Final Downsizing Factor                  : %s\n", $downsizing_factor_B_log;
 
-## --- END NEW BLOCK: Enhanced Section C Rationale Logging ---
+        ## --- END: Enhanced Section C Rationale Logging ---
+
         # Conditionally print detailed analytical breakdown for downsizing
         if ($downsizing_reason_B_log =~ /^Analytical/ &&
             defined $calc_debug_info_ref->{'EffPEfficientTarget'} && # Internal keys can remain Eff...
@@ -2579,13 +2625,13 @@ sub log_profile_rationale
             printf {$fh} "  - Detailed Analytical Path for Downsizing:\n";
             printf {$fh} "     a. Initial Condition Checks for Downsizing Path:\n";
             my $eff_cond_norm_p50_met_str_B = $calc_debug_info_ref->{'EffCondNormP50Met'} ? "YES (Low P50)" : "NO (P50 not low enough)";
-            printf {$fh} "        - NormRunQ P50                      : %-5s (Condition: < %.2f for consideration? %s)\n",
+            printf {$fh} "        - NormRunQ P50                       : %-5s (Condition: < %.2f for consideration? %s)\n",
             ($normP50_for_this_calc // $na),
             $NORM_P50_THRESHOLD_FOR_EFFICIENCY_CONSIDERATION,
             $eff_cond_norm_p50_met_str_B;
 
             my $eff_cond_volatility_met_str_B = $calc_debug_info_ref->{'EffCondVolatilityMet'} ? "YES (Not excessively volatile)" : "NO (Too volatile)";
-            printf {$fh} "        - Workload Volatility               : %-5s (NormP90 %.2f / NormP50 %.2f. Condition: < %.2f to proceed? %s)\n",
+            printf {$fh} "        - Workload Volatility                : %-5s (NormP90 %.2f / NormP50 %.2f. Condition: < %.2f to proceed? %s)\n",
             ($calc_debug_info_ref->{'EffVolatilityRatio'} // $na),
             ($normP90_for_this_calc ne $na ? ($normP90_for_this_calc+0):0), # Ensure numeric for sprintf
             ($normP50_for_this_calc ne $na ? ($normP50_for_this_calc+0):0),
@@ -2594,17 +2640,17 @@ sub log_profile_rationale
             print {$fh} "\n";
 
             printf {$fh} "     b. Calculating Raw Efficient PhysC Target (Theoretical Minimum if RunQ was at Target Norm):\n";
-            printf {$fh} "        - Base PhysC for Profile            : %s cores\n", ($calc_debug_info_ref->{'EffPBase'} // $na);
-            printf {$fh} "        - AbsRunQ Metric Used               : %s (value: %.2f threads)\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
-            printf {$fh} "        - SMT Value                         : %s\n", ($calc_debug_info_ref->{'EffSMTValue'} // $na);
+            printf {$fh} "        - Base PhysC for Profile             : %s cores\n", ($calc_debug_info_ref->{'EffPBase'} // $na);
+            printf {$fh} "        - AbsRunQ Metric Used                : %s (value: %.2f threads)\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
+            printf {$fh} "        - SMT Value                          : %s\n", ($calc_debug_info_ref->{'EffSMTValue'} // $na);
             my $smt_txt = defined $calc_debug_info_ref->{'EffSMTValue'}
                           ? $calc_debug_info_ref->{'EffSMTValue'} : $na;
             my $tgt_val = $calc_debug_info_ref->{'EffTargetNormRunQ'};
             my $tgt_txt = (defined $tgt_val && looks_like_number($tgt_val))
                           ? sprintf('%.2f', $tgt_val) : $na;
-            printf {$fh} "        - Target NormRunQ for SMT%-11s: %s (internal heuristic for optimal queue/LCPU)\n", $smt_txt, $tgt_txt;
-            printf {$fh} "        - Raw Efficient PhysC Target        : %s / (SMT * Target NormRunQ)\n", $abs_runq_key_reported_in_log;
-            printf {$fh} "                                              %s / (%s * %.2f) = %s cores\n",
+            printf {$fh} "        - Target NormRunQ for SMT%-11s : %s (internal heuristic for optimal queue/LCPU)\n", $smt_txt, $tgt_txt;
+            printf {$fh} "        - Raw Efficient PhysC Target         : %s / (SMT * Target NormRunQ)\n", $abs_runq_key_reported_in_log;
+            printf {$fh} "                                               %s / (%s * %.2f) = %s cores\n",
             ($abs_runq_value_used_for_calc // $na),
             ($calc_debug_info_ref->{'EffSMTValue'} // $na),
             ($calc_debug_info_ref->{'EffTargetNormRunQ'} // $na),
@@ -2612,12 +2658,12 @@ sub log_profile_rationale
             print {$fh} "\n";
 
             printf {$fh} "     c. Blending Raw Target with Observed Base PhysC (Applying Confidence):\n";
-            printf {$fh} "        - Blending Weights                  : %.0f%% Base PhysC / %.0f%% Raw Target\n",
+            printf {$fh} "        - Blending Weights                   : %.0f%% Base PhysC / %.0f%% Raw Target\n",
             defined $calc_debug_info_ref->{'EffBlendWeightBase'} ? (($calc_debug_info_ref->{'EffBlendWeightBase'} // 0) * 100) : 0,
             defined $calc_debug_info_ref->{'EffBlendWeightTarget'} ? (($calc_debug_info_ref->{'EffBlendWeightTarget'} // 0) * 100) : 0;
-            printf {$fh} "        - Blending Rationale                : %s\n", ($calc_debug_info_ref->{'EffBlendReason'} // $na);
-            printf {$fh} "        - Blended Efficient Target          : (Base PhysC * Weight) + (Raw Target * Weight)\n";
-            printf {$fh} "                                              (%s * %.2f) + (%s * %.2f) = %s cores\n",
+            printf {$fh} "        - Blending Rationale                 : %s\n", ($calc_debug_info_ref->{'EffBlendReason'} // $na);
+            printf {$fh} "        - Blended Efficient Target           : (Base PhysC * Weight) + (Raw Target * Weight)\n";
+            printf {$fh} "                                               (%s * %.2f) + (%s * %.2f) = %s cores\n",
             ($calc_debug_info_ref->{'EffPBase'} // $na),
             ($calc_debug_info_ref->{'EffBlendWeightBase'} // 0.0),
             ($calc_debug_info_ref->{'EffPEfficientTargetRaw'} // $na),
@@ -2628,23 +2674,23 @@ sub log_profile_rationale
             printf {$fh} "     d. Determining Potential CPU Downsizing (Based on Blended Target):\n";
             my $eff_comp_base_vs_target_met_str_B = defined($calc_debug_info_ref->{'EffComparisonBaseVsTargetMet'})
             ? ($calc_debug_info_ref->{'EffComparisonBaseVsTargetMet'} ? "YES" : "NO") : $na;
-            printf {$fh} "        - Comparison                        : Base PhysC (%s) > Blended Efficient Target (%s)? %s\n",
+            printf {$fh} "        - Comparison                         : Base PhysC (%s) > Blended Efficient Target (%s)? %s\n",
             ($calc_debug_info_ref->{'EffPBase'} // $na),
             ($calc_debug_info_ref->{'EffPEfficientTarget'} // $na),
             $eff_comp_base_vs_target_met_str_B;
 
             if (defined $calc_debug_info_ref->{'EffComparisonBaseVsTargetMet'} && $calc_debug_info_ref->{'EffComparisonBaseVsTargetMet'})
             {
-                printf {$fh} "        - Potential CPU Downsize            : %s - %s = %s cores\n",
+                printf {$fh} "        - Potential CPU Downsize             : %s - %s = %s cores\n",
                 ($calc_debug_info_ref->{'EffPBase'} // $na),
                 ($calc_debug_info_ref->{'EffPEfficientTarget'} // $na),
                 ($calc_debug_info_ref->{'EffPotentialReduction'} // $na);
-                printf {$fh} "        - Max Downsize Cap %%                : %.1f%% (Reason: %s)\n",
+                printf {$fh} "        - Max Downsize Cap %%                 : %.1f%% (Reason: %s)\n",
                 ($calc_debug_info_ref->{'EffMaxAllowableReductionPerc'} eq $na ? ($MAX_EFFICIENCY_REDUCTION_PERCENTAGE*100) : ($calc_debug_info_ref->{'EffMaxAllowableReductionPerc'} +0) ),
                 ($calc_debug_info_ref->{'EffReductionCapReason'} // $na);
-                printf {$fh} "        - Max Allowable Downsize            : %s cores (Base PhysC * Max Downsize Cap %%)\n",
+                printf {$fh} "        - Max Allowable Downsize             : %s cores (Base PhysC * Max Downsize Cap %%)\n",
                 ($calc_debug_info_ref->{'EffMaxAllowableReductionCores'} // $na);
-                printf {$fh} "        - Actual CPU Downsized By           : %s cores (min of Potential and Max Allowable)\n",
+                printf {$fh} "        - Actual CPU Downsized By            : %s cores (min of Potential and Max Allowable)\n",
                 ($calc_debug_info_ref->{'EffActualReductionCores'} // $na);
             }
             else
@@ -2654,39 +2700,38 @@ sub log_profile_rationale
             print {$fh} "\n";
 
             printf {$fh} "     e. Final Downsizing Factor Calculation:\n";
-            printf {$fh} "        - Calculated Factor                 : (Base PhysC - Actual Reduction) / Base PhysC\n";
+            printf {$fh} "        - Calculated Factor                  : (Base PhysC - Actual Reduction) / Base PhysC\n";
             my $eff_p_base_val_for_div_B = ($calc_debug_info_ref->{'EffPBase'} ne $na && ($calc_debug_info_ref->{'EffPBase'} + 0) != 0)
             ? ($calc_debug_info_ref->{'EffPBase'} + 0) : 1.0;
             my $eff_p_base_display_for_div_B = ($eff_p_base_val_for_div_B == 1.0 && ($calc_debug_info_ref->{'EffPBase'} eq $na || ($calc_debug_info_ref->{'EffPBase'} + 0) == 0))
             ? "$eff_p_base_val_for_div_B (adj for display)" : ($calc_debug_info_ref->{'EffPBase'} // $na);
-            printf {$fh} "                                              (%s - %s) / %s = %s\n",
+            printf {$fh} "                                               (%s - %s) / %s = %s\n",
             ($calc_debug_info_ref->{'EffPBase'} // $na),
             ($calc_debug_info_ref->{'EffActualReductionCores'} // "0.0000"),
             $eff_p_base_display_for_div_B,
             ($calc_debug_info_ref->{'EffCalculatedFactor'} // $na);
         }
-        printf {$fh} "  => PhysC after Downsizing                 : %s cores\n\n", $physc_after_downsizing_B_log;
+        printf {$fh} "  => PhysC after Downsizing                  : %s cores\n\n", $physc_after_downsizing_B_log;
 
         # --- Section D: CPU Upsizing (Additive CPU) ---
         print {$fh} "Section D: CPU Upsizing (Additive CPU)\n";
         my $apply_additive_C_log_sec = $is_runq_pressure_C_log_sec || $is_workload_pressure_C_log_sec;
 
-		printf {$fh} "  - Additive Logic Triggered                : %s\n", ($apply_additive_C_log_sec ? "Yes" : "No");
+		printf {$fh} "  - Additive Logic Triggered                 : %s\n", ($apply_additive_C_log_sec ? "Yes" : "No");
 
         if ($apply_additive_C_log_sec)
         {
             printf {$fh} "    Details of Upsizing Calculation:\n";
-            printf {$fh} "    - Base for Upsizing                     : %s cores (PhysC after Downsizing)\n", $physc_after_downsizing_B_log;
-            printf {$fh} "    - Effective LCPUs at Base               : %s threads\n", ($calc_debug_info_ref->{'EffectiveLCPUsAtBase'} // $na);
-            printf {$fh} "    - Excess Threads Calculated             : %s threads\n", ($calc_debug_info_ref->{'ExcessThreads'} // $na);
-            printf {$fh} "    - Raw Additive CPU                      : %s cores\n", ($calc_debug_info_ref->{'RawAdditive'} // $na);
-            printf {$fh} "    - Entitlement-Based Cap                 : %s cores (Max Additive Cap: %s)\n",
+            printf {$fh} "    - Base for Upsizing                      : %s cores (PhysC after Downsizing)\n", $physc_after_downsizing_B_log;
+            printf {$fh} "    - Effective LCPUs at Base                : %s threads\n", ($calc_debug_info_ref->{'EffectiveLCPUsAtBase'} // $na);
+            printf {$fh} "    - Excess Threads Calculated              : %s threads\n", ($calc_debug_info_ref->{'ExcessThreads'} // $na);
+            printf {$fh} "    - Raw Additive CPU                       : %s cores (excess threads / SMT)\n", ($calc_debug_info_ref->{'RawAdditive'} // $na);
+            printf {$fh} "    - Entitlement-Based Cap                  : %s cores (Max Additive Cap: %s)\n",
             (defined $calc_debug_info_ref->{'HotThreadWLDampenedAdditiveFrom'} && $calc_debug_info_ref->{'HotThreadWLDampeningApplied'} eq "True"
                 ? $calc_debug_info_ref->{'HotThreadWLDampenedAdditiveFrom'}
                 : ($calc_debug_info_ref->{'CappedRawAdditive'} // $na) # Show original value before HTW if HTW was applied
             ), ($calc_debug_info_ref->{'MaxAdditiveCap'} // $na);
 
-            printf {$fh} "    Details of LCPU Calculations:\n";
             # Log enhanced burst and small entitlement handling details
             printf {$fh} "  Pressure Basis Rationale                   : %s\n", ($calc_debug_info_ref->{'PressureBasisRationale'} // "N/A");
             printf {$fh} "  Burst Allowance Used                       : %s\n", ($calc_debug_info_ref->{'BurstAllowanceUsed'} // "N/A");
@@ -2695,39 +2740,42 @@ sub log_profile_rationale
 
             if (defined $calc_debug_info_ref->{'HotThreadWLDampeningApplied'} && $calc_debug_info_ref->{'HotThreadWLDampeningApplied'} eq "True")
             {
-				printf {$fh} "    - Hot Thread Dampening                         : Applied\n";
-                printf {$fh} "        Conditions Summary                         : %s\n", ($calc_debug_info_ref->{'HotThreadWLConditionsString'} // $na);
-                printf {$fh} "        Dynamic Dampen Factor                      : %s\n", ($calc_debug_info_ref->{'HotThreadWLDynamicFactor'} // $na);
-                printf {$fh} "        Additive (Before HTW)                      : %s cores -> (After HTW): %s cores\n",
+                printf {$fh} "    - Hot Thread Dampening                : Applied\n";
+                printf {$fh} "        Conditions Summary                : %s\n", ($calc_debug_info_ref->{'HotThreadWLConditionsString'} // $na);
+                printf {$fh} "        Dynamic Dampen Factor             : %s\n", ($calc_debug_info_ref->{'HotThreadWLDynamicFactor'} // $na);
+                printf {$fh} "        Additive (Before HTW)             : %s cores -> (After HTW): %s cores\n",
                 ($calc_debug_info_ref->{'HotThreadWLDampenedAdditiveFrom'} // $na),
                 ($calc_debug_info_ref->{'HotThreadWLDampenedAdditiveTo'} // $na);
             }
             elsif (defined $calc_debug_info_ref->{'HotThreadWLDampeningApplied'}) # Checked but not applied
             {
-                printf {$fh} "    - Hot Thread Dampening                  : Not Applied (Details: %s)\n", ($calc_debug_info_ref->{'HotThreadWLConditionsString'} // "Conditions not met");
+                printf {$fh} "    - Hot Thread Dampening                   : Not Applied (Details: %s)\n", ($calc_debug_info_ref->{'HotThreadWLConditionsString'} // "Conditions not met");
             }
 
-            printf {$fh} "    - Volatility Factor Applied             : %s (Reason: %s)\n", ($calc_debug_info_ref->{'VoltFactor'} // $na), ($calc_debug_info_ref->{'VoltFactorReason'} // $na);
-            printf {$fh} "    - Pool Factor Applied                   : %s\n", ($calc_debug_info_ref->{'PoolFactor'} // $na);
+            printf {$fh} "    - Volatility Factor Applied              : %s (Reason: %s)\n", ($calc_debug_info_ref->{'VoltFactor'} // $na), ($calc_debug_info_ref->{'VoltFactorReason'} // $na);
+            printf {$fh} "    - Pool Factor Applied                    : %s\n", ($calc_debug_info_ref->{'PoolFactor'} // $na);
+            if (defined $calc_debug_info_ref->{'DBWDampeningApplied'} && $calc_debug_info_ref->{'DBWDampeningApplied'} ne 'False') {
+            printf {$fh} "    - Dispatch-Bound (DBW) Anomaly Dampening : %s\n", $calc_debug_info_ref->{'DBWDampeningApplied'};
+            }
 
             if (defined $calc_debug_info_ref->{'AdditiveSafetyCapApplied'} && $calc_debug_info_ref->{'AdditiveSafetyCapApplied'} =~ /^True/)
             {
-                printf {$fh} "    - Final Additive Safety Cap             : %s\n", $calc_debug_info_ref->{'AdditiveSafetyCapApplied'};
+                printf {$fh} "    - Final Additive Safety Cap              : %s\n", $calc_debug_info_ref->{'AdditiveSafetyCapApplied'};
             }
         }
-		printf {$fh} "  => Final Additive CPU                     : %s cores\n", ($calc_debug_info_ref->{'FinalAdditive'} // "0.0000");
-		printf {$fh} "  => PhysC after Upsizing                   : %s cores\n\n", ($calc_debug_info_ref->{'PreMaxCpuCapRec'} // $na);
+		printf {$fh} "  => Final Additive CPU                      : %s cores\n", ($calc_debug_info_ref->{'FinalAdditive'} // "0.0000");
+		printf {$fh} "  => PhysC after Upsizing                    : %s cores\n\n", ($calc_debug_info_ref->{'PreMaxCpuCapRec'} // $na);
 
 
         # --- Section E: Maximum CPU Sizing Sanity Checks ---
         print {$fh} "Section E: Maximum CPU Sizing Sanity Checks\n";
-        printf {$fh} "  - Recommendation before Max Sanity Check  : %s cores\n", ($calc_debug_info_ref->{'PreMaxCpuCapRec'} // $na);
-        printf {$fh} "  - LPAR MaxCPU (from VM config)            : %s cores\n", $lpar_max_cpu_display_A_log_sec;
-        printf {$fh} "  - Entitlement (for forecast multiplier)   : %s cores\n", $entitlement_display_A_log_sec;
-        printf {$fh} "  - Forecast Multiplier Used                : %s\n", ($calc_debug_info_ref->{'ForecastMultiplier'} // $na);
-        printf {$fh} "  - Effective MaxCPU Sanity Limit           : %s cores\n", ($calc_debug_info_ref->{'EffectiveMaxCPUCap'} // $na);
-        printf {$fh} "  - Limited by MaxCPU Sanity Check?         : %s\n", ($calc_debug_info_ref->{'CappedByMaxCPU'} // $na);
-        printf {$fh} "  => Recommendation after Max Sanity Check  : %s cores\n\n", ($final_recommendation_unrounded_str // $na);
+        printf {$fh} "  - Recommendation before Max Sanity Check   : %s cores\n", ($calc_debug_info_ref->{'PreMaxCpuCapRec'} // $na);
+        printf {$fh} "  - LPAR MaxCPU (from VM config)             : %s cores\n", $lpar_max_cpu_display_A_log_sec;
+        printf {$fh} "  - Entitlement (for forecast multiplier)    : %s cores\n", $entitlement_display_A_log_sec;
+        printf {$fh} "  - Forecast Multiplier Used                 : %s\n", ($calc_debug_info_ref->{'ForecastMultiplier'} // $na);
+        printf {$fh} "  - Effective MaxCPU Sanity Limit            : %s cores\n", ($calc_debug_info_ref->{'EffectiveMaxCPUCap'} // $na);
+        printf {$fh} "  - Limited by MaxCPU Sanity Check?          : %s\n", ($calc_debug_info_ref->{'CappedByMaxCPU'} // $na);
+        printf {$fh} "  => Recommendation after Max Sanity Check   : %s cores\n\n", ($final_recommendation_unrounded_str // $na);
     } # End else for ReasonForNoModification (main calculation block)
 
     # --- Footer Block (Bottom Summary) ---
@@ -2744,7 +2792,7 @@ sub log_profile_rationale
         $nfit_growth_adj_to_display = sprintf("%.4f", $growth_metrics->{adjustment});
     }
 
-    printf {$fh} "    - Initial Base PhysC                    : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
+    printf {$fh} "    - Initial Base PhysC                     : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
 
     if ($first_nfit_state->{debug}{growthRationale}) {
         my $gd = $first_nfit_state->{debug}{growthRationale} || {};
@@ -2756,7 +2804,7 @@ sub log_profile_rationale
             return $val ? "Passed" : "Failed";
         };
 
-        printf {$fh} "    - nfit GrowthAdj Applied                : +%s cores\n", $nfit_growth_adj_to_display;
+        printf {$fh} "    - nfit GrowthAdj Applied                 : +%s cores\n", $nfit_growth_adj_to_display;
         printf {$fh} "    - Rationale for GrowthAdj (from nfit):\n";
         # Use growth parameters reported by nfit if available, otherwise use this script's defaults.
         my $proj_days = $gp->{projection_days} // $DEFAULT_GROWTH_PROJECTION_DAYS;
@@ -2776,7 +2824,7 @@ sub log_profile_rationale
     my $downsizing_summary_reason_footer = $calc_debug_info_ref->{'DownsizingReason'} // "N/A";
 # Let us not abbreviate this, at least not for now.
 #    if (length($downsizing_summary_reason_footer) > 70) { $downsizing_summary_reason_footer = substr($downsizing_summary_reason_footer, 0, 67) . "..."; }
-	printf {$fh} "    - CPU Downsizing                        : Factor %s -> PhysC became %s. (Summary: %s)\n",
+	printf {$fh} "    - CPU Downsizing                         : Factor %s -> PhysC became %s. (Summary: %s)\n",
     ($calc_debug_info_ref->{'DownsizingFactor'} // $na),
     ($calc_debug_info_ref->{'DownsizedPhysC'} // $na),
     $downsizing_summary_reason_footer;
@@ -2812,7 +2860,7 @@ sub log_profile_rationale
              $additive_reason_summary_footer = "No significant pressure detected.";
         }
     }
-    printf {$fh} "    - CPU Upsizing (Additive)               : %s cores. (Reason: %s)\n",
+    printf {$fh} "    - CPU Upsizing (Additive)                : %s cores. (Reason: %s)\n",
     $additive_final_val_footer, $additive_reason_summary_footer;
 
     my $lpar_cap_applied_summary_footer = "Not applied or N/A";
@@ -2822,7 +2870,7 @@ sub log_profile_rationale
         ? "Applied (Effective Limit: " . ($calc_debug_info_ref->{'EffectiveMaxCPUCap'} // $na) . ")"
         : "Not Applied (Effective Limit: " . ($calc_debug_info_ref->{'EffectiveMaxCPUCap'} // $na) . ")";
     }
-    printf {$fh} "    - Max CPU Sanity Check                  : %s\n", $lpar_cap_applied_summary_footer;
+    printf {$fh} "    - Max CPU Sanity Check                   : %s\n", $lpar_cap_applied_summary_footer;
     print {$fh} "======================================================================\n\n";
 
 }
@@ -2955,8 +3003,21 @@ sub load_profile_definitions
             # Initialize the new profile with its name and default runq_behavior. Flags added later.
             push @loaded_profiles_list, { name => $current_section_name, flags => undef, runq_behavior => 'default' };
         }
-        elsif (defined $current_section_name && $line =~ /^\s*([^=]+?)\s*=\s*(.+)$/) # Matches key-value pair like nfit_flags = ...
+        elsif (defined $current_section_name && $line =~ /^\s*([^=]+?)\s*=\s*(.+)$/) # Matches key-value pair
         {
+            if ($current_section_name eq 'NormRunQ_Target') {
+                my $tier = uc($1);
+                my $value = $2;
+                $tier =~ s/\s+//g;
+                $value =~ s/\s+//g;
+                if (looks_like_number($value) && $value >= 0.1 && $value <= 2.0) {
+                    $custom_runq_targets{$tier} = $value;
+                } else {
+                    warn "Warning: Invalid Target NormRunQ '$value' for tier '$tier' in nfit.profiles.cfg. Value must be numeric between 0.1 and 2.0. Ignoring.\n";
+                }
+                next; # Move to the next line
+            }
+
             my $key = lc($1); # Key name (lowercase for case-insensitivity)
             my $value = $2;   # Value
             $key =~ s/^\s+|\s+$//g;   # Trim spaces from key
@@ -3101,11 +3162,15 @@ sub calculate_runq_modified_physc
         $p99w1_overall_vm_has_abs_runq_pressure,
         $p99w1_overall_vm_has_norm_runq_pressure,
         # NEW: Adaptive threshold parameters
+        $vcpu_for_lpar_numeric,
+        $pool_cpu_for_lpar_numeric,
         $adaptive_runq_saturation_thresh,
         $adaptive_target_norm_runq,
         $adaptive_max_efficiency_reduction,
         $results_table_ref, # Pass reference to the complete results table
-        $vm_name_for_lookup # Pass the current VM name for lookups
+        $vm_name_for_lookup, # Pass the current VM name for lookups
+        $pure_p99w1_physc,  # Pass the pure, unadjusted P-99W1 value
+        $final_tier         # Pass the finalised definitive workload tier to use for NormRunQ targets
     ) = @_;
 
     my %debug_info;
@@ -3182,7 +3247,83 @@ sub calculate_runq_modified_physc
     my $abs_runq_p_numeric  = ($abs_runq_p_value_str  ne $na_str && $abs_runq_p_value_str  =~ /^-?[0-9.]+$/) ? ($abs_runq_p_value_str + 0)  : undef;
     $debug_info{'NormRunQ_P90_Val'} = (defined $norm_p90_numeric) ? sprintf("%.2f", $norm_p90_numeric) : $na_str;
 
+    # Calculate Effective LCPUs for Pressure
+    # --- START of Refined Next-Generation Burst Model ---
+    # This block calculates the effective LCPU count used for all pressure assessments.
+    my ($effective_lcpus_for_pressure_calc, $pressure_basis_rationale);
     my $max_cpu_for_lpar_numeric = ($debug_info{'LPARMaxCPUConfig'} ne $na_str) ? $debug_info{'LPARMaxCPUConfig'} : 0;
+
+    # Step 1: Calculate Base Burst Factor using EVR (VCPU/Entitlement Ratio).
+    my $base_burst_factor = 0.50; # Default for conservative/standard configurations.
+    my $evr_tier_rationale = "Conservative/Standard (EVR < 5x)";
+    if ($curr_ent_numeric > 0 && $vcpu_for_lpar_numeric > 0) {
+        my $evr = $vcpu_for_lpar_numeric / $curr_ent_numeric;
+        if ($evr > 10) {
+            $base_burst_factor = 3.00; # 300% for aggressively bursty VMs.
+            $evr_tier_rationale = sprintf("Aggressive (EVR %.1fx > 10x)", $evr);
+        } elsif ($evr >= 5) {
+            $base_burst_factor = 1.50; # 150% for moderately bursty VMs.
+            $evr_tier_rationale = sprintf("Moderate (EVR %.1fx >= 5x)", $evr);
+        }
+    }
+
+    # Step 2: Apply Adaptive Pool Constraint.
+    my $pool_constraint_multiplier = 1.0;
+    my $pool_constraint_rationale = "Default Pool (ID 0), no constraint applied";
+
+    if ($is_in_non_default_pool && $pool_cpu_for_lpar_numeric > 0 && $curr_ent_numeric > 0) {
+        # Constraint is more severe for VMs that take a larger share of a small pool.
+        my $vm_share_of_pool = $curr_ent_numeric / $pool_cpu_for_lpar_numeric;
+        # The constraint scales from 0% to 30% based on the VM's share.
+        $pool_constraint_multiplier = 1.0 - (0.3 * min(1.0, $vm_share_of_pool * 2));
+        $pool_constraint_multiplier = max(0.7, $pool_constraint_multiplier); # Floor at 0.70.
+        $pool_constraint_rationale = sprintf("User Pool (Share %.1f%%), multiplier of %.2f applied", $vm_share_of_pool*100, $pool_constraint_multiplier);
+    }
+    my $final_burst_allowance = $base_burst_factor * $pool_constraint_multiplier;
+
+    # Step 3: Calculate Theoretical Capacity.
+    my $theoretical_lcpus = ($curr_ent_numeric * (1 + $final_burst_allowance)) * $smt_used;
+
+    # Step 4: Perform Probabilistic Reality Check using P-99W1.
+    my $p99w1_physc_val = $pure_p99w1_physc;
+    my $capacity_headroom = ($max_cpu_for_lpar_numeric > 0) ? (1 - ($p99w1_physc_val / $max_cpu_for_lpar_numeric)) : 0;
+    my $headroom_confidence_modifier = 1.0; # Default high confidence.
+    my $headroom_rationale = "High Headroom (>30%), full confidence in observed peak";
+    if ($capacity_headroom < 0.10) { # Less than 10% headroom.
+        $headroom_confidence_modifier = 0.75;
+        $headroom_rationale = sprintf("Low Headroom (%.1f%%), low confidence in further bursting", $capacity_headroom * 100);
+    } elsif ($capacity_headroom < 0.30) { # 10-30% headroom.
+        $headroom_confidence_modifier = 0.90;
+        $headroom_rationale = sprintf("Medium Headroom (%.1f%%), medium confidence", $capacity_headroom * 100);
+    }
+    my $confidence_adjusted_peak_lcpus = ($p99w1_physc_val * $smt_used) * $headroom_confidence_modifier;
+
+    # Step 5: Determine Final Effective LCPUs.
+    my $absolute_ceiling_lcpus = $max_cpu_for_lpar_numeric > 0 ? ($max_cpu_for_lpar_numeric * $smt_used) : ($vcpu_for_lpar_numeric * $smt_used);
+    $effective_lcpus_for_pressure_calc = min($absolute_ceiling_lcpus, max($theoretical_lcpus, $confidence_adjusted_peak_lcpus));
+
+    # Build the multi-line rationale for the log.
+    $pressure_basis_rationale = sprintf(
+        "\n   1. Theoretical Capacity (Config)\n".
+        "      - Base Burst Factor                    : %.0f%% (Reason: %s)\n".
+        "      - Pool Constraint                      : %.2fx (Reason: %s)\n".
+        "      => Theoretical LCPUs                   : %.2f Ent * (1 + %.2f Final Burst) * %d SMT = %.1f\n".
+        "   2. Observed Capacity (Evidence-based)\n".
+        "      - Observed Peak (P-99W1)               : %.2f cores (Headroom: %.1f%%)\n".
+        "      - Confidence Modifier                  : %.2fx (Reason: %s)\n".
+        "      => Conf-Adjusted LCPUs                 : (%.2f Cores * %d SMT) * %.2f = %.1f\n".
+        "   3. Final Decision\n".
+        "      => Effective LCPUs                     : min(%.1f Max LCPUs, max(%.1f Theoretical, %.1f Observed)) = %.1f",
+        $base_burst_factor*100, $evr_tier_rationale,
+        $pool_constraint_multiplier, $pool_constraint_rationale,
+        $curr_ent_numeric, $final_burst_allowance, $smt_used, $theoretical_lcpus,
+        $p99w1_physc_val, $capacity_headroom*100,
+        $headroom_confidence_modifier, $headroom_rationale,
+        $p99w1_physc_val, $smt_used, $headroom_confidence_modifier, $confidence_adjusted_peak_lcpus,
+        $absolute_ceiling_lcpus, $theoretical_lcpus, $confidence_adjusted_peak_lcpus, $effective_lcpus_for_pressure_calc
+    );
+    # --- END of Refined Next-Generation Burst Model ---
+
     my $norm_p25_numeric = ($norm_runq_p25_str ne $na_str && $norm_runq_p25_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p25_str + 0) : undef;
     my $norm_p75_numeric = ($norm_runq_p75_str ne $na_str && $norm_runq_p75_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p75_str + 0) : undef;
 
@@ -3209,115 +3350,16 @@ sub calculate_runq_modified_physc
     $debug_info{'NormRunQ_P50_Val'} = (defined $norm_p50_numeric) ? sprintf("%.2f", $norm_p50_numeric) : $na_str;
     $debug_info{'NormRunQ_P75_Val'} = (defined $norm_p75_numeric) ? sprintf("%.2f", $norm_p75_numeric) : $na_str;
 
-    # Calculate Effective LCPUs for Pressure
-    my $effective_lcpus_for_pressure_calc = 0;
-    my $pressure_basis_rationale = "N/A";
-
-    # --- Calculate graduated burst allowance based on entitlement size ---
-    my $burst_allowance_raw;
-    if ($curr_ent_numeric > 0 && $curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
-        # Use graduated burst for small uncapped LPARs
-        $burst_allowance_raw = calculate_graduated_burst($curr_ent_numeric);
-    } else {
-        # Use standard burst factor for larger entitlements or capped LPARs
-        $burst_allowance_raw = $ENTITLEMENT_BURST_ALLOWANCE_FACTOR;
-    }
-    my $burst_allowance_clamped = max($BURST_ALLOWANCE_MIN_FACTOR, min($BURST_ALLOWANCE_MAX_FACTOR, $burst_allowance_raw));
-    my $burst_was_clamped = (abs($burst_allowance_raw - $burst_allowance_clamped) > 1e-9);
-
+    # Log the enhanced burst and small entitlement details
+    $debug_info{'EffectiveLCPUsForPressure'} = sprintf("%.1f", $effective_lcpus_for_pressure_calc);
+    $debug_info{'EffectiveLCPUsAtBase'} = sprintf("%.4f", $effective_lcpus_for_pressure_calc); # Log the correct basis
     my $runq_pressure_p_val = ($effective_lcpus_for_pressure_calc > 0) ? (($abs_runq_p_numeric // 0) / $effective_lcpus_for_pressure_calc) : 0;
 
-    if ($max_cpu_for_lpar_numeric > 0 && $smt_used > 0)
-    {
-        # 1. Calculate the MaxCPU-based capacity candidate
-        my $l_conf = $max_cpu_for_lpar_numeric * $smt_used;
-
-        # 2. For uncapped VMs (where MaxCPU > Entitlement), use enhanced calculation
-        if ($curr_ent_numeric > 0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) {
-
-            # Special handling for small entitlements < 1
-            if ($curr_ent_numeric < 1.0) {
-                # Calculate structural availability based on hardware thread allocation behaviour
-                my $structural_factor = calculate_structural_availability_factor($curr_ent_numeric);
-                my $l_structural = 1.0 * $smt_used * $structural_factor;
-
-                # Calculate burst-tolerant entitlement with graduated burst
-                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
-
-                # Use the maximum of structural and burst calculations for small entitlements
-                # This acknowledges hardware thread availability whilst remaining conservative
-                my $l_small_ent = max($l_structural, $l_ent_burst);
-
-                # Choose the minimum of MaxCPU capacity and small entitlement calculation
-                $effective_lcpus_for_pressure_calc = min($l_conf, $l_small_ent);
-
-                # Apply minimum floor for safety
-                my $pre_floor_value = $effective_lcpus_for_pressure_calc;
-                $effective_lcpus_for_pressure_calc = apply_minimum_lcpu_floor($effective_lcpus_for_pressure_calc, $smt_used);
-
-                # Build detailed rationale string
-                $pressure_basis_rationale = sprintf(
-                    "Small Entitlement Handler (Ent=%.2f): max(Structural: 1vCPU×%d SMT×%.2f factor=%.1f, Burst: %.2f×(1+%.2f)×%d SMT=%.1f) capped by MaxCPU×SMT=%.0f → %.0f LCPUs",
-                    $curr_ent_numeric,
-                    $smt_used, $structural_factor, $l_structural,
-                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
-                    $l_conf,
-                    $effective_lcpus_for_pressure_calc
-                );
-
-                if ($pre_floor_value < $effective_lcpus_for_pressure_calc) {
-                    $pressure_basis_rationale .= sprintf(" [Floor applied: raised from %.1f to %d LCPUs]",
-                        $pre_floor_value, $effective_lcpus_for_pressure_calc);
-                }
-
-                if ($burst_was_clamped) {
-                    $pressure_basis_rationale .= sprintf(" [Burst %.2f→%.2f]", $burst_allowance_raw, $burst_allowance_clamped);
-                }
-
-            } else {
-                # Standard calculation for entitlements >= 1
-                my $l_ent_burst = ($curr_ent_numeric * (1 + $burst_allowance_clamped)) * $smt_used;
-
-                # Choose the minimum of the two candidates
-                $effective_lcpus_for_pressure_calc = min($l_conf, $l_ent_burst);
-
-                # Build the detailed rationale string showing the comparison
-                $pressure_basis_rationale = sprintf("Burst-Tolerant Entitlement (min(%.2f vCPU×SMT=%d=%.0f, %.2f ENT×(1+%.2f burst)×SMT=%d=%.0f) → %.0f LCPUs)",
-                    $max_cpu_for_lpar_numeric, $smt_used, $l_conf,
-                    $curr_ent_numeric, $burst_allowance_clamped, $smt_used, $l_ent_burst,
-                    $effective_lcpus_for_pressure_calc
-                );
-                if ($burst_was_clamped) {
-                    $pressure_basis_rationale .= sprintf(" [Note: Original burst factor %.2f was clamped to %.2f]", $burst_allowance_raw, $burst_allowance_clamped);
-                }
-            }
-        } else {
-            # For capped VMs, the basis is simply MaxCPU-based capacity
-            if ($max_cpu_for_lpar_numeric > 0) {
-                $effective_lcpus_for_pressure_calc = $l_conf;
-                $pressure_basis_rationale = sprintf("MaxCPU basis (%.2f vCPU * %d SMT = %.0f LCPUs)",
-                    $max_cpu_for_lpar_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
-            } elsif ($curr_ent_numeric > 0) {
-                $effective_lcpus_for_pressure_calc = $curr_ent_numeric * $smt_used;
-                $pressure_basis_rationale = sprintf("Entitlement fallback (%.2f ENT * %d SMT = %.0f LCPUs)",
-                    $curr_ent_numeric, $smt_used, $effective_lcpus_for_pressure_calc);
-            } else {
-                $effective_lcpus_for_pressure_calc = 0;
-                $pressure_basis_rationale = "No valid capacity basis (MaxCPU/Entitlement missing)";
-            }
-        }
-
-        if ($effective_lcpus_for_pressure_calc > 0) {
-            my $absq = (defined $abs_runq_p_numeric && looks_like_number($abs_runq_p_numeric)) ? $abs_runq_p_numeric : 0;
-            $runq_pressure_p_val = $absq / $effective_lcpus_for_pressure_calc;
-        } else {
-            $runq_pressure_p_val = 0; # Safe default if no capacity basis is found
-            $pressure_basis_rationale = "No valid capacity basis found (MaxCPU/Entitlement missing or zero)";
-        }
-    }
     $debug_info{'NormRunQ_IQRC_Val'} = (defined $normrunq_iqrc_val) ? sprintf("%.3f", $normrunq_iqrc_val) : $na_str;
     $debug_info{'RunQPressure_P90_Val'} = sprintf("%.4f", $runq_pressure_p_val);
     $debug_info{'PressureBasisRationale'} = $pressure_basis_rationale;
+    $debug_info{'BurstAllowanceUsed'} = sprintf("%.2f%% (EVR-based, Pool-adjusted)", $final_burst_allowance * 100);
+    $debug_info{'SmallEntitlementHandlerActive'} = ($curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) ? "Yes" : "No";
 
     # =========================
     # Section C: Strategic Efficiency / Downsizing (ALWAYS RUNS)
@@ -3353,7 +3395,26 @@ sub calculate_runq_modified_physc
         }
         else
         {
-            my $target_norm_runq_eff_calc = $adaptive_target_norm_runq;
+            # --- Adaptive Target NormRunQ by Workload Type ---
+            my $target_norm_runq_eff_calc;
+            my $adaptive_target_reason;
+            my ($pattern) = ($final_tier =~ /^([OGBP])/);
+            my $base_tier = $pattern // 'G'; # Fallback to General for unknown patterns
+
+            # Use the full tier if available (e.g., G3), otherwise use the base pattern (e.g., G)
+            my $tier_to_check = (exists $custom_runq_targets{$final_tier} || exists $DEFAULT_RUNQ_TARGETS{$final_tier})
+                                ? $final_tier
+                                : $base_tier;
+
+            if (exists $custom_runq_targets{$tier_to_check}) {
+                $target_norm_runq_eff_calc = $custom_runq_targets{$tier_to_check};
+                $adaptive_target_reason = "User-defined target for tier '$tier_to_check' from nfit.profiles.cfg";
+            } else {
+                $target_norm_runq_eff_calc = $DEFAULT_RUNQ_TARGETS{$tier_to_check} // 0.80; # Final fallback
+                $adaptive_target_reason = "Built-in default target for tier '$tier_to_check'";
+            }
+            $debug_info{'AdaptiveTargetNormRunQReason'} = "$adaptive_target_reason: ${target_norm_runq_eff_calc}";
+
             my $p_efficient_target_raw = ($smt_used * $target_norm_runq_eff_calc > 0.0001)
                 ? ($abs_runq_p_numeric / ($smt_used * $target_norm_runq_eff_calc))
                 : $eff_p_base_numeric + 1;
@@ -3389,20 +3450,34 @@ sub calculate_runq_modified_physc
                 $debug_info{'EffPotentialReduction'} = sprintf("%.4f", $potential_reduction_cores);
                 $debug_info{'RunQ_Potential'} = sprintf("%.4f", -1 * $potential_reduction_cores);
 
-                my $current_max_reduction_perc_val = $adaptive_max_efficiency_reduction;
-                my $reduction_cap_reason_template = "Volatility (%.2f) low, using full reduction cap of %.1f%%.";
+                # --- Size-Aware Maximum Downsizing Cap ---
+                my $base_max_reduction_factor;
+                my $size_aware_cap_reason;
+                if ($eff_p_base_numeric < 1.0) {
+                    $base_max_reduction_factor = 0.30; # 30% for Micro-partitions
+                    $size_aware_cap_reason = sprintf("BasePhysC (%.2f) < 1.0, using %.0f%% cap", $eff_p_base_numeric, $base_max_reduction_factor * 100);
+                } elsif ($eff_p_base_numeric < 4.0) {
+                    $base_max_reduction_factor = 0.25; # 25% for Small VMs
+                    $size_aware_cap_reason = sprintf("BasePhysC (%.2f) < 4.0, using %.0f%% cap", $eff_p_base_numeric, $base_max_reduction_factor * 100);
+                } else {
+                    $base_max_reduction_factor = 0.20; # 20% for Medium/Large VMs
+                    $size_aware_cap_reason = sprintf("BasePhysC (%.2f) >= 4.0, using %.0f%% cap", $eff_p_base_numeric, $base_max_reduction_factor * 100);
+                }
+
+                my $current_max_reduction_perc_val = $base_max_reduction_factor;
+                my $volatility_reason = "";
 
                 if ($volatility_ratio > $VOLATILITY_MODERATE_HIGH_CAP_THRESH) {
-                    $current_max_reduction_perc_val = $adaptive_max_efficiency_reduction * $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY;
-                    $reduction_cap_reason_template = "Volatility (%.2f) moderately high (>%.2f), reduction cap limited to %.1f%%.";
-                    $debug_info{'EffReductionCapReason'} = sprintf($reduction_cap_reason_template, $volatility_ratio, $VOLATILITY_MODERATE_HIGH_CAP_THRESH, $current_max_reduction_perc_val * 100);
+                    $current_max_reduction_perc_val *= $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY;
+                    $volatility_reason = sprintf(" (scaled by %.2fx for high volatility)", $REDUCTION_CAP_SCALE_FOR_MODERATE_HIGH_VOLATILITY);
+                } elsif ($volatility_ratio > $VOLATILITY_MODERATE_MEDIUM_CAP_THRESH) {
+                    $current_max_reduction_perc_val *= $REDUCTION_CAP_SCALE_FOR_MODERATE_MEDIUM_VOLATILITY;
+                    $volatility_reason = sprintf(" (scaled by %.2fx for medium volatility)", $REDUCTION_CAP_SCALE_FOR_MODERATE_MEDIUM_VOLATILITY);
                 } elsif ($volatility_ratio > $VOLATILITY_MODERATE_LOW_CAP_THRESH) {
-                    $current_max_reduction_perc_val = $adaptive_max_efficiency_reduction * $REDUCTION_CAP_SCALE_FOR_MODERATE_VOLATILITY;
-                    $reduction_cap_reason_template = "Volatility (%.2f) moderate (>%.2f), reduction cap limited to %.1f%%.";
-                    $debug_info{'EffReductionCapReason'} = sprintf($reduction_cap_reason_template, $volatility_ratio, $VOLATILITY_MODERATE_LOW_CAP_THRESH, $current_max_reduction_perc_val * 100);
-                } else {
-                    $debug_info{'EffReductionCapReason'} = sprintf($reduction_cap_reason_template, $volatility_ratio, $current_max_reduction_perc_val * 100);
+                    $current_max_reduction_perc_val *= $REDUCTION_CAP_SCALE_FOR_MODERATE_VOLATILITY;
+                    $volatility_reason = sprintf(" (scaled by %.2fx for moderate volatility)", $REDUCTION_CAP_SCALE_FOR_MODERATE_VOLATILITY);
                 }
+                $debug_info{'EffReductionCapReason'} = $size_aware_cap_reason . $volatility_reason;
 
                 $debug_info{'EffMaxAllowableReductionPerc'} = $current_max_reduction_perc_val * 100;
                 my $max_allowable_reduction_cores = $eff_p_base_numeric * $current_max_reduction_perc_val;
@@ -3541,14 +3616,8 @@ sub calculate_runq_modified_physc
     # =========================
     # Section D: Tactical Additive CPU (ALWAYS RUNS; no early return)
     # =========================
-    $debug_info{'BurstAllowanceUsed'} = sprintf("%.2f%% (graduated for Ent=%.2f)" ,
-        $burst_allowance_clamped * 100, $curr_ent_numeric);
-    $debug_info{'SmallEntitlementHandler'} = ($curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric)
-        ? "Yes" : "No";
     my $is_runq_pressure = ($runq_pressure_p_val > $adaptive_runq_saturation_thresh);
     $debug_info{'IsRunQPressure'} = $is_runq_pressure ? "True" : "False";
-    # Log the enhanced burst and small entitlement details
-    $debug_info{'EffectiveLCPUsForPressure'} = sprintf("%.1f", $effective_lcpus_for_pressure_calc);
 
     my $is_workload_pressure_calc = 0;
     my $workload_pressure_reason_str_calc = "Workload pressure conditions not met or inputs N/A.";
@@ -3600,24 +3669,24 @@ sub calculate_runq_modified_physc
     # RunQ_Strategic: This is the high-confidence, risk-adjusted strategic signal. For upsizing, this should represent the potential after the most fundamental structural constraints are applied, but before secondary, more tactical dampening. This corresponds to the Entitlement-Based Cap value. It answers the question, "What is the scale of the pressure, considering the LPAR's configured entitlement?"
     # RunQ_Potential: This represents the pure, unconstrained demand. In the additive path, this corresponds to the Raw Additive CPU, which is the direct conversion of "excess threads" before any caps are applied. It answers the question, "What is the raw measure of unmet demand?"
 
+    my $excess_threads = 0;
     if ($apply_additive_logic && defined $smt_used && $smt_used > 0)
     {
-        # The tolerance calculation for excess threads must use the same entitlement-aware
-        # LCPU basis that was used to detect the pressure in the first place.
-        $debug_info{'EffectiveLCPUsAtBase'} = sprintf("%.4f", $effective_lcpus_for_pressure_calc); # Log the correct basis
         my $capacity_threshold_for_excess = $RUNQ_ADDITIVE_TOLERANCE_FACTOR * $effective_lcpus_for_pressure_calc;
-        my $excess_threads = (defined $abs_runq_p_numeric ? $abs_runq_p_numeric : 0) - $capacity_threshold_for_excess;
+        $excess_threads = (defined $abs_runq_p_numeric ? $abs_runq_p_numeric : 0) - $capacity_threshold_for_excess;
 
         if ($excess_threads > 0)
         {
-            $debug_info{'ExcessThreads'} = sprintf("%.4f (AbsRunQ %s %.2f > Tolerated Capacity %.2f based on %.1f x %.4f LCPUs from %s)",
-                $excess_threads,
+            $debug_info{'ExcessThreads'} = sprintf(
+                "\n         1. Observed Run Queue (%s) : %.2f threads\n".
+                "         2. Tolerated Capacity               : %.1f LCPUs * %.2f (Tolerance Factor) = %.2f threads\n".
+                "         => Excess Threads to Service        : %.2f - %.2f = %.2f",
                 $debug_info{AbsRunQKeyUsed}, ($abs_runq_p_numeric // 0.0),
-                $capacity_threshold_for_excess,
-                $RUNQ_ADDITIVE_TOLERANCE_FACTOR,
-                $effective_lcpus_for_pressure_calc,
-                ($pressure_basis_rationale =~ /Burst-Tolerant/ ? "Entitlement+Burst" : "MaxCPU"));
-            $raw_additive_cpu = $excess_threads / $smt_used if $smt_used > 0;
+                $effective_lcpus_for_pressure_calc, $RUNQ_ADDITIVE_TOLERANCE_FACTOR, $capacity_threshold_for_excess,
+                ($abs_runq_p_numeric // 0.0), $capacity_threshold_for_excess,
+                $excess_threads
+            );
+           $raw_additive_cpu = $excess_threads / $smt_used if $smt_used > 0;
 
             if ($curr_ent_numeric < $MAX_ADD_ENT_THRESH1)       { $max_additive_cap_sliding = $MAX_ADD_ABS_VAL1; }
             elsif ($curr_ent_numeric < $MAX_ADD_ENT_THRESH2)    { $max_additive_cap_sliding = $curr_ent_numeric * $MAX_ADD_PERC_VAL2; }
@@ -3756,7 +3825,7 @@ sub calculate_runq_modified_physc
                 # Invert the signals to provide a diagnostic alert.
 
                 # RunQ_Potential signals the anomaly directly.
-                $debug_info{'RunQ_Potential'} = "ANOMALY";
+                $debug_info{'RunQ_Potential'} = "ANOMALY (XRQ)";
 
                 # RunQ_Strategic is capped at the LPAR's maximum configured CPU.
                 # This provides a reasonable, albeit aggressive, strategic ceiling.
@@ -3799,29 +3868,78 @@ sub calculate_runq_modified_physc
     $debug_info{'VoltFactor'}        = sprintf("%.2f", $volatility_confidence_factor);
     $debug_info{'PoolFactor'}        = sprintf("%.2f", $pool_confidence_factor);
 
-    # --- Safety hard-cap for additive (unchanged logic) ---
+    # --- Anomaly Detection: Dispatch-Bound Workload (DBW) Heuristic ---
+    my $dbw_dampening_applied = "False";
+    # Condition 1: Low CPU utilisation relative to entitlement.
+    my $cond1_low_util = (defined $base_physc && $base_physc < ($curr_ent_numeric * $DBW_LOW_UTIL_FACTOR));
+    # Condition 2: High Dispatch Stress Ratio (DSR).
+    my $dsr = 0;
+    if (defined $base_physc && $base_physc > 0.01 && defined $abs_runq_p_numeric) {
+        $dsr = $abs_runq_p_numeric / ($base_physc * $smt_used);
+    }
+    my $cond2_high_dsr = ($dsr > $DBW_DSR_THRESHOLD);
+    # Condition 3: High median run-queue pressure.
+    my $cond3_high_median_pressure = (defined $norm_p50_numeric && $norm_p50_numeric > $DBW_MEDIAN_PRESSURE_THRESHOLD);
+
+    if ($cond1_low_util && $cond2_high_dsr && $cond3_high_median_pressure) {
+        my $original_additive = $additive_cpu;
+        $debug_info{'RunQ_Potential'} = "ANOMALY (DBW)"; # Set Potential to diagnostic label
+        $additive_cpu *= 0.25; # Apply 75% dampening
+        $dbw_dampening_applied = sprintf(
+            "True (75%% dampening applied).\n                                               Additive CPU reduced from %.4f to %.4f.\n                                               Conditions met: Low Util (BaseP %.2f < %.2f Ent * %.2f), High DSR (%.1f > %.1f), High Median Pressure (NormP50 %.2f > %.1f)",
+            $original_additive, $additive_cpu,
+            $base_physc, $curr_ent_numeric, $DBW_LOW_UTIL_FACTOR,
+            $dsr, $DBW_DSR_THRESHOLD,
+            $norm_p50_numeric, $DBW_MEDIAN_PRESSURE_THRESHOLD
+        );
+    }
+    $debug_info{'DBWDampeningApplied'} = $dbw_dampening_applied;
+
+    # --- Adaptive Safety Hard-Cap ---
     my $original_additive_before_safety_cap = $additive_cpu;
     my $additive_safety_cap_applied_reason = "Not applied";
-    my $safety_cap_from_base = (defined $eff_p_base_numeric && $eff_p_base_numeric > $FLOAT_EPSILON)
-        ? ($eff_p_base_numeric * $ADDITIVE_CPU_SAFETY_CAP_FACTOR_OF_BASE)
-        : $ADDITIVE_CPU_SAFETY_CAP_ABSOLUTE;
-    my $final_safety_cap_value = min($ADDITIVE_CPU_SAFETY_CAP_ABSOLUTE, $safety_cap_from_base);
-    $final_safety_cap_value = max(0.0, $final_safety_cap_value);
+
+    # Step 1: Calculate the Primary Dynamic Cap from Entitlement and Headroom.
+    my $cap_from_ent = $curr_ent_numeric * 0.25;
+    my $headroom = ($max_cpu_for_lpar_numeric > $curr_ent_numeric) ? ($max_cpu_for_lpar_numeric - $curr_ent_numeric) : 0;
+    my $cap_from_headroom = $headroom * 0.50;
+    my $primary_cap = ($headroom > 0) ? min($cap_from_ent, $cap_from_headroom) : $cap_from_ent;
+
+    # Step 2: Calculate the new, re-calibrated Relative Pressure Gate Modifier.
+    my $pressure_gate_modifier = 1.0; # Default to full for significant pressure.
+    my $pressure_ratio = ($effective_lcpus_for_pressure_calc > 0) ? (($excess_threads // 0) / $effective_lcpus_for_pressure_calc) : 0;
+
+    # Re-calibrated logic: "moderate" pressure gets a less punitive gate; "minor" tier is removed.
+    if ($pressure_ratio < 1.0) {
+        $pressure_gate_modifier = 0.75; # Moderate pressure.
+    }
+
+    # Step 3: Apply the Pressure Gate.
+    my $gated_cap = $primary_cap * $pressure_gate_modifier;
+
+    # Step 4: Apply the Floor and global Ceiling.
+    my $relative_floor = 0.02 * max($curr_ent_numeric, 1.0); # 2% of Ent, min 0.02 cores.
+    my $final_safety_cap_value = max($relative_floor, $gated_cap);
+    $final_safety_cap_value = min($final_safety_cap_value, 2.0); # Global 2.0 core ceiling.
+
+    my $cap_rationale = sprintf("min(EntCap=%.2f, HeadCap=%.2f) * PresGate=%.2f -> floor/ceil -> %.4f",
+        $cap_from_ent, $cap_from_headroom, $pressure_gate_modifier, $final_safety_cap_value);
+
     if ($additive_cpu > $final_safety_cap_value)
     {
         $additive_cpu = $final_safety_cap_value;
-        $additive_safety_cap_applied_reason = sprintf("True: Additive CPU hard-capped to %.4f (min(%.2f abs_cap, %.2f * BaseP=%.4f))",
+        $additive_safety_cap_applied_reason = sprintf("True: Additive CPU hard-capped to %.4f (%s)",
             $additive_cpu,
-            $ADDITIVE_CPU_SAFETY_CAP_ABSOLUTE,
-            $ADDITIVE_CPU_SAFETY_CAP_FACTOR_OF_BASE,
-            $eff_p_base_numeric // 0.0);
+            $cap_rationale);
     }
     else
     {
-        $additive_safety_cap_applied_reason = sprintf("False (Additive %.4f within hard cap of %.4f)",
+        $additive_safety_cap_applied_reason = sprintf("False (Additive %.4f within adaptive hard cap of %.4f from %s)",
             $original_additive_before_safety_cap,
-            $final_safety_cap_value);
+            $final_safety_cap_value,
+            $cap_rationale);
     }
+
     $debug_info{'AdditiveSafetyCapApplied'} = $additive_safety_cap_applied_reason;
     $debug_info{'RunQ_Tactical'} = $additive_cpu;
     $debug_info{'FinalAdditive'} = sprintf("%.4f", $additive_cpu);
@@ -5141,7 +5259,8 @@ sub _write_standard_csv_report {
         my $pressure_bool_str_csv = $hint_pressure_for_csv{$vm_name} ? "True" : "False";
         my $pressure_detail_str_csv = $pressure_details_for_csv{$vm_name} // '';
 
-		push @data_row_csv, $vm_name, "", $hint_type_tier_csv, $hint_pattern_shape_csv, $pressure_bool_str_csv, $pressure_detail_str_csv, $smt_used_for_vm_csv;
+        my $tier_override_value = $tier_override_for_csv{$vm_name} // ""; # Use override if it exists, otherwise blank.
+		push @data_row_csv, $vm_name, $tier_override_value, $hint_type_tier_csv, $hint_pattern_shape_csv, $pressure_bool_str_csv, $pressure_detail_str_csv, $smt_used_for_vm_csv;
 
         my ($serial_out, $systype_out, $poolname_out, $poolid_out, $ent_out) = ('', '', '', '', '');
         if (defined $cfg_csv) {
@@ -7127,6 +7246,41 @@ sub set_adaptive_thresholds {
     }
 
     return ($sat_thresh, $target_norm_runq, $max_downsize_perc_factor);
+}
+
+# --- parse_vm_tier_overrides ---
+# Parses a simple INI-style file to allow users to override the auto-detected
+# tier for specific VMs, giving them fine-grained control.
+sub parse_vm_tier_overrides {
+    my ($filepath) = @_;
+    my %overrides;
+    return \%overrides unless (-f $filepath);
+
+    print STDERR "  - VM Tier Overrides found: $filepath\n";
+    open my $fh, '<:encoding(utf8)', $filepath or do {
+        warn "Warning: Could not open VM tier override file '$filepath': $!. Skipping overrides.";
+        return \%overrides;
+    };
+
+    my $current_vm = '';
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/\s*[#;].*//;
+        $line =~ s/^\s+|\s+$//g;
+        next if $line eq '';
+
+        if ($line =~ /^\s*\[\s*([^\]]+?)\s*\]\s*$/) {
+            $current_vm = $1;
+        } elsif ($current_vm ne '' && $line =~ /^\s*tier\s*=\s*(.+)$/i) {
+            my $tier = uc($1);
+            $tier =~ s/\s+//g;
+            $overrides{$current_vm} = $tier;
+            $current_vm = ''; # Reset after reading the tier
+        }
+    }
+    close $fh;
+    print STDERR "    - Loaded " . scalar(keys %overrides) . " VM-specific tier overrides.\n";
+    return \%overrides;
 }
 
 # --- usage_wrapper ---
