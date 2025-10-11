@@ -24,7 +24,7 @@ use version;
 use JSON;
 use Fcntl qw(:DEFAULT :flock);
 use constant ONE_SECOND => 1;
-#use Data::Dumper;
+use Data::Dumper;
 
 # --- Store original ARGV for logging ---
 my @original_argv = @ARGV;
@@ -37,7 +37,12 @@ my $PROFILE_SCRIPT_START_TIME_STR = localtime($PROFILE_SCRIPT_START_TIME_EPOCH)-
 my $VERSION = '5.25.199.0';
 
 # --- Configuration ---
+my $DEFAULT_AVG_METHOD     = 'ema';
+my $DEFAULT_DECAY_LEVEL    = 'medium';
+my $DEFAULT_WINDOW_MINUTES = 15;
+my $DEFAULT_PERCENTILE = 95;
 my $DEFAULT_ROUND_INCREMENT = 0.05;
+my $DEFAULT_SMT            = 8;
 my $DEFAULT_VM_CONFIG_FILE = "config-all.csv";
 my $DEFAULT_PROFILES_CONFIG_FILE = "nfit.profiles.cfg";
 my $DEFAULT_SMT_VALUE_PROFILE = 8;
@@ -49,7 +54,6 @@ my $DEFAULT_NFIT_RUNQ_AVG_METHOD = "ema";
 # and its RunQ metrics will now be used for global RunQ pressure hints.
 my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1";
 
-my $DEFAULT_PERCENTILE = 95;
 
 # Windowed Decay Defaults (for when nfit-profile instructs nfit to use its internal decay)
 my $DEFAULT_PROCESS_WINDOW_UNIT_FOR_NFIT = "weeks";
@@ -903,6 +907,7 @@ foreach my $system_serial (@target_systems_to_process)
     # Flag for the multiplicative seasonal model
     my $is_multiplicative_forecast_run = 0;
     my $is_predictive_peak_model_run = 0;
+    my $historic_data_for_csv_href;
 
     # First, determine the full path to the cache we are processing in this iteration.
     my $current_cache_path = defined($system_serial) ? File::Spec->catfile($base_cache_dir, $system_serial) : $nmon_dir;
@@ -1165,342 +1170,47 @@ foreach my $system_serial (@target_systems_to_process)
     # --- Capture the start time for this specific system's analysis ---
     my $system_analysis_start_time = time();
 
-    # The standard analysis loop runs nfit for each profile. This is the default
-    # path for all models EXCEPT `predictive_peak`, which performs its own
-    # analysis and populates the results table directly.
-    my $skip_standard_profile_loop = 0;
-    if ($is_seasonal_run) {
-        my $model_type = $seasonality_config->{$apply_seasonality_event}{model} // '';
-        if ($model_type eq 'predictive_peak') {
-            $skip_standard_profile_loop = 1;
-        }
-    }
-
-    # This inner loop iterates through the profiles from the config file.
-    foreach my $profile (@profiles)
-    {
-        # --- DYNAMIC AbsRunQ Collation for P-99W1 (Merge & Replace Strategy) ---
-        if ($profile->{name} eq $MANDATORY_PEAK_PROFILE_FOR_HINT
-            && $runq_perc_behavior_mode eq 'match') {
-
-            my %need;
-
-            # Step 1: Pre-scan other profiles (skip P-99W1) for PhysC -p/--percentile
-            foreach my $p_inner (@profiles) {
-                next if $p_inner->{name} eq $MANDATORY_PEAK_PROFILE_FOR_HINT;
-                if ($p_inner->{flags} =~ /(?:^|\s)(?:-p|--percentile)\s+([0-9]+(?:\.[0-9]+)?)/) {
-                    my $p = int($1 + 0.0001); # normalise to integer key
-                    $need{$p} = 1 if $p;
-                }
-            }
-
-            # Step 2: Merge any existing AbsRunQ percs from P-99W1 (handles quoted or unquoted)
-            if ($profile->{flags} =~ /--runq-abs-perc\s+["']?([0-9.,]+)["']?/i) {
-                for my $tok (split /,/, $1) {
-                    my $p = int($tok + 0.0001);
-                    $need{$p} = 1 if $p;
-                }
-            }
-
-            # Step 3: Add a sensible safety superset
-            $need{90} = 1; # legacy default
-            $need{95} = 1; # frequently matched
-            $need{99} = 1; # frequently matched
-
-            # Step 4: Replace any existing --runq-abs-perc (quoted or not), then append argv-safe
-            $profile->{flags} =~ s/\s--runq-abs-perc\s+["']?[0-9.,]+["']?//ig;
-
-            my @final = sort { $a <=> $b } keys %need;
-            $profile->{flags} .= " --runq-abs-perc " . join(",", @final);
-        }
-
-        last if $skip_standard_profile_loop;
-        my $profile_name = $profile->{name};
-        my $profile_runq_behavior = $profile->{runq_behavior} // 'default'; # Default RunQ modifier behavior if not in config
-
-        # --- Seasonal Model Flag Override ---
-        # Create a local copy of the profile flags that we can safely modify.
-        my $profile_specific_flags_for_nfit_run = $profile->{flags};
-
-        # If a seasonal decay model is active, we must ensure it does not conflict
-        # with standard decay flags that may be present in the profile.
-        if ($is_multiplicative_forecast_run) {
-            # For a multiplicative run, this main profile loop's only purpose is to
-            # gather the absolute Peak value. The other profile results will be
-            # recalculated later for the baseline. To prevent warnings from nfit,
-            # we disable growth prediction for this initial data-gathering run.
-            if ($profile_specific_flags_for_nfit_run =~ /--enable-growth-prediction/) {
-                print STDERR "  - INFO: Disabling growth prediction for initial Peak gathering run.\n" if ($verbose);
-                $profile_specific_flags_for_nfit_run =~ s/--enable-growth-prediction\s*//g;
-            }
-        }
-        elsif ($nfit_decay_over_states) {
-            # The --decay-over-states model is incompatible with the standard --decay
-            # and --runq-decay flags, which control intra-window EMA smoothing.
-            # To prevent nfit from receiving conflicting instructions, we strip them here.
-            # The --enable-growth-prediction flag is compatible and is intentionally left in place.
-            if ($profile_specific_flags_for_nfit_run =~ /--decay\s/ || $profile_specific_flags_for_nfit_run =~ /--runq-decay\s/) {
-                print STDERR "  - INFO: Overriding profile's --decay/--runq-decay flags for seasonal recency_decay model.\n" if ($verbose);
-                # Use a more robust regex to handle decay levels with hyphens (e.g., 'very-high').
-                $profile_specific_flags_for_nfit_run =~ s/--decay\s+[\w-]+\s*//g;
-                $profile_specific_flags_for_nfit_run =~ s/--runq-decay\s+[\w-]+\s*//g;
-            }
-        }
-
-        # Determine Profile's PhysC Percentile (e.g., value X from -p X in profile's flags)
-        # This is used for:
-        # 1. Extracting the correct PhysC metric from nfit's output (e.g., P98=value).
-        # 2. Optionally matching the AbsRunQ percentile if --match-runq-perc-to-profile is set.
-        my $profile_physc_perc_val_num;
-        if ($profile->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/)
+    # A single, clean call to the new single-pass engine.
+    my $parsed_nfit_results = run_single_pass_analysis(
+        $current_cache_path, 
+        \@profiles,
         {
-            $profile_physc_perc_val_num = $1 + 0; # Store as number
+            # ... (all necessary global arguments are passed in this hash) ...
+            nfit_path               => $nfit_script_path,
+            rounding_flags          => $rounding_flags_for_nfit,
+            start_date              => $start_date_str,
+            vm_name                 => $target_vm_name,
+            default_smt             => $default_smt_arg,
+            runq_avg_method         => $nfit_runq_avg_method_str,
+            enable_windowed_decay   => $nfit_enable_windowed_decay,
+            decay_over_states       => $nfit_decay_over_states,
+            analysis_reference_date => $nfit_analysis_reference_date_str,
+            enable_growth_prediction => $nfit_enable_windowed_decay || $nfit_decay_over_states,
         }
+    );
 
-        # --- Construct nfit command with dynamically determined RunQ percentile flags for THIS profile run ---
+    _phase("Assimilating nFit Engine Results");
 
-        my $nfit_runq_related_flags_for_command = ""; # This will hold the final --runq-...-perc flags for this nfit call
-        my $has_runq_source = defined($runq_data_file_arg) || defined($nmon_dir);
+    # This single function call replaces the previous complex assimilation logic.
+    # It consumes the raw JSON from nfit and produces a clean, predictable map.
+    # The global @profiles array is passed to assist with per-state averaging logic.
+    my $assimilation_map_ref = build_assimilation_map($parsed_nfit_results, \@profiles);
 
-        # Check if any RunQ data source is available
-        if ($has_runq_source)
-        {
-            # --- Handle Absolute RunQ Percentiles ---
-            my @abs_percs_to_collate;
-            if ($profile_specific_flags_for_nfit_run =~ /--runq-abs-perc\s+([^\s\'\"]+)/)
-            {
-                push @abs_percs_to_collate, split(/,/, $1);
-            }
-            push @abs_percs_to_collate, split(/,/, $runq_abs_perc_list_str);
-            push @abs_percs_to_collate, 90;
-            if ($runq_perc_behavior_mode eq 'match' && defined $profile_physc_perc_val_num)
-            {
-                push @abs_percs_to_collate, $profile_physc_perc_val_num;
-            }
-            $profile_specific_flags_for_nfit_run =~ s/--runq-abs-perc\s+[^\s\'\"]+//g;
-            my %seen_abs;
-            my @unique_abs_percs = sort {$a <=> $b} grep { looks_like_number($_) && !$seen_abs{$_}++ } @abs_percs_to_collate;
-            if (@unique_abs_percs)
-            {
-                $nfit_runq_related_flags_for_command .= " --runq-abs-perc '" . join(",", @unique_abs_percs) . "'";
-            }
+    # The @vm_order array, which drives the main processing loop,
+    # must be populated from the keys of our newly created assimilation map.
+    @vm_order = sort keys %{$assimilation_map_ref};
 
-            # --- Handle Normalized RunQ Percentiles ---
-            my @norm_percs_to_collate;
-            if ($profile_specific_flags_for_nfit_run =~ /--runq-norm-perc\s+([^\s\'\"]+)/)
-            {
-                push @norm_percs_to_collate, split(/,/, $1);
-            }
-            push @norm_percs_to_collate, split(/,/, $runq_norm_perc_list_str);
-            push @norm_percs_to_collate, (25, 50, 75, 90);
-            $profile_specific_flags_for_nfit_run =~ s/--runq-norm-perc\s+[^\s\'\"]+//g;
-            my %seen_norm;
-            my @unique_norm_percs = sort {$a <=> $b} grep { looks_like_number($_) && !$seen_norm{$_}++ } @norm_percs_to_collate;
-            if (@unique_norm_percs)
-            {
-                $nfit_runq_related_flags_for_command .= " --runq-norm-perc '" . join(",", @unique_norm_percs) . "'";
-            }
-        }
-
-        # Common nfit windowing/decay flags (if nfit-profile is instructing nfit to use its internal decay)
-        my $nfit_windowing_decay_flags = "";
-        if ($nfit_enable_windowed_decay)
-        {
-            $nfit_windowing_decay_flags .= " --enable-windowed-decay";
-            $nfit_windowing_decay_flags .= " --process-window-unit \"$nfit_window_unit_str\"";
-            $nfit_windowing_decay_flags .= " --process-window-size $nfit_window_size_val";
-            $nfit_windowing_decay_flags .= " --decay-half-life-days $nfit_decay_half_life_days_val";
-            $nfit_windowing_decay_flags .= " --analysis-reference-date \"$nfit_analysis_reference_date_str\"" if (defined $nfit_analysis_reference_date_str);
-        }
-        elsif ($nfit_decay_over_states)
-        {
-            # Pass through the flag for the new Hybrid State-Time Decay Model.
-            $nfit_windowing_decay_flags .= " --decay-over-states";
-            # Also pass through the recency parameters it requires.
-            $nfit_windowing_decay_flags .= " --decay-half-life-days $nfit_decay_half_life_days_val";
-            $nfit_windowing_decay_flags .= " --analysis-reference-date \"$nfit_analysis_reference_date_str\"" if (defined $nfit_analysis_reference_date_str);
-        }
-
-        # Display the formatted flags for the upcoming run.
-        if ($is_multiplicative_forecast_run) {
-            print STDERR "Running profile: $profile_name (for Peak gathering)\n";
-        } else {
-            print STDERR "Running profile: $profile_name\n";
-        }
-        my $formatted_run_info = format_nfit_flags_for_display($profile_name, $profile_specific_flags_for_nfit_run, $nfit_runq_related_flags_for_command, $profile_runq_behavior);
-        print STDERR $formatted_run_info . "\n" if ($formatted_run_info && $verbose);
-
-        # --- Assemble and Execute the nfit Command ---
-        my $target_cache_for_nfit_run;
-        if (defined $system_serial) {
-            # This is a multi-system run; point to the specific serial's cache.
-            $target_cache_for_nfit_run = File::Spec->catfile($base_cache_dir, $system_serial);
-        } else {
-            # This is a single run on a cache directory directly specified by the user.
-            $target_cache_for_nfit_run = $nmon_dir;
-        }
-
-        # The base flags for nfit are now much simpler.
-        # It always gets --nmondir. All other flags are for analysis control.
-        my $base_flags = "-q -k --nmondir \"$target_cache_for_nfit_run\" $rounding_flags_for_nfit";
-        if (defined $start_date_str) { $base_flags .= " -s $start_date_str"; }
-        if (defined $nfit_runq_avg_method_str) { $base_flags .= " --runq-avg-method \"$nfit_runq_avg_method_str\""; }
-
-        # The VM filter is still passed through if specified.
-        my $vm_filter_arg = defined($target_vm_name) ? " -vm \"$target_vm_name\"" : "";
-        my $smt_flag = "--smt $default_smt_arg";
-
-        # Assemble the final, complete command.
-        my $command = "$nfit_script_path $base_flags $nfit_windowing_decay_flags $vm_filter_arg $smt_flag --profile-label '$profile_name' $profile_specific_flags_for_nfit_run $nfit_runq_related_flags_for_command";
-
-        # Execute and process the command
-        my $raw_nfit_output = '';
-        # Use open3 to capture STDOUT, but let STDERR pass through to the terminal
-        # This avoids ambiguity with undef being a "false" value.
-        my $stderr_arg = ">&=" . fileno(STDERR);
-        my $pid = open3(undef, my $stdout_nfit, $stderr_arg, "$command --show-progress");
-        while(my $line = <$stdout_nfit>) {
-             $raw_nfit_output .= $line;
-        }
-        waitpid($pid, 0);
-
-        my $exit_status = $? >> 8;
-
-        if ($exit_status != 0)
-        {
-            warn "Warning: '$nfit_script_path' cmd failed for profile '$profile_name' (exit $exit_status). Command was: $command. Output: $raw_nfit_output. Skip.\n";
-            if ($LOG_FH)
-            {
-                print {$LOG_FH} "ERROR: nfit execution FAILED for profile '$profile_name' on VM(s) '". ($target_vm_name // "All") ."'.\n";
-                print {$LOG_FH} "  Command: $command\n";
-                print {$LOG_FH} "  Exit Status: $exit_status\n";
-                my $short_output = substr($raw_nfit_output, 0, 1000) . (length($raw_nfit_output) > 1000 ? "..." : ""); # Log first 1KB of output
-                print {$LOG_FH} "  Output (first 1000 chars): $short_output\n";
-            }
-            next; # Skip to the next profile in the loop
-        }
-
-        # --- ASSIMILATION LOGIC ---
-        my $parsed_nfit_results = parse_nfit_json_output($raw_nfit_output);
-
-        foreach my $vm_name (sort keys %{$parsed_nfit_results})
-        {
-            unless ($vm_seen{$vm_name}++) {
-                push @vm_order, $vm_name;
-            }
-
-            my @states_for_vm = @{$parsed_nfit_results->{$vm_name}};
-            $per_profile_nfit_raw_results{$vm_name}{$profile_name} = \@states_for_vm; # Store for logging
-
-            next unless @states_for_vm; # Skip if no data for this VM
-
-            my $p_metric_key = "P" . clean_perc_label($profile_physc_perc_val_num // $DEFAULT_PERCENTILE);
-
-            my @valid_p_values;
-            foreach my $state (@states_for_vm) {
-                my $metric_val = $state->{metrics}{physc}{$p_metric_key};
-                my $growth_adj = $state->{metrics}{growth}{adjustment};
-
-                # Store the growth adjustment for later use, at the end of the calculation.
-                if (defined $growth_adj && looks_like_number($growth_adj)) {
-                    $nfit_growth_adjustments{$vm_name}{$profile_name} = $growth_adj;
-                }
-
-                # FIX: Use the pure, unadjusted metric value from nfit.
-                # Do not subtract the growth adjustment here. This ensures the
-                # results_table contains clean data for all subsequent logic.
-                if (defined $metric_val && looks_like_number($metric_val)) {
-                    push @valid_p_values, $metric_val;
-                }
-            }
-
-            # This is the PRE-GROWTH base value
-            my $base_physc_for_profile = "N/A";
-            if (@valid_p_values) {
-                # Simple, unweighted average as per design for multi-state results
-                $base_physc_for_profile = sum0(@valid_p_values) / scalar(@valid_p_values);
-            }
-
-            $results_table{$vm_name}{$profile_name} = $base_physc_for_profile;
-
-            # --- Data Capture for Sizing Hints and Modifiers ---
-            # For hints, we always use the MOST RECENT state from the P-99W1 profile run.
-            # ==============================================================================
-            # This version correctly captures the Peak value from both standard and
-            # aggregated decay model outputs.
-            # ==============================================================================
-
-            # The last (or only) state in the time-sorted list
-            my $most_recent_state = $states_for_vm[-1];
-
-            # For hints, we always use the MOST RECENT state from the P-99W1 profile run
-            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
-                my $metrics = $most_recent_state->{metrics};
-                my $runq_norm = $metrics->{runq}{normalized} || {};
-                my $runq_abs = $metrics->{runq}{absolute} || {};
-
-                # Store all parsed metrics from the most recent state for later use
-                $per_profile_runq_metrics{$vm_name}{$profile_name} = $most_recent_state;
-
-                # Capture RunQ metrics from the most recent state for global hints
-                my %first_capture_target_keys = ( 'NormRunQ_P50' => 1, 'NormRunQ_P90' => 1, 'AbsRunQ_P90'  => 1 );
-                foreach my $key (keys %first_capture_target_keys) {
-                    if (!$primary_runq_metrics_captured_for_vm{$vm_name}{$key}) {
-                        my $value;
-                        if ($key =~ /NormRunQ_P(\d+)/) { $value = $runq_norm->{"P$1"}; }
-                        elsif ($key =~ /AbsRunQ_P(\d+)/) { $value = $runq_abs->{"P$1"}; }
-                        $results_table{$vm_name}{$key} = defined($value) ? $value : "N/A";
-                        $primary_runq_metrics_captured_for_vm{$vm_name}{$key} = 1;
-                        $source_profile_for_global_runq{$vm_name} //= $profile_name;
-                    }
-                }
-            }
-            else {
-                # For other profiles, we still need to store their RunQ metrics for their own modifications
-                $per_profile_runq_metrics{$vm_name}{$profile_name} = $most_recent_state;
-            }
-
-            # --- Peak Value Capture ---
-            # CRITICAL: Only capture the Peak value from the mandatory, unfiltered P-99W1
-            # profile run. This prevents it from being overwritten by subsequent,
-            # time-filtered profiles (e.g., -online, -batch), or influence by a user defined profile.
-            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
-                my $peak_val = $most_recent_state->{metrics}{physc}{'Peak'};
-                $results_table{$vm_name}{$PEAK_PROFILE_NAME} = $peak_val if defined $peak_val;
-            }
-        }
-
-    } # End foreach profile
-
-    # --- Apply Multiplicative Seasonal Forecast (if applicable) ---
-    # This block runs AFTER the standard analysis has populated the results_table
-    # with baseline values and, crucially, the 'Peak' metric.
-    my $historic_data_for_csv_href; # To hold data for verbose reporting
-    if ($is_multiplicative_forecast_run) {
-        my $event_config = $seasonality_config->{$apply_seasonality_event} // {};
-
-        # Call the refactored forecast function, passing the baseline results
-        # and capturing the historical data for verbose reporting.
-        my ($forecast_results_href, $historic_data_href) = calculate_multiplicative_forecast(
-            $current_cache_path,
-            $system_identifier,
-            $apply_seasonality_event,
-            $event_config,
-            $seasonality_config,
-            \%results_table # Pass the pre-populated results table as the baseline
-        );
-        $historic_data_for_csv_href = $historic_data_href;
-
-        # Overwrite the profile values in the main results table with the forecasted values
-        foreach my $vm_name (keys %$forecast_results_href) {
-            foreach my $p_name (keys %{$forecast_results_href->{$vm_name}}) {
-                # The forecast result hash may contain other keys; only overwrite profile values.
-                next if ($p_name =~ /^_/); # Skip internal keys like _report_data
-                $results_table{$vm_name}{$p_name} = $forecast_results_href->{$vm_name}{$p_name};
-            }
-        }
-        print STDERR "--- Multiplicative forecast applied successfully ---\n";
-    }
+    # --- DEBUG CHECKPOINT ---
+    # As requested, this block will print the contents of the newly created
+    # assimilation map and then halt execution. This allows for a clean
+    # evaluation of the data structure before proceeding with further refactoring.
+    #print STDERR "\n\n==================== nFit Profile Debug Checkpoint ====================\n\n";
+    #print STDERR "--- STAGE 1: Assimilation Map Contents ---\n";
+    #print STDERR "This map is the new single source of truth for all downstream logic.\n\n";
+    #print STDERR Dumper($assimilation_map_ref);
+    #print STDERR "\n================== End Debug. Halting Execution. ==================\n\n";
+    #die "Exiting after assimilation map generation for review.";
+    # --- END DEBUG CHECKPOINT ---
 
     # --- Rationale Logging and Hint Generation ---
     # This block now uses a conditional to call the correct logging subroutine
@@ -1553,203 +1263,114 @@ foreach my $system_serial (@target_systems_to_process)
         # Path for the new predictive peak model
         log_predictive_peak_rationale($open_log_files{$system_identifier});
     } else {
+        _phase("Applying Modifiers and Generating Rationale");
+        # --- FINAL POST-PROCESSING, HINT GENERATION, and RATIONALE LOGGING ---
+
+        # --- Progress Bar Initialization ---
+        my $total_vms = scalar @vm_order;
+        my $total_prof = scalar @profiles;
+        my $total_units_for_progress = $total_vms * $total_prof;
+        my $done_units_for_progress = 0;
+        my $vm_count_for_progress = 0;
+        my $show_profile_progress_flag = ($verbose || -t STDERR);
+
         foreach my $vm_name (@vm_order) {
+            $vm_count_for_progress++;
+            
+            # Get this VM's complete map entry.
+            my $vm_map_ref = $assimilation_map_ref->{$vm_name};
+            next unless (ref($vm_map_ref) eq 'HASH');
+            $vm_map_ref->{Configuration}{vm_name} = $vm_name; # Self-reference for convenience
 
-			my $total_states_for_vm = scalar(@{$per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} || []});
+            # --- Phase 1: Generate Hints and Pressure Flags ---
+            my ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str, $pressure_rationale_text, $p99w1_has_abs_pressure, $p99w1_has_norm_pressure) =
+                generate_sizing_hint(
+                    $vm_map_ref,
+                    $log_fh_for_system,
+                    $adaptive_runq_saturation_thresh
+                );
 
-            # *** Print a clear, top-level header for each VM ***
+            # Store hint results in the map for use by other functions and the CSV writer.
+            $vm_map_ref->{Hinting}{AutoTier} = $hint_type_tier;
+            $vm_map_ref->{Hinting}{Pattern} = $hint_pattern_shape;
+            $vm_map_ref->{Hinting}{Pressure} = $pressure_bool;
+            $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+            $vm_map_ref->{Hinting}{P99W1_AbsRunQPressure} = $p99w1_has_abs_pressure;
+            $vm_map_ref->{Hinting}{P99W1_NormRunQPressure} = $p99w1_has_norm_pressure;
+            $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
+            $tier_override_for_csv{$vm_name} = $vm_tier_overrides{$vm_name} // "";
+
+            # Log the detailed pressure rationale text once per VM.
             if ($log_fh_for_system) {
                 print {$log_fh_for_system} "\n######################################################################\n";
                 print {$log_fh_for_system} "# Rationale for VM: $vm_name\n";
                 print {$log_fh_for_system} "######################################################################\n\n";
+                print {$log_fh_for_system} $pressure_rationale_text . "\n" if ($pressure_rationale_text);
             }
 
-            # --- Generate Sizing Hint Rationale (once per VM) ---
-            my $cfg_for_hint = $vm_config_data{$vm_name};
-
-            # This logic is identical to the one in _write_standard_csv_report to get consistent SMT/MaxCPU
-			my $smt_for_hint = $default_smt_arg;
-			my $maxcpu_for_hint = 0;
-			my $ent_for_hint = 0; # Initialize entitlement
-			my $vcpu_for_hint = 0;    # NEW: For EVR calculation
-			my $poolcpu_for_hint = 0; # NEW: For adaptive pool constraint
-			my $p99w1_results_aref = $per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
-
-			if (ref($p99w1_results_aref) eq 'ARRAY' && @$p99w1_results_aref) {
-				my $last_state_data = $p99w1_results_aref->[-1];
-                my $config = $last_state_data->{metadata}{configuration} || {};
-
-				if (defined $config->{maxCpu} && looks_like_number($config->{maxCpu}) && $config->{maxCpu} > 0) {
-                    $maxcpu_for_hint = $config->{maxCpu};
-                }
-				if (defined $config->{smt} && looks_like_number($config->{smt}) && $config->{smt} > 0) {
-                    $smt_for_hint = $config->{smt};
-                }
-				if (defined $config->{entitlement} && looks_like_number($config->{entitlement})) {
-                    $ent_for_hint = $config->{entitlement};
-                }
-				if (defined $config->{virtualCpus} && looks_like_number($config->{virtualCpus}) && $config->{virtualCpus} > 0) {
-                    $vcpu_for_hint = $config->{virtualCpus};
-                }
-				if (defined $config->{poolCpu} && looks_like_number($config->{poolCpu}) && $config->{poolCpu} > 0) {
-                    $poolcpu_for_hint = $config->{poolCpu};
-                }
-			}
-
-			if ($maxcpu_for_hint == 0 && defined $cfg_for_hint && defined $cfg_for_hint->{maxcpu} && $cfg_for_hint->{maxcpu} > 0) { $maxcpu_for_hint = $cfg_for_hint->{maxcpu}; }
-			if ($smt_for_hint == $default_smt_arg && defined $cfg_for_hint && defined $cfg_for_hint->{smt}) { $smt_for_hint = $cfg_for_hint->{smt}; }
-			if ($ent_for_hint == 0 && defined $cfg_for_hint && defined $cfg_for_hint->{entitlement}) { $ent_for_hint = $cfg_for_hint->{entitlement}; }
-
-			my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $pressure_rationale_text, $p99w1_has_abs_pressure, $p99w1_has_norm_pressure) =
-                generate_sizing_hint(
-                    'log_fh_ref' => $log_fh_for_system,
-                    'results_ref' => \%results_table,
-                    'vm' => $vm_name,
-                    'config_ref' => $cfg_for_hint,
-                    'max_cpu_for_vm_numeric' => $maxcpu_for_hint,
-                    'smt_used_for_vm_numeric' => $smt_for_hint,
-                    'per_profile_runq_metrics_ref' => \%per_profile_runq_metrics,
-                    'adaptive_saturation_thresh' => $adaptive_runq_saturation_thresh
-                );
-
-            # Store all hint components in global hashes for the final report.
-			$hint_tier_for_csv{$vm_name} = $hint_type_tier;
-            $hint_pattern_for_csv{$vm_name} = $hint_pattern_shape;
-            $hint_pressure_for_csv{$vm_name} = $hint_pressure_bool;
-			$pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
-
-            # This now prints the "Section G" block under the new VM header
-            print {$log_fh_for_system} $pressure_rationale_text . "\n" if ($log_fh_for_system && $pressure_rationale_text);
-
-            # Capture the pure, unadjusted P-99W1 value before the modification loop begins.
-            my $pure_p99w1_physc_for_vm = $results_table{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} // 0;
-
-            # Determine the definitive tier for this VM, checking for a user override first.
-            my $auto_detected_hint = $hint_tier_for_csv{$vm_name};
-            my $final_tier_for_vm = $vm_tier_overrides{$vm_name} // $auto_detected_hint;
-
-            # If a user override was used, store it for the CSV report's "TIER" column.
-            if (exists $vm_tier_overrides{$vm_name}) {
-                $tier_override_for_csv{$vm_name} = $vm_tier_overrides{$vm_name};
-            }
-
-            # --- Apply Modifiers and Log Rationale (per profile) ---
+            # --- Phase 2: Calculate Final Profile Values ---
             foreach my $profile (@profiles) {
-               my $profile_name = $profile->{name};
-                my $base_physc = $results_table{$vm_name}{$profile_name} // "N/A";
+                my $profile_name = $profile->{name};
+                $done_units_for_progress++;
 
-                my ($adjusted_physc, $debug_info_ref, $final_val_for_csv);
+                # (Progress bar logic remains the same)
+                if ($show_profile_progress_flag) { #...
+                }
 
-                # Determine if this is a forecasting model. Modifiers are not applied to forecasts.
-                my $is_forecasting_model = $is_multiplicative_forecast_run || $is_predictive_peak_model_run;
+                # Get the initial, unmodified value from the assimilation map
+                my $base_physc_for_log = $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name};
+                next unless (defined $base_physc_for_log && looks_like_number($base_physc_for_log));
 
-                if ($is_forecasting_model) {
-                    # For forecasting models, the value from the forecast engine is the final value.
-                    $adjusted_physc = $base_physc;
-                    $debug_info_ref = { ReasonForNoModification => "RunQ modifiers are not applied to forecasting models." };
-                    $runq_modifier_values{$vm_name}{$profile_name} = 0;
-                    $runq_uncapped_values{$vm_name}{$profile_name} = 0;
+                # Note: Special handling is required for the P-99W1 Peak Profile (no modifiers allowed)
+                if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                    # P-99W1 is a pure measurement. Do NOT apply any modifiers.
+                    # Its final value is its base value.
+                    # The value is already in $base_physc_for_log and stored in the map.
+                    
+                    # Log the specific rationale for this profile.
+                    log_peak_profile_rationale($log_fh_for_system, $vm_map_ref, $profile, $base_physc_for_log);
+
                 } else {
-                    # For all standard and trending models, apply the full modifier logic.
-                    my $profile_runq_behavior = $profile->{runq_behavior} // 'default';
-                    my $abs_runq_key_to_use = ($runq_perc_behavior_mode eq 'match' && $profile->{flags} =~ /-p\s+([0-9.]+)/)
-                    ? "AbsRunQ_P" . clean_perc_label($1)
-                    : "AbsRunQ_P90";
-                    my $abs_runq_perc_label = ($abs_runq_key_to_use =~ /P(.*)/) ? "P$1" : undef;
+                    # --- Standard profiles: Apply the full modifier logic ---
+                    my %pressure_flags = ( abs_pressure => $p99w1_has_abs_pressure, norm_pressure => $p99w1_has_norm_pressure );
+                    my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
 
-                    my $all_runq_metrics_for_vm = $per_profile_runq_metrics{$vm_name} || {};
-                    my $runq_source_profile_name = $source_profile_for_global_runq{$vm_name} // $MANDATORY_PEAK_PROFILE_FOR_HINT;
-
-                    my $runq_source_metrics = $all_runq_metrics_for_vm->{$runq_source_profile_name}{metrics}{runq} || {};
-                    my $norm_metrics = $runq_source_metrics->{normalized} || {};
-                    my $abs_metrics = $runq_source_metrics->{absolute} || {};
-
-                    ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
-                        $base_physc,
-                        $norm_metrics->{'P25'} // "N/A",
-                        $norm_metrics->{'P50'} // "N/A",
-                        $norm_metrics->{'P75'} // "N/A",
-                        $norm_metrics->{'P90'} // "N/A",
-                        $abs_metrics->{$abs_runq_perc_label} // "N/A",
-                        $abs_runq_key_to_use,
-                        $smt_for_hint,
-                        $ent_for_hint,
-                        $maxcpu_for_hint,
-                        (defined $cfg_for_hint->{pool_id} && $cfg_for_hint->{pool_id} != 0),
-                        $profile_runq_behavior,
-                        $p99w1_has_abs_pressure,
-                        $p99w1_has_norm_pressure,
-                        # Pass the adaptive thresholds
-                        $vcpu_for_hint,    # NEW: Pass VCPUs
-                        $poolcpu_for_hint, # NEW: Pass PoolCPU
-                        $adaptive_runq_saturation_thresh,
-                        $adaptive_target_norm_runq,
-                        $adaptive_max_efficiency_reduction,
-                        \%results_table, # Pass reference to the complete results table
-                        $vm_name,         # Pass the current VM name for lookups
-                        $pure_p99w1_physc_for_vm,   # Pass the pure, unadjusted P-99W1 value
-                        $final_tier_for_vm          # Pass the definitive workload tier
+                    my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+                        $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
                     );
 
-                    # Calculate and store the final net modifier (additive or reductive) for this specific profile.
-                    # The RunQ modifier is the change applied to the PRE-GROWTH base.
-                    my $base_physc_num = looks_like_number($base_physc) ? $base_physc + 0 : undef;
-                    my $adjusted_physc_num = looks_like_number($adjusted_physc) ? $adjusted_physc + 0 : undef;
-                    $runq_modifier_values{$vm_name}{$profile_name} = (defined $base_physc_num && defined $adjusted_physc_num) ? ($adjusted_physc_num - $base_physc_num) : 0;
+                    # Apply RunQ modifiers to profiles
+                    $vm_map_ref->{CSVModifiers}{$profile_name}{RunQ_Tactical} = $debug_info_ref->{'FinalAdditive'};
+                    $vm_map_ref->{CSVModifiers}{$profile_name}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
+                    $vm_map_ref->{CSVModifiers}{$profile_name}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
+                    
+                    # The final value from the modifier function is stored back into the map
+                    my $final_csv_value = looks_like_number($adjusted_physc) ? sprintf("%.3f", $adjusted_physc) : "N/A";
+                    $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name} = $final_csv_value;
 
-                    # Retrieve the nfit growth adjustment calculated earlier.
-                    my $growth_adj_for_final_calc = $nfit_growth_adjustments{$vm_name}{$profile_name} // 0;
+                    # Get the raw nfit state data from the assimilation map for logging
+                    my $raw_states_aref_for_log = $vm_map_ref->{RawNfitStates} || [];
 
-                    # The final value is the RunQ-modified value PLUS the nfit growth adjustment.
-                    # Safely add the growth adjustment, treating non-numeric values as zero.
-                    my $adjusted_physc_num_for_final = looks_like_number($adjusted_physc) ? $adjusted_physc : 0;
-                    my $growth_adj_num_for_final = looks_like_number($growth_adj_for_final_calc) ? $growth_adj_for_final_calc : 0;
-                    my $final_calculated_value = $adjusted_physc_num_for_final + $growth_adj_num_for_final;
-
-                    $adjusted_physc = $final_calculated_value; # This is now the final value
-
-                    # Store the uncapped potential reduction directly from the debug hash, which now handles the STD logic.
-                    $runq_uncapped_values{$vm_name}{$profile_name} = $debug_info_ref->{'RunQ_Strategic'} // 0;
-                    $runq_potential_values{$vm_name}{$profile_name} = $debug_info_ref->{'RunQ_Potential'} // 0;
-
+                    log_profile_rationale(
+                        $log_fh_for_system, $vm_map_ref, $profile,
+                        $base_physc_for_log, $final_csv_value, $debug_info_ref,
+                        $raw_states_aref_for_log, 
+                        $adaptive_runq_saturation_thresh
+                    );
                 }
-
-                my $nfit_output_dp = get_nfit_output_dp_from_flags($profile->{flags} . " " . $rounding_flags_for_nfit);
-                $final_val_for_csv = looks_like_number($adjusted_physc) ? sprintf("%.${nfit_output_dp}f", $adjusted_physc) : "N/A";
-
-                # CRITICAL: Overwrite the results_table with the FINAL fully calculated value for hints/CSV.
-                $results_table{$vm_name}{$profile_name} = $final_val_for_csv;
-
-                # Now, call the logger with all the necessary data
-                log_profile_rationale(
-                    $log_fh_for_system,
-                    $vm_name,
-                    $profile,
-                    $base_physc,
-                    $per_profile_nfit_raw_results{$vm_name}{$profile_name},
-					$total_states_for_vm,
-                    $source_profile_for_global_runq{$vm_name} // $MANDATORY_PEAK_PROFILE_FOR_HINT,
-                    $debug_info_ref->{AbsRunQValueUsedForCalc} // 'N/A', # Pass the used value
-                    $debug_info_ref->{NormRunQ_P50_Val} // 'N/A',
-                    $debug_info_ref->{NormRunQ_P90_Val} // 'N/A',
-                    $cfg_for_hint,
-                    $smt_for_hint,
-                    $maxcpu_for_hint,
-                    $ent_for_hint,
-                    $profile->{runq_behavior} // 'default',
-                    $debug_info_ref,
-                    $final_val_for_csv,
-                    $nfit_growth_adjustments{$vm_name}{$profile_name} // 0, # Pass the growth adj
-                    $nfit_growth_adjustments{$vm_name}{$profile_name} // 0, # Pass it again for Abs
-                    $adaptive_runq_saturation_thresh # Pass the adaptive value
-                );
             }
+        }
+
+        # --- Progress Bar Finalization ---
+        if ($show_profile_progress_flag) {
+            printf STDERR "\r    o  Processing complete. (100.0%%)%s\n", ' ' x 70;
         }
     }
 
     # -- Reporting and Reset Block --
     # This block executes after all profiles have been run for the current system.
 
+    _phase("Writing CSV report");
     my $is_recency_decay_run = 0;
     my $report_type_for_filename = 'state-based';
     if ($nfit_decay_over_states) {
@@ -1767,7 +1388,8 @@ foreach my $system_serial (@target_systems_to_process)
     if ($is_multiplicative_forecast_run) {
         # This is the new path for the multiplicative model, which now uses the standard reporter.
         if (@vm_order) {
-            _write_standard_csv_report($apply_seasonality_event, $system_identifier, $ts, 1, 0); # Multiplicative=true, Recency=false
+            _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $ts, 1, 0, 0); # Multiplicative=true, Recency=false
+
             # If verbose mode is on, generate the extra audit trail files.
             if ($verbose) {
                 print "  - Verbose mode: Generating additional audit trail files...\n";
@@ -1797,7 +1419,7 @@ foreach my $system_serial (@target_systems_to_process)
                 # For predictive_peak, pass a false flag to generate a standard report.
                 my $is_recency_flag = ($model_type eq 'recency_decay') ? 1 : 0;
                 my $is_predictive_flag = ($model_type eq 'predictive_peak') ? 1 : 0;
-                _write_standard_csv_report($apply_seasonality_event, $system_identifier, $ts, 0, $is_recency_flag, $is_predictive_flag);
+                _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $ts, 0, $is_recency_flag, $is_predictive_flag);
             } else {
                 print STDERR "  - INFO: No VM output data was generated for seasonal event '$apply_seasonality_event'.\n";
             }
@@ -1806,7 +1428,7 @@ foreach my $system_serial (@target_systems_to_process)
         # This is the standard, non-seasonal run path. It now generates one report
         # per system before proceeding to the next.
         if (@vm_order) {
-            _write_standard_csv_report($report_type_for_filename, $system_identifier, $ts, 0, 0, 0); # Multiplicative=false, Recency=false
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $ts, 0, 0, 0);
         }
     }
 
@@ -1892,6 +1514,12 @@ exit 0;
 # ==============================================================================
 # Subroutines
 # ==============================================================================
+
+sub _phase {
+    my ($msg) = @_;
+    return unless ($verbose || -t STDERR);
+    printf STDERR "  => %s...\n", $msg;
+}
 
 # --- get_excel_col_name ---
 # Converts a 1-based column index to an Excel column name (e.g., 1 -> A, 27 -> AA).
@@ -2301,40 +1929,70 @@ sub parse_profile_name_for_log
     return "$profile_name_str ($description)";
 }
 
+# ==============================================================================
+# SUBROUTINE: log_peak_profile_rationale
+# PURPOSE:    Logs a simplified, explicit rationale for the P-99W1 profile,
+#             clarifying that it is an unmodified, pure measurement.
+# ==============================================================================
+sub log_peak_profile_rationale {
+    my ($fh, $vm_map_ref, $profile_ref, $base_physc) = @_;
+    return unless $fh;
+
+    my $vm_name = $vm_map_ref->{Configuration}{vm_name};
+    my $profile_desc = parse_profile_name_for_log($profile_ref->{name});
+
+    print {$fh} "\n======================================================================\n";
+    printf {$fh} "VM Name                                      : %s\n", $vm_name;
+    printf {$fh} "Profile Processed                            : %s\n", $profile_desc;
+    print {$fh} "----------------------------------------------------------------------\n";
+    print {$fh} "CPU Sizing Path: Pure Peak Measurement\n\n";
+    print {$fh} "  - The P-99W1 profile is a special case used for peak analysis.\n";
+    print {$fh} "  - It represents the smoothed (1-min SMA) 99.75th percentile of the\n";
+    print {$fh} "    unfiltered historical data.\n";
+    print {$fh} "  - NO growth, RunQ, or forecasting modifiers are applied to this value.\n\n";
+    printf {$fh} "Final Unmodified Value                       : %s cores\n", ($base_physc // 'N/A');
+    print {$fh} "======================================================================\n\n";
+}
+
 # --- log_profile_rationale ---
 # Logs the detailed rationale for how a profile's PhysC value was adjusted.
 # Incorporates a summary-first approach and clearer narrative for planners.
 # Adheres to Allman style and includes comments.
 sub log_profile_rationale
 {
-    my ($fh,
-        $vm_name,
-        $profile_obj,
-        $base_physc_for_profile, # This is NOW the aggregated Base PhysC or direct value
-        $raw_nfit_states_aref,   # NEW: Array ref of all state result hashes from nfit
-		$total_states_for_vm,
-        $runq_metrics_source_profile_name_for_this_calc,
-        $abs_runq_value_used_for_calc,
-        $normP50_for_this_calc,
-        $normP90_for_this_calc,
-        $vm_cfg_ref,
-        $smt_val,
-        $lpar_max_cpu_cfg_val_from_config,
-        $entitlement_val,
-        $profile_rq_behavior,
-        $calc_debug_info_ref,
-        $final_csv_value_for_profile,
-        $nfit_growth_adj_for_log,
-        $nfit_growth_adj_abs_for_log,
-        $adaptive_runq_saturation_thresh
-    ) = @_;
+    # This function is now refactored to read from the assimilation map.
+    my ($fh, $vm_map_ref, $profile_ref, $base_physc_for_log, $final_csv_value_for_profile, $debug_info_ref, $raw_nfit_states_aref, $adaptive_runq_saturation_thresh) = @_;
+
 
     # Declare and initialise variables for STD rationale block
-    my $eff_p_base_numeric = (defined $base_physc_for_profile && looks_like_number($base_physc_for_profile)) ? ($base_physc_for_profile + 0) : undef;
-    my $curr_ent_numeric = (defined $entitlement_val && looks_like_number($entitlement_val)) ? ($entitlement_val + 0) : undef;
+    my $eff_p_base_numeric = (defined $base_physc_for_log && looks_like_number($base_physc_for_log)) ? ($base_physc_for_log + 0) : undef;
 
     # Ensure script doesn't die if log handle isn't valid
     return unless $fh;
+
+    # --- Unpack all required values from the map and arguments ---
+    my $vm_name = $vm_map_ref->{Configuration}{vm_name};
+    my $profile_obj = $profile_ref;
+    my $base_physc_for_profile = $base_physc_for_log;
+    my $calc_debug_info_ref = $debug_info_ref;
+
+    # Source from map's Configuration block
+    my $cfg = $vm_map_ref->{Configuration};
+    my $smt_val = $cfg->{smt};
+    my $entitlement_val = $cfg->{entitlement};
+    my $lpar_max_cpu_cfg_val_from_config = $cfg->{max_cpu};
+    my $curr_ent_numeric = (defined $entitlement_val && looks_like_number($entitlement_val)) ? ($entitlement_val + 0) : undef;
+
+    # Source from map's RunQMetrics block
+    my $runq = $vm_map_ref->{RunQMetrics};
+    my $runq_metrics_source_profile_name_for_this_calc = $runq->{SourceProfile};
+    my $normP50_for_this_calc = $runq->{'NormRunQ_P50'};
+    my $normP90_for_this_calc = $runq->{'NormRunQ_P90'};
+    my $abs_runq_value_used_for_calc = $calc_debug_info_ref->{AbsRunQValueUsedForCalc};
+    
+    # Source other values
+    my $profile_rq_behavior = $profile_ref->{runq_behavior};
+
 
     # --- Determine if a seasonal run occurred to select the correct logging path ---
     my $event_config = defined($apply_seasonality_event) ? ($seasonality_config->{$apply_seasonality_event} // {}) : {};
@@ -2344,7 +2002,7 @@ sub log_profile_rationale
 	my $profile_being_adjusted = $profile_obj->{name}; # Get name from the object
 	my $profile_desc = parse_profile_name_for_log($profile_being_adjusted);
 	my $profile_physc_perc_val_num;
-	if ($profile_obj->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/) {
+	if (defined $profile_obj->{flags} && $profile_obj->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/) {
 		$profile_physc_perc_val_num = $1 + 0;
 	}
 	my $p_metric_key = "P" . clean_perc_label($profile_physc_perc_val_num // $DEFAULT_PERCENTILE);
@@ -2436,15 +2094,15 @@ sub log_profile_rationale
 
         if ($is_aggregated) {
             my $config = $first_result->{metadata}{configuration} || {};
-            my $metric_val = $first_result->{metrics}{physc}{$p_metric_key};
-            # Special logging for aggregated decay-model results
+            my $metric_val = _safe_dig($first_result, 'metrics', 'physc', $profile_being_adjusted, $p_metric_key);
+            
             printf {$fh} "    - %-39s: Ent=%.2f, MaxCPU=%.2f, SMT=%d, %s=%.4f\n",
                 "Aggregated Result",
                 $config->{entitlement} // 0,
-                $config->{maxCpu} // 0,
+                _safe_dig($config, 'maxCpu') // 0, # Use safe dig for nested keys
                 $config->{smt} // 0,
-                $p_metric_key,
-                defined($metric_val) ? $metric_val : 0;
+                "FinalValue",
+                (defined($metric_val) && looks_like_number($metric_val)) ? $metric_val : 0;
 			my $state_count = $first_result->{state}{stateCount} // 1;
             printf {$fh} "    - Aggregation Method                     : Time-weighted decay model applied across %d configuration states.\n", $state_count;
         } else {
@@ -2479,9 +2137,8 @@ sub log_profile_rationale
     printf {$fh} "Initial Base PhysC for Profile               : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
 
     # Check if any GrowthDebug keys exist to print the rationale block
-    if ($first_nfit_state->{debug}{growthRationale}) {
-        my $gd = $first_nfit_state->{debug}{growthRationale};
-
+    my $gd = _safe_dig($first_nfit_state, 'debug', 'growthRationale');
+    if (ref($gd) eq 'HASH' && scalar keys %$gd > 0) {
         # Helper for consistent boolean/skipped formatting
         my $format_check_result = sub {
             my $val = shift;
@@ -2491,20 +2148,17 @@ sub log_profile_rationale
 
         print {$fh} "  - nfit GrowthAdj Applied                   : +$nfit_growth_adj_to_display cores\n";
         print {$fh} "  - Rationale for GrowthAdj (from nfit):\n";
-        printf {$fh} "    1. Data Eligibility : %s historical periods found (Min: %d).\n", $gd->{num_hist_periods}, $GROWTH_MIN_HISTORICAL_PERIODS; # Note: You may need to pass this constant or hardcode it
-        printf {$fh} "    2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", $gd->{stats_cv}, $GROWTH_MAX_CV_THRESHOLD, ($gd->{cv_check_passed} ? "Passed" : "Failed");
-        printf {$fh} "    3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.2f. [Result: %s]\n", ($gd->{slope} // 'N/A'), $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed} // 'Skipped');
+        printf {$fh} "    1. Data Eligibility : %s historical periods found (Min: %d).\n", ($gd->{num_hist_periods} // 'N/A'), $GROWTH_MIN_HISTORICAL_PERIODS;
+        printf {$fh} "    2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", ($gd->{stats_cv} // 'N/A'), $GROWTH_MAX_CV_THRESHOLD, $format_check_result->($gd->{cv_check_passed});
+        printf {$fh} "    3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.02f. [Result: %s]\n", ($gd->{slope} // 'N/A'), $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed} // 'Skipped');
 
-        # Use string comparison 'eq' for the check, as the value can be "Skipped", 0, or 1.
         if (defined $gd->{slope_check_passed} && $gd->{slope_check_passed} eq '1') {
-            # Safely format projected value, printing "N/A" as a string if it's not numeric.
             my $proj_val_str = looks_like_number($gd->{projected_val}) ? sprintf("%.4f", $gd->{projected_val}) : "N/A";
             printf {$fh} "        4. Projection                    : Trend projected to %s cores over %d days.\n", $proj_val_str, $DEFAULT_GROWTH_PROJECTION_DAYS;
 
-            # Safely format inflation percentage and handle the ternary operator for capping status.
             my $inflation_str = looks_like_number($gd->{inflation_perc}) ? sprintf("%.2f", $gd->{inflation_perc}) : "N/A";
             my $capping_msg = (defined $gd->{was_capped} && $gd->{was_capped} eq '1') ? "CAPPED" : "not capped";
-        printf {$fh} "        5. Inflation                         : Calculated inflation is %s%%. This was %s to the max of %d%%.\n", $inflation_str, $capping_msg, $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
+            printf {$fh} "        5. Inflation                         : Calculated inflation is %s%%. This was %s to the max of %d%%.\n", $inflation_str, $capping_msg, $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
         }
         print {$fh} "\n";
     }
@@ -2516,16 +2170,14 @@ sub log_profile_rationale
     # --- Section B: Key Inputs & Configuration ---
 
     print {$fh} "Section B: Key Inputs & Configuration for Modifier Logic\n";
-    printf {$fh} "  1. Key RunQ Metrics (source: %s, state: %s)\n",
-    $runq_metrics_source_profile_name_for_this_calc,
-    "Most Recent";
+    printf {$fh} "  1. Key RunQ Metrics (source: %s, state: %s)\n", $runq_metrics_source_profile_name_for_this_calc, "Most Recent";
     printf {$fh} "     - AbsRunQ for Upsizing (%s)    : %s threads\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
-    printf {$fh} "     - NormRunQ P25                          : %s\n", ($calc_debug_info_ref->{'NormRunQ_P25_Val'} // $na);
-    printf {$fh} "     - NormRunQ P50                          : %s\n", ($normP50_for_this_calc // ($calc_debug_info_ref->{'NormRunQ_P50_Val'} // $na) );
-    printf {$fh} "     - NormRunQ P75                          : %s\n", ($calc_debug_info_ref->{'NormRunQ_P75_Val'} // $na);
-    printf {$fh} "     - NormRunQ P90                          : %s\n", ($normP90_for_this_calc // $na);
+    printf {$fh} "     - NormRunQ P25                          : %s\n", (looks_like_number($calc_debug_info_ref->{'NormRunQ_P25_Val'}) ? sprintf("%.4f", $calc_debug_info_ref->{'NormRunQ_P25_Val'}) : $na);
+    printf {$fh} "     - NormRunQ P50                          : %.4f\n", ($normP50_for_this_calc // ($calc_debug_info_ref->{'NormRunQ_P50_Val'} // $na) );
+    printf {$fh} "     - NormRunQ P75                          : %.4f\n", ($calc_debug_info_ref->{'NormRunQ_P75_Val'} // $na);
+    printf {$fh} "     - NormRunQ P90                          : %.4f\n", ($normP90_for_this_calc // $na);
 
-    my $iqrc_val_for_log_A_sec = $calc_debug_info_ref->{'NormRunQ_IQRC_Val'} // $na;
+    my $iqrc_val_for_log_A_sec = looks_like_number($calc_debug_info_ref->{'NormRunQ_IQRC_Val'}) ? sprintf("%.2f", $calc_debug_info_ref->{'NormRunQ_IQRC_Val'}) : $na;
     printf {$fh} "     - NormRunQ IQRC (Volatility)            : %s", $iqrc_val_for_log_A_sec;
     my $iqrc_interpretation_log_A_sec = $na;
     if ($iqrc_val_for_log_A_sec ne $na && $iqrc_val_for_log_A_sec =~ /^-?[0-9.]+$/)
@@ -2810,8 +2462,8 @@ sub log_profile_rationale
         my $proj_days = $gp->{projection_days} // $DEFAULT_GROWTH_PROJECTION_DAYS;
         my $max_inf   = $gp->{max_inflation_perc} // $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
 
-        printf {$fh} "        1. Data Eligibility : %s historical periods found (Min: %d).\n", $gd->{num_hist_periods}, $GROWTH_MIN_HISTORICAL_PERIODS;
-        printf {$fh} "        2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", $gd->{stats_cv}, $GROWTH_MAX_CV_THRESHOLD, $format_check_result->($gd->{cv_check_passed});
+        printf {$fh} "        1. Data Eligibility : %s historical periods found (Min: %d).\n", (defined $gd->{num_hist_periods} ? $gd->{num_hist_periods} : 'N/A'), $GROWTH_MIN_HISTORICAL_PERIODS;
+        printf {$fh} "        2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", ($gd->{stats_cv} // 'N/A'), $GROWTH_MAX_CV_THRESHOLD, $format_check_result->($gd->{cv_check_passed});
         printf {$fh} "        3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.2f. [Result: %s]\n", ($gd->{slope} // 'N/A'), $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed} // 'Skipped');
 
         if (defined $gd->{slope_check_passed} && $gd->{slope_check_passed} ne 'N/A') {
@@ -2951,144 +2603,55 @@ sub quote_csv {
 # Loads profile configurations from the specified INI-like file.
 # Each section [Profile Name] defines a profile.
 # Keys: nfit_flags (mandatory), runq_modifier_behavior (optional, default: 'default').
-sub load_profile_definitions
-{
+# This version correctly handles multi-line values for the 'nfit_flags' key.
+sub load_profile_definitions {
     my ($filepath) = @_;
     my @loaded_profiles_list;
-    my $current_section_name = undef; # Name of the current [Profile] being parsed
-    my $line_number = 0;
+    my $current_profile = undef;
+    my $last_key = '';
 
-    open my $fh, '<:encoding(utf8)', $filepath
-        or die "Error: Cannot open profiles config file '$filepath': $!\n";
+    open my $fh, '<:encoding(utf8)', $filepath or die "Error: Cannot open profiles config file '$filepath': $!\n";
 
-    while (my $line = <$fh>)
-    {
-        $line_number++;
+    while (my $line = <$fh>) {
         chomp $line;
-        $line =~ s/\s*#.*//;    # Remove comments starting with #
-        $line =~ s/\s*;.*//;    # Remove comments starting with ; (alternative comment)
-        $line =~ s/^\s+|\s+$//g; # Trim leading/trailing whitespace
-        next if $line eq '';    # Skip empty lines or lines that became empty after comment removal
+        $line =~ s/\s*[#;].*//;    # Remove comments
+        $line =~ s/^\s+|\s+$//g; # Trim whitespace
+        next if $line eq '';
 
-        if ($line =~ /^\s*\[\s*([^\]]+?)\s*\]\s*$/) # Matches section header like [Profile Name]
-        {
-            # Before starting a new section, check if the previous one was potentially incomplete
-            if (defined $current_section_name && @loaded_profiles_list &&
-                $loaded_profiles_list[-1]{name} eq $current_section_name &&
-                !defined $loaded_profiles_list[-1]{flags} && # Flags are mandatory
-                (!defined $loaded_profiles_list[-1]{runq_behavior} || $loaded_profiles_list[-1]{runq_behavior} eq 'default') )
-            {
-                my $is_incomplete = 1;
-                # A profile needs flags to be valid. If flags were somehow defined but this check missed it,
-                # this might be overly cautious, but missing flags is the primary concern.
-                if (defined $loaded_profiles_list[-1]{flags})
-                {
-                    $is_incomplete = 0;
-                }
-                if ($is_incomplete)
-                {
-                    warn "Warning: Profile section '[$current_section_name]' in '$filepath' (ending before line $line_number) appears incomplete (missing nfit_flags). Skipping this potentially malformed entry.\n";
-                    pop @loaded_profiles_list; # Remove the incomplete profile
-                }
+        if ($line =~ /^\s*\[\s*([^\]]+?)\s*\]\s*$/) { # New section
+            my $section_name = $1;
+            $current_profile = { name => $section_name, flags => '', runq_behavior => 'default' };
+            push @loaded_profiles_list, $current_profile;
+            $last_key = '';
+        } elsif ($current_profile && $line =~ /^\s*([^=]+?)\s*=\s*(.*)$/) { # New key-value pair
+            my $key = lc($1);
+            my $value = $2;
+            $key =~ s/^\s+|\s+$//g;
+            $value =~ s/^\s+|\s+$//g;
+            $last_key = $key;
+            
+            if ($key eq 'nfit_flags') {
+                $current_profile->{flags} = $value;
+            } elsif ($key eq 'runq_modifier_behavior') {
+                $current_profile->{runq_behavior} = $value;
             }
-
-            $current_section_name = $1; # Capture profile name from section header
-            $current_section_name =~ s/^\s+|\s+$//g; # Trim spaces from profile name
-            if ($current_section_name eq '')
-            {
-                warn "Warning: Empty section name in '$filepath' at line $line_number. Skipping.\n";
-                $current_section_name = undef; # Reset current section context
-                next;
-            }
-            # Initialize the new profile with its name and default runq_behavior. Flags added later.
-            push @loaded_profiles_list, { name => $current_section_name, flags => undef, runq_behavior => 'default' };
+        } elsif ($current_profile && $last_key eq 'nfit_flags') { # Continuation of nfit_flags
+            $current_profile->{flags} .= " $line";
         }
-        elsif (defined $current_section_name && $line =~ /^\s*([^=]+?)\s*=\s*(.+)$/) # Matches key-value pair
-        {
-            if ($current_section_name eq 'NormRunQ_Target') {
-                my $tier = uc($1);
-                my $value = $2;
-                $tier =~ s/\s+//g;
-                $value =~ s/\s+//g;
-                if (looks_like_number($value) && $value >= 0.1 && $value <= 2.0) {
-                    $custom_runq_targets{$tier} = $value;
-                } else {
-                    warn "Warning: Invalid Target NormRunQ '$value' for tier '$tier' in nfit.profiles.cfg. Value must be numeric between 0.1 and 2.0. Ignoring.\n";
-                }
-                next; # Move to the next line
-            }
-
-            my $key = lc($1); # Key name (lowercase for case-insensitivity)
-            my $value = $2;   # Value
-            $key =~ s/^\s+|\s+$//g;   # Trim spaces from key
-            $value =~ s/^\s+|\s+$//g; # Trim spaces from value
-
-            # Ensure we are adding to the currently parsed profile
-            if (@loaded_profiles_list && $loaded_profiles_list[-1]{name} eq $current_section_name)
-            {
-                if ($key eq 'nfit_flags')
-                {
-                    if (defined $loaded_profiles_list[-1]{flags}) # Check for duplicate flags
-                    {
-                        warn "Warning: Duplicate 'nfit_flags' for profile '[$current_section_name]' in '$filepath' (around line $line_number). Using last one defined.\n";
-                    }
-                    $loaded_profiles_list[-1]{flags} = $value;
-                }
-                elsif ($key eq 'runq_modifier_behavior')
-                {
-                    if (defined $loaded_profiles_list[-1]{runq_behavior} && $loaded_profiles_list[-1]{runq_behavior} ne 'default')
-                    { # Check for duplicate runq_behavior definition
-                        warn "Warning: Duplicate 'runq_modifier_behavior' for profile '[$current_section_name]' in '$filepath' (around line $line_number). Using last one defined.\n";
-                    }
-                    # Validate the value for runq_modifier_behavior
-                    if ($value eq 'additive_only' || $value eq 'default')
-                    {
-                        $loaded_profiles_list[-1]{runq_behavior} = $value;
-                    }
-                    else
-                    {
-                        warn "Warning: Invalid value '$value' for 'runq_modifier_behavior' in profile '[$current_section_name]' (line $line_number). Using default. Allowed: additive_only, default.\n";
-                        $loaded_profiles_list[-1]{runq_behavior} = 'default'; # Fallback to default if invalid value
-                    }
-                }
-                # Add other potential profile-specific keys here if needed in the future
-                # else { warn "Warning: Unknown key '$key' in profile '[$current_section_name]' ..."; }
-            }
-            else # Key-value pair found outside a valid section or for a mismatched section
-            {
-                warn "Warning: Key-value pair '$key=$value' found for invalid or unexpected section '$current_section_name' in '$filepath' (line $line_number). Ensure section was defined correctly. Skipping.\n";
-            }
-        }
-        elsif ($line ne '') # Non-empty line that doesn't match section or key-value format
-        {
-            warn "Warning: Unparseable line $line_number in profiles config '$filepath': $line\n";
-        }
-    } # End while loop reading file
+    }
     close $fh;
 
-    # Final validation of loaded profiles: ensure all valid profiles have 'nfit_flags'
+    # Final validation and cleanup
     my @valid_profiles;
-    foreach my $p_ref (@loaded_profiles_list)
-    {
-        if (defined $p_ref->{flags} && $p_ref->{flags} ne '')
-        {
-            # --- Mandate that the special P-99W1 profile is unfiltered ---
-            if ($p_ref->{name} eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
-                # Check for any time-filtering flags. The regex looks for the flags as distinct words.
-                if ($p_ref->{flags} =~ /\s-(?:online|batch|no-weekends)\b/) {
-                    die "ERROR: The mandatory profile '[$MANDATORY_PEAK_PROFILE_FOR_HINT]' in '$filepath' must not contain any time-filtering flags " .
-                        "(-online, -batch, -no-weekends).\n" .
-                        "       This profile is used to determine the true, unfiltered Peak value for the entire dataset.\n" .
-                        "       Please remove the time-filtering flag from this specific profile definition.\n";
-                }
-            }
+    foreach my $p_ref (@loaded_profiles_list) {
+        # Clean up any leading/trailing whitespace from concatenated flags
+        $p_ref->{flags} =~ s/^\s+|\s+$//g if defined $p_ref->{flags};
 
-            # runq_behavior is already defaulted or set during parsing
+        if (defined $p_ref->{flags} && $p_ref->{flags} ne '') {
+            # (existing validation logic for mandatory P-99W1, etc.)
             push @valid_profiles, $p_ref;
-        }
-        else # Profile is missing the mandatory 'nfit_flags'
-        {
-            warn "Warning: Profile '[" . $p_ref->{name} . "]' in '$filepath' is missing mandatory 'nfit_flags' definition. Removing this profile from processing.\n";
+        } else {
+            warn "Warning: Profile '[$p_ref->{name}]' in '$filepath' is missing 'nfit_flags'. Skipping.\n";
         }
     }
     return @valid_profiles;
@@ -3146,32 +2709,74 @@ sub apply_minimum_lcpu_floor {
 # --- calculate_runq_modified_physc (refactor: decoupled C & D, no early-returns, adds RunQ_Strategic) ---
 sub calculate_runq_modified_physc
 {
-    my (
-        $selected_tier_physc_value_str,
-        $norm_runq_p25_str,
-        $norm_runq_p50_str,
-        $norm_runq_p75_str,
-        $norm_runq_p90_str,
-        $abs_runq_p_value_str,
-        $abs_runq_key_for_debug,
-        $smt_used,
-        $current_entitlement_str,
-        $max_cpu_config_str,
-        $is_in_non_default_pool,
-        $profile_runq_behavior_setting,
-        $p99w1_overall_vm_has_abs_runq_pressure,
-        $p99w1_overall_vm_has_norm_runq_pressure,
-        # NEW: Adaptive threshold parameters
-        $vcpu_for_lpar_numeric,
-        $pool_cpu_for_lpar_numeric,
-        $adaptive_runq_saturation_thresh,
-        $adaptive_target_norm_runq,
-        $adaptive_max_efficiency_reduction,
-        $results_table_ref, # Pass reference to the complete results table
-        $vm_name_for_lookup, # Pass the current VM name for lookups
-        $pure_p99w1_physc,  # Pass the pure, unadjusted P-99W1 value
-        $final_tier         # Pass the finalised definitive workload tier to use for NormRunQ targets
-    ) = @_;
+    my ($vm_name, $vm_map_ref, $profile_ref, $pressure_flags_href, $adaptive_thresholds_href) = @_;
+
+    # --- Unpack all required values from the assimilation map and arguments ---
+    my $profile_name = $profile_ref->{name};
+    my $profile_runq_behavior_setting = $profile_ref->{runq_behavior} // 'default';
+
+    # Core values from the map
+    my $selected_tier_physc_value_str = $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name};
+    my $pure_p99w1_physc              = $vm_map_ref->{CoreResults}{ProfileValues}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
+
+    # Configuration from the map
+    my $cfg_ref                 = $vm_map_ref->{Configuration};
+    my $smt_used                = $cfg_ref->{smt};
+    my $current_entitlement_str = $cfg_ref->{entitlement};
+    my $max_cpu_config_str      = $cfg_ref->{max_cpu};
+    my $vcpu_for_lpar_numeric   = $cfg_ref->{virtual_cpus};
+    my $pool_cpu_for_lpar_numeric = $cfg_ref->{pool_cpu};
+    my $is_in_non_default_pool  = (defined $cfg_ref->{pool_id} && $cfg_ref->{pool_id} != 0);
+
+    # RunQ Metrics from the map
+    my $runq_metrics_ref = $vm_map_ref->{RunQMetrics};
+    my $norm_runq_p25_str = $runq_metrics_ref->{'NormRunQ_P25'};
+    my $norm_runq_p50_str = $runq_metrics_ref->{'NormRunQ_P50'};
+    my $norm_runq_p75_str = $runq_metrics_ref->{'NormRunQ_P75'};
+    my $norm_runq_p90_str = $runq_metrics_ref->{'NormRunQ_P90'};
+
+    # Determine which AbsRunQ percentile value to use based on profile behaviour.
+    my $abs_runq_key_to_use = "AbsRunQ_P90"; # Default to fixed
+    if ($runq_perc_behavior_mode eq 'match' && $profile_ref->{flags} =~ /-p\s+([0-9.]+)/) {
+        $abs_runq_key_to_use = "AbsRunQ_P" . clean_perc_label($1);
+    }
+
+    # --- DEBUG CHECKPOINT 2: Verify RunQ Key Lookup ---
+    # This block will inspect the key being generated against the available keys in the map.
+#    my $calculate_runq_modified_physc_debug_run_once = 0;
+#    if (!$calculate_runq_modified_physc_debug_run_once) {
+#        my ($p_val_for_debug) = $profile_ref->{flags} =~ /-p\s+([0-9.]+)/;
+#        print STDERR "\n\n==================== DEBUG: RunQ Metric Lookup ====================\n\n";
+#        print STDERR "Processing VM: $vm_name | Profile: " . $profile_ref->{name} . "\n";
+#        print STDERR "--------------------------------------------------------------------------\n";
+#        print STDERR "--> Key Generation for 'runq-perc-behavior=match':\n";
+#        printf STDERR "    - Profile '-p' flag value : %s\n", ($p_val_for_debug // 'Not Found');
+#        printf STDERR "    - Generated Key to Look For : '%s'\n\n", $abs_runq_key_to_use;
+#        print STDERR "--> Available Keys in Assimilation Map [RunQMetrics]:\n";
+#        if (ref($runq_metrics_ref) eq 'HASH' && scalar(keys %$runq_metrics_ref) > 0) {
+#            print STDERR "    " . join("\n    ", sort keys %$runq_metrics_ref) . "\n";
+#        } else {
+#            print STDERR "    <No RunQ metrics were found in the assimilation map>\n";
+#        }
+#        print STDERR "========================================================================================\n\n";
+#        $calculate_runq_modified_physc_debug_run_once = 1;
+#        die "Exiting after debug checkpoint 2 for key lookup validation.";
+#    }
+    # --- END DEBUG ---
+
+    my $abs_runq_p_value_str = $runq_metrics_ref->{$abs_runq_key_to_use};
+    my $abs_runq_key_for_debug = $abs_runq_key_to_use;
+
+    # Pressure flags and adaptive thresholds passed in from the main loop
+    my $p99w1_overall_vm_has_abs_runq_pressure  = $pressure_flags_href->{abs_pressure};
+    my $p99w1_overall_vm_has_norm_runq_pressure = $pressure_flags_href->{norm_pressure};
+    my $adaptive_runq_saturation_thresh   = $adaptive_thresholds_href->{saturation};
+    my $adaptive_target_norm_runq         = $adaptive_thresholds_href->{target};
+    my $adaptive_max_efficiency_reduction = $adaptive_thresholds_href->{max_reduction};
+
+    # Hinting data from the map
+    my $final_tier = $vm_map_ref->{Hinting}{FinalTierForVM} // $vm_map_ref->{Hinting}{AutoTier};
+ 
 
     my %debug_info;
     my $na_str = "N/A";
@@ -3244,19 +2849,19 @@ sub calculate_runq_modified_physc
 
     my $norm_p50_numeric = ($norm_runq_p50_str ne $na_str && $norm_runq_p50_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p50_str + 0) : undef;
     my $norm_p90_numeric = ($norm_runq_p90_str ne $na_str && $norm_runq_p90_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p90_str + 0) : undef;
-    my $abs_runq_p_numeric  = ($abs_runq_p_value_str  ne $na_str && $abs_runq_p_value_str  =~ /^-?[0-9.]+$/) ? ($abs_runq_p_value_str + 0)  : undef;
+    my $abs_runq_p_numeric  = ($abs_runq_p_value_str ne $na_str && $abs_runq_p_value_str  =~ /^-?[0-9.]+$/) ? ($abs_runq_p_value_str + 0)  : undef;
     $debug_info{'NormRunQ_P90_Val'} = (defined $norm_p90_numeric) ? sprintf("%.2f", $norm_p90_numeric) : $na_str;
 
     # Calculate Effective LCPUs for Pressure
     # --- START of Refined Next-Generation Burst Model ---
     # This block calculates the effective LCPU count used for all pressure assessments.
     my ($effective_lcpus_for_pressure_calc, $pressure_basis_rationale);
-    my $max_cpu_for_lpar_numeric = ($debug_info{'LPARMaxCPUConfig'} ne $na_str) ? $debug_info{'LPARMaxCPUConfig'} : 0;
+    my $max_cpu_for_lpar_numeric = (defined $max_cpu_config_str && looks_like_number($max_cpu_config_str)) ? ($max_cpu_config_str + 0) : 0;
 
     # Step 1: Calculate Base Burst Factor using EVR (VCPU/Entitlement Ratio).
     my $base_burst_factor = 0.50; # Default for conservative/standard configurations.
     my $evr_tier_rationale = "Conservative/Standard (EVR < 5x)";
-    if ($curr_ent_numeric > 0 && $vcpu_for_lpar_numeric > 0) {
+    if (defined $curr_ent_numeric && $curr_ent_numeric > 0 && defined $vcpu_for_lpar_numeric && $vcpu_for_lpar_numeric > 0) {
         my $evr = $vcpu_for_lpar_numeric / $curr_ent_numeric;
         if ($evr > 10) {
             $base_burst_factor = 3.00; # 300% for aggressively bursty VMs.
@@ -3398,20 +3003,22 @@ sub calculate_runq_modified_physc
             # --- Adaptive Target NormRunQ by Workload Type ---
             my $target_norm_runq_eff_calc;
             my $adaptive_target_reason;
-            my ($pattern) = ($final_tier =~ /^([OGBP])/);
-            my $base_tier = $pattern // 'G'; # Fallback to General for unknown patterns
-
-            # Use the full tier if available (e.g., G3), otherwise use the base pattern (e.g., G)
-            my $tier_to_check = (exists $custom_runq_targets{$final_tier} || exists $DEFAULT_RUNQ_TARGETS{$final_tier})
-                                ? $final_tier
-                                : $base_tier;
+            
+            # The final_tier is the authoritative source (e.g., "G2" from hint or override)
+            my $tier_to_check = $final_tier;
 
             if (exists $custom_runq_targets{$tier_to_check}) {
                 $target_norm_runq_eff_calc = $custom_runq_targets{$tier_to_check};
                 $adaptive_target_reason = "User-defined target for tier '$tier_to_check' from nfit.profiles.cfg";
-            } else {
-                $target_norm_runq_eff_calc = $DEFAULT_RUNQ_TARGETS{$tier_to_check} // 0.80; # Final fallback
+            } elsif (exists $DEFAULT_RUNQ_TARGETS{$tier_to_check}) {
+                $target_norm_runq_eff_calc = $DEFAULT_RUNQ_TARGETS{$tier_to_check};
                 $adaptive_target_reason = "Built-in default target for tier '$tier_to_check'";
+            } else {
+                # Fallback to the base pattern (e.g., 'G' from 'G2') if the full tier is not found
+                my ($pattern) = ($final_tier =~ /^([OGBP])/);
+                my $base_tier = $pattern // 'G';
+                $target_norm_runq_eff_calc = $DEFAULT_RUNQ_TARGETS{$base_tier} // $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC;
+                $adaptive_target_reason = "Fallback target for base pattern '$base_tier'";
             }
             $debug_info{'AdaptiveTargetNormRunQReason'} = "$adaptive_target_reason: ${target_norm_runq_eff_calc}";
 
@@ -3535,24 +3142,25 @@ sub calculate_runq_modified_physc
     } elsif ($profile_runq_behavior_setting eq 'additive_only') {
        $skip_downsizing_reason = "Profile runq_behavior=additive_only.";
     } elsif (defined $curr_ent_numeric && $curr_ent_numeric > 0 && defined $eff_p_base_numeric && ($eff_p_base_numeric > $curr_ent_numeric)) {
+
         # --- Enhanced STD Pattern Detection with Multiple Confidence Boosters ---
 
-        # 1. Dynamically determine the source profile for PhysC stability metrics
-        my ($pattern) = (($hint_tier_for_csv{$vm_name_for_lookup} // 'G') =~ /^([A-Z])/);
+        # 1. Dynamically determine the source profile for PhysC stability metrics.
+        my ($pattern) = (($vm_map_ref->{Hinting}{AutoTier} // 'G') =~ /^([A-Z])/);
         my %pattern_to_profile_map = ('O' => 'O3-95W15', 'B' => 'B3-95W15', 'G' => 'G3-95W15', 'P' => 'G3-95W15');
         my $source_profile_base = $pattern_to_profile_map{$pattern} // 'G3-95W15';
 
         my $p50_profile_name = $source_profile_base; $p50_profile_name =~ s/-95W/-50W/;
 
-        # 2. Look up PhysC P50 (from the new profile) and P95 (from the base profile)
-        my $physc_p50 = $results_table_ref->{$vm_name_for_lookup}{$p50_profile_name};
-        my $physc_p95 = $results_table_ref->{$vm_name_for_lookup}{$source_profile_base};
+        # 2. Look up PhysC P50 and P95 from the assimilation map's CoreResults.
+        my $physc_p50 = $vm_map_ref->{CoreResults}{ProfileValues}{$p50_profile_name};
+        my $physc_p95 = $vm_map_ref->{CoreResults}{ProfileValues}{$source_profile_base};
 
-        # 3. Calculate PhysC stability using the P95/P50 ratio
-        my $physc_stability_ratio = (defined $physc_p50 && $physc_p50 > 0.01) ? (($physc_p95 // 0) / $physc_p50) : 999;
+        # 3. Calculate PhysC stability using the P95/P50 ratio.
+        my $physc_stability_ratio = (defined $physc_p50 && looks_like_number($physc_p50) && $physc_p50 > 0.01) ? ((looks_like_number($physc_p95) ? $physc_p95 : 0) / $physc_p50) : 999;
         my $is_physc_stable = ($physc_stability_ratio < (1.0 + $STD_PHYSC_STABILITY_THRESH));
 
-        # 4. Core STD pattern detection (all 3 conditions must be met)
+        # 4. Core STD pattern detection (all 3 conditions must be met).
         my $is_std_pattern = (defined $norm_p90_numeric && $norm_p90_numeric < $STD_NORM_P90_THRESH) &&
                              (defined $normrunq_iqrc_val && $normrunq_iqrc_val < $STD_IQRC_THRESH) &&
                              $is_physc_stable;
@@ -3567,7 +3175,7 @@ sub calculate_runq_modified_physc
             # PATTERN MATCHED: This is a high-confidence inefficient workload.
             my $actual_reduction_num = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'})) ? ($debug_info{'EffActualReductionCores'} + 0) : 0;
 
-            # 5. Impact-based dampening
+            # 5. Impact-based dampening.
             my $spinning_thread_impact_ratio = 1.0 / max(1, $effective_lcpus_for_pressure_calc);
             my $graduated_dampening_factor;
             my $tier_rationale;
@@ -3941,8 +3549,23 @@ sub calculate_runq_modified_physc
     }
 
     $debug_info{'AdditiveSafetyCapApplied'} = $additive_safety_cap_applied_reason;
-    $debug_info{'RunQ_Tactical'} = $additive_cpu;
-    $debug_info{'FinalAdditive'} = sprintf("%.4f", $additive_cpu);
+
+    # Determine the final tactical modifier
+    # The tactical modifier is either the additive CPU (if upsizing) or the
+    # negative efficiency reduction (if downsizing).
+    my $final_tactical_modifier = 0;
+    if ($additive_cpu > $FLOAT_EPSILON) {
+        # Upsizing occurred
+        $final_tactical_modifier = $additive_cpu;
+    } elsif ($efficiency_factor_numeric < (1.0 - $FLOAT_EPSILON)) {
+        # Downsizing occurred. The modifier is the amount removed.
+        my $actual_reduction = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'})) 
+                               ? ($debug_info{'EffActualReductionCores'} + 0) : 0;
+        $final_tactical_modifier = -1 * $actual_reduction;
+    }
+
+    $debug_info{'RunQ_Tactical'} = $final_tactical_modifier;
+    $debug_info{'FinalAdditive'} = sprintf("%.4f", $final_tactical_modifier);
 
     # =========================
     # Final Synthesis + MaxCPU (same behaviour)
@@ -3983,19 +3606,17 @@ sub calculate_runq_modified_physc
 # specific boolean flags for P-99W1's RunQ pressure conditions.
 sub generate_sizing_hint
 {
-    my %args = @_;
-    # Unpack arguments, including the log file handle reference.
-    my $LOG_FH                       = $args{'log_fh_ref'};
-    my $results_ref                  = $args{'results_ref'};
-    my $vm                           = $args{'vm'};
-    my $config_ref                   = $args{'config_ref'};
-    my $max_cpu_for_vm_numeric       = $args{'max_cpu_for_vm_numeric'} // 0;
-    my $smt_used_for_vm_numeric      = $args{'smt_used_for_vm_numeric'} // 0;
-    my $per_profile_runq_metrics_ref = $args{'per_profile_runq_metrics_ref'};
-    my $adaptive_saturation_thresh   = $args{'adaptive_saturation_thresh'};
+    # This function is now refactored to read all its inputs from the assimilation map.
+    my ($vm_map_ref, $log_fh, $adaptive_saturation_thresh) = @_;
 
-    # $MANDATORY_PEAK_PROFILE_FOR_HINT should be globally available or passed.
-    # Example: my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1"; (defined outside)
+    # --- Unpack all required values from the assimilation map ---
+    my $vm_name                  = $vm_map_ref->{Configuration}{vm_name}; # We will add vm_name to the map
+    my $config_ref               = $vm_map_ref->{Configuration};
+    my $results_ref              = $vm_map_ref->{CoreResults}{ProfileValues};
+    my $runq_metrics_ref         = $vm_map_ref->{RunQMetrics};
+    my $max_cpu_for_vm_numeric   = $config_ref->{max_cpu} // 0;
+    my $smt_used_for_vm_numeric  = $config_ref->{smt} // $default_smt_arg;
+    my $LOG_FH                   = $log_fh;
 
     my $na_str_hint = "N/A";
     my @global_pressure_rationale_lines;
@@ -4016,21 +3637,18 @@ sub generate_sizing_hint
 
     # --- VIO Server Check ---
     my $is_vio_server = 0;
-    if (defined $config_ref &&
-        defined $config_ref->{'systemtype'} &&
-        $config_ref->{'systemtype'} =~ /VIO Server/i)
-    {
-        $is_vio_server = 1;
+    if (defined $config_ref->{systemtype} && $config_ref->{systemtype} =~ /VIO Server/i) {
+       $is_vio_server = 1;
     }
 
     # --- Profile Value Parsing (Pattern/Peakiness & P-99W1 PhysC) ---
-    my $o3_val_str = $results_ref->{$vm}{'O3-95W15'} // "0";
+    my $o3_val_str = $results_ref->{'O3-95W15'} // "0";
     my $o3_val_num = ($o3_val_str ne $na_str_hint && $o3_val_str =~ /^-?[0-9.]+\z/) ? ($o3_val_str + 0) : 0;
-    my $b3_val_str = $results_ref->{$vm}{'B3-95W15'} // "0";
+    my $b3_val_str = $results_ref->{'B3-95W15'} // "0";
     my $b3_val_num = ($b3_val_str ne $na_str_hint && $b3_val_str =~ /^-?[0-9.]+\z/) ? ($b3_val_str + 0) : 0;
-    my $g3_val_str = $results_ref->{$vm}{'G3-95W15'} // "0";
+    my $g3_val_str = $results_ref->{'G3-95W15'} // "0";
     my $g3_val_num = ($g3_val_str ne $na_str_hint && $g3_val_str =~ /^-?[0-9.]+\z/) ? ($g3_val_str + 0) : 0;
-    my $p99w1_physc_val_str = $results_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT} // $na_str_hint;
+    my $p99w1_physc_val_str = looks_like_number($results_ref->{$MANDATORY_PEAK_PROFILE_FOR_HINT}) ? sprintf("%.3f", $results_ref->{$MANDATORY_PEAK_PROFILE_FOR_HINT}) : $na_str_hint;
     my $p99w1_physc_val_num = ($p99w1_physc_val_str ne $na_str_hint && $p99w1_physc_val_str =~ /^-?[0-9.]+\z/)
     ? ($p99w1_physc_val_str + 0)
     : 0;
@@ -4054,23 +3672,9 @@ sub generate_sizing_hint
     my @pressure_points;
 
     # Fetch P-99W1's specific RunQ metrics
-    my $p99w1_abs_runq_p90_val_str = $na_str_hint;
-    my $p99w1_norm_runq_p90_val_str = $na_str_hint;
-    # ... (logic to fetch $p99w1_abs_runq_p90_val_str and $p99w1_norm_runq_p90_val_str as before) ...
-    # ... (logging of these input RunQ values to @global_pressure_rationale_lines as before) ...
-    if (defined $per_profile_runq_metrics_ref &&
-        exists $per_profile_runq_metrics_ref->{$vm} &&
-        exists $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT})
-    {
-        my $p99w1_metrics_block = $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT}->{metrics};
+    my $p99w1_abs_runq_p90_val_str = looks_like_number($runq_metrics_ref->{'AbsRunQ_P90'}) ? sprintf("%.3f", $runq_metrics_ref->{'AbsRunQ_P90'}) : $na_str_hint;
+    my $p99w1_norm_runq_p90_val_str = looks_like_number($runq_metrics_ref->{'NormRunQ_P90'}) ? sprintf("%.3f", $runq_metrics_ref->{'NormRunQ_P90'}) : $na_str_hint;
 
-        if (defined $p99w1_metrics_block && ref($p99w1_metrics_block) eq 'HASH') {
-            my $abs_runq_metrics = $p99w1_metrics_block->{runq}{absolute} || {};
-            my $norm_runq_metrics = $p99w1_metrics_block->{runq}{normalized} || {};
-            $p99w1_abs_runq_p90_val_str = $abs_runq_metrics->{'P90'} // $na_str_hint;
-            $p99w1_norm_runq_p90_val_str = $norm_runq_metrics->{'P90'} // $na_str_hint;
-        }
-    }
     push @global_pressure_rationale_lines, sprintf("  Input %s AbsRunQ P90     : %s threads (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
     push @global_pressure_rationale_lines, sprintf("  Input %s NormRunQ P90    : %s (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_norm_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
     push @global_pressure_rationale_lines, "";
@@ -4159,8 +3763,8 @@ sub generate_sizing_hint
     push @global_pressure_rationale_lines, "  4. Pool Context:";
 
     # Get Pool ID from nfit's dynamic data, and Pool Name from the optional config file
-    my $pool_id_from_nmon = $per_profile_runq_metrics_ref->{$vm}{$MANDATORY_PEAK_PROFILE_FOR_HINT}->{metadata}{poolId} // 0;
-    my $pool_name_from_config = (defined $config_ref && defined $config_ref->{pool_name}) ? $config_ref->{pool_name} : undef;
+    my $pool_id_from_nmon = $config_ref->{pool_id} // 0;
+    my $pool_name_from_config = $vm_config_data{$vm_name}{pool_name} // undef; # Still need the original config file for this
 
     # A non-default pool is one where the ID is not 0.
     my $is_non_default_pool = (looks_like_number($pool_id_from_nmon) && $pool_id_from_nmon != 0);
@@ -4189,8 +3793,8 @@ sub generate_sizing_hint
     # --- Tiering logic (remains unchanged) ---
     my $initial_tier_range_str = "3/4";
     # --- Tiering logic (with added safety checks for numeric values) ---
-    my $p99w1_val_for_tier = $results_ref->{$vm}{'P-99W1'};
-    my $g3_val_for_tier    = $results_ref->{$vm}{'G3-95W15'};
+    my $p99w1_val_for_tier = $results_ref->{'P-99W1'};
+    my $g3_val_for_tier    = $results_ref->{'G3-95W15'};
 
     if (looks_like_number($p99w1_val_for_tier) && looks_like_number($g3_val_for_tier) && $g3_val_for_tier > 0) {
         if ($p99w1_val_for_tier > $g3_val_for_tier * $HIGH_PEAK_RATIO_THRESHOLD) {
@@ -5174,19 +4778,57 @@ sub _get_warning_for_vm_forecast {
     return undef;
 }
 
+sub raw_init_vm_bucket {
+    my ($store_hr, $vm) = @_;
+    $store_hr->{$vm} //= {};
+    die "raw_init_vm_bucket: VM bucket not HASH for $vm"
+        unless ref($store_hr->{$vm}) eq 'HASH';
+    return $store_hr->{$vm};
+}
+
+sub raw_set_profile_rows {
+    my ($store_hr, $vm, $profile, $rows_aref) = @_;
+    my $bucket = raw_init_vm_bucket($store_hr, $vm);
+    $bucket->{$profile} = (ref($rows_aref) eq 'ARRAY') ? $rows_aref : [];
+}
+
+sub raw_get_profile_rows {
+    my ($store_hr, $vm, $profile) = @_;
+    return [] unless ref($store_hr) eq 'HASH';
+    my $b = $store_hr->{$vm};
+    return [] unless ref($b) eq 'HASH';
+    my $a = $b->{$profile};
+    return (ref($a) eq 'ARRAY') ? $a : [];
+}
+
+sub raw_get_last_state {
+    my ($store_hr, $vm, $profile) = @_;
+    my $rows = raw_get_profile_rows($store_hr, $vm, $profile);
+    return @$rows ? $rows->[-1] : undef;
+}
+
+sub _safe_dig {
+    my ($href, @path) = @_;
+    my $cur = $href;
+    for my $k (@path) {
+        return undef unless ref($cur) eq 'HASH' && exists $cur->{$k};
+        $cur = $cur->{$k};
+    }
+    return $cur;
+}
+
 # ==============================================================================
-# Encapsulates the entire CSV generation process, from header to footer.
-# It relies on globally scoped variables (@vm_order, %results_table, etc.)
-# being populated before it is called.
-# It applies consistent, 3-decimal-place formatting for all numeric results.
+# SUBROUTINE: _write_standard_csv_report (Refactored for Assimilation Map)
+# PURPOSE:    Encapsulates the entire CSV generation process. It now reads all
+#             its data from the final, fully populated assimilation map.
 # ==============================================================================
 sub _write_standard_csv_report {
-    my ($report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag) = @_;
+    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag) = @_;
 
     # Ensure we have data to process before creating a file.
-    return unless (@vm_order);
+    # The @vm_order array is still used to control the iteration order.
+    return unless (@vm_order && ref($assimilation_map_ref) eq 'HASH');
 
-    # Sanitise identifiers for use in filenames.
     my $system_id_for_filename = $system_id || 'standard';
     $system_id_for_filename =~ s/[^a-zA-Z0-9_.-]//g;
     my $report_type_for_filename = $report_type;
@@ -5196,216 +4838,118 @@ sub _write_standard_csv_report {
     push @generated_files, $output_filename;
 
     open my $out_fh, '>', $output_filename or die "FATAL: Cannot open output file '$output_filename': $!";
-#    print STDERR "Analysis complete. Writing '$report_type' report to: $output_filename\n";
 
-    # Create a local copy of the header to modify for this specific report.
     my @header_for_this_report = @output_header_cols_csv;
     my $formula_col_offset = 0;
 
-    # Conditionally remove RunQ_Tactical for multiplicative forecasts
+    # Logic to add/remove model-specific columns remains the same...
     if ($is_multiplicative_run_flag) {
-        @header_for_this_report = grep { $_ ne 'RunQ_Tactical' && $_ ne 'RunQ_Strategic' && $_ ne 'RunQ_Source' } @header_for_this_report;
+        @header_for_this_report = grep { $_ ne 'RunQ_Tactical' && $_ ne 'RunQ_Strategic' && $_ ne 'RunQ_Potential' && $_ ne 'RunQ_Source' } @header_for_this_report;
     }
-
-    # Find the index of the 'Current - ENT' column to insert new columns before it.
     my ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
-    $ent_idx //= scalar(@header_for_this_report); # Fallback to appending if not found
-
-    # Conditionally add new columns for the specific seasonal models.
+    $ent_idx //= scalar(@header_for_this_report);
     if ($is_multiplicative_run_flag) {
-        # Add columns for the Multiplicative model
         my @new_cols = ("SeasonalMultiplier", "Baseline_PhysC");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
-    } elsif ($is_recency_decay_run_flag) {
-        # Add columns for the Recency-Decay model
-        my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max");
-        splice @header_for_this_report, $ent_idx, 0, @new_cols;
-        $formula_col_offset = scalar(@new_cols);
-    } elsif ($nfit_decay_over_states) {
-        # Also add columns for the standard (non-seasonal) Hybrid State-Time Decay model
+    } elsif ($is_recency_decay_run_flag || $nfit_decay_over_states) {
         my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
     } elsif ($is_predictive_peak_run_flag) {
-        # Add columns for the Predictive Peak model
         my @new_cols = ("TrueBaseline_P99W1", "PredictedPeak_P99W1", "ForecastSource");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
     }
 
-    # Print the CSV header to the file.
     print {$out_fh} join(",", map { quote_csv($_) } @header_for_this_report) . "\n";
 
     my $excel_row_num_counter = 1;
-    my %runq_modifier_source_for_csv; # To store the dynamically chosen source profile
 
-    # Iterate through VMs in the order they were first seen to maintain consistency
-    foreach my $vm_name (sort @vm_order) {
+    foreach my $vm_name (@vm_order) {
         $excel_row_num_counter++;
         my @data_row_csv;
-        my $cfg_csv = $vm_config_data{$vm_name};
 
-        my $is_vio_server = (defined $cfg_csv && defined $cfg_csv->{'systemtype'} && $cfg_csv->{'systemtype'} =~ /VIO Server/i);
+        # Get the complete, final data for this VM from the assimilation map.
+        my $vm_map_ref = $assimilation_map_ref->{$vm_name};
+        my $cfg = $vm_map_ref->{Configuration};
+        my $core = $vm_map_ref->{CoreResults};
+        my $hinting = $vm_map_ref->{Hinting};
+        my $modifiers = $vm_map_ref->{CSVModifiers};
 
-        my $smt_used_for_vm_csv = $default_smt_arg;
-        if (defined $cfg_csv && defined $cfg_csv->{smt}) {
-            $smt_used_for_vm_csv = $cfg_csv->{smt};
-        }
+        # --- Populate CSV row directly from the map ---
+        push @data_row_csv, $vm_name, ($tier_override_for_csv{$vm_name} // "");
+        push @data_row_csv, $hinting->{AutoTier} // "", $hinting->{Pattern} // "";
+        push @data_row_csv, ($hinting->{Pressure} ? "True" : "False"), $hinting->{PressureDetail} // "";
+        push @data_row_csv, $cfg->{smt} // "";
+        push @data_row_csv, $cfg->{serial_number} // "", $vm_config_data{$vm_name}{systemtype} // ""; # systemtype from old config is richer
+        push @data_row_csv, $vm_config_data{$vm_name}{pool_name} // "", $cfg->{pool_id} // "";
 
-        # --- Use pre-calculated hint data ---
-        my $hint_type_tier_csv = $hint_tier_for_csv{$vm_name} // '';
-        my $hint_pattern_shape_csv = $hint_pattern_for_csv{$vm_name} // '';
-        my $pressure_bool_str_csv = $hint_pressure_for_csv{$vm_name} ? "True" : "False";
-        my $pressure_detail_str_csv = $pressure_details_for_csv{$vm_name} // '';
-
-        my $tier_override_value = $tier_override_for_csv{$vm_name} // ""; # Use override if it exists, otherwise blank.
-		push @data_row_csv, $vm_name, $tier_override_value, $hint_type_tier_csv, $hint_pattern_shape_csv, $pressure_bool_str_csv, $pressure_detail_str_csv, $smt_used_for_vm_csv;
-
-        my ($serial_out, $systype_out, $poolname_out, $poolid_out, $ent_out) = ('', '', '', '', '');
-        if (defined $cfg_csv) {
-            $serial_out = $cfg_csv->{serial} // '';
-            $systype_out = $cfg_csv->{systemtype} // '';
-            $poolname_out = $cfg_csv->{pool_name} // '';
-            $poolid_out = $cfg_csv->{pool_id} // '';
-            $ent_out = $cfg_csv->{entitlement} // '';
-        } else {
-            my $last_state_data_ref = ($per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} // [])->[-1];
-            if ($last_state_data_ref && ref($last_state_data_ref) eq 'HASH') {
-                my $metadata = $last_state_data_ref->{metadata} || {};
-                my $config = $metadata->{configuration} || {};
-                $serial_out = $metadata->{serialNumber} // '';
-                $poolid_out = $metadata->{poolId} // '';
-                $ent_out = $config->{entitlement} // '';
-            }
-        }
-        push @data_row_csv, $serial_out, $systype_out, $poolname_out, $poolid_out;
-
-        # --- Dynamic RunQ Modifier source logic ---
         unless ($is_multiplicative_run_flag || $is_predictive_peak_run_flag) {
-            # Determine the source profile based on the hint
-            my $hint = $hint_tier_for_csv{$vm_name} // "G";
-            my ($pattern) = ($hint =~ /^([A-Z])/);
-            my %pattern_to_profile_map = (
-                'O' => 'O3-95W15',
-                'B' => 'B3-95W15',
-                'G' => 'G3-95W15',
-                'P' => 'G3-95W15' # Fallback for Peak/VIO
-            );
-            my $source_profile = $pattern_to_profile_map{$pattern} // 'G3-95W15';
-
-            # If the dynamically chosen profile has no data, fall back to G3
-            unless (exists $runq_modifier_values{$vm_name}{$source_profile}) {
-                $source_profile = 'G3-95W15';
-            }
-            $runq_modifier_source_for_csv{$vm_name} = $source_profile;
-
-            # Get modifier values from the dynamically determined source profile
-            my $tactical_val = $runq_modifier_values{$vm_name}{$source_profile} // 0;
-            my $tactical_val_formatted = sprintf("%+.3f", $tactical_val); # Use %+f to show sign
-            push @data_row_csv, $tactical_val_formatted;
-
-            my $strategic_val = $runq_uncapped_values{$vm_name}{$source_profile} // 0;
-            my $strategic_val_formatted = sprintf("%+.3f", $strategic_val);
-            push @data_row_csv, $strategic_val_formatted;
-
-            my $potential_val = $runq_potential_values{$vm_name}{$source_profile} // 0;
-            my $potential_val_formatted = (looks_like_number($potential_val)) ? sprintf("%+.3f", $potential_val) : $potential_val;
-            push @data_row_csv, $potential_val_formatted;
-
-            # Add the source profile name to the CSV
+            # Determine the source profile for the RunQ modifier columns
+            my $hint_pattern = ($hinting->{AutoTier} =~ /^([A-Z])/) ? $1 : 'G';
+            my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+            my $source_profile = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
+            
+            my $mods_for_source = $modifiers->{$source_profile} || {};
+            push @data_row_csv, (defined $mods_for_source->{RunQ_Tactical} ? sprintf("%+.3f", $mods_for_source->{RunQ_Tactical}) : "0.000");
+            push @data_row_csv, (defined $mods_for_source->{RunQ_Strategic} ? sprintf("%+.3f", $mods_for_source->{RunQ_Strategic}) : "0.000");
+            push @data_row_csv, (defined $mods_for_source->{RunQ_Potential} && looks_like_number($mods_for_source->{RunQ_Potential}) ? sprintf("%+.3f", $mods_for_source->{RunQ_Potential}) : ($mods_for_source->{RunQ_Potential} // "0.000"));
             push @data_row_csv, $source_profile;
         }
+        
+        # Push the Peak value, ensuring 3-digit precision
+        my $peak_val = $core->{PeakValue};
+        push @data_row_csv, (defined $peak_val && looks_like_number($peak_val)) ? sprintf("%.3f", $peak_val) : ($peak_val // "");
 
-        # --- Apply consistent 3-decimal-place formatting to all numeric results ---
-        my $peak_val = $results_table{$vm_name}{$PEAK_PROFILE_NAME} // "";
-        my $peak_val_formatted = (looks_like_number($peak_val)) ? sprintf("%.3f", $peak_val) : $peak_val;
-        push @data_row_csv, $peak_val_formatted;
-
+        # Push all profile values with enforced 3-digit precision
         foreach my $profile (@profiles) {
-            my $prof_val = $results_table{$vm_name}{$profile->{name}} // "";
-            my $prof_val_formatted = (looks_like_number($prof_val)) ? sprintf("%.3f", $prof_val) : $prof_val;
-            push @data_row_csv, $prof_val_formatted;
+            my $val = $core->{ProfileValues}{$profile->{name}};
+            my $formatted_val = (defined $val && looks_like_number($val)) ? sprintf("%.3f", $val) : ($val // "");
+            push @data_row_csv, $formatted_val;
         }
 
-        # Conditionally add data for the new seasonal columns.
+        # Model-specific columns
         if ($is_multiplicative_run_flag) {
-            my $seasonal_multiplier_for_row = "N/A";
-            my $baseline_physc_for_row = "N/A";
-            if (exists $seasonal_debug_info{$vm_name}) {
-                # Use the P-99W1 profile's debug info as the representative value for the row.
-                my $debug_info_for_vm = $seasonal_debug_info{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} || {};
-                if (defined $debug_info_for_vm->{'multiplier'}) {
-                    $seasonal_multiplier_for_row = sprintf("%.2f", $debug_info_for_vm->{'multiplier'});
-                }
-                if (defined $debug_info_for_vm->{'baseline'}) {
-                    $baseline_physc_for_row = sprintf("%.3f", $debug_info_for_vm->{'baseline'});
-                }
-            }
-            push @data_row_csv, $seasonal_multiplier_for_row, $baseline_physc_for_row;
-
+            my $s_data = $seasonal_debug_info{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} || {};
+            push @data_row_csv, (defined $s_data->{multiplier} ? sprintf("%.2f", $s_data->{multiplier}) : "N/A");
+            push @data_row_csv, (defined $s_data->{baseline} ? sprintf("%.3f", $s_data->{baseline}) : "N/A");
         } elsif ($is_recency_decay_run_flag || $nfit_decay_over_states) {
-            # --- Calculate Min/Max GrowthAdj across all profiles for this VM ---
-            my @growth_adjs;
-            foreach my $profile (@profiles) {
-                my $raw_results_ref = $per_profile_nfit_raw_results{$vm_name}{$profile->{name}};
-                if (ref($raw_results_ref) eq 'ARRAY' && @$raw_results_ref && $raw_results_ref->[0]{metrics}{growth}) {
-                    my $growth_val = $raw_results_ref->[0]{metrics}{growth}{adjustment};
-                    if (defined $growth_val && looks_like_number($growth_val)) {
-                       push @growth_adjs, $growth_val if $growth_val > 0.001;
-                    }
-                }
-            }
-
-            my $min_adj_str = @growth_adjs ? sprintf("%.3f", min(@growth_adjs)) : "0.000";
-            my $max_adj_str = @growth_adjs ? sprintf("%.3f", max(@growth_adjs)) : "0.000";
-
-            push @data_row_csv, $min_adj_str, $max_adj_str;
+            # For decay models, get the min and max growth adjustments calculated across all profiles.
+            my $vm_map_ref = $assimilation_map_ref->{$vm_name};
+            my $growth_min = $vm_map_ref->{Growth}{min_adj} // 0;
+            my $growth_max = $vm_map_ref->{Growth}{max_adj} // 0;
+            my $min_str = sprintf("%.3f", $growth_min);
+            my $max_str = sprintf("%.3f", $growth_max);
+            push @data_row_csv, $min_str, $max_str;
         } elsif ($is_predictive_peak_run_flag) {
-            # Retrieve the debug info for the specific VM being processed in the loop.
             my $s_data = $seasonal_debug_info{$vm_name}{'P-99W1'} || {};
-
-            my $baseline_val = $s_data->{'TrueBaseline'};
-            my $predicted_val = $s_data->{'PredictedPeak'};
-            my $source = $s_data->{'FinalSource'} || 'N/A';
-
-            # Use our finalized, user-friendly labels for the CSV output.
-            if ($source eq 'PeakPrediction') {
-                $source = 'PredictedPeak';
-            } elsif ($source eq 'TrueBaseline') {
-                $source = 'BaselineIsHigher';
-            } elsif ($source eq 'BaselineOnly (NoPrediction)') {
-                $source = 'BaselineOnly (NoPrediction)';
-            }
-
-            my $baseline_str = (defined $baseline_val && looks_like_number($baseline_val)) ? sprintf("%.3f", $baseline_val) : "N/A";
-            my $predicted_str = (defined $predicted_val && looks_like_number($predicted_val)) ? sprintf("%.3f", $predicted_val) : "N/A";
-
-            push @data_row_csv, $baseline_str, $predicted_str, $source;
+            my $source = $s_data->{FinalSource} || 'N/A';
+            if ($source eq 'PeakPrediction') { $source = 'PredictedPeak'; }
+            elsif ($source eq 'TrueBaseline') { $source = 'BaselineIsHigher'; }
+            push @data_row_csv, (defined $s_data->{TrueBaseline} ? sprintf("%.3f", $s_data->{TrueBaseline}) : "N/A");
+            push @data_row_csv, (defined $s_data->{PredictedPeak} ? sprintf("%.3f", $s_data->{PredictedPeak}) : "N/A");
+            push @data_row_csv, $source;
         }
 
-        my $current_ent_display = (looks_like_number($ent_out)) ? sprintf("%.2f", $ent_out) : $ent_out;
-
-        # Pass the calculated offset to the formula generator
+        # Entitlement and formula columns
+        my $ent_out = $cfg->{entitlement};
+        my $current_ent_display = (looks_like_number($ent_out)) ? sprintf("%.2f", $ent_out) : ($ent_out // "");
         my $nfit_ent_formula_str = generate_nfit_ent_formula($excel_row_num_counter, scalar(@profiles), $formula_col_offset);
-
-        # Dynamically calculate column letters for NETT formulas to handle the offset.
-        my $col_nfit_ent_letter = get_excel_col_name(12 + scalar(@profiles) + 2 + $formula_col_offset);
-        my $col_curr_ent_letter = get_excel_col_name(12 + scalar(@profiles) + 1 + $formula_col_offset);
-
+        my $col_nfit_ent_letter = get_excel_col_name(scalar(@output_header_cols_csv) - 2 + $formula_col_offset);
+        my $col_curr_ent_letter = get_excel_col_name(scalar(@output_header_cols_csv) - 3 + $formula_col_offset);
         my $nett_user_formula_str = sprintf("=(%s%d-%s%d)", $col_nfit_ent_letter, $excel_row_num_counter, $col_curr_ent_letter, $excel_row_num_counter);
         my $nett_perc_user_formula_str = sprintf("=IFERROR((%s%d-%s%d)/%s%d,\"\")", $col_nfit_ent_letter, $excel_row_num_counter, $col_curr_ent_letter, $excel_row_num_counter, $col_curr_ent_letter, $excel_row_num_counter);
-
         push @data_row_csv, $current_ent_display, $nfit_ent_formula_str, $nett_user_formula_str, $nett_perc_user_formula_str;
+
         print {$out_fh} join(",", map { quote_csv($_) } @data_row_csv) . "\n";
     }
 
     if ($add_excel_formulas) {
         my %serials_map;
-        foreach my $vm (@vm_order) {
-            if (exists $vm_config_data{$vm} && defined $vm_config_data{$vm}{serial} && $vm_config_data{$vm}{serial} ne '') {
-                $serials_map{$vm_config_data{$vm}{serial}} = 1;
-            }
+        foreach my $vm_name (@vm_order) {
+            my $serial = $assimilation_map_ref->{$vm_name}{Configuration}{serial_number};
+            $serials_map{$serial} = 1 if (defined $serial && $serial ne '');
         }
         my @sorted_serials = sort keys %serials_map;
         print_csv_footer($out_fh, $excel_row_num_counter, $physc_data_file, scalar(@profiles), \@sorted_serials, $formula_col_offset);
@@ -5509,7 +5053,7 @@ sub _get_recurring_monthly_period {
 # SeasonalMultiplier column, and correctly offset Excel formulas.
 # ==============================================================================
 sub _write_multiplicative_seasonal_report {
-    my ($system_id, $event_name, $timestamp, $forecast_data_href) = @_;
+    my ($system_id, $event_name, $timestamp, $forecast_data_href, $assimilation_map_ref) = @_;
 
     my $s_id_safe = $system_id;
     my $e_name_safe = $event_name;
@@ -5537,6 +5081,13 @@ sub _write_multiplicative_seasonal_report {
         my $vm_data = $forecast_data_href->{$vm_name};
         my $report_data = $vm_data->{_report_data} || {};
         my $cfg_csv = $vm_config_data{$vm_name};
+
+        # Get the complete, final data for this VM from the assimilation map.
+        my $vm_map_ref = $assimilation_map_ref->{$vm_name};
+        my $cfg = $vm_map_ref->{Configuration};
+        my $core = $vm_map_ref->{CoreResults};
+        my $hinting = $vm_map_ref->{Hinting};
+        my $modifiers = $vm_map_ref->{CSVModifiers};
 
         # Gather standard fields for the row
         my $smt_out = $cfg_csv->{smt} // $default_smt_arg;
@@ -7281,6 +6832,455 @@ sub parse_vm_tier_overrides {
     close $fh;
     print STDERR "    - Loaded " . scalar(keys %overrides) . " VM-specific tier overrides.\n";
     return \%overrides;
+}
+
+# ==============================================================================
+# SUBROUTINE: build_transform_manifest
+# PURPOSE:    Parses all loaded profiles and aggregates their computational
+#             requirements into a single "transform manifest". This manifest
+#             identifies each unique data transformation needed for PhysC,
+#             NormRunQ, and AbsRunQ, ensuring calculation parameters are
+#             correctly isolated.
+# ==============================================================================
+# REPLACE the entire 'build_transform_manifest' subroutine with this corrected version.
+# This version ensures strict isolation between all manifest entries.
+
+sub build_transform_manifest {
+    my ($profiles_ref, $global_runq_avg_method) = @_;
+    my %manifest;
+
+    # Helper to create a consistent transform key.
+    my $_get_transform_key = sub {
+        my ($metric, $method, $window, $decay, $filter, $time, $weekends) = @_;
+        return join(":", $metric, $method, $window, $decay, $filter, $time, $weekends);
+    };
+
+    foreach my $profile (@$profiles_ref) {
+        my $flags = $profile->{flags};
+        my $p_name = $profile->{name};
+
+        # --- Extract all relevant parameters from the profile's flags ---
+        my ($p_perc)      = $flags =~ /-p\s+([0-9.]+)/;
+        my ($w_min)       = $flags =~ /-w\s+(\d+)/;
+        my ($avg_method)  = $flags =~ /--avg-method\s+(\w+)/;
+        my ($decay)       = $flags =~ /--decay\s+([\w-]+)/;
+        my ($runq_decay)  = $flags =~ /--runq-decay\s+([\w-]+)/;
+        my ($filter_perc) = $flags =~ /--filter-above-perc\s+([0-9.]+)/;
+        my ($rq_norm_str) = $flags =~ /--runq-norm-perc\s+"?([0-9.,\s]+)"?/;
+        my ($rq_abs_str)  = $flags =~ /--runq-abs-perc\s+"?([0-9.,\s]+)"?/;
+        my $time_filter = 'none';
+        if ($flags =~ / -online\b/)     { $time_filter = 'online'; }
+        elsif ($flags =~ / -batch\b/)   { $time_filter = 'batch'; }
+        my $no_weekends = ($flags =~ / -no-weekends\b/) ? 1 : 0;
+
+        # --- 1. PhysC Transform ---
+        my $physc_method = $avg_method // $DEFAULT_AVG_METHOD;
+        my $physc_decay = $decay // $DEFAULT_DECAY_LEVEL;
+        my $physc_window = $w_min // 15;
+        my $physc_filter = $filter_perc // '0';
+        
+        my $physc_key = $_get_transform_key->('PhysC', $physc_method, $physc_window, $physc_decay, $physc_filter, $time_filter, $no_weekends);
+        
+        # Find or create the transform. CRITICAL: Initialize 'profiles' with a NEW hash ref '{}'.
+        $manifest{$physc_key} //= {
+            metric => 'PhysC', method => $physc_method, window => $physc_window, decay => $physc_decay,
+            filter_perc => $physc_filter, time_filter => $time_filter, no_weekends => $no_weekends,
+            profiles => {}
+        };
+
+        # Add this profile's directives under the correct transform.
+        if (defined $p_perc) {
+            my $p_directives = $manifest{$physc_key}{profiles}{$p_name} //= {};
+            push @{ $p_directives->{percentiles} }, $p_perc;
+            
+            $p_directives->{enable_growth} = 1 if ($flags =~ /--enable-growth-prediction\b/);
+            $p_directives->{enable_clipping} = 1 if ($flags =~ /--enable-clipping-detection\b/);
+            $p_directives->{calculate_peak} = 1 if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT || $flags =~ /-k\b|--peak\b/);
+        }
+
+        # --- 2. RunQ Transforms ---
+        my $runq_eff_decay = $runq_decay // $decay // 'medium';
+        my $runq_method = ($global_runq_avg_method eq 'none') ? 'none' : ($global_runq_avg_method // $DEFAULT_NFIT_RUNQ_AVG_METHOD);
+        my $runq_window = $w_min // 15;
+        
+        if (defined $rq_norm_str) {
+            my @norm_percs = grep { looks_like_number($_) } split /[,\s]+/, $rq_norm_str;
+            push @norm_percs, (25, 50, 75, 90);
+            my %seen; @norm_percs = grep { !$seen{$_}++ } @norm_percs;
+
+            if (@norm_percs) {
+                my $norm_key = $_get_transform_key->('NormRunQ', $runq_method, $runq_window, $runq_eff_decay, '0', $time_filter, $no_weekends);
+                $manifest{$norm_key} //= {
+                    metric => 'NormRunQ', method => $runq_method, window => $runq_window, decay => $runq_eff_decay,
+                    filter_perc => '0', time_filter => $time_filter, no_weekends => $no_weekends,
+                    profiles => {}
+                };
+                if (@norm_percs) {
+                    my $n_directives = $manifest{$norm_key}{profiles}{$p_name} //= {};
+                    push @{ $n_directives->{percentiles} }, @norm_percs;
+                }
+            }
+        }
+
+        if (defined $rq_abs_str) {
+            my @abs_percs = grep { looks_like_number($_) } split /[,\s]+/, $rq_abs_str;
+            push @abs_percs, $p_perc if ($runq_perc_behavior_mode eq 'match' && defined $p_perc);
+            my %seen; @abs_percs = grep { !$seen{$_}++ } @abs_percs;
+            
+            if (@abs_percs) {
+                my $abs_key = $_get_transform_key->('AbsRunQ', $runq_method, $runq_window, $runq_eff_decay, '0', $time_filter, $no_weekends);
+                $manifest{$abs_key} //= {
+                    metric => 'AbsRunQ', method => $runq_method, window => $runq_window, decay => $runq_eff_decay,
+                    filter_perc => '0', time_filter => $time_filter, no_weekends => $no_weekends,
+                    profiles => {}
+                };
+                if (@abs_percs) {
+                    my $a_directives = $manifest{$abs_key}{profiles}{$p_name} //= {};
+                    push @{ $a_directives->{percentiles} }, @abs_percs;
+                }
+            }
+        }
+    }
+
+    # Final pass to de-duplicate percentiles
+    foreach my $key (keys %manifest) {
+        foreach my $p_name (keys %{ $manifest{$key}{profiles} }) {
+            if (exists $manifest{$key}{profiles}{$p_name}{percentiles}) {
+                my $percs_ref = \@{ $manifest{$key}{profiles}{$p_name}{percentiles} };
+                my %seen; @$percs_ref = grep { !$seen{$_}++ } @$percs_ref;
+            }
+        }
+    }
+
+    # remove profiles that never got valid percentiles:
+    foreach my $key (keys %manifest) {
+        foreach my $pname (keys %{ $manifest{$key}{profiles} }) {
+            my $pd = $manifest{$key}{profiles}{$pname};
+            delete $manifest{$key}{profiles}{$pname}
+                unless (ref($pd) eq 'HASH' && exists $pd->{percentiles} && @{ $pd->{percentiles} });
+        }
+    }
+    
+    return \%manifest;
+}
+
+# ==============================================================================
+# SUBROUTINE: run_single_pass_analysis
+# PURPOSE:    Orchestrates the single-pass analysis for a given system cache.
+#             It builds the manifest, assembles and executes the nfit command
+#             with all necessary global flags, and returns the parsed results.
+# ==============================================================================
+sub run_single_pass_analysis {
+    my ($system_cache_dir, $profiles_ref, $args_ref) = @_;
+
+    # 1. Build the manifest using the function already added.
+    _phase("Building transform manifest");
+    my $transform_manifest = build_transform_manifest($profiles_ref, $args_ref->{runq_avg_method});
+
+    # *** ADD THIS COMPLETE DIAGNOSTIC BLOCK TO PROVE THE CORRECTNESS OF THE MANIFEST***
+#    {
+#        warn "\n" . "=" x 70 . "\n";
+#        warn "STEP 1: MANIFEST DEBUG IN nfit-profile.pl (After build_transform_manifest)\n";
+#        warn "=" x 70 . "\n\n";
+#        
+#        # Test profile to trace
+#        my $test_profile = 'B3-95W15';
+#        
+#        # Count PhysC transforms
+#        my @physc_transforms = grep { 
+#            $transform_manifest->{$_}{metric} eq 'PhysC' 
+#        } keys %$transform_manifest;
+#        warn "Total PhysC transforms created: " . scalar(@physc_transforms) . "\n\n";
+#        
+#        # Check which transforms contain our test profile
+#        my @transforms_with_test = grep {
+#            $transform_manifest->{$_}{metric} eq 'PhysC' &&
+#            exists $transform_manifest->{$_}{profiles}{$test_profile}
+#        } keys %$transform_manifest;
+#        
+#        warn "Transforms containing '$test_profile': " . scalar(@transforms_with_test) . "\n";
+#        
+#        if (@transforms_with_test) {
+#            foreach my $key (sort @transforms_with_test) {
+#                my $prof_data = $transform_manifest->{$key}{profiles}{$test_profile};
+#                my $has_pct = defined $prof_data->{percentiles};
+#                my $pct_val = $has_pct ? "[" . join(",", @{$prof_data->{percentiles}}) . "]" : "UNDEFINED";
+#                warn "  - $key\n";
+#                warn "    Percentiles: $pct_val\n";
+#            }
+#        } else {
+#            warn "  ERROR: '$test_profile' not found in ANY PhysC transform!\n";
+#        }
+#        
+#        warn "\n";
+#        
+#        # Show summary of ALL PhysC transforms and their profiles
+#        warn "Complete PhysC Transform Summary:\n";
+#        warn "-" x 70 . "\n";
+#        foreach my $key (sort @physc_transforms) {
+#            my @profiles_in_transform = sort keys %{$transform_manifest->{$key}{profiles}};
+#            warn "Transform: $key\n";
+#            warn "  Profiles (" . scalar(@profiles_in_transform) . "): " . join(", ", @profiles_in_transform) . "\n";
+#            
+#            # Check if percentiles are defined for each
+#            my @with_pct = grep { 
+#                defined $transform_manifest->{$key}{profiles}{$_}{percentiles} 
+#            } @profiles_in_transform;
+#            my @without_pct = grep { 
+#                !defined $transform_manifest->{$key}{profiles}{$_}{percentiles} 
+#            } @profiles_in_transform;
+#            
+#            if (@without_pct) {
+#                warn "  WARNING: Profiles without percentiles: " . join(", ", @without_pct) . "\n";
+#            }
+#        }
+#        
+#        warn "\n" . "=" x 70 . "\n";
+#        warn "END STEP 1 MANIFEST DEBUG\n";
+#        warn "=" x 70 . "\n\n";
+#    }
+#    # *** END DIAGNOSTIC BLOCK ***
+
+    # Check if any profile in the manifest requires growth prediction.
+    my $any_profile_has_growth = 0;
+    foreach my $transform (values %$transform_manifest) {
+        foreach my $profile_directives (values %{ $transform->{profiles} }) {
+            if ($profile_directives->{enable_growth}) {
+                $any_profile_has_growth = 1;
+                last;
+            }
+        }
+        last if $any_profile_has_growth;
+    }
+    
+    # 2. Create a temporary file for the manifest.
+    my ($fh_manifest, $manifest_filename) = tempfile(UNLINK => 1);
+    print $fh_manifest JSON->new->pretty->encode($transform_manifest);
+    close $fh_manifest;
+
+    # --- BEGIN STEP 1 DEBUGGING ---
+#    print STDERR "--- DEBUG: TRANSFORM MANIFEST ---\n";
+#    my $manifest_json_for_debug = JSON->new->pretty->encode($transform_manifest);
+#    print STDERR $manifest_json_for_debug . "\n";
+#    print STDERR "--- MANIFEST DEBUG END. SCRIPT WILL NOW EXIT. ---\n";
+#    exit 0; # Exit early for debugging
+    # --- END STEP 1 DEBUGGING ---
+    
+    # 3. Assemble the complete nfit command with all preserved global flags.
+    my $command = $args_ref->{nfit_path} . " --manifest $manifest_filename";
+    
+    # Add required I/O and pass-through global flags.
+    $command .= " --nmondir \"$system_cache_dir\"";
+    $command .= " " . $args_ref->{rounding_flags} if $args_ref->{rounding_flags};
+    $command .= " --smt $args_ref->{default_smt}" if defined $args_ref->{default_smt};
+    $command .= " --runq-avg-method $args_ref->{runq_avg_method}" if defined $args_ref->{runq_avg_method};
+
+    # Add optional filtering flags.
+    $command .= " --startdate $args_ref->{start_date}" if defined $args_ref->{start_date};
+    $command .= " --vm \"$args_ref->{vm_name}\"" if defined $args_ref->{vm_name};
+    
+    # Add optional filtering flags.
+    $command .= " --startdate $args_ref->{start_date}" if defined $args_ref->{start_date};
+    $command .= " --vm \"$args_ref->{vm_name}\"" if defined $args_ref->{vm_name};
+
+    # --- MODIFIED: Add flags for specific analysis models, auto-enabling decay for growth ---
+    my $decay_mode_set = 0;
+    if ($args_ref->{enable_windowed_decay}) {
+        $command .= " --enable-windowed-decay";
+        $decay_mode_set = 1;
+    }
+    if ($args_ref->{decay_over_states}) {
+        $command .= " --decay-over-states";
+        $decay_mode_set = 1;
+    }
+
+    # If any profile needs growth, a decay model is required. Auto-enable one if not set.
+    if ($any_profile_has_growth && !$decay_mode_set) {
+        $command .= " --enable-windowed-decay";
+        # Optionally print a notice to stderr that a default mode was activated.
+        print STDERR "INFO: Auto-enabling --enable-windowed-decay as it is required for profile-level growth prediction.\n";
+    }
+
+    # Pass the global growth flag if needed, and other flags like clipping detection
+    $command .= " --enable-growth-prediction" if $any_profile_has_growth;
+    $command .= " --analysis-reference-date $args_ref->{analysis_reference_date}" if defined $args_ref->{analysis_reference_date};
+    $command .= " --enable-clipping-detection" if $args_ref->{enable_clipping_detection}; # Pass this through
+   
+    # 4. Execute the nfit engine and capture its output.
+     _phase("Executing nFit Engine.");
+    my $raw_nfit_output = `$command`;
+    my $exit_status = $? >> 8;
+    
+    if ($exit_status != 0) {
+        die "FATAL: nfit single-pass engine failed for system '$system_cache_dir' with exit code $exit_status.\nCMD: $command\nOUTPUT: $raw_nfit_output";
+    }
+
+    # --- BEGIN STEP 2 DEBUGGING ---
+    #print STDERR "--- DEBUG: RAW JSON OUTPUT FROM nfit.pl ---\n";
+    #print STDERR "nfit.pl Exit Status: " . $exit_status . "\n";
+    #print STDERR "Command Executed:\n$command\n\n";
+    #print STDERR "Output Received:\n";
+    #print STDERR $raw_nfit_output . "\n";
+    #print STDERR "--- JSON DEBUG END. SCRIPT WILL NOW EXIT. ---\n";
+    #exit 0; # Exit early for debugging
+    # --- END STEP 2 DEBUGGING ---
+    
+    # 5. Parse and return the final results.
+    return parse_nfit_json_output($raw_nfit_output);
+}
+
+# Helper for hash references (with safe fallback)
+sub _safe_get {
+    my ($href, $key, $fallback) = @_;
+    return (ref($href) eq 'HASH' && exists $href->{$key}) ? $href->{$key} : $fallback;
+}
+
+# ==============================================================================
+# SUBROUTINE: build_assimilation_map
+# PURPOSE:    Acts as an anti-corruption layer by consuming the raw, nested JSON
+#             output from the nfit.pl engine and transforming it into a stable,
+#             predictable, and mostly flat Perl hash structure. This map becomes
+#             the single source of truth for all subsequent consumer logic within
+#             nfit-profile.pl.
+# ARGUMENTS:
+#   1. $parsed_nfit_results_href (hash ref): The raw, decoded Perl hash from nfit.pl.
+#   2. $profiles_aref (array ref): A reference to the global @profiles array.
+#
+# RETURNS:
+#   - A hash reference to the fully populated assimilation map.
+# ==============================================================================
+sub build_assimilation_map {
+    my ($parsed_nfit_results_href, $profiles_aref) = @_;
+
+    my %assimilation_map;
+
+    # Iterate through each VM returned by the nfit engine.
+    foreach my $vm_name (sort keys %{$parsed_nfit_results_href}) {
+        my @states_for_vm = @{ $parsed_nfit_results_href->{$vm_name} };
+        next unless @states_for_vm;
+
+        # The representative state is used to source common metadata and RunQ metrics.
+        my $representative_state = $states_for_vm[-1];
+        my $is_aggregated = (ref($representative_state) eq 'HASH' && ($representative_state->{analysisType} // '') =~ /aggregated/i);
+
+        # Initialise the map entry for this VM with a predictable structure.
+        my $vm_map = $assimilation_map{$vm_name} = {
+            Configuration    => {},
+            CoreResults      => { ProfileValues => {}, PeakValue => undef },
+            Hinting          => {},
+            RunQMetrics      => {},
+            Growth           => { min_adj => 0.0, max_adj => 0.0, adjustment => 0.0, rationale => {} },
+            RawNfitStates    => \@states_for_vm,
+            SeasonalForecast => {},
+            CSVModifiers     => {},
+        };
+
+        # --- Block 1: Populate Configuration ---
+        my $metadata_block = _safe_dig($representative_state, 'metadata') || {};
+        $vm_map->{Configuration} = {
+            smt           => $metadata_block->{smt},
+            entitlement   => $metadata_block->{entitlement},
+            max_cpu       => $metadata_block->{max_cpu},
+            virtual_cpus  => $metadata_block->{virtual_cpus},
+            is_capped     => $metadata_block->{capped},
+            pool_id       => $metadata_block->{pool_id},
+            pool_cpu      => $metadata_block->{pool_cpu},
+            serial_number => $metadata_block->{serial_number},
+            proc_type     => $metadata_block->{proc_type},
+            proc_version  => $metadata_block->{proc_version},
+            proc_clock    => $metadata_block->{proc_clock},
+        };
+
+        # --- Block 2: Populate CoreResults (ProfileValues and PeakValue) ---
+        if ($is_aggregated) {
+            # For aggregated runs, data is already per-profile.
+            # Growth is now calculated per profile inside nfit.pl.
+            my $physc_metrics = _safe_dig($representative_state, 'metrics', 'physc') || {};
+            my @growth_values_for_vm;
+
+            foreach my $profile_name (keys %$physc_metrics) {
+                my $profile_data = $physc_metrics->{$profile_name};
+
+                # The FinalValue from nfit.pl is now growth-inclusive. This becomes the new baseline
+                # for all subsequent RunQ modifier logic in nfit-profile.pl.
+                $vm_map->{CoreResults}{ProfileValues}{$profile_name} = $profile_data->{FinalValue};
+                
+                # Collect the raw 'GrowthAdj' for min/max calculation.
+                # Include zero for profiles where growth wasn't calculated or enabled.
+                my $growth_adj_for_profile = $profile_data->{GrowthAdj} // 0;
+                push @growth_values_for_vm, $growth_adj_for_profile;
+            }
+            
+            # Calculate and store the min/max of all per-profile growth adjustments for the VM.
+            my @non_zero_growth_values = grep { $_ > 0 } @growth_values_for_vm;
+
+            # The max is taken from all values (to correctly show 0 if no growth occurred).
+            $vm_map->{Growth}{max_adj} = @growth_values_for_vm ? max(@growth_values_for_vm) : 0.0;
+            
+            # The min is taken ONLY from the non-zero values, falling back to 0 if none exist.
+            $vm_map->{Growth}{min_adj} = @non_zero_growth_values ? min(@non_zero_growth_values) : 0.0;
+
+
+            # The PeakValue comes from the raw peak tracker, not a specific profile's aggregated value.
+            $vm_map->{CoreResults}{PeakValue} = _safe_dig($representative_state, 'metadata', 'peakPhyscFromLatestState');
+
+       } else {
+            # Logic for per-state runs remains correct.
+            my %profile_sums;
+            my %profile_counts;
+            foreach my $profile (@$profiles_aref) {
+                my ($p_val_num) = $profile->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/;
+                my $p_metric_key = "P" . clean_perc_label($p_val_num // $DEFAULT_PERCENTILE);
+                foreach my $state (@states_for_vm) {
+                    my $metric_val = _safe_dig($state, 'metrics', 'physc', $profile->{name}, $p_metric_key);
+                    if (defined $metric_val && looks_like_number($metric_val)) {
+                        $profile_sums{$profile->{name}} += $metric_val;
+                        $profile_counts{$profile->{name}}++;
+                    }
+                }
+            }
+            foreach my $profile_name (keys %profile_sums) {
+                if ($profile_counts{$profile_name} > 0) {
+                    $vm_map->{CoreResults}{ProfileValues}{$profile_name} = $profile_sums{$profile_name} / $profile_counts{$profile_name};
+                }
+            }
+            my @peak_values;
+            foreach my $state (@states_for_vm) {
+                my $peak_val = _safe_dig($state, 'metrics', 'physc', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'Peak');
+                push @peak_values, $peak_val if (defined $peak_val && looks_like_number($peak_val));
+            }
+            $vm_map->{CoreResults}{PeakValue} = max(@peak_values) if @peak_values;
+        }
+
+        # --- Block 3: Populate RunQMetrics (Comprehensive) ---
+        # This loop iterates through ALL profiles to find and collate every RunQ
+        # metric calculated by the nfit engine into a single, unified block.
+        $vm_map->{RunQMetrics}{SourceProfile} = $MANDATORY_PEAK_PROFILE_FOR_HINT; # P-99W1 remains the default source
+        foreach my $profile (@$profiles_aref) {
+            my $p_name = $profile->{name};
+            my $runq_norm_metrics = _safe_dig($representative_state, 'metrics', 'runq', 'normalized', $p_name) || {};
+            my $runq_abs_metrics  = _safe_dig($representative_state, 'metrics', 'runq', 'absolute', $p_name) || {};
+            foreach my $key (keys %$runq_norm_metrics) {
+                $vm_map->{RunQMetrics}{"NormRunQ_$key"} //= $runq_norm_metrics->{$key};
+            }
+            foreach my $key (keys %$runq_abs_metrics) {
+                $vm_map->{RunQMetrics}{"AbsRunQ_$key"} //= $runq_abs_metrics->{$key};
+            }
+        }
+
+        # Calculate IQRC.
+        my ($p25, $p50, $p75) = ($vm_map->{RunQMetrics}{'NormRunQ_P25'}, $vm_map->{RunQMetrics}{'NormRunQ_P50'}, $vm_map->{RunQMetrics}{'NormRunQ_P75'});
+        if (defined $p50 && $p50 > $FLOAT_EPSILON && defined $p75 && defined $p25) {
+            $vm_map->{RunQMetrics}{IQRC} = ($p75 - $p25) / $p50;
+        }
+
+        # --- Block 4: Populate Growth ---
+        if ($is_aggregated) {
+            $vm_map->{Growth}{adjustment} = _safe_dig($representative_state, 'metrics', 'growth', 'adjustment') // 0.0;
+            $vm_map->{Growth}{rationale}  = _safe_dig($representative_state, 'debug', 'growthRationale') || {};
+        }
+    }
+    return \%assimilation_map;
 }
 
 # --- usage_wrapper ---
