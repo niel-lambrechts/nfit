@@ -1089,7 +1089,7 @@ foreach my $system_serial (@target_systems_to_process)
         # months in the data cache and save the results to the new history file.
         # It does not produce a CSV output.
         # Call the new subroutine to handle the history generation.
-        update_monthly_history($current_cache_path, $system_identifier, $seasonality_config, $min_days_for_history);
+        update_monthly_history($current_cache_path, $system_identifier, $seasonality_config, $min_days_for_history, $adaptive_runq_saturation_thresh);
 
         # After updating the history, we skip the rest of the processing for this system.
         print STDERR "--- History update complete for system: $system_identifier ---\n";
@@ -1172,24 +1172,34 @@ foreach my $system_serial (@target_systems_to_process)
                 my $smt_for_hint = (defined $cfg_for_hint && defined $cfg_for_hint->{smt}) ? $cfg_for_hint->{smt} : $default_smt_arg;
                 my $maxcpu_for_hint = (defined $cfg_for_hint && defined $cfg_for_hint->{maxcpu}) ? $cfg_for_hint->{maxcpu} : 0;
 
-                # We don't have raw nfit state data, so we call the hint generator with what we have.
-                # The pressure part will be less accurate, but Hint/Pattern will work.
-                my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str) =
-                generate_sizing_hint(
-                    'log_fh_ref'  => undef, # No log rationale needed here
-                    'results_ref' => \%results_table,
-                    'vm'          => $vm_name,
-                    'config_ref'  => $cfg_for_hint,
-                    'max_cpu_for_vm_numeric' => $maxcpu_for_hint,
-                    'smt_used_for_vm_numeric' => $smt_for_hint,
-                    'per_profile_runq_metrics_ref' => {}, # No RunQ metrics available in this path
-                    'adaptive_saturation_thresh' => $adaptive_runq_saturation_thresh
+                # Build the VM map structure that generate_sizing_hint expects
+                my %vm_map_for_hint = (
+                    Configuration => {
+                        vm_name     => $vm_name,
+                        max_cpu     => $maxcpu_for_hint,
+                        smt         => $smt_for_hint,
+                        entitlement => $cfg_for_hint->{entitlement} // 0,
+                        %{$cfg_for_hint || {}}  # Include any other config fields
+                    },
+                    CoreResults => {
+                        ProfileValues => $results_table{$vm_name}
+                    },
+                    RunQMetrics => {}  # No RunQ metrics available in this path
                 );
+
+                # Call generate_sizing_hint with correct signature (3 positional args)
+                my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
+                    generate_sizing_hint(
+                        \%vm_map_for_hint,
+                        undef,  # No log file handle needed here
+                        $adaptive_runq_saturation_thresh
+                    );
 
                 $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
                 $hint_pattern_for_csv{$vm_name}   = $hint_pattern_shape;
                 $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
                 $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
+
                 # The final peak is the higher of the baseline and prediction for the P-99W1 profile.
                 my $baseline_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'TrueBaseline'} // 0;
                 my $predicted_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'PredictedPeak'} // 0;
@@ -1274,18 +1284,29 @@ foreach my $system_serial (@target_systems_to_process)
                 }
         }
 
-            my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, undef, undef, undef) =
-                generate_sizing_hint(
-                    'log_fh_ref' => undef, # We don't need the rationale text here, just the CSV values.
-                    'results_ref' => \%results_table,
-                    'vm' => $vm_name,
-                    'config_ref' => $cfg_for_hint,
-                    'max_cpu_for_vm_numeric' => $maxcpu_for_hint,
-                    'smt_used_for_vm_numeric' => $smt_for_hint,
-                    'per_profile_runq_metrics_ref' => \%per_profile_runq_metrics,
-                    'adaptive_saturation_thresh' => $adaptive_runq_saturation_thresh # Pass the adaptive value
+            # Build the VM map structure that generate_sizing_hint expects
+            my %vm_map_for_hint = (
+                Configuration => {
+                    vm_name     => $vm_name,
+                    max_cpu     => $maxcpu_for_hint,
+                    smt         => $smt_for_hint,
+                    entitlement => $ent_for_hint,
+                    %{$cfg_for_hint || {}}  # Include any other config fields
+                },
+                CoreResults => {
+                    ProfileValues => $results_table{$vm_name}
+                },
+                RunQMetrics => $per_profile_runq_metrics{$vm_name} || {}
+            );
 
-                );
+            # Call generate_sizing_hint with correct signature (3 positional args)
+            my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
+            generate_sizing_hint(
+                \%vm_map_for_hint,
+                undef,  # We don't need the rationale text here, just the CSV values
+                $adaptive_runq_saturation_thresh
+            );
+
             $hint_tier_for_csv{$vm_name} = $hint_type_tier;
             $hint_pattern_for_csv{$vm_name} = $hint_pattern_shape;
             $hint_pressure_for_csv{$vm_name} = $hint_pressure_bool;
@@ -6066,16 +6087,21 @@ sub _generate_seasonal_snapshot_for_period {
         my $pid = open3(undef, my $stdout, $stderr_arg, $nfit_cmd);
         while(my $line = <$stdout>) { $nfit_output .= $line; }
         waitpid($pid, 0);
+
         next if $?;
+
         my $parsed = parse_nfit_json_output($nfit_output);
         my $p_metric_key = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
         foreach my $vm_name (keys %$parsed) {
             my $final_state = $parsed->{$vm_name}[-1];
             next unless $final_state;
-            if (defined $final_state->{metrics}{physc}{$p_metric_key}) {
-                $baseline_period_results{$vm_name}{$profile->{name}} = $final_state->{metrics}{physc}{$p_metric_key};
+
+            # Note: The result is now nested under the profile name key.
+            my $metric_val = _safe_dig($final_state, 'metrics', 'physc', $profile->{name}, $p_metric_key);
+            if (defined $metric_val) {
+                $baseline_period_results{$vm_name}{$profile->{name}} = $metric_val;
             }
-        }
+       }
     }
 
 
@@ -6095,11 +6121,14 @@ sub _generate_seasonal_snapshot_for_period {
             my $p_metric_key = "P" . clean_perc_label(($residual_flags =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
             foreach my $vm_name (keys %$parsed) {
                 my $final_state = $parsed->{$vm_name}[-1];
-                if ($final_state && defined $final_state->{metrics}{physc}{$p_metric_key}) {
-                    $sanitized_peak_results{$vm_name} = $final_state->{metrics}{physc}{$p_metric_key};
+                # --- fix: Use _safe_dig to correctly parse the nested structure ---
+                # The profile name used here is the one passed to the nfit command.
+                my $metric_val = _safe_dig($final_state, 'metrics', 'physc', 'ResidualPeakProfile', $p_metric_key);
+                if (defined $metric_val) {
+                    $sanitized_peak_results{$vm_name} = $metric_val;
                 }
             }
-        }
+       }
     }
 
     # --- 3. Analyse Standard Peak Period ---
@@ -6124,24 +6153,26 @@ sub _generate_seasonal_snapshot_for_period {
             next unless $final_state;
 
             my $standard_peak_value;
-            if (defined $final_state->{metrics}{physc}{$p_metric_key}) {
-                $standard_peak_value = $final_state->{metrics}{physc}{$p_metric_key};
+            # Note: The result is now nested under the profile name key.
+            my $metric_val = _safe_dig($final_state, 'metrics', 'physc', $profile->{name}, $p_metric_key);
+            if (defined $metric_val) {
+                $standard_peak_value = $metric_val;
                 $peak_period_results{$vm_name}{$profile->{name}} = $standard_peak_value;
             }
 
-            # --- FIX: Manually construct the complete, correctly structured ClippingInfo block ---
-            my $clipping_metrics = $final_state->{metrics}{clipping};
+            my $clipping_metrics = _safe_dig($final_state, 'metrics', 'physc', $profile->{name}, 'ClippingInfo');
             if ($clipping_metrics && ref($clipping_metrics) eq 'HASH' && exists $clipping_metrics->{isClipped}) {
-                my $unmet_demand = $clipping_metrics->{unmetDemand} // 0;
+                my $unmet_demand_est = _safe_get($clipping_metrics, 'unmetDemandEstimate', 0);
                 # nfit.pl returns a flat structure, but nfit-forecast expects the nested one. We reconstruct it here.
                 $clipping_info_results{$vm_name}{$profile->{name}} = {
                     isClipped               => $clipping_metrics->{isClipped},
-                    clippingConfidence      => $clipping_metrics->{confidence},
-                    capacityLimit           => $final_state->{metadata}{configuration}{maxCpu},
-                    unmetDemandEstimate     => $unmet_demand,
-                    unclippedPeakEstimate   => ($standard_peak_value // 0) + $unmet_demand,
+                    clippingConfidence      => _safe_get($clipping_metrics, 'clippingConfidence', 'unknown'),
+                    capacityLimit           => _safe_dig($final_state, 'metadata', 'max_cpu'),
+                    unmetDemandEstimate     => $unmet_demand_est,
+                    unclippedPeakEstimate   => ($standard_peak_value // 0) + $unmet_demand_est,
                     platformSpecificMarkers => {
-                        aix_runq_saturation => $clipping_metrics->{runqSaturationScore}
+                        # This value is nested inside platformMarkers in the nfit output
+                        aix_runq_saturation => _safe_dig($clipping_metrics, 'platformMarkers', 'aix_runq_saturation') // 0
                     }
                 };
             }
@@ -6173,14 +6204,13 @@ sub _generate_seasonal_snapshot_for_period {
 }
 
 # ==============================================================================
-# SUBROUTINE: update_monthly_history
-# PURPOSE:    Orchestrates a Two-Phase strategy to create and update the
-#             unified monthly history cache (`.nfit.history.json`). This is the
-#             primary data generation process for all predictive models.
+# SUBROUTINE: update_monthly_history (PRODUCTION FIX - Unified In-Memory)
+# PURPOSE:    Orchestrates a robust, multi-phase strategy to create and update
+#             the unified monthly history cache using a single in-memory hash
+#             to prevent data corruption from conflicting file writes.
 # ==============================================================================
 sub update_monthly_history {
-    my ($system_cache_dir, $system_identifier, $seasonality_config, $min_days_for_history) = @_;
-
+    my ($system_cache_dir, $system_identifier, $seasonality_config, $min_days_for_history, $adaptive_runq_saturation_thresh) = @_;
     print STDERR "\n--- Updating Unified Monthly History for system: $system_identifier ---\n";
 
     my $data_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
@@ -6192,97 +6222,146 @@ sub update_monthly_history {
     }
     print STDERR "Data cache spans from " . $cache_start_obj->date . " to " . $cache_end_obj->date . "\n";
 
-    my $existing_history = read_unified_history($system_cache_dir);
+    # --- Step 1: Load existing history ONCE ---
+    my $history_data = read_unified_history($system_cache_dir);
     my @months_to_process;
 
-    # --- Planning Stage: Discover unprocessed or partially processed months ---
+    # --- Step 2: Planning Stage - Discover unprocessed months ---
     print STDERR "Scanning cache for unprocessed or incomplete months...\n";
     my $iterator_month = Time::Piece->new($cache_start_obj->epoch)->truncate(to => 'month');
     while ($iterator_month <= $cache_end_obj) {
         my $month_key = $iterator_month->strftime('%Y-%m');
-
         my $month_start_obj = Time::Piece->new($iterator_month->epoch);
         my $month_end_obj   = Time::Piece->new($month_start_obj->epoch)->add_months(1) - ONE_DAY;
-
         my $effective_start_obj = ($cache_start_obj > $month_start_obj) ? $cache_start_obj : $month_start_obj;
         my $effective_end_obj   = ($cache_end_obj   < $month_end_obj)   ? $cache_end_obj   : $month_end_obj;
+        my $days_in_period = ($effective_start_obj <= $effective_end_obj) ? (int(($effective_end_obj->epoch - $effective_start_obj->epoch) / 86400) + 1) : 0;
 
-        my $days_in_period = ($effective_start_obj <= $effective_end_obj)
-            ? (int(($effective_end_obj->epoch - $effective_start_obj->epoch) / 86400) + 1)
-            : 0;
-
-        if (exists $existing_history->{$month_key}) {
-            my $stored_days = $existing_history->{$month_key}{Metadata}{ProcessedDays} // 0;
+        my $should_process = 0;
+        if (exists $history_data->{$month_key}) {
+            my $stored_days = $history_data->{$month_key}{Metadata}{ProcessedDays} // 0;
             if ($days_in_period > $stored_days) {
                  print STDERR "  - INFO: Found more complete data for $month_key ($days_in_period > $stored_days days). Queueing for reprocessing.\n";
-            } else {
-                $iterator_month = $iterator_month->add_months(1);
-                next; # Skip, history is up-to-date for this month
+                 $should_process = 1;
             }
+        } elsif ($days_in_period >= $min_days_for_history) {
+            $should_process = 1;
         }
 
-        if ($days_in_period >= $min_days_for_history) {
-            push @months_to_process, {
-                key     => $month_key,
-                start_obj => $effective_start_obj,
-                end_obj   => $effective_end_obj,
-                days    => $days_in_period
-            };
+        if ($should_process) {
+            push @months_to_process, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period };
         }
         $iterator_month = $iterator_month->add_months(1);
     }
     print STDERR "Scan complete.\n";
 
+    # --- Step 3: Execution Stage ---
     if (@months_to_process) {
         print STDERR "Identified " . scalar(@months_to_process) . " month(s) to process: " . join(", ", map { $_->{key} } @months_to_process) . "\n";
 
-        # --- Execution Stage: Two-Phase Priming ---
         my @all_historical_peaks = find_all_historical_periods($seasonality_config, $data_cache_file);
 
-        # Phase 1: Generate the foundational monthly workload analysis.
-        _generate_monthly_workload_history($system_cache_dir, \@months_to_process, $existing_history);
-
-        # Phase 2: Generate the model-specific seasonal snapshots.
-        _generate_seasonal_snapshot_history($system_cache_dir, \@months_to_process, $seasonality_config, \@all_historical_peaks);
-
+        # This single function call modifies the in-memory $history_data hash.
+        _generate_monthly_and_seasonal_history(
+            $system_cache_dir, \@months_to_process, $seasonality_config,
+            \@all_historical_peaks, $history_data, $adaptive_runq_saturation_thresh
+        );
     } else {
         print STDERR "No new months to process. History is up to date.\n";
     }
 
-    # --- Phase 3: Final pass to enrich history with pre-calculated growth data from L2 cache ---
-    _enrich_history_with_growth_rationale($system_cache_dir);
+    # --- Phase 3: Enrich with Growth Rationale from L2 Cache ---
+    my $was_enriched = _enrich_history_with_growth_rationale($system_cache_dir, $history_data);
+
+    # --- Step 4: Final Write ---
+    # The history file is written only ONCE at the end if any changes were made.
+    if (@months_to_process || $was_enriched) {
+        print "\n--- Finalising History Cache ---\n";
+        print "  - Writing all updates to .nfit.history.json...\n";
+        _write_full_history($system_cache_dir, $history_data);
+        print "  - Write complete.\n";
+    }
 }
 
 # ==============================================================================
-# SUBROUTINE: _generate_monthly_workload_history (Phase 1)
-# PURPOSE:    Processes a list of months to generate and save the generic,
-#             model-agnostic `MonthlyWorkloadAnalysis` for each one.
+# SUBROUTINE: _generate_monthly_and_seasonal_history (PRODUCTION FIX - COMBINED)
+# PURPOSE:    Processes months to generate both generic analysis and snapshots,
+#             modifying a single in-memory hash to prevent data corruption.
 # ==============================================================================
-sub _generate_monthly_workload_history {
-    my ($system_cache_dir, $months_to_process_aref, $existing_history_href) = @_;
+sub _generate_monthly_and_seasonal_history {
+    my ($system_cache_dir, $months_to_process_aref, $seasonality_config, $all_historical_peaks_aref, $history_data_href, $adaptive_runq_saturation_thresh) = @_;
 
-    print "\n--- Phase 1: Generating Monthly Workload Analysis ---\n";
     foreach my $month_job (@$months_to_process_aref) {
         my $month_key = $month_job->{key};
         my $start_str = $month_job->{start_obj}->strftime('%Y-%m-%d');
         my $end_str   = $month_job->{end_obj}->strftime('%Y-%m-%d');
 
-        print "  - Processing Month: $month_key (Period: $start_str to $end_str)\n";
+        # --- PHASE 1: Generate MonthlyWorkloadAnalysis ---
+        print "\n--- Processing Month: $month_key (Period: $start_str to $end_str) ---\n";
+        my $workload_analysis = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str, $adaptive_runq_saturation_thresh);
 
-        my $workload_analysis = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str);
-
-        # Prepare the full entry for this month, preserving existing snapshots if reprocessing
-        my %month_history_entry = %{$existing_history_href->{$month_key} || {}};
-        $month_history_entry{MonthlyWorkloadAnalysis} = $workload_analysis;
-        $month_history_entry{Metadata} = {
-            ProcessedStartDate => $start_str,
-            ProcessedEndDate   => $end_str,
-            ProcessedDays      => $month_job->{days},
-            LastUpdated        => localtime()->datetime(),
+        # --- Populate the in-memory hash ---
+        $history_data_href->{$month_key} = {
+            MonthlyWorkloadAnalysis => $workload_analysis,
+            Metadata => {
+                ProcessedStartDate => $start_str,
+                ProcessedEndDate   => $end_str,
+                ProcessedDays      => $month_job->{days},
+                LastUpdated        => localtime()->datetime(),
+            }
         };
 
-        print "    - Writing analysis for $month_key to history cache...\n";
-        write_unified_history($system_cache_dir, $month_key, \%month_history_entry);
+        # --- PHASE 2: Generate SeasonalEventSnapshots for this month ---
+        print "  - Discovering seasonal events for month: $month_key...\n";
+        my %seasonal_snapshots_for_month;
+        my %calculation_cache;
+
+        foreach my $event_name (sort keys %$seasonality_config) {
+            next if $event_name eq 'Global';
+            my $event_config = $seasonality_config->{$event_name};
+            next if (($event_config->{model} // '') eq 'recency_decay');
+
+            my ($peak_start, $peak_end) = determine_event_period($event_config, $month_job->{start_obj});
+
+            if ($peak_start && $peak_end && $peak_start <= $month_job->{end_obj} && $peak_end >= $month_job->{start_obj}) {
+                print "    - Found active event: '$event_name'\n";
+                my $baseline_days = $event_config->{baseline_period_days} // 16;
+                my $potential_baseline_start = $peak_start - ($baseline_days * ONE_DAY);
+                my $latest_preceding_peak_end;
+                foreach my $p (@{$all_historical_peaks_aref}) {
+                    if ($p->[1] < $peak_start && (!defined $latest_preceding_peak_end || $p->[1] > $latest_preceding_peak_end)) {
+                        $latest_preceding_peak_end = $p->[1];
+                    }
+                }
+                my $baseline_start_obj = $potential_baseline_start;
+                if (defined $latest_preceding_peak_end && $potential_baseline_start <= $latest_preceding_peak_end) {
+                    $baseline_start_obj = $latest_preceding_peak_end + ONE_DAY;
+                    my $available_days = ($peak_start->epoch - $baseline_start_obj->epoch) / ONE_DAY;
+                    print "      - WARNING: Baseline for this event truncated to " . int($available_days) . " day(s) to avoid overlap.\n";
+                }
+                my $baseline_end_obj = $peak_start - ONE_SECOND;
+                my $model_type_for_key = $event_config->{model} // 'unknown';
+                my $cache_key = $peak_start->date . ":" . $peak_end->date . ":" . $baseline_start_obj->date . ":" . $model_type_for_key;
+
+                my $snapshot_results;
+                if (exists $calculation_cache{$cache_key}) {
+                    print "      - INFO: Reusing cached calculations for identical time period and model type.\n";
+                    $snapshot_results = $calculation_cache{$cache_key};
+                } else {
+                    $snapshot_results = _generate_seasonal_snapshot_for_period($system_cache_dir, $event_config, $event_name, $peak_start, $peak_end, $baseline_start_obj, $baseline_end_obj);
+                    $calculation_cache{$cache_key} = $snapshot_results;
+                }
+                if ($snapshot_results) {
+                    $snapshot_results->{eventName} = $event_name;
+                    $seasonal_snapshots_for_month{$event_name} = $snapshot_results;
+                }
+            }
+        }
+
+        if (scalar keys %seasonal_snapshots_for_month > 0) {
+            $history_data_href->{$month_key}{SeasonalEventSnapshots} = \%seasonal_snapshots_for_month;
+            $history_data_href->{$month_key}{Metadata}{LastUpdated} = localtime()->datetime();
+        }
     }
 }
 
@@ -6363,9 +6442,24 @@ sub _generate_seasonal_snapshot_history {
         if (scalar keys %seasonal_snapshots_for_month > 0) {
             print "    - Writing snapshots for $month_key to history cache...\n";
             my $history_data = read_unified_history($system_cache_dir);
+
+            # CRITICAL FIX: Ensure we don't lose MonthlyWorkloadAnalysis
+            $history_data->{$month_key} //= {};
+
+            # Preserve MonthlyWorkloadAnalysis and Metadata if they exist
+            my $existing_workload = $history_data->{$month_key}{MonthlyWorkloadAnalysis};
+            my $existing_metadata = $history_data->{$month_key}{Metadata};
+
             $history_data->{$month_key}{SeasonalEventSnapshots} = \%seasonal_snapshots_for_month;
+
+            # Update metadata timestamp but preserve other fields
+            if ($existing_metadata) {
+                $history_data->{$month_key}{Metadata} = $existing_metadata;
+            }
             $history_data->{$month_key}{Metadata}{LastUpdated} = localtime()->datetime();
+
             _write_full_history($system_cache_dir, $history_data);
+
         }
     }
 }
@@ -6401,27 +6495,25 @@ sub _write_full_history {
 
 # ==============================================================================
 # SUBROUTINE: _enrich_history_with_growth_rationale
-# PURPOSE:    Performs a final enrichment pass on the unified history file.
+# PURPOSE:    Performs a final enrichment pass on the unified history data (which is passed as an argument).
 #             It robustly scans the nfit L2 Results Cache for growth-enabled
 #             model runs, reads the embedded 'profileLabel' from the data, and
 #             injects the 'growthRationale' block into the correct location,
 #             keyed by the profile name.
 # ==============================================================================
 sub _enrich_history_with_growth_rationale {
-    my ($system_cache_dir) = @_;
+    my ($system_cache_dir, $history_data) = @_;
 
     print "\n--- Phase 3: Enriching History with Growth Rationale from L2 Cache ---\n";
 
-    my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
     my $l2_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.results');
 
-    unless (-f $history_file && -f $l2_cache_file) {
-        print "  - INFO: History file or L2 results cache not found. Skipping enrichment.\n";
+    unless (-f $l2_cache_file) {
+        print "  - INFO: L2 results cache not found. Skipping enrichment.\n";
         return;
     }
 
     # --- Step 1: Load both the history and the L2 cache ---
-    my $history_data = read_unified_history($system_cache_dir);
     my $l2_cache_data = eval {
         local $/;
         open my $fh, '<:encoding(utf8)', $l2_cache_file or die "Could not open L2 cache '$l2_cache_file': $!";
@@ -6456,10 +6548,20 @@ sub _enrich_history_with_growth_rationale {
 
         foreach my $result (@$l2_results_aref) {
             my $vm = $result->{vmName};
-            my $profile_name = $result->{profileLabel};
+            next unless $vm;
 
-            if ($vm && $profile_name && $result->{debug} && $result->{debug}{growthRationale}) {
-                $growth_data_found{$vm}{$profile_name}{$model_type} = $result->{debug}{growthRationale};
+            # Instead of a top-level profileLabel, iterate the metrics.physc
+            # block to find all profiles and their nested rationales.
+            my $physc_metrics = _safe_dig($result, 'metrics', 'physc');
+            next unless (ref($physc_metrics) eq 'HASH');
+
+            foreach my $profile_name (keys %$physc_metrics) {
+                my $profile_data = $physc_metrics->{$profile_name};
+
+                # Check for the rationale in the new, correct location
+                if (ref($profile_data) eq 'HASH' && $profile_data->{growthRationale}) {
+                    $growth_data_found{$vm}{$profile_name}{$model_type} = $profile_data->{growthRationale};
+                }
             }
         }
     }
@@ -6570,7 +6672,7 @@ sub _generate_l2_cache_key_for_nfit {
 #             'MonthlyWorkloadAnalysis' data structure.
 # ==============================================================================
 sub _generate_monthly_workload_analysis {
-    my ($system_cache_dir, $start_date_str, $end_date_str) = @_;
+    my ($system_cache_dir, $start_date_str, $end_date_str, $adaptive_runq_saturation_thresh) = @_;
 
     my %analysis_results;
     my %collated_results_table; # Temporary table for hint generation
@@ -6590,7 +6692,18 @@ sub _generate_monthly_workload_analysis {
 
         # For a generic monthly analysis, we create a clean, unfiltered command.
         # We pass the date range and the profile's specific flags.
-        my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_date_str, $end_date_str, $system_cache_dir, 1, 1, undef, $profile->{name});
+
+       # This call must NOT enable growth. Growth rationale is harvested later from the L2 cache.
+        my $nfit_cmd = _build_nfit_baseline_command(
+            $profile->{flags},
+            $start_date_str,
+            $end_date_str,
+            $system_cache_dir,
+            1, # enable_clipping_detection
+            1, # is_generic_baseline
+            undef, # Under no circumstances must growth prediction be enabled for the monthly analysis.
+            $profile->{name}
+        );
 
         my $nfit_output = '';
         my $stderr_arg = ">&=" . fileno(STDERR);
@@ -6607,24 +6720,25 @@ sub _generate_monthly_workload_analysis {
             my @states = @{$parsed->{$vm_name}};
             $per_profile_raw_results_for_month{$vm_name}{$profile_name} = \@states;
 
-            my @vals = map { $_->{metrics}{physc}{$p_key} } @states;
-            my @valid_vals = grep { defined $_ && looks_like_number($_) } @vals;
+            # When profile label is used, nfit nests results under: profile_name -> percentile_key
+            my $p_key = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
 
-            if (@valid_vals) {
-                my $agg_val = sum0(@valid_vals) / scalar(@valid_vals);
-                $collated_results_table{$vm_name}{$profile_name} = $agg_val;
-            }
+            # CORRECTED: Access via profile_name -> percentile_key
+            my @vals = map { $_->{metrics}{physc}{$profile_name}{$p_key} } @states;
+            my @valid_vals = grep { defined $_ && looks_like_number($_) } @vals;
 
             if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
                 my $most_recent_state = $states[-1];
-                 if ($most_recent_state) {
+                if ($most_recent_state) {
                     $per_profile_runq_metrics_for_month{$vm_name}{$profile_name} = $most_recent_state;
-                    my @peak_vals = map { $_->{metrics}{physc}{'Peak'} } @states;
+
+                    # CORRECTED: Peak is also under profile_name
+                    my @peak_vals = map { $_->{metrics}{physc}{$profile_name}{'Peak'} } @states;
                     my @valid_peaks = grep { defined $_ && looks_like_number($_) } @peak_vals;
                     if (@valid_peaks) {
                         $collated_results_table{$vm_name}{$PEAK_PROFILE_NAME} = max(@valid_peaks);
                     }
-                 }
+                }
             }
         }
     }
@@ -6635,38 +6749,96 @@ sub _generate_monthly_workload_analysis {
         my $p99w1_results_aref = $per_profile_raw_results_for_month{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
         my $last_state_data = (ref($p99w1_results_aref) eq 'ARRAY' && @$p99w1_results_aref) ? $p99w1_results_aref->[-1] : {};
 
-        my $config_block = $last_state_data->{metadata}{configuration} || {};
-        my $max_cpu_from_state = $config_block->{maxCpu} // 0;
-        my $smt_from_state = $config_block->{smt} // $default_smt_arg;
+        my $config_block = _safe_dig($last_state_data, 'metadata', 'configuration') // {};
+        my $max_cpu_from_state = _safe_dig($last_state_data, 'metadata', 'configuration', 'maxCpu') // 0;
+        my $smt_from_state     = _safe_dig($last_state_data, 'metadata', 'configuration', 'smt') // $default_smt_arg;
 
-        # Use the existing hint generator on the collated results.
-        my ($hint, $pattern, $pressure, $pressure_detail) = generate_sizing_hint(
-            log_fh_ref  => undef,
-            results_ref => \%collated_results_table,
-            vm          => $vm_name,
-            config_ref  => $vm_config_ref,
-            max_cpu_for_vm_numeric => $max_cpu_from_state,
-            smt_used_for_vm_numeric => $smt_from_state,
-            per_profile_runq_metrics_ref => \%per_profile_runq_metrics_for_month
+        # Build the VM map structure that generate_sizing_hint expects
+        my %vm_map = (
+            Configuration => {
+                vm_name     => $vm_name,
+                max_cpu     => $max_cpu_from_state,
+                smt         => $smt_from_state,
+                entitlement => $vm_config_ref->{entitlement} // 0,
+                %{$vm_config_ref || {}}
+            },
+            CoreResults => {
+                ProfileValues => $collated_results_table{$vm_name}
+            },
+            # FIX: RunQ is also nested under profile name when using profile labels
+            RunQMetrics => _safe_dig($last_state_data, 'metrics', 'runq') || {}
         );
 
-        my $runq_metrics_block = $per_profile_runq_metrics_for_month{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT}{metrics}{runq} || {};
+        # Call generate_sizing_hint with correct signature
+        my ($hint, $pattern, $pressure, $pressure_detail, $rationale_text, $has_abs_pressure, $has_norm_pressure) =
+            generate_sizing_hint(\%vm_map, undef, $adaptive_runq_saturation_thresh);
 
-        # Extract the GrowthRationale block from the P-99W1 profile run
+
+        # FIX: Access RunQ metrics through the profile name, just like physc
+        my $runq_metrics_block = $last_state_data->{metrics}{runq} || {};
         my $growth_rationale_block = $last_state_data->{debug}{growthRationale} || {};
 
+        # Build ClippingInfo - iterate through ALL profiles for this VM
+        my $clipping_info_for_vm = {};
+
+        # Loop through all profiles that were actually run for this VM
+        foreach my $profile_name (keys %{$per_profile_raw_results_for_month{$vm_name}}) {
+            my $profile_results_aref = $per_profile_raw_results_for_month{$vm_name}{$profile_name};
+
+            # Get the last state's data for THIS profile
+            next unless (ref($profile_results_aref) eq 'ARRAY' && @$profile_results_aref);
+            my $profile_last_state = $profile_results_aref->[-1];
+
+            # Extract clipping data from THIS profile's output
+            my $clipping_metrics = _safe_dig($profile_last_state, 'metrics', 'physc', $profile_name, 'ClippingInfo');
+
+            # Try alternate path if first doesn't work
+            $clipping_metrics //= _safe_dig($profile_last_state, 'metrics', 'physc', $profile_name, 'Clipping');
+
+            # If we found clipping data, reconstruct the expected structure
+            if ($clipping_metrics && ref($clipping_metrics) eq 'HASH' && exists $clipping_metrics->{isClipped}) {
+                my $unmet_demand_est = $clipping_metrics->{unmetDemandEstimate} // 0;
+
+                # Get the base value for this profile from the profile's own output
+                my $profile_obj = (grep { $_->{name} eq $profile_name } @profiles)[0];
+                my $p_key = "P" . clean_perc_label(($profile_obj->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
+                my $base_peak_for_unclip = _safe_dig($profile_last_state, 'metrics', 'physc', $profile_name, $p_key);
+
+                # Get MaxCPU from VM config (should be same across all profiles for this VM)
+                #   Important: ClippingInfo assembly uses 'maxcpu', not 'max_cpu'.
+                my $maxcpu = $vm_config_ref->{maxcpu} // 0;
+
+                $clipping_info_for_vm->{$profile_name} = {
+                    isClipped               => $clipping_metrics->{isClipped},
+                    clippingConfidence      => $clipping_metrics->{clippingConfidence} // 'unknown',
+                    capacityLimit           => $maxcpu,
+                    # The key from nfit is unmetDemandEstimate, which is already in $unmet_demand_est
+                    unmetDemandEstimate     => $unmet_demand_est,
+                    unclippedPeakEstimate   => ((defined $base_peak_for_unclip && looks_like_number($base_peak_for_unclip)) ? $base_peak_for_unclip : 0) + $unmet_demand_est,
+                    platformSpecificMarkers => {
+                        # This value is nested inside platformMarkers in the nfit output
+                        aix_runq_saturation => _safe_dig($clipping_metrics, 'platformMarkers', 'aix_runq_saturation') // 0
+                    }
+                };
+            }
+        }
+
         # Assemble the final data structure for this VM.
+        # Note: this data structure should NOT include any growthRationale (or any other predictive metadata), since monthly workload analysis is Pure Historical.
         $analysis_results{$vm_name} = {
             Hint           => $hint,
             Pattern        => $pattern,
             Pressure       => $pressure,
             PressureDetail => $pressure_detail,
             RunQMetrics    => {
-                AbsRunQ_P90  => $runq_metrics_block->{absolute}{'P90'},
-                NormRunQ_P90 => $runq_metrics_block->{normalized}{'P90'}
+                # FIX: The assimilation map flattens the keys. Use the correct keys and
+                # source P50 which is essential for downstream logic.
+                AbsRunQ_P90  => _safe_dig($runq_metrics_block, 'absolute', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'P90'),
+                NormRunQ_P50 => _safe_dig($runq_metrics_block, 'normalized', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'P50'),
+                NormRunQ_P90 => _safe_dig($runq_metrics_block, 'normalized', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'P90')
             },
             ProfileValues  => $collated_results_table{$vm_name},
-            growthRationale => $growth_rationale_block
+            ClippingInfo   => $clipping_info_for_vm
         };
     }
 
@@ -7231,17 +7403,17 @@ sub build_assimilation_map {
         # --- Block 1: Populate Configuration ---
         my $metadata_block = _safe_dig($representative_state, 'metadata') || {};
         $vm_map->{Configuration} = {
-            smt           => $metadata_block->{smt},
-            entitlement   => $metadata_block->{entitlement},
-            max_cpu       => $metadata_block->{max_cpu},
-            virtual_cpus  => $metadata_block->{virtual_cpus},
-            is_capped     => $metadata_block->{capped},
-            pool_id       => $metadata_block->{pool_id},
-            pool_cpu      => $metadata_block->{pool_cpu},
-            serial_number => $metadata_block->{serial_number},
-            proc_type     => $metadata_block->{proc_type},
-            proc_version  => $metadata_block->{proc_version},
-            proc_clock    => $metadata_block->{proc_clock},
+            smt           => _safe_dig($representative_state, 'metadata', 'smt'),
+            entitlement   => _safe_dig($representative_state, 'metadata', 'entitlement'),
+            max_cpu       => _safe_dig($representative_state, 'metadata', 'max_cpu'),
+            virtual_cpus  => _safe_dig($representative_state, 'metadata', 'virtual_cpus'),
+            is_capped     => _safe_dig($representative_state, 'metadata', 'capped'),
+            pool_id       => _safe_dig($representative_state, 'metadata', 'pool_id'),
+            pool_cpu      => _safe_dig($representative_state, 'metadata', 'pool_cpu'),
+            serial_number => _safe_dig($representative_state, 'metadata', 'serial_number'),
+            proc_type     => _safe_dig($representative_state, 'metadata', 'proc_type'),
+            proc_version  => _safe_dig($representative_state, 'metadata', 'proc_version'),
+            proc_clock    => _safe_dig($representative_state, 'metadata', 'proc_clock'),
         };
 
         # --- Block 2: Populate CoreResults (ProfileValues and PeakValue) ---
@@ -7254,9 +7426,9 @@ sub build_assimilation_map {
             foreach my $profile_name (keys %$physc_metrics) {
                 my $profile_data = $physc_metrics->{$profile_name};
 
-                # The FinalValue from nfit.pl is now growth-inclusive. This becomes the new baseline
-                # for all subsequent RunQ modifier logic in nfit-profile.pl.
-                $vm_map->{CoreResults}{ProfileValues}{$profile_name} = $profile_data->{FinalValue};
+                # The FinalValue from nfit.pl is now growth-inclusive. This becomes the new baseline for all subsequent RunQ modifier logic in nfit-profile
+                # If FinalValue is missing or undef, it intelligently falls back to BaseValue (which represents the metric before growth adjustment)
+                $vm_map->{CoreResults}{ProfileValues}{$profile_name} = _safe_dig($profile_data, 'FinalValue') // _safe_dig($profile_data, 'BaseValue') // 0;
 
                 # Collect the raw 'GrowthAdj' for min/max calculation.
                 # Include zero for profiles where growth wasn't calculated or enabled.

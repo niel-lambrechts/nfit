@@ -122,7 +122,7 @@ my $decay_half_life_days_val = $DEFAULT_DECAY_HALF_LIFE_DAYS;
 my $analysis_reference_date_str;
 my $decay_over_states_flag = 0;
 
-# Growth Prediction options (NEW)
+# Growth Prediction options
 my $enable_growth_prediction = 0;
 my $growth_projection_days = $DEFAULT_GROWTH_PROJECTION_DAYS;
 my $max_growth_inflation_percent = $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
@@ -133,12 +133,38 @@ my $reset_cache = 0;
 my $enable_clipping_detection = 0;
 my $profile_label;
 
+# Legacy flag support ---
+my $percentile = $DEFAULT_PERCENTILE;
+my $window_minutes = $DEFAULT_WINDOW_MINUTES;
+my $avg_method     = $DEFAULT_AVG_METHOD;
+my $decay_level    = $DEFAULT_DECAY_LEVEL;
+my $runq_decay_level_arg;
+my $filter_above_perc_arg;
+my $peak_flag = 0;
+my $online_flag = 0;
+my $batch_flag  = 0;
+my $no_weekends_flag = 0;
+
 my ($help, $show_version, $verbose, $quiet, $show_progress_flag) = (0, 0, 0, 0, 0);
 
 GetOptions(
     'manifest=s'          => \$manifest_file,
     'physc-data|pc=s'     => \$physc_csv_file,
     'runq-data|rq=s'      => \$runq_csv_file,
+    # Legacy flag support ---
+    'percentile|p=f'          => \$percentile,
+    'window|w=i'              => \$window_minutes,
+    'avg-method=s'            => \$avg_method,
+    'decay=s'                 => \$decay_level,
+    'runq-decay=s'            => \$runq_decay_level_arg,
+    'filter-above-perc=f'     => \$filter_above_perc_arg,
+    'peak|k'                  => \$peak_flag,
+    'online'                  => \$online_flag,
+    'batch'                   => \$batch_flag,
+    'no-weekends'             => \$no_weekends_flag,
+    'runq-norm-perc=s'    => \$runq_norm_perc_str,
+    'runq-abs-perc=s'     => \$runq_abs_perc_str,
+    # --- End of legacy flags ---
     'config=s'            => \$vm_config_file,
     'nmondir=s'           => \$nmon_dir,
     'mgsys|system|serial|host=s' => \$mgsys_filter,
@@ -165,6 +191,7 @@ GetOptions(
     'reset-cache'               => \$reset_cache,
     # Clipping
     'enable-clipping-detection' => \$enable_clipping_detection,
+    'profile-label=s'           => \$profile_label,
     # General Options
     'help|h'              => \$help,
     'verbose|v'           => \$verbose,
@@ -381,9 +408,103 @@ if ($rounding_method ne 'none')
 print STDERR "\nnfit version $VERSION\n";
 print STDERR "-------------------------\n";
 
-# In nfit.pl, after all GetOptions and validation logic
+# --- Legacy Invocation Handler ---
+# If this script is called without a manifest, it means it's being used by an
+# older workflow (like --update-history). We build a manifest in-memory from
+# the legacy command-line flags to remain compatible with the new engine.
+unless ($manifest_file) {
+    # A profile label is required in this mode to identify the output.
+    die "Error: --profile-label is required when nfit is run without a manifest.\n" unless defined $profile_label;
 
-# --- Main Execution Path ---
+    # --- 1. Set Defaults and Determine Parameters ---
+    $percentile            //= $DEFAULT_PERCENTILE;
+    $window_minutes        //= $DEFAULT_WINDOW_MINUTES;
+    $avg_method            //= $DEFAULT_AVG_METHOD;
+    $decay_level           //= $DEFAULT_DECAY_LEVEL;
+    $filter_above_perc_arg //= 0;
+
+    # Determine time filter from flags, mirroring old behavior.
+    my $time_filter = 'none';
+    $time_filter = 'online' if $online_flag;
+    $time_filter = 'batch'  if $batch_flag;
+
+    # Determine the effective RunQ decay level, falling back to the main decay level.
+    # This exactly replicates the logic in nfit.old.pl.
+    my $runq_decay_to_use = $runq_decay_level_arg // $decay_level;
+
+    # --- 2. Build the Multi-Transform Manifest Data Structure ---
+    my %temp_manifest;
+
+    # --- 2a. Build the PhysC Transform ---
+    my $physc_key = join(":", 'PhysC', $avg_method, $window_minutes, $decay_level, $filter_above_perc_arg, $time_filter, ($no_weekends_flag ? 1 : 0));
+    $temp_manifest{$physc_key} = {
+        metric      => 'PhysC',
+        method      => $avg_method,
+        window      => $window_minutes,
+        decay       => $decay_level,
+        filter_perc => $filter_above_perc_arg,
+        time_filter => $time_filter,
+        no_weekends => ($no_weekends_flag ? 1 : 0),
+        profiles    => {
+            $profile_label => {
+                percentiles     => [$percentile],
+                calculate_peak  => ($peak_flag ? 1 : 0),
+                enable_growth   => ($enable_growth_prediction ? 1 : 0),
+                enable_clipping => ($enable_clipping_detection ? 1 : 0)
+            }
+        }
+    };
+
+    # --- 2b. Build the NormRunQ Transform ---
+    my @norm_percs_to_calc = parse_percentile_list($runq_norm_perc_str, "runq-norm-perc");
+    if (@norm_percs_to_calc) {
+        my $norm_runq_key = join(":", 'NormRunQ', $runq_avg_method_str, $window_minutes, $runq_decay_to_use, 0, $time_filter, ($no_weekends_flag ? 1 : 0));
+        $temp_manifest{$norm_runq_key} = {
+            metric      => 'NormRunQ',
+            method      => $runq_avg_method_str,
+            window      => $window_minutes,
+            decay       => $runq_decay_to_use,
+            filter_perc => 0,
+            time_filter => $time_filter,
+            no_weekends => ($no_weekends_flag ? 1 : 0),
+            profiles    => {
+                $profile_label => {
+                    percentiles => \@norm_percs_to_calc
+                }
+            }
+        };
+    }
+
+    # --- 2c. Build the AbsRunQ Transform ---
+    my @abs_percs_to_calc = parse_percentile_list($runq_abs_perc_str, "runq-abs-perc");
+    if (@abs_percs_to_calc) {
+        my $abs_runq_key = join(":", 'AbsRunQ', $runq_avg_method_str, $window_minutes, $runq_decay_to_use, 0, $time_filter, ($no_weekends_flag ? 1 : 0));
+        $temp_manifest{$abs_runq_key} = {
+            metric      => 'AbsRunQ',
+            method      => $runq_avg_method_str,
+            window      => $window_minutes,
+            decay       => $runq_decay_to_use,
+            filter_perc => 0,
+            time_filter => $time_filter,
+            no_weekends => ($no_weekends_flag ? 1 : 0),
+            profiles    => {
+                $profile_label => {
+                    percentiles => \@abs_percs_to_calc
+                }
+            }
+        };
+    }
+
+    # --- 3. Write Manifest to a Temporary File ---
+    my ($fh, $filename) = tempfile(UNLINK => 1);
+    print $fh JSON->new->encode(\%temp_manifest);
+    close $fh;
+
+    # Set the $manifest_file variable, so the main engine uses our generated file.
+    $manifest_file = $filename;
+}
+# --- End: Legacy Handler ---
+
 if ($manifest_file) {
     # New single-pass engine entry point.
     # We now construct a single hash reference containing all necessary global
@@ -1947,7 +2068,9 @@ sub run_single_pass_from_manifest {
                 $aggregated_results->{$vm_name},
                 $growth_results_by_profile, # Pass the new growth data
                 $states_by_vm,
-                $args_ref
+                $args_ref,
+                $final_metrics,
+                $manifest
             );
             push @output_objects, $output_obj if defined $output_obj;
         }
@@ -2277,6 +2400,7 @@ sub assemble_output {
             my $output_obj = {
                 vmName       => $vm_name,
                 analysisType => 'aggregated',
+                profileLabel => $profile_label,
                 state        => { stateCount => scalar(@{$states_by_vm_href->{$vm_name}}) },
                 metadata     => $last_state_obj->{metadata},
                 metrics      => { physc => {}, runq => { normalized => {}, absolute => {} }, growth => {} },
@@ -2401,7 +2525,8 @@ sub assemble_output {
                         }
 
                         if ($metric_type eq 'PhysC' && exists $metric_results->{Clipping}) {
-                            $output_obj->{metrics}{physc}{$profile_name}{Clipping} = $metric_results->{Clipping};
+                            # The history priming logic expects this exact block name.
+                            $output_obj->{metrics}{physc}{$profile_name}{ClippingInfo} = $metric_results->{Clipping};
                         }
                     }
                 }
@@ -2489,8 +2614,7 @@ sub _safe_dig {
 #             This is the dedicated output path for decay/growth models.
 # ==============================================================================
 sub assemble_aggregated_output {
-    my ($vm_name, $aggregated_metrics_href, $growth_results_href,
-        $states_by_vm_href, $args_ref) = @_;
+    my ($vm_name, $aggregated_metrics_href, $growth_results_href, $states_by_vm_href, $args_ref, $final_metrics_href, $manifest_href) = @_;
 
     my $rounding_method = 'none';
     my $round_increment;
@@ -2505,6 +2629,9 @@ sub assemble_aggregated_output {
     my $last_state_obj = $states_by_vm_href->{$vm_name}[-1];
     return undef unless $last_state_obj;
 
+    # Correctly get the zero-based index of the last state.
+    my $last_state_id = @{$states_by_vm_href->{$vm_name}} - 1;
+
     my $output_obj = {
         vmName       => $vm_name,
         analysisType => ($args_ref->{decay_over_states}) ? 'hybrid_decay_aggregated' : 'windowed_decay_aggregated',
@@ -2513,6 +2640,11 @@ sub assemble_aggregated_output {
         metrics      => { physc => {}, runq => { normalized => {}, absolute => {} } },
         debug        => {}
     };
+
+    # Populate profileLabel (when it is defined)
+    if (defined $profile_label && $profile_label ne '') {
+        $output_obj->{profileLabel} = $profile_label;
+    }
 
     # Populate PhysC metrics for each profile
     foreach my $profile_name (keys %{$aggregated_metrics_href}) {
@@ -2541,10 +2673,28 @@ sub assemble_aggregated_output {
             FinalValue      => apply_rounding($final_val_with_growth, $round_increment, $rounding_method),
         };
 
-        # Place the rationale in the top-level debug hash for this profile if it exists
+        # --- GrowthRationale block ---
+        # Inject the rationale directly into this profile's block,
+        # not the top-level debug hash.
         if (scalar keys %$growth_rationale > 0) {
-            $output_obj->{debug}{growthRationale} = $growth_rationale;
+            $output_obj->{metrics}{physc}{$profile_name}{growthRationale} = $growth_rationale;
         }
+
+        # --- ClippingInfo block ---
+        # Find the transform key for this profile to locate its clipping data
+        # in the results from the final state, ensuring it's saved to the L2 cache.
+        my ($transform_key) = grep {
+            $manifest_href->{$_}{metric} eq 'PhysC' &&
+            exists $manifest_href->{$_}{profiles}{$profile_name}
+        } keys %$manifest_href;
+
+        if ($transform_key) {
+            my $clipping_data = _safe_dig($final_metrics_href, $vm_name, $last_state_id, $transform_key, 'Clipping');
+            if ($clipping_data && ref($clipping_data) eq 'HASH') {
+                $output_obj->{metrics}{physc}{$profile_name}{ClippingInfo} = $clipping_data;
+            }
+        }
+
     }
 
     # Populate Peak and RunQ metrics
