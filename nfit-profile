@@ -6055,152 +6055,388 @@ sub write_unified_history {
 }
 
 # ==============================================================================
-# SUBROUTINE: _generate_seasonal_snapshot_for_period
-# PURPOSE:    Helper function to perform the analysis for a single seasonal
-#             event's peak and baseline periods.
+# SUBROUTINE: _build_residual_manifest
+# PURPOSE:    Creates a manifest for the residual peak profile. The residual
+#             profile is a special, ultra-sensitive profile (typically P99.9
+#             with W1 window) used to detect volatile workload spikes.
+#
+# ARGUMENTS:
+#   1. $event_config (hash ref): The event configuration containing the
+#      residual_peak_profile flags string.
+#
+# RETURNS:
+#   - Hash reference to the manifest, or undef if no residual profile defined.
 # ==============================================================================
-sub _generate_seasonal_snapshot_for_period {
-    my ($system_cache_dir, $event_config, $event_name, $peak_start, $peak_end, $baseline_start, $baseline_end) = @_;
+sub _build_residual_manifest {
+    my ($event_config) = @_;
 
-    my %peak_period_results;
-    my %baseline_period_results;
-    my %clipping_info_results;
-    my %residual_results;
-    my %sanitized_peak_results;
+    # Check if a residual profile is configured
+    my $residual_flags_str = $event_config->{residual_peak_profile};
+    return undef unless (defined $residual_flags_str && $residual_flags_str ne '');
 
+    # Create a temporary profile object from the flags string
+    # This follows the same structure as profiles loaded from config
+    my $temp_profile = {
+        name  => 'ResidualPeakProfile',  # Fixed name for identification
+        flags => $residual_flags_str
+    };
+
+    # Use the existing manifest builder with a single-element profile array
+    my $manifest = build_transform_manifest([$temp_profile], $nfit_runq_avg_method_str);
+
+    return $manifest;
+}
+
+# ==============================================================================
+# SUBROUTINE: _execute_history_pass
+# PURPOSE:    Executes a single nfit pass for history priming using a sanitised
+#             manifest. This wrapper reduces code duplication and ensures
+#             consistent command construction across all history passes.
+#
+# ARGUMENTS:
+#   1. $system_cache_dir (string): Path to the system cache directory
+#   2. $manifest_href (hash ref): The sanitised historical manifest
+#   3. $start_date (Time::Piece): Start date for analysis
+#   4. $end_date (Time::Piece): End date for analysis
+#   5. $enable_clipping (boolean): Whether to enable clipping detection
+#   6. $pass_name (string): Descriptive name for logging (e.g., "Baseline")
+#
+# RETURNS:
+#   - Hash reference to parsed results (VM -> [states]), or empty hash on failure
+# ==============================================================================
+sub _execute_history_pass {
+    my ($system_cache_dir, $manifest_href, $start_date, $end_date, $enable_clipping, $pass_name) = @_;
+
+    # Validate inputs
+    unless (ref($manifest_href) eq 'HASH') {
+        warn "WARNING: _execute_history_pass received invalid manifest for $pass_name pass\n";
+        return {};
+    }
+
+    # Write manifest to temporary file
+    use File::Temp qw(tempfile);
+    my ($fh_manifest, $manifest_filename) = tempfile(
+        "nfit_seasonal_${pass_name}_XXXXXX",
+        SUFFIX => '.json',
+        UNLINK => 1,
+        TMPDIR => 1
+    );
+
+    print $fh_manifest JSON->new->pretty->canonical->encode($manifest_href);
+    close $fh_manifest;
+
+    # Build the nfit command
+    my $nfit_cmd = "$nfit_script_path --manifest $manifest_filename "
+                 . "--nmondir \"$system_cache_dir\" "
+                 . "--startdate " . $start_date->ymd . " "
+                 . "--enddate " . $end_date->ymd . " "
+                 . "--smt $default_smt_arg "
+                 . "--runq-avg-method $nfit_runq_avg_method_str";
+
+    # Add clipping detection if requested (typically only for peak analysis)
+    $nfit_cmd .= " --enable-clipping-detection" if $enable_clipping;
+
+    # Execute the command
+    print STDERR "      - Executing $pass_name analysis: " . $start_date->ymd . " to " . $end_date->ymd . "\n";
+
+    my $nfit_output = '';
+    my $stderr_arg = ">&=" . fileno(STDERR);
+    my $pid = open3(undef, my $stdout_fh, $stderr_arg, $nfit_cmd);
+
+    while (my $line = <$stdout_fh>) {
+        $nfit_output .= $line;
+    }
+
+    waitpid($pid, 0);
+    my $exit_code = $? >> 8;
+
+    # Check for failure
+    if ($exit_code != 0) {
+        warn "WARNING: nfit failed during $pass_name pass (exit code: $exit_code)\n";
+        warn "Command: $nfit_cmd\n";
+        return {};
+    }
+
+    # Parse and return results
+    my $parsed_results = parse_nfit_json_output($nfit_output);
+
+    return $parsed_results;
+}
+
+# ==============================================================================
+# SUBROUTINE: _assemble_seasonal_snapshot
+# PURPOSE:    Assembles the final SeasonalEventSnapshot structure from the
+#             results of three nfit passes (baseline, peak, residual). This
+#             function contains the battle-tested logic for extracting values,
+#             calculating residuals, and building ClippingInfo blocks.
+#
+# ARGUMENTS:
+#   1. $peak_results_href (hash ref): Parsed peak period results
+#   2. $baseline_results_href (hash ref): Parsed baseline period results
+#   3. $residual_results_href (hash ref): Parsed residual peak results (may be empty)
+#   4. $event_config (hash ref): Event configuration
+#   5. $event_name (string): Event name for metadata
+#   6. $peak_end (Time::Piece): Peak end date for metadata
+#   7. $profiles_aref (array ref): Reference to the profiles array
+#
+# RETURNS:
+#   - Hash reference to the complete snapshot structure, or undef on failure
+# ==============================================================================
+sub _assemble_seasonal_snapshot {
+    my ($peak_results_href, $baseline_results_href, $residual_results_href,
+        $event_config, $event_name, $peak_end, $profiles_aref) = @_;
+
+    # Validate that profiles array was passed correctly
+    unless (ref($profiles_aref) eq 'ARRAY' && @$profiles_aref) {
+        die "FATAL: _assemble_seasonal_snapshot requires a valid profiles array reference\n";
+    }
+
+    # Determine the correct key names based on model type
     my $model_type = $event_config->{model} // '';
     my ($peak_key, $baseline_key) = ('HistoricPeak', 'HistoricBaseline');
     if ($model_type eq 'predictive_peak' or $model_type eq 'adaptive_peak_forecasting') {
         ($peak_key, $baseline_key) = ('PeakValue', 'BaselineValue');
     }
 
-    # --- 1. Analyse Baseline Period ---
-    print STDERR "      - Analysing Baseline Period: " . $baseline_start->date . " to " . $baseline_end->date . "\n";
-    my $profile_count = scalar(@profiles);
-    my $profile_num = 0;
-    foreach my $profile (@profiles) {
-        $profile_num++;
-        print STDERR "    - Baselining profile $profile_num/$profile_count: $profile->{name}\n";
-        my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $baseline_start->date, $baseline_end->date, $system_cache_dir, 0, 0, undef, $profile->{name});
-        my $nfit_output = '';
-        my $stderr_arg = ">&=" . fileno(STDERR);
-        my $pid = open3(undef, my $stdout, $stderr_arg, $nfit_cmd);
-        while(my $line = <$stdout>) { $nfit_output .= $line; }
-        waitpid($pid, 0);
+    # Initialise result structures
+    my %peak_period_results;
+    my %baseline_period_results;
+    my %clipping_info_results;
+    my %residual_results_final;
 
-        next if $?;
+    # ======================================================================
+    # STEP 1: Extract baseline values for all VMs and profiles
+    # ======================================================================
+    # CRITICAL FIX: When nfit runs without decay (historical mode), it may
+    # return multiple states per VM. Profiles with time filters (e.g. -online)
+    # may appear in earlier states, whilst general profiles appear in later
+    # states. We must search through ALL states to find each profile's value.
+    # ======================================================================
+    foreach my $vm_name (keys %$baseline_results_href) {
+        my $states_aref = $baseline_results_href->{$vm_name};
+        next unless ref($states_aref) eq 'ARRAY' && @$states_aref;
 
-        my $parsed = parse_nfit_json_output($nfit_output);
-        my $p_metric_key = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
-        foreach my $vm_name (keys %$parsed) {
-            my $final_state = $parsed->{$vm_name}[-1];
-            next unless $final_state;
+        # Extract values for each profile
+        foreach my $profile (@$profiles_aref) {
+            my $profile_name = $profile->{name};
+            my $p_key = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
 
-            # Note: The result is now nested under the profile name key.
-            my $metric_val = _safe_dig($final_state, 'metrics', 'physc', $profile->{name}, $p_metric_key);
-            if (defined $metric_val) {
-                $baseline_period_results{$vm_name}{$profile->{name}} = $metric_val;
+            # Search through all states (newest to oldest) to find this profile's value
+            # We search backwards because the most recent state is usually most complete
+            my $metric_val = undef;
+            for (my $i = $#{$states_aref}; $i >= 0; $i--) {
+                my $state = $states_aref->[$i];
+                $metric_val = _safe_dig($state, 'metrics', 'physc', $profile_name, $p_key);
+                last if defined $metric_val;  # Found it, stop searching
             }
-       }
+
+            if (defined $metric_val) {
+                $baseline_period_results{$vm_name}{$profile_name} = $metric_val;
+            }
+        }
     }
 
+    # ======================================================================
+    # STEP 2: Extract sanitised peak values for residual calculation
+    # ======================================================================
+    my %sanitised_peak_values;  # Used for residual calculation
 
-    # --- 2. Get Sanitised Peak for Residual Calculation (if configured) ---
-    if (defined $event_config->{residual_peak_profile} && $event_config->{residual_peak_profile} ne '') {
-        print STDERR "      - Calculating Residual Peak for period: " . $peak_start->date . " to " . $peak_end->date . "\n";
-        my $residual_flags = $event_config->{residual_peak_profile};
-        my $nfit_cmd = _build_nfit_baseline_command($residual_flags, $peak_start->date, $peak_end->date, $system_cache_dir, 0, 0, undef, "ResidualPeakProfile");
-        my $nfit_output = '';
-        my $stderr_arg = ">&=" . fileno(STDERR);
-        my $pid = open3(undef, my $stdout, $stderr_arg, $nfit_cmd);
-        while(my $line = <$stdout>) { $nfit_output .= $line; }
-        waitpid($pid, 0);
+    if (defined $event_config->{residual_peak_profile} &&
+        $event_config->{residual_peak_profile} ne '' &&
+        ref($residual_results_href) eq 'HASH' &&
+        scalar keys %$residual_results_href) {
 
-        if ($? == 0) {
-            my $parsed = parse_nfit_json_output($nfit_output);
-            my $p_metric_key = "P" . clean_perc_label(($residual_flags =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
-            foreach my $vm_name (keys %$parsed) {
-                my $final_state = $parsed->{$vm_name}[-1];
-                # --- fix: Use _safe_dig to correctly parse the nested structure ---
-                # The profile name used here is the one passed to the nfit command.
-                my $metric_val = _safe_dig($final_state, 'metrics', 'physc', 'ResidualPeakProfile', $p_metric_key);
-                if (defined $metric_val) {
-                    $sanitized_peak_results{$vm_name} = $metric_val;
+        foreach my $vm_name (keys %$residual_results_href) {
+            my $states_aref = $residual_results_href->{$vm_name};
+            next unless ref($states_aref) eq 'ARRAY' && @$states_aref;
+
+            # Extract the residual profile's percentile
+            my $residual_flags = $event_config->{residual_peak_profile};
+            my $p_key = "P" . clean_perc_label(($residual_flags =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
+
+            # Search through all states (newest to oldest) to find the residual value
+            my $metric_val = undef;
+            for (my $i = $#{$states_aref}; $i >= 0; $i--) {
+                my $state = $states_aref->[$i];
+                $metric_val = _safe_dig($state, 'metrics', 'physc', 'ResidualPeakProfile', $p_key);
+                last if defined $metric_val;  # Found it, stop searching
+            }
+
+            if (defined $metric_val) {
+                $sanitised_peak_values{$vm_name} = $metric_val;
+            }
+        }
+    }
+
+    # ======================================================================
+    # STEP 3: Extract peak values and clipping info for all profiles
+    # ======================================================================
+    # Same multi-state search logic as baseline extraction above.
+    # ======================================================================
+    foreach my $vm_name (keys %$peak_results_href) {
+        my $states_aref = $peak_results_href->{$vm_name};
+        next unless ref($states_aref) eq 'ARRAY' && @$states_aref;
+
+        # Extract values for each profile
+        foreach my $profile (@$profiles_aref) {
+            my $profile_name = $profile->{name};
+            my $p_key = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
+
+            # Search through all states (newest to oldest) to find this profile's value
+            my $standard_peak_value = undef;
+            my $clipping_metrics = undef;
+            my $source_state = undef;
+
+            for (my $i = $#{$states_aref}; $i >= 0; $i--) {
+                my $state = $states_aref->[$i];
+                my $val = _safe_dig($state, 'metrics', 'physc', $profile_name, $p_key);
+                if (defined $val) {
+                    $standard_peak_value = $val;
+                    $source_state = $state;
+                    last;  # Found it, stop searching
                 }
             }
-       }
-    }
 
-    # --- 3. Analyse Standard Peak Period ---
-    print STDERR "      - Analysing Standard Peak Period: " . $peak_start->date . " to " . $peak_end->date . "\n";
-    $profile_num = 0;
-    foreach my $profile (@profiles) {
-        $profile_num++;
-        print STDERR "    - Analysing standard peak $profile_num/$profile_count: $profile->{name}\n";
-        my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $peak_start->date, $peak_end->date, $system_cache_dir, 1, 0, undef, $profile->{name});
-        my $nfit_output = '';
-        my $stderr_arg = ">&=" . fileno(STDERR);
-        my $pid = open3(undef, my $stdout, $stderr_arg, $nfit_cmd);
-        while(my $line = <$stdout>) { $nfit_output .= $line; }
-        waitpid($pid, 0);
-        next if $?;
-
-        my $parsed = parse_nfit_json_output($nfit_output);
-        my $p_metric_key = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
-
-        foreach my $vm_name (keys %$parsed) {
-            my $final_state = $parsed->{$vm_name}[-1];
-            next unless $final_state;
-
-            my $standard_peak_value;
-            # Note: The result is now nested under the profile name key.
-            my $metric_val = _safe_dig($final_state, 'metrics', 'physc', $profile->{name}, $p_metric_key);
-            if (defined $metric_val) {
-                $standard_peak_value = $metric_val;
-                $peak_period_results{$vm_name}{$profile->{name}} = $standard_peak_value;
+            if (defined $standard_peak_value) {
+                $peak_period_results{$vm_name}{$profile_name} = $standard_peak_value;
             }
 
-            my $clipping_metrics = _safe_dig($final_state, 'metrics', 'physc', $profile->{name}, 'ClippingInfo');
+            # Extract clipping information from the same state where we found the value
+            if (defined $source_state) {
+                $clipping_metrics = _safe_dig($source_state, 'metrics', 'physc', $profile_name, 'ClippingInfo');
+            }
+
             if ($clipping_metrics && ref($clipping_metrics) eq 'HASH' && exists $clipping_metrics->{isClipped}) {
-                my $unmet_demand_est = _safe_get($clipping_metrics, 'unmetDemandEstimate', 0);
-                # nfit.pl returns a flat structure, but nfit-forecast expects the nested one. We reconstruct it here.
-                $clipping_info_results{$vm_name}{$profile->{name}} = {
+                my $unmet_demand_est = $clipping_metrics->{unmetDemandEstimate} // 0;
+                my $max_cpu = _safe_dig($source_state, 'metadata', 'max_cpu') // 0;
+
+                # Assemble ClippingInfo with the exact structure expected by consumers
+                $clipping_info_results{$vm_name}{$profile_name} = {
                     isClipped               => $clipping_metrics->{isClipped},
-                    clippingConfidence      => _safe_get($clipping_metrics, 'clippingConfidence', 'unknown'),
-                    capacityLimit           => _safe_dig($final_state, 'metadata', 'max_cpu'),
+                    clippingConfidence      => $clipping_metrics->{clippingConfidence} // 'unknown',
+                    capacityLimit           => $max_cpu,
                     unmetDemandEstimate     => $unmet_demand_est,
                     unclippedPeakEstimate   => ($standard_peak_value // 0) + $unmet_demand_est,
                     platformSpecificMarkers => {
-                        # This value is nested inside platformMarkers in the nfit output
                         aix_runq_saturation => _safe_dig($clipping_metrics, 'platformMarkers', 'aix_runq_saturation') // 0
                     }
                 };
             }
 
-            if (defined $standard_peak_value && exists $sanitized_peak_results{$vm_name}) {
-                my $residual = $sanitized_peak_results{$vm_name} - $standard_peak_value;
-                $residual_results{$vm_name}{$profile->{name}} = ($residual > 0) ? $residual : 0;
+            # Calculate peak residual if we have sanitised peak data
+            if (defined $standard_peak_value && exists $sanitised_peak_values{$vm_name}) {
+                my $residual = $sanitised_peak_values{$vm_name} - $standard_peak_value;
+                $residual_results_final{$vm_name}{$profile_name} = ($residual > 0) ? $residual : 0;
             }
         }
     }
 
-    # --- 4. Final Validation and Return ---
+    # ======================================================================
+    # STEP 4: Validate and return
+    # ======================================================================
     unless (scalar keys %peak_period_results && scalar keys %baseline_period_results) {
         warn "      - WARNING: Could not generate valid peak/baseline data for event '$event_name'. Skipping snapshot.\n";
         return undef;
     }
 
+    # Assemble the final snapshot structure
     return {
         eventName     => $event_name,
-        periodEndDate => $peak_end->date,
+        periodEndDate => $peak_end->ymd,
         generatedOn   => localtime()->datetime(),
         results       => {
             $peak_key      => \%peak_period_results,
             $baseline_key  => \%baseline_period_results,
             'ClippingInfo' => \%clipping_info_results,
-            'PeakResidual' => \%residual_results
+            'PeakResidual' => \%residual_results_final
         }
     };
+}
+
+# ==============================================================================
+# SUBROUTINE: _generate_seasonal_snapshot_for_period
+# PURPOSE:    Performs single-pass analysis for a seasonal event's peak and
+#             baseline periods using the manifest-driven Single Pass Engine
+#             architecture. This function executes nfit three times (baseline,
+#             peak, residual) instead of 3 * N times (where N = number of profiles).
+#
+#             This refactored version achieves the same I/O reduction as the
+#             monthly analysis (typically 16x for a 16-profile configuration).
+# ==============================================================================
+sub _generate_seasonal_snapshot_for_period {
+    my ($system_cache_dir, $event_config, $event_name, $peak_start, $peak_end, $baseline_start, $baseline_end) = @_;
+
+    print STDERR "      - Using Single Pass Engine for seasonal event: $event_name\n";
+
+    # ======================================================================
+    # STEP 1: Build and sanitise the main manifest (all profiles)
+    # ======================================================================
+    my $tactical_manifest = build_transform_manifest(\@profiles, $nfit_runq_avg_method_str);
+    my $main_historical_manifest = _sanitise_manifest_for_history($tactical_manifest);
+
+    # ======================================================================
+    # STEP 2: Build and sanitise the residual manifest (if configured)
+    # ======================================================================
+    my $residual_historical_manifest = undef;
+
+    if (defined $event_config->{residual_peak_profile} && $event_config->{residual_peak_profile} ne '') {
+        my $residual_tactical_manifest = _build_residual_manifest($event_config);
+        if (defined $residual_tactical_manifest) {
+            $residual_historical_manifest = _sanitise_manifest_for_history($residual_tactical_manifest);
+        }
+    }
+
+    # ======================================================================
+    # STEP 3: Execute three nfit passes
+    # ======================================================================
+
+    # Pass 1: Baseline period (no clipping detection needed)
+    my $baseline_results = _execute_history_pass(
+        $system_cache_dir,
+        $main_historical_manifest,
+        $baseline_start,
+        $baseline_end,
+        0,  # enable_clipping = false
+        "Baseline"
+    );
+
+    # Pass 2: Standard peak period (with clipping detection)
+    my $peak_results = _execute_history_pass(
+        $system_cache_dir,
+        $main_historical_manifest,
+        $peak_start,
+        $peak_end,
+        1,  # enable_clipping = true
+        "Peak"
+    );
+
+    # Pass 3: Residual peak period (only if configured)
+    my $residual_results = {};
+    if (defined $residual_historical_manifest) {
+        $residual_results = _execute_history_pass(
+            $system_cache_dir,
+            $residual_historical_manifest,
+            $peak_start,
+            $peak_end,
+            0,  # enable_clipping = false
+            "Residual"
+        );
+    }
+
+    # ======================================================================
+    # STEP 4: Assemble the final snapshot structure
+    # ======================================================================
+    my $snapshot_result = _assemble_seasonal_snapshot(
+        $peak_results,
+        $baseline_results,
+        $residual_results,
+        $event_config,
+        $event_name,
+        $peak_end,
+        \@profiles  # Pass profiles array explicitly to ensure correct scoping
+    );
+
+    return $snapshot_result;
 }
 
 # ==============================================================================
@@ -6465,13 +6701,146 @@ sub _generate_seasonal_snapshot_history {
 }
 
 # ==============================================================================
+# SUBROUTINE: _validate_history_structure
+# PURPOSE:    Performs structural validation on the history data structure before
+#             writing to disk. This safety check prevents corruption by detecting
+#             missing or empty blocks that would break downstream consumers.
+#
+# ARGUMENTS:
+#   1. $history_href (hash ref): The complete history data structure
+#
+# RETURNS:
+#   - 1 on success (structure is valid)
+#   - Dies with detailed error message on validation failure
+#
+# VALIDATION CHECKS:
+#   1. Required blocks exist (MonthlyWorkloadAnalysis, Metadata)
+#   2. Blocks are not empty
+#   3. Required fields are present in nested structures
+#   4. Basic data type validation (hashes where expected, etc.)
+# ==============================================================================
+sub _validate_history_structure {
+    my ($history_href) = @_;
+
+    # Validate input type
+    unless (ref($history_href) eq 'HASH') {
+        die "FATAL: History structure validation failed - not a hash reference\n";
+    }
+
+    # Check that we have at least one month of data
+    my @months = keys %$history_href;
+    unless (@months) {
+        die "FATAL: History structure validation failed - no monthly data present\n";
+    }
+
+    # Validate each month's structure
+    foreach my $month_key (sort @months) {
+        my $month_data = $history_href->{$month_key};
+
+        # Check that month data is a hash
+        unless (ref($month_data) eq 'HASH') {
+            die "FATAL: History structure validation failed for $month_key - month data is not a hash\n";
+        }
+
+        # Check for required top-level blocks
+        unless (exists $month_data->{MonthlyWorkloadAnalysis}) {
+            die "FATAL: History structure validation failed for $month_key - missing MonthlyWorkloadAnalysis block\n";
+        }
+
+        unless (exists $month_data->{Metadata}) {
+            die "FATAL: History structure validation failed for $month_key - missing Metadata block\n";
+        }
+
+        # Validate MonthlyWorkloadAnalysis is not empty
+        my $workload_analysis = $month_data->{MonthlyWorkloadAnalysis};
+        unless (ref($workload_analysis) eq 'HASH') {
+            die "FATAL: History structure validation failed for $month_key - MonthlyWorkloadAnalysis is not a hash\n";
+        }
+
+        unless (scalar keys %$workload_analysis) {
+            die "FATAL: History structure validation failed for $month_key - MonthlyWorkloadAnalysis is empty\n";
+        }
+
+        # Validate that each VM in MonthlyWorkloadAnalysis has required fields
+        foreach my $vm_name (keys %$workload_analysis) {
+            my $vm_data = $workload_analysis->{$vm_name};
+
+            unless (ref($vm_data) eq 'HASH') {
+                die "FATAL: History structure validation failed for $month_key VM $vm_name - VM data is not a hash\n";
+            }
+
+            # Check for required fields
+            my @required_fields = qw(ProfileValues Hint Pattern Pressure);
+            foreach my $field (@required_fields) {
+                unless (exists $vm_data->{$field}) {
+                    die "FATAL: History structure validation failed for $month_key VM $vm_name - missing required field: $field\n";
+                }
+            }
+
+            # Validate ProfileValues is a non-empty hash
+            unless (ref($vm_data->{ProfileValues}) eq 'HASH' && scalar keys %{$vm_data->{ProfileValues}}) {
+                die "FATAL: History structure validation failed for $month_key VM $vm_name - ProfileValues is empty or invalid\n";
+            }
+        }
+
+        # Validate Metadata structure
+        my $metadata = $month_data->{Metadata};
+        unless (ref($metadata) eq 'HASH') {
+            die "FATAL: History structure validation failed for $month_key - Metadata is not a hash\n";
+        }
+
+        # Check for essential metadata fields
+        unless (exists $metadata->{ProcessedDays}) {
+            die "FATAL: History structure validation failed for $month_key - Metadata missing ProcessedDays\n";
+        }
+
+        # Optional: Validate SeasonalEventSnapshots structure if present
+        if (exists $month_data->{SeasonalEventSnapshots}) {
+            my $seasonal = $month_data->{SeasonalEventSnapshots};
+            unless (ref($seasonal) eq 'HASH') {
+                die "FATAL: History structure validation failed for $month_key - SeasonalEventSnapshots is not a hash\n";
+            }
+
+            # Validate each event's structure
+            foreach my $event_name (keys %$seasonal) {
+                my $event_data = $seasonal->{$event_name};
+
+                unless (ref($event_data) eq 'HASH' && exists $event_data->{results}) {
+                    die "FATAL: History structure validation failed for $month_key event $event_name - missing or invalid results block\n";
+                }
+            }
+        }
+    }
+
+    # All validation checks passed
+    return 1;
+}
+
+# ==============================================================================
 # SUBROUTINE: _write_full_history
 # PURPOSE:    A simple wrapper for writing the entire history data structure.
 #             This is a simplified version of write_unified_history for clarity.
+#             Now includes structural validation before writing to prevent corruption.
 # ==============================================================================
 sub _write_full_history {
     my ($system_cache_dir, $history_data_href) = @_;
 
+    # ======================================================================
+    # CRITICAL SAFETY CHECK: Validate structure before writing
+    # ======================================================================
+    # This validation prevents corrupted or incomplete data from being
+    # persisted to disk. It's better to fail fast with a clear error
+    # than to write broken data that silently breaks downstream consumers.
+    # ======================================================================
+    eval {
+        _validate_history_structure($history_data_href);
+    };
+    if ($@) {
+        die "FATAL: Aborting history write due to validation failure:\n$@\n"
+            . "This prevents corruption of the history cache.\n";
+    }
+
+    # Proceed with validated data
     my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
     my $lock_file    = File::Spec->catfile($system_cache_dir, '.nfit.history.lock');
 
@@ -6666,94 +7035,75 @@ sub _generate_l2_cache_key_for_nfit {
 }
 
 # ==============================================================================
-# SUBROUTINE: _generate_monthly_workload_analysis
-# PURPOSE:    A helper function that performs a full analysis for a given
-#             time period (typically one month) and returns the comprehensive
-#             'MonthlyWorkloadAnalysis' data structure.
+# SUBROUTINE: _assemble_monthly_analysis
+# PURPOSE:    Assembles the MonthlyWorkloadAnalysis data structure from parsed
+#             nfit JSON output. This function contains the battle-tested logic
+#             for extracting profile values, calculating sizing hints, building
+#             RunQ metrics, and assembling ClippingInfo blocks.
+#
+# ARGUMENTS:
+#   1. $parsed_results_href (hash ref): Parsed JSON from nfit (VM -> [states])
+#   2. $adaptive_runq_saturation_thresh (float): Adaptive saturation threshold
+#
+# RETURNS:
+#   - Hash reference containing the complete MonthlyWorkloadAnalysis structure
+#     keyed by VM name.
+#
+# EXTRACTED FROM:
+#   This function was extracted from _generate_monthly_workload_analysis to
+#   enable code reuse and preserve all recent bug fixes to ClippingInfo
+#   assembly and RunQ metrics extraction.
 # ==============================================================================
-sub _generate_monthly_workload_analysis {
-    my ($system_cache_dir, $start_date_str, $end_date_str, $adaptive_runq_saturation_thresh) = @_;
+sub _assemble_monthly_analysis {
+    my ($parsed_results_href, $adaptive_runq_saturation_thresh) = @_;
+
+    # Validate inputs
+    unless (ref($parsed_results_href) eq 'HASH') {
+        die "FATAL: _assemble_monthly_analysis requires parsed results hash reference";
+    }
 
     my %analysis_results;
-    my %collated_results_table; # Temporary table for hint generation
-    my %per_profile_runq_metrics_for_month;
-    my %per_profile_raw_results_for_month;
+    my %collated_results_table;  # Temporary table for hint generation
 
-    # --- Step 1: Run nfit for all defined profiles ---
-    my $profile_count = scalar(@profiles);
-    my $profile_num = 0;
+    # ======================================================================
+    # STEP 1: Build collated results table for Peak profile
+    # ======================================================================
+    # We need to extract Peak values from the mandatory peak profile
+    # (P-99W1) to support the sizing hint generation logic.
+    # ======================================================================
+    foreach my $vm_name (keys %$parsed_results_href) {
+        my $states_aref = $parsed_results_href->{$vm_name};
+        next unless ref($states_aref) eq 'ARRAY' && @$states_aref;
 
-    foreach my $profile (@profiles) {
-        $profile_num++;
-        my $profile_name = $profile->{name};
+        # Extract Peak values from the P-99W1 profile across all states
+        my @peak_vals = map {
+            _safe_dig($_, 'metrics', 'physc', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'Peak')
+        } @$states_aref;
 
-        # --- NEW: Added progress indicator ---
-        print STDERR "    - Analysing profile $profile_num/$profile_count: $profile_name\n";
+        my @valid_peaks = grep { defined $_ && looks_like_number($_) } @peak_vals;
 
-        # For a generic monthly analysis, we create a clean, unfiltered command.
-        # We pass the date range and the profile's specific flags.
-
-       # This call must NOT enable growth. Growth rationale is harvested later from the L2 cache.
-        my $nfit_cmd = _build_nfit_baseline_command(
-            $profile->{flags},
-            $start_date_str,
-            $end_date_str,
-            $system_cache_dir,
-            1, # enable_clipping_detection
-            1, # is_generic_baseline
-            undef, # Under no circumstances must growth prediction be enabled for the monthly analysis.
-            $profile->{name}
-        );
-
-        my $nfit_output = '';
-        my $stderr_arg = ">&=" . fileno(STDERR);
-        my $pid_nfit = open3(undef, my $stdout_nfit, $stderr_arg, "$nfit_cmd --show-progress");
-        while(my $line = <$stdout_nfit>) { $nfit_output .= $line; }
-        waitpid($pid_nfit, 0);
-        next if $?;
-
-        my $parsed = parse_nfit_json_output($nfit_output);
-        my $p_key  = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
-
-        # Collate the results for each VM.
-        foreach my $vm_name (keys %$parsed) {
-            my @states = @{$parsed->{$vm_name}};
-            $per_profile_raw_results_for_month{$vm_name}{$profile_name} = \@states;
-
-            # When profile label is used, nfit nests results under: profile_name -> percentile_key
-            my $p_key = "P" . clean_perc_label(($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
-
-            # CORRECTED: Access via profile_name -> percentile_key
-            my @vals = map { $_->{metrics}{physc}{$profile_name}{$p_key} } @states;
-            my @valid_vals = grep { defined $_ && looks_like_number($_) } @vals;
-
-            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
-                my $most_recent_state = $states[-1];
-                if ($most_recent_state) {
-                    $per_profile_runq_metrics_for_month{$vm_name}{$profile_name} = $most_recent_state;
-
-                    # CORRECTED: Peak is also under profile_name
-                    my @peak_vals = map { $_->{metrics}{physc}{$profile_name}{'Peak'} } @states;
-                    my @valid_peaks = grep { defined $_ && looks_like_number($_) } @peak_vals;
-                    if (@valid_peaks) {
-                        $collated_results_table{$vm_name}{$PEAK_PROFILE_NAME} = max(@valid_peaks);
-                    }
-                }
-            }
+        if (@valid_peaks) {
+            $collated_results_table{$vm_name}{$PEAK_PROFILE_NAME} = max(@valid_peaks);
         }
     }
 
-    # --- Step 2: Generate hints and extract key metrics for each VM ---
+    # ======================================================================
+    # STEP 2: Generate hints and extract metrics for each VM
+    # ======================================================================
     foreach my $vm_name (keys %collated_results_table) {
         my $vm_config_ref = $vm_config_data{$vm_name};
-        my $p99w1_results_aref = $per_profile_raw_results_for_month{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
-        my $last_state_data = (ref($p99w1_results_aref) eq 'ARRAY' && @$p99w1_results_aref) ? $p99w1_results_aref->[-1] : {};
+        my $states_aref = $parsed_results_href->{$vm_name};
+        my $last_state_data = $states_aref->[-1] // {};
 
-        my $config_block = _safe_dig($last_state_data, 'metadata', 'configuration') // {};
+        # ------------------------------------------------------------------
+        # Extract configuration metadata from the last state
+        # ------------------------------------------------------------------
         my $max_cpu_from_state = _safe_dig($last_state_data, 'metadata', 'configuration', 'maxCpu') // 0;
         my $smt_from_state     = _safe_dig($last_state_data, 'metadata', 'configuration', 'smt') // $default_smt_arg;
 
-        # Build the VM map structure that generate_sizing_hint expects
+        # ------------------------------------------------------------------
+        # Build the VM map structure for sizing hint generation
+        # ------------------------------------------------------------------
         my %vm_map = (
             Configuration => {
                 vm_name     => $vm_name,
@@ -6765,74 +7115,83 @@ sub _generate_monthly_workload_analysis {
             CoreResults => {
                 ProfileValues => $collated_results_table{$vm_name}
             },
-            # FIX: RunQ is also nested under profile name when using profile labels
             RunQMetrics => _safe_dig($last_state_data, 'metrics', 'runq') || {}
         );
 
-        # Call generate_sizing_hint with correct signature
+        # ------------------------------------------------------------------
+        # Generate sizing hint using existing, proven logic
+        # ------------------------------------------------------------------
         my ($hint, $pattern, $pressure, $pressure_detail, $rationale_text, $has_abs_pressure, $has_norm_pressure) =
             generate_sizing_hint(\%vm_map, undef, $adaptive_runq_saturation_thresh);
 
-
-        # FIX: Access RunQ metrics through the profile name, just like physc
+        # ------------------------------------------------------------------
+        # Extract RunQ metrics from the last state
+        # ------------------------------------------------------------------
         my $runq_metrics_block = $last_state_data->{metrics}{runq} || {};
-        my $growth_rationale_block = $last_state_data->{debug}{growthRationale} || {};
 
-        # Build ClippingInfo - iterate through ALL profiles for this VM
+        # ------------------------------------------------------------------
+        # Build ClippingInfo for all profiles
+        # ------------------------------------------------------------------
+        # This logic iterates through all profiles and extracts clipping
+        # detection results. The structure here has been carefully debugged
+        # and must be preserved exactly.
+        # ------------------------------------------------------------------
         my $clipping_info_for_vm = {};
 
-        # Loop through all profiles that were actually run for this VM
-        foreach my $profile_name (keys %{$per_profile_raw_results_for_month{$vm_name}}) {
-            my $profile_results_aref = $per_profile_raw_results_for_month{$vm_name}{$profile_name};
+        foreach my $profile_name (keys %{$last_state_data->{metrics}{physc} || {}}) {
+            # Skip if this isn't a real profile (e.g., metadata keys)
+            next unless ref($last_state_data->{metrics}{physc}{$profile_name}) eq 'HASH';
 
-            # Get the last state's data for THIS profile
-            next unless (ref($profile_results_aref) eq 'ARRAY' && @$profile_results_aref);
-            my $profile_last_state = $profile_results_aref->[-1];
+            # Extract clipping data from this profile's output
+            my $clipping_metrics = _safe_dig($last_state_data, 'metrics', 'physc', $profile_name, 'ClippingInfo');
 
-            # Extract clipping data from THIS profile's output
-            my $clipping_metrics = _safe_dig($profile_last_state, 'metrics', 'physc', $profile_name, 'ClippingInfo');
+            # Try alternate path if first doesn't work (backwards compatibility)
+            $clipping_metrics //= _safe_dig($last_state_data, 'metrics', 'physc', $profile_name, 'Clipping');
 
-            # Try alternate path if first doesn't work
-            $clipping_metrics //= _safe_dig($profile_last_state, 'metrics', 'physc', $profile_name, 'Clipping');
-
-            # If we found clipping data, reconstruct the expected structure
+            # Only process if we found valid clipping data
             if ($clipping_metrics && ref($clipping_metrics) eq 'HASH' && exists $clipping_metrics->{isClipped}) {
                 my $unmet_demand_est = $clipping_metrics->{unmetDemandEstimate} // 0;
 
-                # Get the base value for this profile from the profile's own output
+                # Get the base value for this profile to calculate unclipped peak estimate
                 my $profile_obj = (grep { $_->{name} eq $profile_name } @profiles)[0];
-                my $p_key = "P" . clean_perc_label(($profile_obj->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
-                my $base_peak_for_unclip = _safe_dig($profile_last_state, 'metrics', 'physc', $profile_name, $p_key);
+                next unless $profile_obj;  # Safety check
 
-                # Get MaxCPU from VM config (should be same across all profiles for this VM)
-                #   Important: ClippingInfo assembly uses 'maxcpu', not 'max_cpu'.
+                my $p_key = "P" . clean_perc_label(($profile_obj->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE);
+                my $base_peak_for_unclip = _safe_dig($last_state_data, 'metrics', 'physc', $profile_name, $p_key);
+
+                # Get MaxCPU from VM config
+                # IMPORTANT: ClippingInfo uses 'maxcpu' (lowercase), not 'max_cpu'
                 my $maxcpu = $vm_config_ref->{maxcpu} // 0;
 
+                # Assemble the ClippingInfo structure with exact key names
+                # that downstream consumers (nfit-forecast, GUI) expect
                 $clipping_info_for_vm->{$profile_name} = {
                     isClipped               => $clipping_metrics->{isClipped},
                     clippingConfidence      => $clipping_metrics->{clippingConfidence} // 'unknown',
                     capacityLimit           => $maxcpu,
-                    # The key from nfit is unmetDemandEstimate, which is already in $unmet_demand_est
                     unmetDemandEstimate     => $unmet_demand_est,
                     unclippedPeakEstimate   => ((defined $base_peak_for_unclip && looks_like_number($base_peak_for_unclip)) ? $base_peak_for_unclip : 0) + $unmet_demand_est,
                     platformSpecificMarkers => {
-                        # This value is nested inside platformMarkers in the nfit output
                         aix_runq_saturation => _safe_dig($clipping_metrics, 'platformMarkers', 'aix_runq_saturation') // 0
                     }
                 };
             }
         }
 
-        # Assemble the final data structure for this VM.
-        # Note: this data structure should NOT include any growthRationale (or any other predictive metadata), since monthly workload analysis is Pure Historical.
+        # ------------------------------------------------------------------
+        # Assemble the final data structure for this VM
+        # ------------------------------------------------------------------
+        # CRITICAL: This structure must NOT include growthRationale or any
+        # other predictive metadata. MonthlyWorkloadAnalysis is pure historical.
+        # The growthRationale is harvested separately by the enrichment phase.
+        # ------------------------------------------------------------------
         $analysis_results{$vm_name} = {
             Hint           => $hint,
             Pattern        => $pattern,
             Pressure       => $pressure,
             PressureDetail => $pressure_detail,
             RunQMetrics    => {
-                # FIX: The assimilation map flattens the keys. Use the correct keys and
-                # source P50 which is essential for downstream logic.
+                # Extract the specific RunQ metrics needed by downstream logic
                 AbsRunQ_P90  => _safe_dig($runq_metrics_block, 'absolute', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'P90'),
                 NormRunQ_P50 => _safe_dig($runq_metrics_block, 'normalized', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'P50'),
                 NormRunQ_P90 => _safe_dig($runq_metrics_block, 'normalized', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'P90')
@@ -6843,6 +7202,122 @@ sub _generate_monthly_workload_analysis {
     }
 
     return \%analysis_results;
+}
+
+# ==============================================================================
+# SUBROUTINE: _generate_monthly_workload_analysis
+# PURPOSE:    Performs a full single-pass analysis for a given time period
+#             (typically one month) using the manifest-driven Single Pass Engine
+#             architecture, then assembles the comprehensive MonthlyWorkloadAnalysis
+#             data structure.
+#
+#             This function has been refactored to use the SPE to achieve dramatic
+#             I/O reduction (16x for a typical 16-profile configuration).
+# ==============================================================================
+sub _generate_monthly_workload_analysis {
+    my ($system_cache_dir, $start_date_str, $end_date_str, $adaptive_runq_saturation_thresh) = @_;
+
+    print STDERR "    - Using Single Pass Engine for monthly analysis\n";
+
+    # ======================================================================
+    # STEP 1: Build the tactical manifest
+    # ======================================================================
+    # Use the existing, battle-tested build_transform_manifest function.
+    # This function handles all the complexity of profile parameter extraction,
+    # transform key generation, and percentile de-duplication.
+    # ======================================================================
+    my $tactical_manifest = build_transform_manifest(\@profiles, $nfit_runq_avg_method_str);
+
+    # ======================================================================
+    # STEP 2: Create the PURE HISTORICAL manifest
+    # ======================================================================
+    # The sanitisation function is the primary data purity guardrail.
+    # It strips all predictive elements (growth, decay) whilst preserving
+    # the profile's fundamental measurement definition.
+    # ======================================================================
+    my $historical_manifest = _sanitise_manifest_for_history($tactical_manifest);
+
+    # ======================================================================
+    # STEP 3: Write manifest to temporary file
+    # ======================================================================
+    use File::Temp qw(tempfile);
+    my ($fh_manifest, $manifest_filename) = tempfile(
+        'nfit_history_manifest_XXXXXX',
+        SUFFIX => '.json',
+        UNLINK => 1,
+        TMPDIR => 1
+    );
+
+    # Write the manifest using canonical JSON encoding for consistency
+    print $fh_manifest JSON->new->pretty->canonical->encode($historical_manifest);
+    close $fh_manifest;
+
+    # ======================================================================
+    # STEP 4: Build and execute the single nfit command
+    # ======================================================================
+    my $nfit_cmd = "$nfit_script_path --manifest $manifest_filename "
+                 . "--nmondir \"$system_cache_dir\" "
+                 . "--startdate $start_date_str "
+                 . "--enddate $end_date_str "
+                 . "--smt $default_smt_arg "
+                 . "--runq-avg-method $nfit_runq_avg_method_str "
+                 . "--enable-clipping-detection "  # Historical capacity measurement
+                 . "--show-progress";
+
+    # Execute nfit once for all profiles
+    print STDERR "    - Executing nfit engine for date range: $start_date_str to $end_date_str\n";
+
+    my $nfit_output = '';
+    my $nfit_error  = '';
+
+    # Capture both STDOUT (JSON) and STDERR (progress/errors)
+    my $stderr_arg = ">&=" . fileno(STDERR);
+    my $pid = open3(undef, my $stdout_fh, $stderr_arg, $nfit_cmd);
+
+    while (my $line = <$stdout_fh>) {
+        $nfit_output .= $line;
+    }
+
+    waitpid($pid, 0);
+    my $exit_code = $? >> 8;
+
+    # Check for execution failure
+    if ($exit_code != 0) {
+        die "FATAL: nfit engine failed during monthly analysis.\n"
+            . "Exit code: $exit_code\n"
+            . "Command: $nfit_cmd\n"
+            . "Check STDERR output above for details.\n";
+    }
+
+    # ======================================================================
+    # STEP 5: Parse the JSON output
+    # ======================================================================
+    # Use the existing, proven parse_nfit_json_output function.
+    # It correctly handles multi-line JSON output where each line is a
+    # separate VM result object.
+    # ======================================================================
+    my $parsed_results = parse_nfit_json_output($nfit_output);
+
+    # Sanity check: ensure we got results
+    unless (ref($parsed_results) eq 'HASH' && scalar keys %$parsed_results) {
+        warn "WARNING: nfit returned no results for monthly analysis period $start_date_str to $end_date_str\n";
+        return {};
+    }
+
+    print STDERR "    - Successfully processed " . scalar(keys %$parsed_results) . " VM(s)\n";
+
+    # ======================================================================
+    # STEP 6: Assemble the final MonthlyWorkloadAnalysis structure
+    # ======================================================================
+    # Call the extracted assembly logic which contains all the recent
+    # bug fixes for ClippingInfo, RunQ metrics, and profile value extraction.
+    # ======================================================================
+    my $analysis_results = _assemble_monthly_analysis(
+        $parsed_results,
+        $adaptive_runq_saturation_thresh
+    );
+
+    return $analysis_results;
 }
 
 # ==============================================================================
@@ -7190,6 +7665,160 @@ sub build_transform_manifest {
     }
 
     return \%manifest;
+}
+
+# ==============================================================================
+# SUBROUTINE: _sanitise_manifest_for_history
+# PURPOSE:    Transforms a "tactical" manifest (from build_transform_manifest)
+#             into a "historical" manifest by surgically removing all predictive
+#             and time-weighting directives whilst preserving the profile's
+#             fundamental historical definition.
+#
+# ARGUMENTS:
+#   1. $manifest_href (hash ref): The tactical manifest to sanitise.
+#
+# RETURNS:
+#   - A hash reference to the sanitised manifest.
+#
+# CRITICAL DESIGN PRINCIPLES:
+#   This function is the primary data purity guardrail for the history priming
+#   process. It implements the rules defined in:
+#   "nFit - Maintaining Cache Structure Purity.md"
+#
+#   What is REMOVED (predictive/time-weighting):
+#     - decay keys (inter-period time-weighting)
+#     - runq_decay keys (RunQ time-weighting)
+#     - enable_growth directives (forward-looking predictions)
+#
+#   What is PRESERVED (profile definition/historical measurement):
+#     - method (sma/ema/wma) - defines how noise is smoothed
+#     - window - defines the smoothing window size
+#     - time_filter (online/batch) - defines WHAT data to measure
+#     - no_weekends - defines operational time boundaries
+#     - filter_perc - defines data quality thresholds
+#     - calculate_peak - historical maximum measurement
+#     - enable_clipping - historical capacity limit detection
+#
+# RATIONALE:
+#   A workload profile like "G3-95W15" is not just "P95". It is explicitly
+#   defined as "the P95 of a 15-minute simple moving average, excluding
+#   weekends, during online hours". This complete definition must be preserved
+#   in the historical record, as it defines the measurement methodology.
+#
+#   Time-context filters (-online, -no-weekends) are NOT predictive. They
+#   define WHAT is being measured (operational hours vs. all hours). Removing
+#   them would corrupt the historical record by blending non-operational data
+#   into profiles explicitly designed to exclude it.
+# ==============================================================================
+sub _sanitise_manifest_for_history {
+    my ($manifest_href) = @_;
+
+    # Validate input to catch programming errors early
+    unless (ref($manifest_href) eq 'HASH') {
+        die "FATAL: _sanitise_manifest_for_history requires a hash reference. Received: "
+            . (defined $manifest_href ? ref($manifest_href) || 'scalar' : 'undef');
+    }
+
+    # Perform a true deep copy to avoid any possibility of modifying the
+    # original tactical manifest. This is critical for maintainability.
+    use Storable qw(dclone);
+    my $sanitised_href = dclone($manifest_href);
+
+    # Iterate through each transform in the manifest
+    foreach my $transform_key (keys %$sanitised_href) {
+        my $transform = $sanitised_href->{$transform_key};
+
+        # Sanity check: ensure we're working with a proper transform structure
+        next unless ref($transform) eq 'HASH';
+
+        # ======================================================================
+        # STEP 1: Remove predictive time-weighting (decay)
+        # ======================================================================
+        # Decay applies recency weighting across time periods, making older
+        # data contribute less to the final metric. This is predictive logic
+        # (assumes recent behaviour is more relevant for forecasting).
+        #
+        # For historical records, we want pure statistical aggregation where
+        # all time periods in the analysis window are weighted equally.
+        #
+        # We DELETE the keys entirely rather than setting them to 'none' or 'low'
+        # because:
+        #   a) Absence of the key causes nfit to perform pure aggregation
+        #   b) Even 'low' decay applies some time-weighting
+        #   c) Explicit deletion makes the intent unambiguous
+        # ======================================================================
+        delete $transform->{decay};
+        delete $transform->{runq_decay} if exists $transform->{runq_decay};
+
+        # ======================================================================
+        # STEP 2: PRESERVE smoothing method and window
+        # ======================================================================
+        # The method (sma/ema) and window define HOW the profile smooths noise
+        # within each time period. This is NOT predictiveâ€”it's the measurement
+        # methodology.
+        #
+        # Example: "G3-95W15" explicitly means "P95 of 15-minute SMA"
+        #          Changing this would create a different metric entirely.
+        #
+        # NO CHANGES to: $transform->{method}, $transform->{window}
+        # ======================================================================
+
+        # ======================================================================
+        # STEP 3: PRESERVE time-context filters
+        # ======================================================================
+        # Time-context filters define WHAT operational state is being measured:
+        #   - time_filter (online/batch): Operational hours vs. batch windows
+        #   - no_weekends: Weekday operations vs. full week
+        #   - filter_perc: Data quality threshold (exclude idle periods)
+        #
+        # These are fundamental to the profile's definition and MUST be preserved.
+        #
+        # A profile defined with "-online -no-weekends" is explicitly measuring
+        # "workload during operational business hours". Stripping these filters
+        # would contaminate the measurement by including non-operational data.
+        #
+        # NO CHANGES to: $transform->{time_filter}, $transform->{no_weekends},
+        #                $transform->{filter_perc}
+        # ======================================================================
+
+        # ======================================================================
+        # STEP 4: Sanitise profile-level directives
+        # ======================================================================
+        next unless exists $transform->{profiles} && ref($transform->{profiles}) eq 'HASH';
+
+        foreach my $profile_name (keys %{ $transform->{profiles} }) {
+            my $directives = $transform->{profiles}{$profile_name};
+            next unless ref($directives) eq 'HASH';
+
+            # ------------------------------------------------------------------
+            # Remove growth prediction (CRITICAL for data purity)
+            # ------------------------------------------------------------------
+            # Growth prediction is forward-looking and must never appear in
+            # historical records. The history cache must contain only "what
+            # actually happened", not "what we predict will happen".
+            #
+            # We use DELETE rather than setting to 0 to make the absence
+            # explicit and unambiguous.
+            # ------------------------------------------------------------------
+            delete $directives->{enable_growth};
+
+            # ------------------------------------------------------------------
+            # PRESERVE historical measurement flags
+            # ------------------------------------------------------------------
+            # These directives capture factual historical measurements:
+            #   - calculate_peak: The actual maximum value observed
+            #   - enable_clipping: Detection of capacity saturation
+            #
+            # Both are measurements of "what happened" and belong in the
+            # historical record.
+            #
+            # NO CHANGES to: $directives->{calculate_peak},
+            #                $directives->{enable_clipping}
+            # ------------------------------------------------------------------
+        }
+    }
+
+    return $sanitised_href;
 }
 
 # ==============================================================================
