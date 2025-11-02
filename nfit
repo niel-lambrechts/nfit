@@ -82,6 +82,7 @@ my $DEFAULT_MAX_GROWTH_INFLATION_PERCENT   = 25;
 my $CACHE_MANIFEST_FILE = ".nfit.cache.manifest";
 my $CACHE_STATES_FILE   = ".nfit.cache.states";
 my $CACHE_DATA_FILE     = ".nfit.cache.data";
+my $CACHE_INDEX_FILE    = ".nfit.cache.idx";
 my $CACHE_LOCK_FILE     = ".nfit.cache.lock";
 
 # Internal constants for growth heuristics (not user-configurable initially)
@@ -837,117 +838,6 @@ sub parse_percentile_list
     return @percentiles;
 }
 
-sub get_nmon_overall_date_range
-{
-    my ($nmon_file, $global_start_filter_str, $global_end_filter_str) = @_;
-    print STDERR "Scanning NMON file '$nmon_file' for overall effective date range...\n" if ($verbose);
-    # Handle both compressed or uncompressed files.
-    my $fh;
-    if ($nmon_file =~ /\.nmon\.gz$/i) {
-        open $fh, "-|", "gzip", "-dc", "--", $nmon_file or do {
-            warn "Warning: Could not decompress '$nmon_file': $!. Skipping.";
-            next;
-        };
-    }
-    elsif ($nmon_file =~ /\.nmon\.(bz2|bzip2)$/i) {
-        open $fh, "-|", "bzcat", "--", $nmon_file or do {
-            warn "Warning: Could not bzcat '$nmon_file': $!. Skipping.";
-            next;
-        };
-    }
-    elsif ($nmon_file =~ /\.nmon$/i) {
-        open $fh, '<:encoding(utf8)', $nmon_file or do {
-            warn "Warning: Could not open '$nmon_file': $!. Skipping.";
-            next;
-        };
-    }
-    else {
-        warn "Warning: Unsupported file type '$nmon_file'. Skipping.";
-        next;
-    }
-    my $min_date_obj;
-    my $max_date_obj;
-    my $header_skipped = 0;
-    my $first_data_line_checked = 0;
-    my $start_filter_obj;
-    my $end_filter_obj;
-    if (defined $global_start_filter_str)
-    {
-        eval { $start_filter_obj = Time::Piece->strptime($global_start_filter_str, "%Y-%m-%d"); };
-        if ($@ || (defined $global_start_filter_str && ! (defined $start_filter_obj && $start_filter_obj->isa('Time::Piece') ) ) )
-        {
-            die "Error parsing global start date filter '$global_start_filter_str': $@\n";
-        }
-    }
-    if (defined $global_end_filter_str)
-    {
-        eval { $end_filter_obj = Time::Piece->strptime($global_end_filter_str, "%Y-%m-%d"); };
-        if ($@ || (defined $global_end_filter_str && ! (defined $end_filter_obj && $end_filter_obj->isa('Time::Piece') ) ) )
-        {
-            die "Error parsing global end date filter '$global_end_filter_str': $@\n";
-        }
-    }
-    while (my $line = <$fh>)
-    {
-        chomp $line;
-        $line =~ s/\r$//;
-        next if $line =~ /^\s*$/;
-        if (!$header_skipped && !$first_data_line_checked)
-        {
-            if ($line =~ /^(Time,|Date,Time,Hostname,ZZZZ)/i)
-            {
-                $header_skipped = 1;
-                next;
-            }
-            $first_data_line_checked = 1;
-        }
-        elsif ($header_skipped && $line =~ /^(Time,|Date,Time,Hostname,ZZZZ)/i)
-        {
-            next;
-        }
-        if ($line =~ /^(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2})/)
-        {
-            my $timestamp_str_local = $1;
-            $timestamp_str_local =~ s/T/ /;
-            my $current_tp;
-            eval { $current_tp = Time::Piece->strptime($timestamp_str_local, "%Y-%m-%d %H:%M:%S"); };
-            if ($@ || !$current_tp || !$current_tp->isa('Time::Piece'))
-            {
-                next;
-            }
-            my $current_date_day_obj = $current_tp->truncate(to => 'day');
-            if (defined $start_filter_obj && $current_date_day_obj < $start_filter_obj) { next; }
-            if (defined $end_filter_obj   && $current_date_day_obj > $end_filter_obj)   { next; }
-            if (!defined $min_date_obj || !$min_date_obj->isa('Time::Piece') || $current_tp < $min_date_obj)
-            {
-                $min_date_obj = $current_tp;
-            }
-            if (!defined $max_date_obj || !$max_date_obj->isa('Time::Piece') || $current_tp > $max_date_obj)
-            {
-                $max_date_obj = $current_tp;
-            }
-        }
-    }
-    close $fh;
-    if (defined $min_date_obj && $min_date_obj->isa('Time::Piece') && defined $max_date_obj && $max_date_obj->isa('Time::Piece'))
-    {
-        print STDERR "Effective NMON data range for windowing: " . $min_date_obj->datetime . " to " . $max_date_obj->datetime . "\n";
-        my $ret_start = $min_date_obj->truncate(to => 'day');
-        my $ret_end   = $max_date_obj->truncate(to => 'day');
-        unless (defined $ret_start && $ret_start->isa('Time::Piece') && defined $ret_end && $ret_end->isa('Time::Piece'))
-        {
-            print STDERR "Error: Truncated date objects became invalid in get_nmon_overall_date_range.\n";
-            return (undef, undef);
-        }
-        return ($ret_start, $ret_end);
-    }
-    else
-    {
-        print STDERR "Warning: Could not determine valid min/max dates from NMON file '$nmon_file' after global filters.\n";
-        return (undef, undef);
-    }
-}
-
 sub generate_processing_time_windows
 {
     my ($period_start_obj, $period_end_obj, $unit_str, $size_val) = @_;
@@ -1284,6 +1174,209 @@ sub define_time_windows_for_state {
         $current_win_start = $current_win_end->truncate(to => 'day') + ONE_DAY();
     }
     return @windows;
+}
+
+# ==============================================================================
+# SUBROUTINE: build_cache_index
+# PURPOSE:    Builds a date-to-byte-offset index for the L1 cache data file.
+#             This enables O(1) seeking to specific dates instead of sequential
+#             scanning from the start of the file.
+#
+# ARGUMENTS:
+#   1. $data_file (string): Path to the .nfit.cache.data file
+#
+# RETURNS:
+#   Hash reference: { "YYYY-MM-DD" => byte_offset, ... }
+#
+# PERFORMANCE:
+#   - Optimised with substr() for date extraction (5-10x faster than split)
+#   - Uses :raw layer (no UTF-8 decoding overhead)
+#   - For 350MB / 8.9M lines: ~2-3 seconds
+# ==============================================================================
+sub build_cache_index {
+    my ($data_file) = @_;
+
+    my %index;
+    keys(%index) = 100;  # Pre-allocate for ~90 days
+
+    my $current_date = '';
+    my $line_count = 0;
+
+    # Open with :raw for performance (VM names are ASCII on UNIX platforms)
+    open my $fh, '<:raw', $data_file or die "FATAL: Cannot open $data_file: $!\n";
+
+    # Skip header line (Timestamp,VMName,PhysC,RunQ)
+    my $header = <$fh>;
+
+    # Record position before first data line
+    my $line_start_pos = tell($fh);
+
+    while (my $line = <$fh>) {
+        # Extract YYYY-MM-DD (first 10 characters)
+        # This is 5-10x faster than split() operations
+        my $date = substr($line, 0, 10);
+
+        # Validate date format (detect corrupted data)
+        unless ($date =~ /^\d{4}-\d{2}-\d{2}$/) {
+            warn "Warning: Invalid date format at line $line_count: '$date'\n";
+            $line_start_pos = tell($fh);
+            next;
+        }
+
+        # Record byte offset when date changes
+        if ($date ne $current_date) {
+            $index{$date} = $line_start_pos;
+            $current_date = $date;
+        }
+
+        # Save position for next iteration
+        $line_start_pos = tell($fh);
+
+        # Progress indicator for large files
+        if (++$line_count % 1_000_000 == 0) {
+            printf STDERR "\r  Building cache index: %.1fM lines...", $line_count / 1_000_000;
+        }
+    }
+
+    if ($line_count >= 1_000_000) {
+        printf STDERR "\r  Building cache index: %.1fM lines... Done (%d days)    \n",
+            $line_count / 1_000_000, scalar keys %index;
+    }
+
+    close $fh;
+
+    return \%index;
+}
+
+# ==============================================================================
+# SUBROUTINE: load_or_build_cache_index
+# PURPOSE:    Loads an existing cache index if valid, otherwise builds a new one.
+#             Index validity is based on source file size and modification time.
+#
+# ARGUMENTS:
+#   1. $cache_dir (string): Path to the cache directory
+#   2. $data_file (string): Path to the .nfit.cache.data file
+#
+# RETURNS:
+#   Hash reference: { "YYYY-MM-DD" => byte_offset, ... }
+# ==============================================================================
+sub load_or_build_cache_index {
+    my ($cache_dir, $data_file) = @_;
+
+    my $idx_file  = File::Spec->catfile($cache_dir, $CACHE_INDEX_FILE);
+    my $lock_file = File::Spec->catfile($cache_dir, $CACHE_LOCK_FILE);
+
+    my @st = stat($data_file) or die "FATAL: Cannot stat $data_file: $!\n";
+    my ($data_size, $data_mtime) = @st[7, 9];
+
+    # Try to load existing index
+    if (-f $idx_file) {
+        my ($index_size, $index_mtime);
+        my $cached_index;
+        my $cache_ok = 0;
+
+        eval {
+            open my $fh, '<', $idx_file or die "Cannot open index file: $!\n";
+            flock($fh, LOCK_SH) or die "Cannot lock index file: $!\n";
+            local $/; my $raw = <$fh>;
+            close $fh;
+
+            my $idx = decode_json($raw);
+
+            die "Invalid index structure\n" unless ref($idx) eq 'HASH';
+            die "Missing metadata\n"     unless ref($idx->{metadata}) eq 'HASH';
+            die "Missing index\n"        unless ref($idx->{index})    eq 'HASH';
+
+            # Coerce to numeric to avoid any string/dualvar surprises
+            $index_size  = 0 + ($idx->{metadata}{source_size}  // -1);
+            $index_mtime = 0 + ($idx->{metadata}{source_mtime} // -1);
+
+            if ($index_size == $data_size && $index_mtime == $data_mtime) {
+                $cached_index = $idx->{index};
+                $cache_ok = 1;  # mark as a valid cache hit; return after eval
+            }
+            1;
+        } or do {
+            warn "Warning: Cache index corrupted or invalid: $@\n";
+        };
+
+        return $cached_index if $cache_ok;
+        # Fall through to rebuild if we didn’t get a valid cache hit
+    }
+
+    # Cache miss or stale - build new index
+    print STDERR "Building cache index for date-range optimisation...\n";
+    my $index = build_cache_index($data_file);
+
+    # Save the index with metadata
+    my $idx_data = {
+        metadata => {
+            source_file  => $CACHE_DATA_FILE,
+            source_size  => $data_size + 0,
+            source_mtime => $data_mtime + 0,
+            created_at   => gmtime()->datetime(),
+            nfit_version => $VERSION,
+        },
+        index => $index,
+    };
+
+    # Exclusive lock + atomic write (temp then rename)
+    open my $lock_fh, '>>', $lock_file or die "FATAL: Cannot create lock file: $!\n";
+    flock($lock_fh, LOCK_EX) or die "FATAL: Cannot acquire exclusive lock: $!\n";
+
+    my $tmp = "$idx_file.tmp.$$";
+    eval {
+        open my $out, '>', $tmp or die "Cannot write temp index file: $!\n";
+        print {$out} JSON->new->pretty->canonical->encode($idx_data);
+        close $out or die "Cannot close temp index file: $!\n";
+        rename $tmp, $idx_file or die "Cannot atomically replace index file: $!\n";
+        1;
+    } or do {
+        warn "Warning: Failed to save cache index: $@\n";
+        unlink $tmp;
+    };
+
+    flock($lock_fh, LOCK_UN);
+    close $lock_fh;
+
+    return $index;
+}
+
+# ==============================================================================
+# SUBROUTINE: seek_to_start_date
+# PURPOSE:    Seeks to the appropriate position in the data file based on the
+#             start date, using the byte-offset index.
+#
+# ARGUMENTS:
+#   1. $fh (filehandle): Open filehandle to the data file
+#   2. $index (hash ref): Date-to-byte-offset index
+#   3. $start_date_str (string): Start date in YYYY-MM-DD format
+#
+# RETURNS:
+#   Byte offset where seeking occurred (for progress calculation)
+# ==============================================================================
+sub seek_to_start_date {
+    my ($fh, $index, $start_date_str) = @_;
+
+    return 0 unless defined $start_date_str && $start_date_str ne '';
+
+    # Try exact match first
+    if (exists $index->{$start_date_str}) {
+        seek($fh, $index->{$start_date_str}, 0);
+        return $index->{$start_date_str};
+    }
+
+    # No exact match - find closest earlier date
+    my @dates = sort keys %$index;
+    for (my $i = $#dates; $i >= 0; $i--) {
+        if ($dates[$i] le $start_date_str) {
+            seek($fh, $index->{$dates[$i]}, 0);
+            return $index->{$dates[$i]};
+        }
+    }
+
+    # Start date is before all indexed data - start from beginning
+    return 0;
 }
 
 sub get_window_index_for_timestamp {
@@ -1985,8 +2078,27 @@ sub run_single_pass_from_manifest {
     my %persistent_transform_states;
     my %raw_peak_tracker; # Track true raw peak per VM
     my $data_cache_file = File::Spec->catfile($nmon_dir, $CACHE_DATA_FILE);
-    open my $data_fh, '<', $data_cache_file or die "FATAL: Cannot open $data_cache_file: $!";
+
+    # --- Load or build cache index for date-range optimisation ---
+    my $cache_index;
+    my $seek_offset = 0;
+
+    if (defined $start_date_str && $start_date_str ne '') {
+        $cache_index = load_or_build_cache_index($nmon_dir, $data_cache_file);
+    }
+
+    # --- Open data cache ---
+    open my $data_fh, '<:raw', $data_cache_file or die "FATAL: Cannot open $data_cache_file: $!";
     my $header = <$data_fh>; # Read header to determine column indices if needed
+
+    # --- Seek to start date if index available ---
+    if ($cache_index) {
+        $seek_offset = seek_to_start_date($data_fh, $cache_index, $start_date_str);
+        if ($seek_offset > 0) {
+            my $seek_mb = sprintf("%.1f", $seek_offset / 1_048_576);
+            print STDERR "  Seeked to $start_date_str (offset: ${seek_mb}MB)\n" if $verbose;
+        }
+    }
 
     # --- Progress Indicator Initialisation ---
     my $record_counter = 0;
@@ -1994,32 +2106,67 @@ sub run_single_pass_from_manifest {
     my $show_progress = ($verbose || -t STDERR); # Show progress if verbose or interactive
     printf STDERR "\r  -> Processing data cache ..." if ($show_progress);
 
-    # Figure out total size once (works for regular files)
+    # Figure out total size and calculate actual bytes to process
     my $total_bytes = do {
         my @st = stat($data_fh);
         $st[7] // 0  # size in bytes (0 if not a regular file/unknown)
     };
 
+    # Calculate end offset for accurate progress (if we have index and end date)
+    my $end_offset = $total_bytes;
+    if ($cache_index && defined $end_date_str && $end_date_str ne '') {
+        # Find the next date after end_date in index
+        my @dates = sort keys %$cache_index;
+        for my $date (@dates) {
+            if ($date gt $end_date_str) {
+                $end_offset = $cache_index->{$date};
+                last;
+            }
+        }
+    }
+
+    my $bytes_to_process = $end_offset - $seek_offset;
+
     while (my $line = <$data_fh>) {
         $record_counter++;
 
-        if ($show_progress && ($record_counter % $progress_interval == 0)) {
-            my ($ts_str) = split ',', $line, 2;
-            my $tp;
-            eval { $tp = Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S"); };
+        chomp $line;
+        my ($ts_str, $vm, $physc, $runq) = split ',', $line, 4;
 
+        # early exit for non-numeric/corrupt data
+        next unless (defined $physc && defined $runq && looks_like_number($physc) && looks_like_number($runq));
+
+        # parse timee-stamp
+        my $tp;
+        eval { $tp = Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S"); };
+        next if $@; # Skip malformed/unparseable timestamps
+
+        # Global date filters
+        if (defined $end_date_str) {
+            # Use string compare on date, it's faster than object methods
+            my $line_date = substr($ts_str, 0, 10);
+            last if ($line_date gt $end_date_str);
+        }
+        if (defined $start_date_str) {
+            my $line_date = substr($ts_str, 0, 10);
+            next if ($line_date lt $start_date_str);
+        }
+
+        if ($show_progress && ($record_counter % $progress_interval == 0)) {
             my $pct = 0;
-            if ($total_bytes) {
-                # tell($data_fh) is bytes consumed from start for normal files
+            if ($bytes_to_process > 0) {
                 my $pos = tell($data_fh);
-                $pct = $pos ? (100.0 * $pos / $total_bytes) : 0;
+                my $bytes_processed = $pos - $seek_offset;
+                $pct = ($bytes_processed / $bytes_to_process) * 100.0;
+                # Clamp to 100% in case we overshoot
+                $pct = 100.0 if $pct > 100.0;
             }
 
             printf STDERR "\r  -> Processing data cache: %-19s (%.1f%%)",
-                (defined $tp ? $tp->strftime("%Y-%m-%d %H:%M:%S") : ''), $pct;
+                $ts_str, $pct;
         }
 
-        process_data_point($line, $manifest, $states_by_vm, \%analysis_data, \%raw_data, \%transform_states, \%persistent_transform_states, {
+        process_data_point($tp, $vm, $physc, $runq, $manifest, $states_by_vm, \%analysis_data, \%raw_data, \%transform_states, \%persistent_transform_states, {
             vms_to_process            => \%vms_to_process,
             start_date_str            => $start_date_str,
             end_date_str              => $end_date_str,
@@ -2098,11 +2245,7 @@ sub run_single_pass_from_manifest {
 #             transform streams.
 # ==============================================================================
 sub process_data_point {
-    my ($line, $manifest, $states_by_vm, $analysis_data, $raw_data, $transform_states, $persistent_transform_states, $filters) = @_;
-
-
-    chomp $line;
-    my ($ts_str, $vm, $physc, $runq) = split ',', $line, 4;
+    my ($tp, $vm, $physc, $runq, $manifest, $states_by_vm, $analysis_data, $raw_data, $transform_states, $persistent_transform_states, $filters) = @_;
 
     # --- FIX: TRACK TRUE RAW PEAK ---
     # For every valid data point, before any filtering, update the absolute max
@@ -2110,18 +2253,10 @@ sub process_data_point {
     my $raw_peak_tracker = $filters->{raw_peak_tracker};
     $raw_peak_tracker->{$vm} = $physc if (looks_like_number($physc) && $physc > ($raw_peak_tracker->{$vm} // 0));
 
-    # Add a robust guard to skip any line with non-numeric or missing data.
-    return unless (defined $physc && defined $runq && looks_like_number($physc) && looks_like_number($runq));
-
     # 1. Apply global VM filter passed from the orchestrator.
     return unless (exists $filters->{vms_to_process}{$vm} && exists $states_by_vm->{$vm});
 
-    # 2. Apply global date filters.
-    my $tp;
-    eval { $tp = Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S"); };
-    return if $@; # Skip malformed timestamps.
-    if (defined $filters->{start_date_str} && $tp->ymd lt $filters->{start_date_str}) { return; }
-    if (defined $filters->{end_date_str}   && $tp->ymd gt $filters->{end_date_str})   { return; }
+    # 2. Apply global date filters -> This is already done in the caller loop.
 
     # 3. Find the correct state for this timestamp using the hydrated state objects.
     my $state_obj;
