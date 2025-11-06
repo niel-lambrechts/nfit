@@ -575,7 +575,8 @@ my %vm_tier_overrides = %{parse_vm_tier_overrides("$script_dir/etc/nfit.vms.cfg"
 # Define the order of columns for the CSV output
 @output_header_cols_csv = (
     "VM", "TIER", "Hint", "Pattern", "Pressure", "PressureDetail", "SMT",
-    "Serial", "SystemType", "Pool Name", "Pool ID", "RunQ_Tactical", "RunQ_Strategic", "RunQ_Potential", "RunQ_Source", $PEAK_PROFILE_NAME
+    "Serial", "SystemType", "Pool Name", "Pool ID",
+    "RunQ_Tactical", "RunQ_Strategic", "RunQ_Potential", "RunQ_Source", $PEAK_PROFILE_NAME
 );
 
 # Add profile names as column headers (these will contain the RunQ-modified PhysC values)
@@ -1237,7 +1238,7 @@ foreach my $system_serial (@target_systems_to_process)
     # This single function call replaces the previous complex assimilation logic.
     # It consumes the raw JSON from nfit and produces a clean, predictable map.
     # The global @profiles array is passed to assist with per-state averaging logic.
-    my $assimilation_map_ref = build_assimilation_map($parsed_nfit_results, \@profiles);
+    my $assimilation_map_ref = build_assimilation_map($parsed_nfit_results, \@profiles, $adaptive_runq_saturation_thresh);
 
     # The @vm_order array, which drives the main processing loop,
     # must be populated from the keys of our newly created assimilation map.
@@ -1464,7 +1465,7 @@ foreach my $system_serial (@target_systems_to_process)
     if ($is_multiplicative_forecast_run) {
         # This is the new path for the multiplicative model, which now uses the standard reporter.
         if (@vm_order) {
-            _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $ts, 1, 0, 0); # Multiplicative=true, Recency=false
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $ts, 0, 0, 0, $adaptive_runq_saturation_thresh);
 
             # If verbose mode is on, generate the extra audit trail files.
             if ($verbose) {
@@ -1495,7 +1496,7 @@ foreach my $system_serial (@target_systems_to_process)
                 # For predictive_peak, pass a false flag to generate a standard report.
                 my $is_recency_flag = ($model_type eq 'recency_decay') ? 1 : 0;
                 my $is_predictive_flag = ($model_type eq 'predictive_peak') ? 1 : 0;
-                _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $ts, 0, $is_recency_flag, $is_predictive_flag);
+                _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $ts, 0, $is_recency_flag, $is_predictive_flag, $adaptive_runq_saturation_thresh);
             } else {
                 print STDERR "  - INFO: No VM output data was generated for seasonal event '$apply_seasonality_event'.\n";
             }
@@ -1504,7 +1505,7 @@ foreach my $system_serial (@target_systems_to_process)
         # This is the standard, non-seasonal run path. It now generates one report
         # per system before proceeding to the next.
         if (@vm_order) {
-            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $ts, 0, 0, 0);
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $ts, 0, 0, 0, $adaptive_runq_saturation_thresh);
         }
     }
 
@@ -2541,36 +2542,52 @@ sub log_profile_rationale
 
     printf {$fh} "    - Initial Base PhysC                     : %s cores (Aggregated value from nfit)\n", ($base_physc_for_profile // $na);
 
-    if ($first_nfit_state->{debug}{growthRationale}) {
-        my $gd = $first_nfit_state->{debug}{growthRationale} || {};
-        my $gp = $first_nfit_state->{debug}{growthParams} || {};
+    # --- New Robust Trend Rationale Logging ---
+    # Get the rationale for THIS SPECIFIC profile from the assimilation map
+    my $gr = $vm_map_ref->{GrowthRationaleByProfile}{$profile_being_adjusted} || {};
 
-        my $format_check_result = sub {
-            my $val = shift;
-            return "Skipped" if (!defined $val || $val eq 'Skipped');
-            return $val ? "Passed" : "Failed";
-        };
+    # Check if growth was calculated (even if the result was zero or skipped)
+    if (ref($gr) eq 'HASH' && scalar keys %$gr > 0 && defined $gr->{method_used}) {
 
-        printf {$fh} "    - nfit GrowthAdj Applied                 : +%s cores\n", $nfit_growth_adj_to_display;
-        printf {$fh} "    - Rationale for GrowthAdj (from nfit):\n";
-        # Use growth parameters reported by nfit if available, otherwise use this script's defaults.
-        my $proj_days = $gp->{projection_days} // $DEFAULT_GROWTH_PROJECTION_DAYS;
-        my $max_inf   = $gp->{max_inflation_perc} // $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
+        printf {$fh} "    - nfit GrowthAdj Applied                 : %s cores\n",
+            (defined $nfit_growth_adj_to_display && $nfit_growth_adj_to_display > 0) ? "+$nfit_growth_adj_to_display" : "0.0000";
+        print  {$fh} "    - Rationale for GrowthAdj (Robust Trend Analysis):\n";
+        printf {$fh} "        1. Method         : %s (trend analysis on %d %s samples)\n",
+            $gr->{method_used} // 'none',
+            $gr->{sample_points} // 0,
+            $gr->{aggregation_basis} // 'unknown';
 
-        printf {$fh} "        1. Data Eligibility : %s historical periods found (Min: %d).\n", (defined $gd->{num_hist_periods} ? $gd->{num_hist_periods} : 'N/A'), $GROWTH_MIN_HISTORICAL_PERIODS;
-        printf {$fh} "        2. Volatility Check : Coefficient of Variation (CV) was %s. Trend analysis proceeds if CV < %.2f. [Result: %s]\n", ($gd->{stats_cv} // 'N/A'), $GROWTH_MAX_CV_THRESHOLD, $format_check_result->($gd->{cv_check_passed});
-        printf {$fh} "        3. Trend Analysis   : Linear regression slope was %s. Trend is considered positive if slope > %.2f. [Result: %s]\n", ($gd->{slope} // 'N/A'), $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD, $format_check_result->($gd->{slope_check_passed} // 'Skipped');
+        my $volatility_result = $gr->{volatility_check_passed} ? "Passed" : "Failed";
+        printf {$fh} "        2. Volatility Check : CV = %.4f (Limit: < %.2f) [Result: %s]\n",
+            $gr->{volatility_cv} // 0,
+            $GROWTH_MAX_CV_THRESHOLD,
+            $volatility_result;
 
-        if (defined $gd->{slope_check_passed} && $gd->{slope_check_passed} ne 'N/A') {
-            printf {$fh} "        4. Projection       : Trend projected to %s cores over %d days.\n", $gd->{projected_val}, $proj_days;
-            my $capping_msg = ($gd->{was_capped} eq '1') ? "CAPPED" : "not capped";
-            printf {$fh} "        5. Inflation        : Calculated inflation is %s%%. This was %s to the max of %d%%.\n", $gd->{inflation_perc}, $capping_msg, $max_inf;
-        }
+        printf {$fh} "        3. Trend Analysis   : Theil-Sen Estimator (Sen's Slope)\n";
+        printf {$fh} "           - Slope          : %+.6f cores/day\n", $gr->{sen_slope} // 0;
+        printf {$fh} "           - Trend          : %s\n", $gr->{sen_trend} // 'none';
+
+        printf {$fh} "        4. Significance     : Mann-Kendall Test (Variant: %s)\n", $gr->{mk_variant} // 'standard';
+        printf {$fh} "           - p-value        : %.4f (Significant if < 0.05)\n", $gr->{sen_p_value} // 1.0;
+        printf {$fh} "           - Kendall's Tau  : %.4f\n", $gr->{sen_tau} // 0;
+        if (defined $gr->{mk_variant} && $gr->{mk_variant} eq 'hamed-rao') {
+            printf {$fh} "           - Correction     : Hamed-Rao (Autocorrelation corrected)\n";
+            printf {$fh} "           - Adjustment     : %.4f (Adjustment Factor)\n", $gr->{mk_adjustment_factor} // 1;
+            printf {$fh} "           - Samples        : %d (Raw) -> %.2f (Effective 'n_eff')\n",
+                $gr->{sample_points} // 0, $gr->{mk_neff} // 0;
+       }
+
+       if ($gr->{skip_reason}) {
+           printf {$fh} "        5. Result         : Growth skipped. Reason: %s\n", $gr->{skip_reason};
+       } else {
+           printf {$fh} "        5. Result         : Trend is significant. GrowthAdj (%.4f) applied.\n", $gr->{growth_adj} // 0;
+       }
+
+       printf {$fh} "        6. OLS Comparison : Slope = %+.6f, R-squared = %.4f\n",
+           $gr->{ols_slope} // 0, $gr->{ols_r2} // 0;
     }
 
     my $downsizing_summary_reason_footer = $calc_debug_info_ref->{'DownsizingReason'} // "N/A";
-# Let us not abbreviate this, at least not for now.
-#    if (length($downsizing_summary_reason_footer) > 70) { $downsizing_summary_reason_footer = substr($downsizing_summary_reason_footer, 0, 67) . "..."; }
 	printf {$fh} "    - CPU Downsizing                         : Factor %s -> PhysC became %s. (Summary: %s)\n",
     ($calc_debug_info_ref->{'DownsizingFactor'} // $na),
     ($calc_debug_info_ref->{'DownsizedPhysC'} // $na),
@@ -4892,12 +4909,46 @@ sub _safe_dig {
 }
 
 # ==============================================================================
+# SUBROUTINE: map_growth_confidence
+# PURPOSE:    Maps a statistical p-value to a human-readable confidence level
+#             for the CSV report and rationale log.
+# ARGUMENTS:
+#   1. $p_value (numeric): The Mann-Kendall p-value (or undef)
+#   2. $method_used (string): The method string ('sen_slope', 'none', etc.)
+# RETURNS:
+#   - Confidence string: 'high', 'medium', 'low', or 'n/a'
+# ==============================================================================
+sub map_growth_confidence {
+    my ($p_value, $method_used) = @_;
+
+    # Default to 'n/a' (Not Applicable) if no growth was calculated or no p-value
+    return 'n/a' if (!defined $method_used ||
+                     $method_used eq 'none' ||
+                     $method_used eq 'sen_slope_not_significant' ||
+                     $method_used eq 'sen_slope_too_small' ||
+                     !defined $p_value);
+
+    # A p-value of 0 means the trend was extremely significant (p < 0.0001)
+    if ($p_value == 0) {
+        return 'high';
+    }
+    # Map based on standard statistical thresholds
+    if ($p_value < 0.01) {
+        return 'high';      # Very strong evidence (p < 1%)
+    } elsif ($p_value < 0.05) {
+        return 'medium';    # Conventional significance (p < 5%)
+    } else {
+        return 'low';       # Weak or no evidence (p >= 5%)
+    }
+}
+
+# ==============================================================================
 # SUBROUTINE: _write_standard_csv_report (Refactored for Assimilation Map)
 # PURPOSE:    Encapsulates the entire CSV generation process. It now reads all
 #             its data from the final, fully populated assimilation map.
 # ==============================================================================
 sub _write_standard_csv_report {
-    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag) = @_;
+    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag, $adaptive_runq_saturation_thresh) = @_;
 
     # Ensure we have data to process before creating a file.
     # The @vm_order array is still used to control the iteration order.
@@ -4926,13 +4977,28 @@ sub _write_standard_csv_report {
     $ent_idx //= scalar(@header_for_this_report);
     if ($is_multiplicative_run_flag) {
         my @new_cols = ("SeasonalMultiplier", "Baseline_PhysC");
+        # Remove all growth/runq columns for this model
+        @header_for_this_report = grep {
+            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
+        } @header_for_this_report;
+        # Find ent_idx again after grep
+        ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
+        $ent_idx //= scalar(@header_for_this_report); # Fallback
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
-    } elsif ($is_recency_decay_run_flag || $nfit_decay_over_states) {
-        my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max");
+    } elsif ($is_recency_decay_run_flag || $nfit_enable_windowed_decay || $nfit_decay_over_states) {
+        # Add ALL growth columns for decay models
+        my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max", "GrowthMethod", "GrowthConfidence", "GrowthTrend", "GrowthSignificance");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
     } elsif ($is_predictive_peak_run_flag) {
+        # Remove growth/runq columns for this model
+        @header_for_this_report = grep {
+            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
+        } @header_for_this_report;
+        # Find ent_idx again after grep
+        ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
+        $ent_idx //= scalar(@header_for_this_report); # Fallback
         my @new_cols = ("TrueBaseline_P99W1", "PredictedPeak_P99W1", "ForecastSource");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
@@ -4953,26 +5019,43 @@ sub _write_standard_csv_report {
         my $hinting = $vm_map_ref->{Hinting};
         my $modifiers = $vm_map_ref->{CSVModifiers};
 
+        # --- START: Hint-Aware Rationale Selection for CSV ---
+        # Call generate_sizing_hint here, *once* per VM, to get the
+        # authoritative hint. This is now safe, as the assimilation map is fully built.
+        # We use a safe check for $vm_name in %vm_config_data.
+        my ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str);
+
+        if (exists $vm_config_data{$vm_name}) {
+            ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str) =
+                generate_sizing_hint($vm_map_ref, undef, $adaptive_runq_saturation_thresh);
+        } else {
+            # VM is not in config file; fall back to safe defaults
+            ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str) = ('G3', 'G', 0, 'ConfigMissing');
+        }
+
+        ## Deterministic fallback chain for profile selection for growth and for the RunQ modifier columns
+
+        # Map the hint pattern (O, B, G) to the correct T3 planning profile
+        my $hint_pattern = ($hinting->{AutoTier} =~ /^([A-Z])/) ? $1 : 'G';
+        my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+
+        my $source_profile_name = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
+
         # --- Populate CSV row directly from the map ---
         push @data_row_csv, $vm_name, ($tier_override_for_csv{$vm_name} // "");
-        push @data_row_csv, $hinting->{AutoTier} // "", $hinting->{Pattern} // "";
-        push @data_row_csv, ($hinting->{Pressure} ? "True" : "False"), $hinting->{PressureDetail} // "";
+        # Use the hints previously generated
+        push @data_row_csv, $hint_type_tier, $hint_pattern_shape;
+        push @data_row_csv, ($pressure_bool ? "True" : "False"), $pressure_detail_str // "";
         push @data_row_csv, $cfg->{smt} // "";
         push @data_row_csv, $cfg->{serial_number} // "", $vm_config_data{$vm_name}{systemtype} // ""; # systemtype from old config is richer
         push @data_row_csv, $vm_config_data{$vm_name}{pool_name} // "", $cfg->{pool_id} // "";
 
         unless ($is_multiplicative_run_flag || $is_predictive_peak_run_flag) {
-            # Determine the source profile for the RunQ modifier columns
-            my $hint_pattern = ($hinting->{AutoTier} =~ /^([A-Z])/) ? $1 : 'G';
-            my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-            my $source_profile = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
-
-            # This now correctly fetches the single, authoritative values for the VM
-            my $mods = $vm_map_ref->{CSVModifiers} || {};
-            push @data_row_csv, (defined $mods->{RunQ_Tactical} ? sprintf("%+.3f", $mods->{RunQ_Tactical}) : "0.000");
-            push @data_row_csv, (defined $mods->{RunQ_Strategic} ? sprintf("%+.3f", $mods->{RunQ_Strategic}) : "0.000");
-            push @data_row_csv, (defined $mods->{RunQ_Potential} && looks_like_number($mods->{RunQ_Potential}) ? sprintf("%+.3f", $mods->{RunQ_Potential}) : ($mods->{RunQ_Potential} // "0.000"));
-            push @data_row_csv, $mods->{RunQ_Source} // "";
+            # This now correctly fetches the single, authoritative values for the VM (selecting the same profile name as $source_profile_name)
+            push @data_row_csv, (defined $modifiers->{RunQ_Tactical} ? sprintf("%+.3f", $modifiers->{RunQ_Tactical}) : "0.000");
+            push @data_row_csv, (defined $modifiers->{RunQ_Strategic} ? sprintf("%+.3f", $modifiers->{RunQ_Strategic}) : "0.000");
+            push @data_row_csv, (defined $modifiers->{RunQ_Potential} && looks_like_number($modifiers->{RunQ_Potential}) ? sprintf("%+.3f", $modifiers->{RunQ_Potential}) : ($modifiers->{RunQ_Potential} // "0.000"));
+            push @data_row_csv, $modifiers->{RunQ_Source} // "";
         }
 
         # Push the Peak value, ensuring 3-digit precision
@@ -4991,14 +5074,44 @@ sub _write_standard_csv_report {
             my $s_data = $seasonal_debug_info{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} || {};
             push @data_row_csv, (defined $s_data->{multiplier} ? sprintf("%.2f", $s_data->{multiplier}) : "N/A");
             push @data_row_csv, (defined $s_data->{baseline} ? sprintf("%.3f", $s_data->{baseline}) : "N/A");
-        } elsif ($is_recency_decay_run_flag || $nfit_decay_over_states) {
+        } elsif ($is_recency_decay_run_flag || $nfit_enable_windowed_decay || $nfit_decay_over_states) {
             # For decay models, get the min and max growth adjustments calculated across all profiles.
-            my $vm_map_ref = $assimilation_map_ref->{$vm_name};
             my $growth_min = $vm_map_ref->{Growth}{min_adj} // 0;
             my $growth_max = $vm_map_ref->{Growth}{max_adj} // 0;
             my $min_str = sprintf("%.3f", $growth_min);
             my $max_str = sprintf("%.3f", $growth_max);
             push @data_row_csv, $min_str, $max_str;
+
+            # --- Populate Robust Trend Analysis Columns ---
+            # Get the growthRationale hash from the assimilation map
+            # Select the rationale from the *correct* profile based on the hint
+            my $gr = $vm_map_ref->{GrowthRationaleByProfile}{$source_profile_name} || {};
+
+            # 1. GrowthMethod
+            my $method = $gr->{method_used} // 'none';
+            push @data_row_csv, $method;
+
+            # 2. GrowthConfidence
+            my $p_value = $gr->{sen_p_value};
+            push @data_row_csv, map_growth_confidence($p_value, $method);
+
+            # 3. GrowthTrend
+            my $trend = $gr->{sen_trend} // 'none';
+            # Ensure trend is 'none' if the method wasn't a significant trend
+            if ($method eq 'sen_slope_not_significant' || $method eq 'sen_slope_too_small' || $method eq 'none') {
+                $trend = 'none';
+            }
+            push @data_row_csv, $trend;
+
+            # 4. GrowthSignificance (the p-value itself)
+            if (defined $p_value && $method ne 'none') {
+                # Format p-value to 4 decimal places, handling p=0
+                push @data_row_csv, ($p_value == 0) ? "0.0000" : sprintf("%.4f", $p_value);
+            } else {
+                push @data_row_csv, 'n/a';
+            }
+            # --- END: Robust Trend Columns ---
+
         } elsif ($is_predictive_peak_run_flag) {
             my $s_data = $seasonal_debug_info{$vm_name}{'P-99W1'} || {};
             my $source = $s_data->{FinalSource} || 'N/A';
@@ -6879,7 +6992,7 @@ sub _enrich_history_with_growth_rationale {
 
     unless (-f $l2_cache_file) {
         print "  - INFO: L2 results cache not found. Skipping enrichment.\n";
-        return;
+        return 0; # Return false (was not modified)
     }
 
     # --- Step 1: Load both the history and the L2 cache ---
@@ -6892,7 +7005,7 @@ sub _enrich_history_with_growth_rationale {
     };
     if ($@ || !ref($l2_cache_data) eq 'HASH') {
         warn "Warning: Could not decode L2 results cache '$l2_cache_file'. Skipping enrichment.\n";
-        return;
+        return 0; # Return false (was not modified)
     }
 
     # --- Step 2: Scan L2 cache and build a structured hash of all available growth data ---
@@ -6976,6 +7089,9 @@ sub _enrich_history_with_growth_rationale {
     } else {
         print "  - INFO: No new growth rationale data found in L2 cache. History is up to date.\n";
     }
+
+    # Return the modification status to the caller
+    return $was_modified;
 }
 
 # ==============================================================================
@@ -7999,12 +8115,14 @@ sub _safe_get {
 # ARGUMENTS:
 #   1. $parsed_nfit_results_href (hash ref): The raw, decoded Perl hash from nfit.pl.
 #   2. $profiles_aref (array ref): A reference to the global @profiles array.
+#   3. $adaptive_runq_saturation_thresh (float): The dynamically calculated threshold for detecting Absolute RunQ saturation.
+#        This value is passed directly to 'generate_sizing_hint' to determine the VM's pressure status.
 #
 # RETURNS:
 #   - A hash reference to the fully populated assimilation map.
 # ==============================================================================
 sub build_assimilation_map {
-    my ($parsed_nfit_results_href, $profiles_aref) = @_;
+    my ($parsed_nfit_results_href, $profiles_aref, $adaptive_runq_saturation_thresh) = @_;
 
     my %assimilation_map;
 
@@ -8027,6 +8145,8 @@ sub build_assimilation_map {
             RawNfitStates    => \@states_for_vm,
             SeasonalForecast => {},
             CSVModifiers     => {},
+            # GrowthRationaleByProfile will store ALL rationales for logging
+            GrowthRationaleByProfile => {},
         };
 
         # --- Block 1: Populate Configuration ---
@@ -8063,6 +8183,11 @@ sub build_assimilation_map {
                 # Include zero for profiles where growth wasn't calculated or enabled.
                 my $growth_adj_for_profile = $profile_data->{GrowthAdj} // 0;
                 push @growth_values_for_vm, $growth_adj_for_profile;
+                # Harvest ALL rationales ---
+                my $rationale = _safe_dig($profile_data, 'growthRationale');
+                if (ref($rationale) eq 'HASH' && scalar keys %$rationale) {
+                    $vm_map->{GrowthRationaleByProfile}{$profile_name} = $rationale;
+                }
             }
 
             # Calculate and store the min/max of all per-profile growth adjustments for the VM.
@@ -8130,8 +8255,13 @@ sub build_assimilation_map {
 
         # --- Block 4: Populate Growth ---
         if ($is_aggregated) {
-            $vm_map->{Growth}{adjustment} = _safe_dig($representative_state, 'metrics', 'growth', 'adjustment') // 0.0;
-            $vm_map->{Growth}{rationale}  = _safe_dig($representative_state, 'debug', 'growthRationale') || {};
+            # In this new logic, we intentionally leave Growth.adjustment and
+            # Growth.rationale EMPTY.
+            # They will be populated dynamically in the consumer functions
+            # (log_profile_rationale and _write_standard_csv_report)
+            # based on the correct profile context.
+            $vm_map->{Growth}{adjustment} = 0.0; # Default to 0
+            $vm_map->{Growth}{rationale}  = {};  # Default to empty
         }
     }
     return \%assimilation_map;
