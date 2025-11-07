@@ -2552,6 +2552,32 @@ sub log_profile_rationale
         printf {$fh} "    - nfit GrowthAdj Applied                 : %s cores\n",
             (defined $nfit_growth_adj_to_display && $nfit_growth_adj_to_display > 0) ? "+$nfit_growth_adj_to_display" : "0.0000";
         print  {$fh} "    - Rationale for GrowthAdj (Robust Trend Analysis):\n";
+
+        # Display projection metadata if available (Adaptive Growth Projection)
+        if (defined $gr->{projection_days}) {
+            my $proj_days = $gr->{projection_days};
+            my $proj_source = $gr->{projection_days_source} // 'unknown';
+            my $analysis_days = $gr->{analysis_days};
+            my $avg_interval = $gr->{avg_sampling_interval_mins};
+
+            printf {$fh} "        - Projection Horizon    : %d days (%s)\n",
+                $proj_days, $proj_source;
+
+            if (defined $analysis_days) {
+                printf {$fh} "        - Analysis Window       : %d days\n", $analysis_days;
+            }
+
+            if (defined $avg_interval) {
+                printf {$fh} "        - Sampling Interval     : %d minutes (average)\n", $avg_interval;
+            }
+
+            # Calculate and display extrapolation ratio for adaptive projections
+            if ($proj_source eq 'adaptive' && defined $analysis_days && $analysis_days > 0) {
+                my $ratio = sprintf("%.2f", $proj_days / $analysis_days);
+                printf {$fh} "        - Extrapolation Ratio   : %s:1 (projection:analysis)\n", $ratio;
+            }
+        }
+
         printf {$fh} "        1. Method         : %s (trend analysis on %d %s samples)\n",
             $gr->{method_used} // 'none',
             $gr->{sample_points} // 0,
@@ -4979,7 +5005,7 @@ sub _write_standard_csv_report {
         my @new_cols = ("SeasonalMultiplier", "Baseline_PhysC");
         # Remove all growth/runq columns for this model
         @header_for_this_report = grep {
-            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
+            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|ProjectionDays|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
         } @header_for_this_report;
         # Find ent_idx again after grep
         ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
@@ -4988,13 +5014,13 @@ sub _write_standard_csv_report {
         $formula_col_offset = scalar(@new_cols);
     } elsif ($is_recency_decay_run_flag || $nfit_enable_windowed_decay || $nfit_decay_over_states) {
         # Add ALL growth columns for decay models
-        my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max", "GrowthMethod", "GrowthConfidence", "GrowthTrend", "GrowthSignificance");
+        my @new_cols = ("GrowthAdj_Min", "GrowthAdj_Max", "ProjectionDays", "GrowthMethod", "GrowthConfidence", "GrowthTrend", "GrowthSignificance");
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
     } elsif ($is_predictive_peak_run_flag) {
         # Remove growth/runq columns for this model
         @header_for_this_report = grep {
-            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
+            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|ProjectionDays|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
         } @header_for_this_report;
         # Find ent_idx again after grep
         ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
@@ -5086,6 +5112,14 @@ sub _write_standard_csv_report {
             # Get the growthRationale hash from the assimilation map
             # Select the rationale from the *correct* profile based on the hint
             my $gr = $vm_map_ref->{GrowthRationaleByProfile}{$source_profile_name} || {};
+
+            # 0. ProjectionDays (adaptive or user-specified projection horizon)
+            my $proj_days = $gr->{projection_days};
+            if (defined $proj_days && looks_like_number($proj_days)) {
+                push @data_row_csv, int($proj_days);  # Integer format
+            } else {
+                push @data_row_csv, 'n/a';  # No growth calculation performed
+            }
 
             # 1. GrowthMethod
             my $method = $gr->{method_used} // 'none';
@@ -7040,11 +7074,16 @@ sub _enrich_history_with_growth_rationale {
             foreach my $profile_name (keys %$physc_metrics) {
                 my $profile_data = $physc_metrics->{$profile_name};
 
-                # Check for the rationale in the new, correct location
+                # Check for the rationale (the trigger)
                 if (ref($profile_data) eq 'HASH' && $profile_data->{growthRationale}) {
-                    $growth_data_found{$vm}{$profile_name}{$model_type} = $profile_data->{growthRationale};
+                    # --- Store the rationale AND its associated tactical values ---
+                    $growth_data_found{$vm}{$profile_name}{$model_type} = {
+                        rationale  => $profile_data->{growthRationale},
+                        BaseValue  => $profile_data->{BaseValue},
+                        FinalValue => $profile_data->{FinalValue}
+                    };
                 }
-            }
+           }
         }
     }
 
@@ -7064,18 +7103,42 @@ sub _enrich_history_with_growth_rationale {
             foreach my $profile_name (keys %{$growth_data_found{$vm_name}}) {
                 foreach my $model_type (keys %{$growth_data_found{$vm_name}{$profile_name}}) {
 
-                    my $new_data = $growth_data_found{$vm_name}{$profile_name}{$model_type};
+                    # --- Unpack the new data wrapper ---
+                    my $new_data_wrapper = $growth_data_found{$vm_name}{$profile_name}{$model_type}; # This is the hash {rationale, BaseValue, FinalValue}
+                    my $new_rationale    = $new_data_wrapper->{rationale};
 
-                    # Ensure the nested structure exists.
+                    # Ensure the nested structure exists for Rationale.
                     $vm_analysis->{growthRationale} //= {};
                     $vm_analysis->{growthRationale}{$profile_name} //= {};
 
-                    # Check if the data is new or different before marking as modified.
+                    # --- FIX: Create new block for Tactical Values ---
+                    # This is the new block to store tactical results
+                    $vm_analysis->{TacticalValues} //= {};
+
+                    # Check if the Rationale data is new or different.
                     if (!exists $vm_analysis->{growthRationale}{$profile_name}{$model_type} ||
-                        Dumper($vm_analysis->{growthRationale}{$profile_name}{$model_type}) ne Dumper($new_data))
+                        Dumper($vm_analysis->{growthRationale}{$profile_name}{$model_type}) ne Dumper($new_rationale))
                     {
-                         $vm_analysis->{growthRationale}{$profile_name}{$model_type} = $new_data;
+                         $vm_analysis->{growthRationale}{$profile_name}{$model_type} = $new_rationale;
                          $was_modified = 1;
+                    }
+
+                    # --- Harvest BaseValue and FinalValue ---
+                    # This archives the tactical model's input (BaseValue)
+                    # and output (FinalValue) for long-term auditing.
+                    my $base_val = $new_data_wrapper->{BaseValue};
+                    my $final_val = $new_data_wrapper->{FinalValue};
+
+                    if (!exists $vm_analysis->{TacticalValues}{$profile_name} ||
+                        $vm_analysis->{TacticalValues}{$profile_name}{BaseValue} ne $base_val ||
+                        $vm_analysis->{TacticalValues}{$profile_name}{FinalValue} ne $final_val)
+                    {
+                        # Add the tactical results for this profile
+                        $vm_analysis->{TacticalValues}{$profile_name} = {
+                            BaseValue  => $base_val,
+                            FinalValue => $final_val
+                        };
+                        $was_modified = 1;
                     }
                 }
             }
@@ -7182,24 +7245,52 @@ sub _assemble_monthly_analysis {
     my %collated_results_table;  # Temporary table for hint generation
 
     # ======================================================================
-    # STEP 1: Build collated results table for Peak profile
+    # STEP 1: Build collated results table for ALL profiles
     # ======================================================================
-    # We need to extract Peak values from the mandatory peak profile
-    # (P-99W1) to support the sizing hint generation logic.
+    # This step harvests all P-metrics for the MonthlyWorkloadAnalysis.ProfileValues
+    # block, fixing the historical data regression.
+    # It ALSO surgically extracts the max P-99W1 'Peak' metric, which is
+    # a critical, separate input for the hint-generation logic in STEP 2.
     # ======================================================================
     foreach my $vm_name (keys %$parsed_results_href) {
         my $states_aref = $parsed_results_href->{$vm_name};
         next unless ref($states_aref) eq 'ARRAY' && @$states_aref;
 
-        # Extract Peak values from the P-99W1 profile across all states
-        my @peak_vals = map {
-            _safe_dig($_, 'metrics', 'physc', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'Peak')
-        } @$states_aref;
+        my @p99w1_peak_values_for_hinting; # Array to store P-99W1 'Peak' metrics
 
-        my @valid_peaks = grep { defined $_ && looks_like_number($_) } @peak_vals;
+        # Iterate all configured profiles to get their specific P-metric
+        foreach my $profile (@profiles) {
+            my $profile_name = $profile->{name};
 
-        if (@valid_peaks) {
-            $collated_results_table{$vm_name}{$PEAK_PROFILE_NAME} = max(@valid_peaks);
+            # Find the P-metric for this profile (e.g., "P95")
+            my ($p_val_num) = $profile->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/;
+            my $p_metric_key = "P" . clean_perc_label($p_val_num // $DEFAULT_PERCENTILE);
+
+            my $metric_val = undef;
+
+            # Iterate ALL states (newest to oldest)
+            for (my $i = $#{$states_aref}; $i >= 0; $i--) {
+                my $state = $states_aref->[$i];
+
+                # A. Find the P-metric value (if we haven't already)
+                $metric_val //= _safe_dig($state, 'metrics', 'physc', $profile_name, $p_metric_key);
+
+                # B. If this is the P-99W1 profile, find its 'Peak' metric for hinting
+                if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                    my $profile_peak_val = _safe_dig($state, 'metrics', 'physc', $profile_name, 'Peak');
+                    push @p99w1_peak_values_for_hinting, $profile_peak_val if (defined $profile_peak_val && looks_like_number($profile_peak_val));
+                }
+            } # end state loop
+
+            # Store the final P-metric value for the ProfileValues block
+            if (defined $metric_val && looks_like_number($metric_val)) {
+                $collated_results_table{$vm_name}{$profile_name} = $metric_val + 0;
+            }
+        } # end profile loop
+
+        # Store the max P-99W1 Profile Peak for hint logic, using the original key
+        if (@p99w1_peak_values_for_hinting) {
+            $collated_results_table{$vm_name}{$PEAK_PROFILE_NAME} = max(@p99w1_peak_values_for_hinting);
         }
     }
 
