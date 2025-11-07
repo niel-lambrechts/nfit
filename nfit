@@ -126,6 +126,7 @@ my $decay_over_states_flag = 0;
 # Growth Prediction options
 my $enable_growth_prediction = 0;
 my $growth_projection_days = $DEFAULT_GROWTH_PROJECTION_DAYS;
+my $growth_projection_days_user_override = 0;  # Track explicit user specification
 my $max_growth_inflation_percent = $DEFAULT_MAX_GROWTH_INFLATION_PERCENT;
 
 my $show_states_flag = 0;
@@ -185,7 +186,10 @@ GetOptions(
     'decay-over-states'         => \$decay_over_states_flag,
     # Growth Prediction Options (NEW)
     'enable-growth-prediction'       => \$enable_growth_prediction,
-    'growth-projection-days=i'       => \$growth_projection_days,
+    'growth-projection-days=i'       => sub {
+        $growth_projection_days = $_[1];
+        $growth_projection_days_user_override = 1;  # User explicitly set this value
+    },
     'max-growth-inflation-percent=i' => \$max_growth_inflation_percent,
     'show-states'               => \$show_states_flag,
     'include-states=s'          => \$include_states_selector,
@@ -540,6 +544,7 @@ if ($manifest_file) {
 
         # --- Growth Model Tunables ---
         growth_projection_days  => $growth_projection_days,
+        growth_projection_days_user_override => $growth_projection_days_user_override,
         max_growth_inflation_percent => $max_growth_inflation_percent,
 
         # --- Rounding Arguments ---
@@ -1244,6 +1249,12 @@ sub calculate_growth_trend_robust_v1 {
 
         # ---- DIAGNOSTIC ----
         skip_reason => $skip_reason,
+
+        # ---- PROJECTION METADATA (Adaptive Growth Projection v6.x) ----
+        projection_days => $projection_days,
+        projection_days_source => $args_ref->{growth_projection_days_source} // 'default',
+        analysis_days => $args_ref->{analysis_days} // $n,
+        avg_sampling_interval_mins => $args_ref->{avg_sampling_interval_mins} // undef,
     );
 
     # ---- Hamed–Rao MK diagnostics ----
@@ -1264,6 +1275,78 @@ sub calculate_growth_trend_robust_v1 {
 # ==============================================================================
 # END OF ROBUST TREND ANALYSIS MODULE
 # ==============================================================================
+
+# ==============================================================================
+# SUBROUTINE: calculate_adaptive_projection_days
+# PURPOSE:    Dynamically adjust growth projection horizon based on analysis
+#             window and sampling density to prevent statistical over-extrapolation
+#
+# ALGORITHM:
+#   - Short windows (<30 days): Proportional projection to avoid 3:1 ratios
+#   - Long windows (90+ days): Capped at quarterly maximum (90 days)
+#   - Density adjustment: Sparse data (15-60 min intervals) reduces projection
+#   - Conservative approach: Never exceeds 1:1 extrapolation for typical use
+#
+# INPUTS:
+#   $analysis_days     - Number of days in the analysis window
+#   $avg_interval_mins - Average sampling interval in minutes
+#
+# RETURNS: Number of days to project growth (integer, minimum 1)
+#
+# EXAMPLES:
+#   30 days @ 1-min → 30 days (1:1 ratio)
+#   90 days @ 1-min → 90 days (1:1 ratio)
+#   30 days @ 15-min → 22 days (0.75 density factor applied)
+# ==============================================================================
+sub calculate_adaptive_projection_days {
+    my ($analysis_days, $avg_interval_mins) = @_;
+
+    # Guard against invalid inputs
+    return 1 if ($analysis_days < 1);
+    $avg_interval_mins //= 60;  # Default to hourly if undefined
+
+    # Density factor: Higher frequency data supports longer projections
+    # Typical NMON (1-5 min) gets full projection window
+    # Sparse data (15-60 min) gets reduced projection to maintain statistical validity
+    my $density_factor = 1.0;
+    if ($avg_interval_mins > 30) {
+        $density_factor = 0.5;   # Hourly or sparser: significantly reduce projection
+    } elsif ($avg_interval_mins > 10) {
+        $density_factor = 0.75;  # 15-30 min intervals: moderate reduction
+    }
+    # else: 1-10 min intervals use full density_factor = 1.0
+
+    # Base projection determined by analysis window length
+    # Philosophy: Match projection to observation window (1:1 ratio)
+    my $base_projection;
+    if ($analysis_days < 7) {
+        # Very short analysis: Only 1 day projection (indicative only)
+        $base_projection = 1;
+    } elsif ($analysis_days < 14) {
+        # Short analysis: Project half the window (conservative)
+        $base_projection = int($analysis_days * 0.5);
+    } elsif ($analysis_days < 30) {
+        # Medium analysis: Project weekly (7 days)
+        $base_projection = 7;
+    } elsif ($analysis_days < 60) {
+        # Monthly analysis: Project monthly (30 days)
+        $base_projection = 30;
+    } elsif ($analysis_days < 90) {
+        # Bimonthly analysis: Project bimonthly (60 days)
+        $base_projection = 60;
+    } else {
+        # Quarterly or longer: Cap at quarterly maximum (90 days)
+        $base_projection = 90;
+    }
+
+    # Apply density adjustment to base projection
+    my $adjusted_projection = int($base_projection * $density_factor);
+
+    # Enforce minimum floor: Always project at least 1 day
+    $adjusted_projection = 1 if ($adjusted_projection < 1);
+
+    return $adjusted_projection;
+}
 
 # --- Existing Subroutines from Original Script ---
 sub parse_percentile_list
@@ -3233,6 +3316,64 @@ sub calculate_per_profile_growth_adjustments {
                 }
                 next unless (defined $earliest_epoch && defined $latest_epoch);
 
+                # ═══════════════════════════════════════════════════════════════
+                # ADAPTIVE PROJECTION CALCULATION
+                # ═══════════════════════════════════════════════════════════════
+                # Calculate analysis window and sampling characteristics for
+                # adaptive projection horizon determination
+
+                my $analysis_days = int(($latest_epoch - $earliest_epoch) / 86400) + 1;
+
+                # Determine average sampling interval from first state with data
+                # (representative sample, no need to scan entire dataset)
+                my $avg_interval_mins = 60;  # Default fallback (hourly)
+
+                for my $state_idx (0 .. $#{$states_aref}) {
+                    my $state = $states_aref->[$state_idx];
+                    my $packed_data = $analysis_data_href->{$vm_name}{$state_idx}{$transform_key};
+                    next unless defined $packed_data;
+
+                    # Use first state with data as representative sample
+                    my @samples = unpack('f<*', $packed_data);
+                    my $num_samples = scalar(@samples);
+
+                    if ($num_samples > 1) {
+                        my $state_duration = $state->{end_time}->epoch - $state->{start_time}->epoch;
+                        $avg_interval_mins = int(($state_duration / ($num_samples - 1)) / 60);
+                        $avg_interval_mins = 1 if $avg_interval_mins < 1;  # Floor at 1 minute
+                        last;  # Got representative sample, exit loop
+                    }
+                }
+
+                # Determine projection days: user override > adaptive > default
+                my $projection_days;
+                my $projection_days_source;
+
+                if (exists $args_ref->{growth_projection_days_user_override} &&
+                    $args_ref->{growth_projection_days_user_override}) {
+                    # User explicitly specified --growth-projection-days
+                    $projection_days = $args_ref->{growth_projection_days};
+                    $projection_days_source = 'user_specified';
+                } else {
+                    # Calculate adaptive projection days
+                    $projection_days = calculate_adaptive_projection_days(
+                        $analysis_days,
+                        $avg_interval_mins
+                    );
+                    $projection_days_source = 'adaptive';
+                }
+
+                # Store projection metadata for use in growth calculation
+                $args_ref->{growth_projection_days_calculated} = $projection_days;
+                $args_ref->{growth_projection_days_source} = $projection_days_source;
+                $args_ref->{analysis_days} = $analysis_days;
+                $args_ref->{avg_sampling_interval_mins} = $avg_interval_mins;
+
+                # ═══════════════════════════════════════════════════════════════
+                # END ADAPTIVE PROJECTION CALCULATION
+                # ═══════════════════════════════════════════════════════════════
+
+
                 # Build daily buckets from smoothed timeseries values
                 my %daily_buckets;
 
@@ -3306,6 +3447,58 @@ sub calculate_per_profile_growth_adjustments {
                     }
                 }
                 next unless (defined $earliest_epoch && defined $latest_epoch);
+
+                # ═══════════════════════════════════════════════════════════════
+                # ADAPTIVE PROJECTION CALCULATION (Windowed Model)
+                # ═══════════════════════════════════════════════════════════════
+
+                my $analysis_days = int(($latest_epoch - $earliest_epoch) / 86400) + 1;
+
+                # Determine average sampling interval from first window with data
+                my $avg_interval_mins = 60;  # Default fallback
+
+                for my $window_idx (0 .. $#{$windows_aref}) {
+                    my $packed_data = $analysis_data_href->{$vm_name}{$window_idx}{$transform_key};
+                    next unless defined $packed_data;
+
+                    # Use first window with data as representative sample
+                    my @samples = unpack('f<*', $packed_data);
+                    my $num_samples = scalar(@samples);
+
+                    if ($num_samples > 1) {
+                        my $window = $windows_aref->[$window_idx];
+                        my $window_duration = $window->{end_time}->epoch - $window->{start_time}->epoch;
+                        $avg_interval_mins = int(($window_duration / ($num_samples - 1)) / 60);
+                        $avg_interval_mins = 1 if $avg_interval_mins < 1;
+                        last;  # Got representative sample, exit loop
+                    }
+                }
+
+                # Determine projection days
+                my $projection_days;
+                my $projection_days_source;
+
+                if (exists $args_ref->{growth_projection_days_user_override} &&
+                    $args_ref->{growth_projection_days_user_override}) {
+                    $projection_days = $args_ref->{growth_projection_days};
+                    $projection_days_source = 'user_specified';
+                } else {
+                    $projection_days = calculate_adaptive_projection_days(
+                        $analysis_days,
+                        $avg_interval_mins
+                    );
+                    $projection_days_source = 'adaptive';
+                }
+
+                # Store projection metadata
+                $args_ref->{growth_projection_days_calculated} = $projection_days;
+                $args_ref->{growth_projection_days_source} = $projection_days_source;
+                $args_ref->{analysis_days} = $analysis_days;
+                $args_ref->{avg_sampling_interval_mins} = $avg_interval_mins;
+
+                # ═══════════════════════════════════════════════════════════════
+                # END ADAPTIVE PROJECTION CALCULATION
+                # ═══════════════════════════════════════════════════════════════
 
                 # Build daily buckets from smoothed timeseries values (same as Hybrid)
                 my %daily_buckets;
