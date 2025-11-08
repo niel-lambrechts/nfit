@@ -208,6 +208,7 @@ my $nmon_dir;
 my $excel_formulas_flag = "false";
 my $mgsys_filter;
 my $verbose = 0;
+my $force_update = 0;
 
 # Seasonality related variables
 my $apply_seasonality_event;
@@ -246,6 +247,7 @@ GetOptions(
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     'verbose'                    => \$verbose,
+    'force'                      => \$force_update,
 ) or die usage_wrapper();
 
 # --- Validation ---
@@ -1119,7 +1121,7 @@ foreach my $system_serial (@target_systems_to_process)
         # months in the data cache and save the results to the new history file.
         # It does not produce a CSV output.
         # Call the new subroutine to handle the history generation.
-        update_monthly_history($current_cache_path, $system_identifier, $seasonality_config, $min_days_for_history, $adaptive_runq_saturation_thresh);
+        update_monthly_history($current_cache_path, $system_identifier, $seasonality_config, $min_days_for_history, $adaptive_runq_saturation_thresh, $force_update);
 
         # After updating the history, we skip the rest of the processing for this system.
         print STDERR "--- History update complete for system: $system_identifier ---\n";
@@ -6709,7 +6711,7 @@ sub _generate_seasonal_snapshot_for_period {
 #             to prevent data corruption from conflicting file writes.
 # ==============================================================================
 sub update_monthly_history {
-    my ($system_cache_dir, $system_identifier, $seasonality_config, $min_days_for_history, $adaptive_runq_saturation_thresh) = @_;
+    my ($system_cache_dir, $system_identifier, $seasonality_config, $min_days_for_history, $adaptive_runq_saturation_thresh, $force_flag) = @_;
     print STDERR "\n--- Updating Unified Monthly History for system: $system_identifier ---\n";
 
     my $data_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
@@ -6754,6 +6756,16 @@ sub update_monthly_history {
     }
     print STDERR "Scan complete.\n";
 
+    # Pre-execution validation for the first month to be processed
+    if (@months_to_process) {
+        my $first_month_key = $months_to_process[0]{key};
+        _validate_pre_update_conditions($system_cache_dir, $first_month_key, $force_flag);
+
+        # Create checkpoint backup before any modifications
+        print STDERR "\n--- Creating Pre-Tactical Checkpoint ---\n";
+        _create_checkpoint_backup($system_cache_dir, 'pre-tactical', 1);
+    }
+
     # --- Step 3: Execution Stage ---
     if (@months_to_process) {
         print STDERR "Identified " . scalar(@months_to_process) . " month(s) to process: " . join(", ", map { $_->{key} } @months_to_process) . "\n";
@@ -6769,6 +6781,11 @@ sub update_monthly_history {
         print STDERR "No new months to process. History is up to date.\n";
     }
 
+
+    # Track if this was a first run (no pre-existing history file)
+    my $history_file = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
+    my $was_first_run = !(-f $history_file);
+
     # --- Phase 3: Enrich with Growth Rationale from L2 Cache ---
     my $was_enriched = _enrich_history_with_growth_rationale($system_cache_dir, $history_data);
 
@@ -6777,8 +6794,17 @@ sub update_monthly_history {
     if (@months_to_process || $was_enriched) {
         print "\n--- Finalising History Cache ---\n";
         print "  - Writing all updates to .nfit.history.json...\n";
+
         _write_full_history($system_cache_dir, $history_data);
-        print "  - Write complete.\n";
+        print "  - History cache successfully updated.\n";
+
+        # If this was the first run, create a post-write backup to protect the newly created file
+        if ($was_first_run && -f $history_file) {
+            print "\n--- Creating Post-Initial-Write Backup ---\n";
+            _create_checkpoint_backup($system_cache_dir, 'post-initial-write', 1);
+        }
+    } else {
+        print "  - No changes to write. History cache is already current.\n";
     }
 }
 
@@ -7103,6 +7129,9 @@ sub _write_full_history {
             . "This prevents corruption of the history cache.\n";
     }
 
+    # Add lightweight metadata for audit trails
+    _add_lightweight_metadata($history_data_href, 'nfit-profile');
+
     # Proceed with validated data
     my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
     my $lock_file    = File::Spec->catfile($system_cache_dir, '.nfit.history.lock');
@@ -7123,6 +7152,281 @@ sub _write_full_history {
 
     close $lock_fh;
     unlink $lock_file;
+}
+
+# ==============================================================================
+# SUBROUTINE: _create_checkpoint_backup
+# PURPOSE:    Creates a versioned backup of critical cache files to an external
+#             backup directory, using rolling numbering to prevent collisions.
+#             This is automatically called before any write operation that could
+#             corrupt the history cache.
+# ARGUMENTS:
+#   1. $system_cache_dir (string): Path to the system's staging cache directory
+#   2. $checkpoint_type (string): "pre-tactical" or "pre-forecast"
+#   3. $include_l2_cache (boolean): Whether to also backup L2 results cache
+# RETURNS:
+#   - Path to created backup file on success, undef on failure (with warning)
+# ==============================================================================
+sub _create_checkpoint_backup {
+    my ($system_cache_dir, $checkpoint_type, $include_l2_cache) = @_;
+
+    # Derive serial number from staging path (e.g., ROOT/staging/12345ABC)
+    my $serial = basename($system_cache_dir);
+    my $root_dir = dirname(dirname($system_cache_dir)); # Go up from staging/<serial>
+    my $backup_root = File::Spec->catfile($root_dir, 'backups', $serial);
+
+    make_path($backup_root) unless -d $backup_root;
+
+    my $timestamp = localtime->strftime('%Y%m%d_%H%M%S');
+    my $history_source = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
+
+    # Skip if source doesn't exist (first run scenario)
+    unless (-f $history_source) {
+        print "  - No existing history file to backup (first run)\n";
+        return undef;
+    }
+
+    # Generate backup filename with rolling collision prevention
+    my $backup_file = _get_next_available_filename(
+        $backup_root,
+        ".nfit.history.${timestamp}",
+        'json'
+    );
+
+    # Create the backup
+    eval {
+        require File::Copy;
+        File::Copy::copy($history_source, $backup_file)
+            or die "Copy failed: $!";
+        print "  ✓ Created checkpoint backup: " . basename($backup_file) . " (${checkpoint_type})\n";
+    };
+    if ($@) {
+        warn "Warning: Could not create backup at '$backup_file': $@";
+        return undef;
+    }
+
+    # Optionally backup L2 cache and manifest
+    if ($include_l2_cache) {
+        foreach my $cache_file ('.nfit.cache.results', '.nfit.cache.manifest') {
+            my $source = File::Spec->catfile($system_cache_dir, $cache_file);
+            next unless -f $source;
+
+            my $ext = ($cache_file =~ /\.(\w+)$/) ? $1 : '';
+            my $cache_backup = _get_next_available_filename(
+                $backup_root,
+                "${cache_file}.${timestamp}",
+                $ext
+            );
+
+            File::Copy::copy($source, $cache_backup)
+                or warn "Could not backup $cache_file: $!";
+            print "  ✓ Backed up " . basename($cache_file) . "\n";
+        }
+    }
+
+    # Prune old backups to prevent unbounded growth
+    _prune_old_backups($backup_root, 24); # Keep last 24 backups (~2 years)
+
+    return $backup_file;
+}
+
+# ==============================================================================
+# SUBROUTINE: _get_next_available_filename
+# PURPOSE:    Generates a unique filename using rolling numbering (001, 002, etc.)
+#             to prevent collisions, similar to CSV output collision prevention.
+# ARGUMENTS:
+#   1. $dir (string): Directory where file will be created
+#   2. $base_name (string): Base filename without extension
+#   3. $extension (string): File extension (without leading dot)
+# RETURNS:
+#   - Full path to available filename
+# ==============================================================================
+sub _get_next_available_filename {
+    my ($dir, $base_name, $extension) = @_;
+
+    my $counter = 1;
+    my $candidate;
+
+    do {
+        my $suffix = sprintf(".%03d", $counter);
+        if ($extension) {
+            $candidate = File::Spec->catfile($dir, "${base_name}${suffix}.${extension}");
+        } else {
+            $candidate = File::Spec->catfile($dir, "${base_name}${suffix}");
+        }
+        $counter++;
+    } while (-e $candidate && $counter < 1000); # Safety limit
+
+    die "Could not generate unique filename after 999 attempts" if $counter >= 1000;
+
+    return $candidate;
+}
+
+# ==============================================================================
+# SUBROUTINE: _prune_old_backups
+# PURPOSE:    Removes old backup files to prevent unbounded disk usage.
+#             Keeps the N most recent backup files based on modification time.
+# ARGUMENTS:
+#   1. $backup_dir (string): Directory containing backups
+#   2. $keep_count (integer): Number of recent backups to retain
+# RETURNS:
+#   - None
+# ==============================================================================
+sub _prune_old_backups {
+    my ($backup_dir, $keep_count) = @_;
+
+    opendir(my $dh, $backup_dir) or return;
+    my @backups = grep { /^\.nfit\.history\.\d{8}_\d{6}\.\d{3}\.json$/ }
+                  readdir($dh);
+    closedir($dh);
+
+    return if @backups <= $keep_count;
+
+    # Sort by modification time (oldest first)
+    my @sorted = map { $_->[0] }
+                 sort { $a->[1] <=> $b->[1] }
+                 map {
+                     my $path = File::Spec->catfile($backup_dir, $_);
+                     [$_, (stat($path))[9]]
+                 } @backups;
+
+    # Remove oldest files beyond keep_count
+    my $remove_count = @sorted - $keep_count;
+    for (my $i = 0; $i < $remove_count; $i++) {
+        my $old_file = File::Spec->catfile($backup_dir, $sorted[$i]);
+        unlink $old_file or warn "Could not remove old backup $old_file: $!";
+        print "  - Pruned old backup: " . basename($old_file) . "\n";
+    }
+}
+
+# ==============================================================================
+# SUBROUTINE: _validate_pre_update_conditions
+# PURPOSE:    Enforces strict pre-conditions before allowing --update-history to
+#             proceed. Ensures both decay models have been executed for complete
+#             results, and prevents accidental corruption of enriched months.
+# ARGUMENTS:
+#   1. $system_cache_dir (string): Path to the system's staging cache
+#   2. $month_key (string): The month key being updated (e.g., "2025-09")
+#   3. $force_flag (boolean): Whether --force flag was specified
+# RETURNS:
+#   - Dies with error message if validation fails (unless --force specified)
+# ==============================================================================
+sub _validate_pre_update_conditions {
+    my ($system_cache_dir, $month_key, $force_flag) = @_;
+
+    print "\n--- Pre-Update Validation ---\n";
+
+    # Check 1: Verify both decay models have been executed
+    my $l2_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.results');
+
+    if (-f $l2_cache_file) {
+        my $json = JSON->new->relaxed;
+        my $l2_data;
+
+        eval {
+            open my $fh, '<:encoding(utf8)', $l2_cache_file
+                or die "Could not open L2 cache: $!";
+            my $json_text = do { local $/; <$fh> };
+            close $fh;
+            $l2_data = $json->decode($json_text);
+        };
+
+        if ($@) {
+            warn "Warning: Could not read L2 cache for validation: $@\n";
+        } else {
+            my $has_decay_over_states = 0;
+            my $has_windowed_decay = 0;
+
+            # Scan L2 cache for analysisType values
+            foreach my $l2_key (keys %$l2_data) {
+                my $l2_results_aref = $l2_data->{$l2_key};
+                next unless (ref($l2_results_aref) eq 'ARRAY' && @$l2_results_aref);
+
+                my $first_result = $l2_results_aref->[0];
+                my $analysis_type = $first_result->{analysisType} // '';
+
+                $has_decay_over_states = 1 if $analysis_type eq 'hybrid_decay_aggregated';
+                $has_windowed_decay = 1 if $analysis_type eq 'windowed_decay_aggregated';
+
+                # Early exit if both found
+                last if ($has_decay_over_states && $has_windowed_decay);
+            }
+
+            unless ($has_decay_over_states && $has_windowed_decay) {
+                if ($force_flag) {
+                    warn "⚠ WARNING: Both decay models not detected in L2 cache. " .
+                         "Proceeding due to --force flag.\n";
+                } else {
+                    die "FATAL: Incomplete tactical analysis detected.\n" .
+                        "Both --decay-over-states AND --enable-windowed-decay must be " .
+                        "executed before --update-history.\n" .
+                        "Current state: decay-over-states=$has_decay_over_states, " .
+                        "windowed-decay=$has_windowed_decay\n" .
+                        "Use --force to override this check.\n";
+                }
+            } else {
+                print "  ✓ Both decay models confirmed in L2 cache\n";
+            }
+        }
+    } else {
+        if ($force_flag) {
+            warn "⚠ WARNING: L2 cache not found. Proceeding due to --force flag.\n";
+        } else {
+            die "FATAL: L2 results cache not found at '$l2_cache_file'.\n" .
+                "You must run tactical analysis before --update-history.\n" .
+                "Use --force to override this check.\n";
+        }
+    }
+
+    # Check 2: Prevent overwriting already-enriched months
+    my $history_data = read_unified_history($system_cache_dir);
+
+    if (exists $history_data->{$month_key}) {
+        if (exists $history_data->{$month_key}{SeasonalEventSnapshots}) {
+            # Check if any snapshot has forecast enrichment
+            my $snapshots = $history_data->{$month_key}{SeasonalEventSnapshots};
+            foreach my $event_name (keys %$snapshots) {
+                if (exists $snapshots->{$event_name}{forecast}) {
+                    if ($force_flag) {
+                        warn "⚠ WARNING: Month $month_key already enriched with forecasts. " .
+                             "This will be overwritten. Proceeding due to --force flag.\n";
+                    } else {
+                        die "FATAL: Month $month_key already contains forecast enrichment.\n" .
+                            "Re-running tactical analysis would corrupt forecast consistency.\n" .
+                            "If intentional, use --force to override.\n" .
+                            "Consider restoring from ROOT/backups/<serial>/ if this is an error.\n";
+                    }
+                    last;
+                }
+            }
+        }
+    }
+
+    print "  ✓ Pre-update validation passed\n";
+}
+
+# ==============================================================================
+# SUBROUTINE: _add_lightweight_metadata
+# PURPOSE:    Adds lightweight modification tracking metadata to each month entry
+#             in the history cache, providing audit trails without the complexity
+#             of cryptographic checksums.
+# ARGUMENTS:
+#   1. $history_data_href (hash ref): The complete history data structure
+#   2. $updated_by (string): Tool name that performed the update
+# RETURNS:
+#   - None (modifies hash reference in place)
+# ==============================================================================
+sub _add_lightweight_metadata {
+    my ($history_data_href, $updated_by) = @_;
+
+    foreach my $month_key (keys %$history_data_href) {
+        $history_data_href->{$month_key}{_metadata} = {
+            last_updated => scalar(localtime->strftime('%Y-%m-%dT%H:%M:%S%z')),
+            updated_by => $updated_by,
+            toolkit_version => $VERSION,
+            backup_recommendation => "Restore from ROOT/backups/<serial>/ if corruption suspected"
+        };
+    }
 }
 
 # ==============================================================================
@@ -8539,6 +8843,7 @@ Seasonality and Business Cycle Analysis:
                                  This command discovers and processes completed months in
                                  your data cache, generating both generic monthly analysis
                                  and specific seasonal event snapshots.
+  --force                      : Overrides pre-execution validation checks. Use with caution.
   --min-history-days <N>       : When updating history, process partial months that have
                                  at least N days of data. (Default: 28).
 
