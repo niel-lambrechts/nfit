@@ -205,6 +205,12 @@ GetOptions(
     'show-progress'       => \$show_progress_flag,
 ) or die usage();
 
+# Enforce mutual exclusivity for decay models
+if ($enable_windowed_decay && $decay_over_states_flag) {
+    die "FATAL: Incompatible arguments. --enable-windowed-decay and --decay-over-states are mutually exclusive.\n" .
+        "       Please select only one decay model for the analysis run.\n";
+}
+
 # --- Validation ---
 if ($show_version)
 {
@@ -1194,18 +1200,14 @@ sub calculate_growth_trend_robust_v1 {
         $skip_reason = 'Mann-Kendall test failed';
    } elsif ($mk_result->{passed}) {
         # A significant trend can be negative, flat, or positive.
-        # We only apply growth if it is significantly POSITIVE, aligning
-        # with the $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD.
+        $growth_adj = $sen_slope * $projection_days;
+        $method_used = 'sen_slope';
 
-        if ($sen_slope > $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD) {
-            # Trend is statistically significant AND positive
-            $growth_adj = $sen_slope * $projection_days;
-            $method_used = 'sen_slope';
-        } else {
-            # Trend is significant but flat or decreasing.
+        if ($sen_slope < $GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD && $sen_slope > -$GROWTH_MIN_POSITIVE_SLOPE_THRESHOLD) {
+            # Trend is significant but slope is trivial
             $growth_adj = 0; # Do not apply negative or zero growth
             $method_used = 'sen_slope_not_significant';
-            $skip_reason = sprintf("Trend is significant (p=%.4f) but not positive (slope=%.6f)", $mk_result->{p_value}, $sen_slope);
+            $skip_reason = sprintf("Trend is significant (p=%.4f) but trivial (slope=%.6f)", $mk_result->{p_value}, $sen_slope);
         }
    } else {
         # Sen's slope calculated but trend not statistically significant
@@ -1368,37 +1370,84 @@ sub parse_percentile_list
     return @percentiles;
 }
 
+# ==============================================================================
+# SUBROUTINE: generate_processing_time_windows
+# PURPOSE:    Subdivides an analysis period into regular time windows.
+#
+# ARGUMENTS:
+#   1. $period_start_obj (Time::Piece): The effective start of the analysis.
+#   2. $period_end_obj (Time::Piece): The effective end of the analysis.
+#   3. $unit_str (string): "days" or "weeks".
+#   4. $size_val (integer): The number of units in each window.
+#
+# RETURNS:
+#   - An array reference of window hashes:
+#     [ { id => "YYYYMMDD", start_obj => ..., end_obj => ... }, ... ]
+#     or [ { id => "YYYYWww", start_obj => ..., end_obj => ... }, ... ]
+#
+# NOTES:
+#   - Implements [start, end) boundaries (start inclusive, end exclusive)
+#     to prevent double-counting data points that fall on a midnight boundary.
+# ==============================================================================
 sub generate_processing_time_windows
 {
     my ($period_start_obj, $period_end_obj, $unit_str, $size_val) = @_;
+
     my @windows;
-    return () unless (defined $period_start_obj && defined $period_end_obj && $period_start_obj->isa('Time::Piece') && $period_end_obj->isa('Time::Piece') && $period_start_obj <= $period_end_obj);
-    my $current_window_start = Time::Piece->new($period_start_obj->epoch);
+    return \@windows unless (
+        defined $period_start_obj && defined $period_end_obj &&
+        $period_start_obj->isa('Time::Piece') && $period_end_obj->isa('Time::Piece') &&
+        $period_start_obj <= $period_end_obj
+    );
+
+    # Start from the beginning of the day for clean boundaries
+    my $current_window_start = $period_start_obj->truncate(to => 'day');
+
     while ($current_window_start <= $period_end_obj)
     {
         my $current_window_end;
+        my $window_id;
+
         if ($unit_str eq "days")
         {
-            $current_window_end = Time::Piece->new($current_window_start->epoch) + (ONE_DAY() * ($size_val - 1));
+            # A 1-day window starting today ends tomorrow (exclusive)
+            $current_window_end = $current_window_start + (ONE_DAY() * $size_val);
+            # ID is the start date
+            $window_id = $current_window_start->strftime('%Y%m%d');
         }
         elsif ($unit_str eq "weeks")
         {
-            $current_window_end = Time::Piece->new($current_window_start->epoch) + (ONE_WEEK() * $size_val) - ONE_DAY();
+            # A 1-week window starting today ends 7 days from now (exclusive)
+            $current_window_end = $current_window_start + (ONE_WEEK() * $size_val);
+            # ID is the ISO week (Monday-based) of the *start* of the window
+            $window_id = $current_window_start->strftime('%Y_W%V');
         }
         else
         {
             die "Unsupported window unit: $unit_str\n";
         }
-        if ($current_window_end > $period_end_obj)
-        {
-            $current_window_end = Time::Piece->new($period_end_obj->epoch);
+
+        # Do not create a window that starts after the period has ended
+        last if $current_window_start > $period_end_obj;
+
+        # The last window must not go past the end of the analysis period.
+        # Note: We do *not* truncate the period_end_obj, as it may be intra-day.
+        if ($current_window_end > $period_end_obj) {
+             $current_window_end = $period_end_obj + 1; # +1 second to make it exclusive
         }
-        my $representative_date = Time::Piece->new($current_window_end->epoch);
-        push @windows, [Time::Piece->new($current_window_start->epoch), Time::Piece->new($current_window_end->epoch), $representative_date];
-        # Move to the start of the next day for the next window
-        $current_window_start = $current_window_end->truncate(to => 'day') + ONE_DAY;
+
+        # Create the window hash
+        push @windows, {
+            id        => $window_id,
+            start_obj => Time::Piece->new($current_window_start->epoch),
+            # end_obj is exclusive
+            end_obj   => Time::Piece->new($current_window_end->epoch)
+        };
+
+        # The next window starts exactly where this one ended
+        $current_window_start = $current_window_end;
     }
-    return @windows;
+    return \@windows;
 }
 
 sub get_window_key_for_timestamp
@@ -2173,127 +2222,165 @@ sub _calculate_clipping_metrics
 }
 
 # ==============================================================================
-# SUBROUTINE: aggregate_decay_metrics
-# PURPOSE:    Applies the final recency-weighted aggregation for decay models.
-#             It takes the per-state metrics, synthesises a daily time series,
-#             and calculates a single, final value for each profile.
+# SUBROUTINE: aggregate_decay_metrics (CORRECTED VERSION)
+# PURPOSE:    Aggregates per-bin metrics using recency weighting (decay) and
+#             extracts RunQ metrics from the most recent bin WITH ACTUAL DATA.
+#
+# Important:
+#   - Previous versions assumed the chronologically last time window exists for
+#     all VMs, causing failures when certain VMs have incomplete data.
+#   - This version finds the most recent bin that actually has data for each VM.
 # ==============================================================================
 sub aggregate_decay_metrics {
-    my ($metrics_href, $manifest_href, $states_by_vm_href, $transform_states_href, $raw_peak_tracker_ref, $args_ref) = @_;
+    my ($vm_name, $final_metrics_href, $manifest_href,
+        $model_is_windowed, $window_context_aref, $state_context_aref,
+        $analysis_ref_obj, $args_ref) = @_;
 
-    my %aggregated_results;
+    my %aggregated_results_for_vm;
 
-    # Determine the analysis reference date for the calculations.
-    my $analysis_ref_obj;
-    if ($args_ref->{analysis_reference_date}) {
-        eval { $analysis_ref_obj = Time::Piece->strptime($args_ref->{analysis_reference_date}, "%Y-%m-%d"); };
-    } else {
-        # Fallback: find the latest date from all states if no date is provided.
-        my $latest_epoch = 0;
-        foreach my $vm_states (values %$states_by_vm_href) {
-            foreach my $state (@$vm_states) {
-                $latest_epoch = $state->{end_epoch} if $state->{end_epoch} > $latest_epoch;
+    # Get all per-bin metrics for this specific VM
+    my $metrics_for_vm = $final_metrics_href->{$vm_name};
+    return {} unless (defined $metrics_for_vm && ref($metrics_for_vm) eq 'HASH');
+
+    # Find all unique profiles that have metrics for this VM
+    my %profiles_for_vm;
+    foreach my $bin_id (keys %{$metrics_for_vm}) {
+        foreach my $key (keys %{$metrics_for_vm->{$bin_id}}) {
+            $profiles_for_vm{$_} = 1 for keys %{$manifest_href->{$key}{profiles} || {}};
+        }
+    }
+
+    foreach my $profile_name (keys %profiles_for_vm) {
+        # Find the PhysC transform key for this profile
+        my ($physc_transform_key) = grep {
+            $manifest_href->{$_}{metric} eq 'PhysC' &&
+            exists $manifest_href->{$_}{profiles}{$profile_name}
+        } keys %$manifest_href;
+        next unless $physc_transform_key;
+
+        # Get the percentile key for this profile
+        my $percentiles = _safe_dig($manifest_href, $physc_transform_key, 'profiles', $profile_name, 'percentiles');
+        next unless (defined $percentiles && ref $percentiles eq 'ARRAY' && @$percentiles);
+        my $p_val = $percentiles->[0]; # Assumes first percentile is the primary one
+        my $p_key = "P" . clean_perc_label($p_val);
+
+        # --- Build Time Series for PhysC ---
+        # This series is built from the *aggregated metrics* of each bin.
+        my @physc_timeseries;
+
+        # Create a bin iterator for this loop
+        my $bin_iterator = _create_bin_iterator(
+            $model_is_windowed, $window_context_aref, $state_context_aref
+        );
+
+        while (my $bin_meta = $bin_iterator->()) {
+            my $bin_id = $bin_meta->{id};
+
+            # Get the aggregated metric for this bin
+            my $metric_val = _safe_dig($metrics_for_vm, $bin_id, $physc_transform_key, $p_key);
+
+            if (defined $metric_val && looks_like_number($metric_val)) {
+                push @physc_timeseries, {
+                    value => $metric_val,
+                    date  => $bin_meta->{end_obj} # Use bin end-date for recency
+                };
             }
         }
-        $analysis_ref_obj = Time::Piece->new($latest_epoch);
-    }
-    $analysis_ref_obj = $analysis_ref_obj->truncate(to => 'day');
 
-    foreach my $vm_name (keys %$metrics_href) {
-        # Find all unique profiles for this VM
-        my %profiles_for_vm;
-        foreach my $state_id (keys %{$metrics_href->{$vm_name}}) {
-            next unless $state_id =~ /^\d+$/; # Only process numeric state IDs
-            foreach my $key (keys %{$metrics_href->{$vm_name}{$state_id}}) {
-                $profiles_for_vm{$_} = 1 for keys %{$manifest_href->{$key}{profiles} || {}};
+        # Calculate aggregated PhysC value
+        if (@physc_timeseries) {
+            my $aggregated_physc = calculate_recency_weighted_average(
+                \@physc_timeseries,
+                $analysis_ref_obj,
+                $args_ref->{decay_half_life_days}
+            );
+            $aggregated_results_for_vm{$profile_name}{aggregated_value} = $aggregated_physc;
+        }
+    } # end foreach profile
+
+    # ===========================================================================
+    # CRITICAL FIX: Extract RunQ metrics from the MOST RECENT BIN WITH DATA
+    # ===========================================================================
+    # PROBLEM: VMs may go offline or have incomplete data in the chronologically
+    #          last time window due to InfluxDB ingestion lag or system downtime.
+    #          The previous code blindly used the last chronological window,
+    #          causing undef lookups and cascading failures.
+    #
+    # SOLUTION: Build a map of bin end times, then find the most recent bin that
+    #           actually exists in metrics_for_vm for THIS SPECIFIC VM.
+    # ===========================================================================
+
+    my $last_valid_bin_id = undef;
+    my $last_valid_bin_end_epoch = 0;
+
+    # Build a lookup map of bin_id -> end_epoch for O(1) access
+    my %bin_end_times;
+    my $bin_iterator_for_times = _create_bin_iterator(
+        $model_is_windowed, $window_context_aref, $state_context_aref
+    );
+    while (my $bin_meta = $bin_iterator_for_times->()) {
+        $bin_end_times{$bin_meta->{id}} = $bin_meta->{end_obj}->epoch;
+    }
+
+    # Find the most recent bin that actually has data for this VM
+    foreach my $bin_id (keys %{$metrics_for_vm}) {
+        if (exists $bin_end_times{$bin_id}) {
+            my $bin_end = $bin_end_times{$bin_id};
+            if ($bin_end > $last_valid_bin_end_epoch) {
+                $last_valid_bin_end_epoch = $bin_end;
+                $last_valid_bin_id = $bin_id;
             }
+        }
+    }
+
+    # Extract RunQ metrics from the identified bin
+    if (defined $last_valid_bin_id) {
+        # Optional diagnostic output for debugging
+        if ($args_ref->{verbose} && $args_ref->{verbose} > 1) {
+            warn "DEBUG: Using bin '$last_valid_bin_id' for RunQ metrics extraction (VM: $vm_name)\n";
         }
 
         foreach my $profile_name (keys %profiles_for_vm) {
-            # Find PhysC transform for this profile
-            my ($physc_transform_key) = grep {
-                $manifest_href->{$_}{metric} eq 'PhysC' &&
+            # Find NormRunQ transform for this profile
+            my ($norm_rq_key) = grep {
+                $manifest_href->{$_}{metric} eq 'NormRunQ' &&
                 exists $manifest_href->{$_}{profiles}{$profile_name}
             } keys %$manifest_href;
 
-            next unless $physc_transform_key;
+            if ($norm_rq_key) {
+                my $norm_metrics = _safe_dig($metrics_for_vm, $last_valid_bin_id, $norm_rq_key);
 
-            # Build time series for PhysC
-            my @physc_timeseries;
-            my $last_state_id;
-            foreach my $state_id (sort { $a <=> $b } keys %{$metrics_href->{$vm_name}}) {
-                next unless $state_id =~ /^\d+$/;
-                $last_state_id = $state_id;
-
-                if (exists $metrics_href->{$vm_name}{$state_id}{$physc_transform_key}) {
-                    my $perc_metrics = $metrics_href->{$vm_name}{$state_id}{$physc_transform_key};
-                    my $profile_perc = $manifest_href->{$physc_transform_key}{profiles}{$profile_name}{percentiles}[0];
-                    my $perc_key = "P" . $profile_perc;
-
-                    if (defined $perc_metrics->{$perc_key}) {
-                        my $state_obj = $states_by_vm_href->{$vm_name}[$state_id];
-                        push @physc_timeseries, {
-                            value => $perc_metrics->{$perc_key},
-                            date  => $state_obj->{end_time}
-                        };
-                    }
+                # Validate the retrieved data structure
+                if (defined $norm_metrics &&
+                    ref($norm_metrics) eq 'HASH' &&
+                    keys %$norm_metrics) {
+                    $aggregated_results_for_vm{_RunQ}{normalized}{$profile_name} = $norm_metrics;
                 }
             }
 
-            # Calculate aggregated PhysC value
-            if (@physc_timeseries) {
-                my $aggregated_physc = calculate_recency_weighted_average(
-                    \@physc_timeseries,
-                    $analysis_ref_obj,
-                    $args_ref->{decay_half_life_days}
-                );
+            # Find AbsRunQ transform for this profile
+            my ($abs_rq_key) = grep {
+                $manifest_href->{$_}{metric} eq 'AbsRunQ' &&
+                exists $manifest_href->{$_}{profiles}{$profile_name}
+            } keys %$manifest_href;
 
-                $aggregated_results{$vm_name}{$profile_name}{aggregated_value} = $aggregated_physc;
-            }
+            if ($abs_rq_key) {
+                my $abs_metrics = _safe_dig($metrics_for_vm, $last_valid_bin_id, $abs_rq_key);
 
-            # For each profile, extract any associated RunQ metrics from the LAST state.
-            if (defined $last_state_id) {
-                # Find the NormRunQ transform associated with this specific profile.
-                my ($norm_rq_key) = grep { $manifest_href->{$_}{metric} eq 'NormRunQ' && exists $manifest_href->{$_}{profiles}{$profile_name} } keys %$manifest_href;
-                if ($norm_rq_key && exists $metrics_href->{$vm_name}{$last_state_id}{$norm_rq_key}) {
-                    my $norm_metrics = $metrics_href->{$vm_name}{$last_state_id}{$norm_rq_key};
-                    # Add this profile's RunQ metrics to the aggregated results hash, nested under a temporary key.
-                    $aggregated_results{$vm_name}{_RunQ}{normalized}{$profile_name} = $norm_metrics;
-                }
-
-                # Find the AbsRunQ transform associated with this specific profile.
-                my ($abs_rq_key) = grep { $manifest_href->{$_}{metric} eq 'AbsRunQ' && exists $manifest_href->{$_}{profiles}{$profile_name} } keys %$manifest_href;
-                if ($abs_rq_key && exists $metrics_href->{$vm_name}{$last_state_id}{$abs_rq_key}) {
-                    my $abs_metrics = $metrics_href->{$vm_name}{$last_state_id}{$abs_rq_key};
-                    # Add this profile's RunQ metrics to the aggregated results hash.
-                    $aggregated_results{$vm_name}{_RunQ}{absolute}{$profile_name} = $abs_metrics;
-                 }
-
-                # Also store Peak value from last state
-                my ($peak_key) = grep {
-                    $manifest_href->{$_}{metric} eq 'PhysC' &&
-                    exists $manifest_href->{$_}{profiles}{$profile_name} &&
-                    $manifest_href->{$_}{profiles}{$profile_name}{calculate_peak}
-               } keys %$manifest_href;
-
-                if ($peak_key) {
-                    my $transform_state_data = $transform_states_href->{$vm_name}{$last_state_id}{$peak_key};
-                    if ($transform_state_data && exists $transform_state_data->{peak_value}) {
-                        $aggregated_results{$vm_name}{Peak} = $transform_state_data->{peak_value};
-                    }
+                # Validate the retrieved data structure
+                if (defined $abs_metrics &&
+                    ref($abs_metrics) eq 'HASH' &&
+                    keys %$abs_metrics) {
+                    $aggregated_results_for_vm{_RunQ}{absolute}{$profile_name} = $abs_metrics;
                 }
             }
         }
+    } else {
+        # This should be extremely rare - only if VM has no data at all
+        warn "WARNING: No bins with valid data found for VM '$vm_name' - RunQ metrics unavailable\n";
     }
 
-    # --- Inject the TRUE raw peak into the aggregated results ---
-    foreach my $vm_name (keys %aggregated_results) {
-        if (exists $raw_peak_tracker_ref->{$vm_name}) {
-            $aggregated_results{$vm_name}{Peak} = $raw_peak_tracker_ref->{$vm_name};
-        }
-    }
-    return \%aggregated_results;
-
+    return \%aggregated_results_for_vm;
 }
 
 # ==============================================================================
@@ -2418,6 +2505,41 @@ sub run_single_pass_from_manifest {
     my $states_json_text = do { open my $fh, '<:encoding(utf8)', $states_cache_file; local $/; <$fh> };
     my $states_by_vm = decode_json($states_json_text);
 
+    # ======================================================================
+    # == 1. Generate Analysis Context (Windows or States)
+    # ======================================================================
+    # This block determines the binning strategy for the entire run.
+
+    my $time_windows_aref = []; # Default to empty array
+    my $binning_context_source; # For logging
+    my $data_cache_file = File::Spec->catfile($nmon_dir, $CACHE_DATA_FILE);
+
+    if ($enable_windowed_decay) {
+        # --- Windowed-Decay Model ---
+        # Find the true start/end of the cache data and intersect with user flags.
+        my ($eff_start, $eff_end) = _get_effective_cache_range(
+            $data_cache_file, $start_date_str, $end_date_str
+        );
+
+        if ($eff_start && $eff_end) {
+            # Generate the time-window bins for the effective analysis period.
+            $time_windows_aref = generate_processing_time_windows(
+                $eff_start, $eff_end,
+                $process_window_unit_str, $process_window_size_val
+            );
+            $binning_context_source = "TimeWindows (" . scalar(@$time_windows_aref) . " bins)";
+        } else {
+            warn "Warning: Could not determine effective date range for windowed decay. No data will be processed.\n";
+        }
+    } else {
+        # --- Hybrid-Decay or Standard Model ---
+        # The binning context will be the VM's Configuration States.
+        # This is handled dynamically inside process_data_point.
+        $binning_context_source = "ConfigStates";
+    }
+
+    print STDERR "  Binning Strategy: $binning_context_source\n" if $verbose;
+
     # This block modifies the %states_by_vm hash IN-PLACE, adding derived
     # metadata and Time::Piece objects that are used by all downstream functions.
     print STDERR "Hydrating configuration states...\n" if $verbose;
@@ -2469,7 +2591,6 @@ sub run_single_pass_from_manifest {
     # configuration states for a given VM, ensuring continuity.
     my %persistent_transform_states;
     my %raw_peak_tracker; # Track true raw peak per VM
-    my $data_cache_file = File::Spec->catfile($nmon_dir, $CACHE_DATA_FILE);
 
     # --- Load or build cache index for date-range optimisation ---
     my $cache_index;
@@ -2564,7 +2685,11 @@ sub run_single_pass_from_manifest {
             end_date_str              => $end_date_str,
             smt_fallback              => $smt_value,
             raw_peak_tracker          => \%raw_peak_tracker,
-            enable_clipping_detection => $enable_clipping_detection
+            enable_clipping_detection => $enable_clipping_detection,
+
+            # --- NEW CONTEXT FLAGS ---
+            enable_windowed_decay     => $enable_windowed_decay,
+            time_windows_aref         => $time_windows_aref, # Pass the generated windows
         });
     }
     close $data_fh;
@@ -2589,31 +2714,76 @@ sub run_single_pass_from_manifest {
     if ($is_aggregated_run) {
         # --- PATH A: AGGREGATED RUNS (Decay / Growth) ---
 
-        # 1. Calculate recency-weighted baselines (WITHOUT growth)
-        my $aggregated_results = aggregate_decay_metrics($final_metrics, $manifest, $states_by_vm, \%transform_states, \%raw_peak_tracker, $args_ref);
+        my $aggregated_results_all_vms = {};
+        my $growth_results_all_vms = {};
 
-        # 2. Calculate per-profile growth adjustments using the baselines
-        my $growth_results_by_profile = {};
-        if ($args_ref->{enable_growth_prediction}) {
-           $growth_results_by_profile = calculate_per_profile_growth_adjustments(
-                $aggregated_results, \%analysis_data, $final_metrics, $manifest, $states_by_vm, $args_ref
-            );
+        # Determine the analysis reference date (used by both models)
+        my $analysis_ref_obj;
+        if ($args_ref->{analysis_reference_date}) {
+            eval { $analysis_ref_obj = Time::Piece->strptime($args_ref->{analysis_reference_date}, "%Y-%m-%d"); };
+        } else {
+            # Fallback: find the latest date from all states
+            my $latest_epoch = 0;
+            foreach my $vm_states (values %$states_by_vm) {
+                foreach my $state (@$vm_states) {
+                    $latest_epoch = $state->{end_epoch} if $state->{end_epoch} > $latest_epoch;
+                }
+            }
+            $analysis_ref_obj = Time::Piece->new($latest_epoch);
         }
+        $analysis_ref_obj = $analysis_ref_obj->truncate(to => 'day');
 
-        # 3. Assemble the final JSON, combining baselines and growth
-        foreach my $vm_name (sort keys %$aggregated_results) {
+
+        # Iterate over each VM to create its specific context and run aggregations
+        foreach my $vm_name (keys %$final_metrics) {
+
+            # --- FIX: Pass raw context arrays, not an iterator ---
+            # Pass the model selector flag and the two potential data contexts.
+            # The consumer functions will create their own iterators as needed.
+
+            # 2. Calculate recency-weighted baselines (WITHOUT growth)
+            my $aggregated_results_for_vm = aggregate_decay_metrics(
+                $vm_name,
+                $final_metrics,
+                $manifest,
+                $enable_windowed_decay,      # Pass model selector
+                $time_windows_aref,          # Pass window context
+                $states_by_vm->{$vm_name},   # Pass state context
+                $analysis_ref_obj,
+                $args_ref
+            );
+            $aggregated_results_all_vms->{$vm_name} = $aggregated_results_for_vm;
+
+            # 3. Calculate per-profile growth adjustments
+            if ($args_ref->{enable_growth_prediction}) {
+                $growth_results_all_vms->{$vm_name} = calculate_per_profile_growth_adjustments(
+                    $vm_name,
+                    $aggregated_results_for_vm, # Pass this VM's baseline
+                    \%analysis_data,
+                    $manifest,
+                    $enable_windowed_decay,      # Pass model selector
+                    $time_windows_aref,          # Pass window context
+                    $states_by_vm->{$vm_name},   # Pass state context
+                    $args_ref,
+                    $analysis_ref_obj
+                );
+            }
+        } # End foreach $vm_name
+
+        # 4. Assemble the final JSON
+        foreach my $vm_name (sort keys %$aggregated_results_all_vms) {
             my $output_obj = assemble_aggregated_output(
                 $vm_name,
-                $aggregated_results->{$vm_name},
-                $growth_results_by_profile, # Pass the new growth data
+                $aggregated_results_all_vms->{$vm_name},
+                $growth_results_all_vms->{$vm_name} || {}, # Pass this VM's growth
                 $states_by_vm,
                 $args_ref,
                 $final_metrics,
-                $manifest
+                $manifest,
+                \%raw_peak_tracker # Pass raw peak tracker
             );
             push @output_objects, $output_obj if defined $output_obj;
         }
-
     } else {
         # --- PATH B: STANDARD PER-STATE RUNS ---
         @output_objects = @{ assemble_output($final_metrics, $manifest, $states_by_vm, \%transform_states, $args_ref) };
@@ -2650,20 +2820,45 @@ sub process_data_point {
 
     # 2. Apply global date filters -> This is already done in the caller loop.
 
-    # 3. Find the correct state for this timestamp using the hydrated state objects.
-    my $state_obj;
-    my $state_id;
-    # This loop is optimised by assuming states are sorted by time.
-    for (my $i=0; $i < @{$states_by_vm->{$vm}}; $i++) {
-        my $s = $states_by_vm->{$vm}[$i];
-        # Check if the timestamp falls within the state's epoch range.
-        if ($tp->epoch >= $s->{start_time}->epoch && $tp->epoch <= $s->{end_time}->epoch) {
-            $state_obj = $s;
-            $state_id = $i;
-            last;
+    # 3. Find the correct bin for this data point based on the analysis model
+    my $bin_key;
+    my $state_obj; # State object is still needed for metadata (SMT, max_cpu)
+    my $ts_epoch = $tp->epoch;
+
+    if ($filters->{enable_windowed_decay}) {
+        # --- Windowed-Decay Model ---
+        # Bin key is the Time Window ID (e.g., "2025_W42")
+        # Use the fast binary search helper.
+        $bin_key = _binary_search_window_index($ts_epoch, $filters->{time_windows_aref});
+
+        # We still need the state_obj for SMT/config, so find it.
+        # This is a linear scan, but only runs *after* we know the timestamp
+        # is in a valid time window.
+        if (defined $bin_key) {
+             for (my $i=0; $i < @{$states_by_vm->{$vm}}; $i++) {
+                my $s = $states_by_vm->{$vm}[$i];
+                if ($ts_epoch >= $s->{start_time}->epoch && $ts_epoch <= $s->{end_time}->epoch) {
+                    $state_obj = $s;
+                    last;
+                }
+            }
+        }
+    } else {
+        # --- Hybrid-Decay or Standard Model ---
+        # Bin key is the numeric State ID (0, 1, 2...)
+        for (my $i=0; $i < @{$states_by_vm->{$vm}}; $i++) {
+            my $s = $states_by_vm->{$vm}[$i];
+            if ($ts_epoch >= $s->{start_time}->epoch && $ts_epoch <= $s->{end_time}->epoch) {
+                $state_obj = $s;
+                $bin_key   = $i; # Use the zero-based index as the key
+                last;
+            }
         }
     }
-    return unless $state_obj;
+
+    # If no valid bin (state or window) was found, or if state metadata
+    # is missing, we cannot process this data point.
+    return unless (defined $bin_key && defined $state_obj);
 
     # 4. Iterate through all required transforms for this data point.
     foreach my $key (keys %$manifest) {
@@ -2693,8 +2888,8 @@ sub process_data_point {
         }
 
         # --- Data processing continues only if the data point was not filtered out ---
-        # This tracks the PEAK of the rolling average, which IS state-specific.
-        my $t_state = $transform_states->{$vm}{$state_id}{$key} //= initialise_transform_state($entry);
+        # This tracks the PEAK of the rolling average, which is bin-specific.
+        my $t_state = $transform_states->{$vm}{$bin_key}{$key} //= initialise_transform_state($entry);
 
         # --- Use the PERSISTENT state for the rolling average calculation ---
         my $p_state = $persistent_transform_states->{$vm}{$key} //= initialise_transform_state($entry);
@@ -2716,14 +2911,14 @@ sub process_data_point {
 
         # 4e. Store the rolling average in the packed array for percentile calculation.
         if (defined $rolling_avg) {
-            update_packed_array($analysis_data, $vm, $state_id, $key, $rolling_avg, $t_state);
+            update_packed_array($analysis_data, $vm, $bin_key, $key, $rolling_avg, $t_state);
         }
 
         # 4f. Conditionally gather raw data if clipping detection is enabled.
         if ($filters->{enable_clipping_detection} && $entry->{metric} eq 'PhysC') {
             # Use a different hash to store raw data streams.
-            update_packed_array($raw_data, $vm, $state_id, $key."_raw_physc", $physc);
-            update_packed_array($raw_data, $vm, $state_id, $key."_raw_runq", $runq);
+            update_packed_array($raw_data, $vm, $bin_key, $key."_raw_physc", $physc);
+            update_packed_array($raw_data, $vm, $bin_key, $key."_raw_runq", $runq);
         }
     }
 }
@@ -3119,6 +3314,63 @@ sub generate_manifest_key {
     return sha256_hex($canonical_string);
 }
 
+# ==============================================================================
+# SUBROUTINE: _create_bin_iterator
+# PURPOSE:    Creates a bin-agnostic iterator (a coderef) that yields
+#             bin metadata in chronological order, regardless of whether
+#             the bins are time-windows or configuration states.
+#
+# ARGUMENTS:
+#   1. $model_is_windowed (boolean): True if in --enable-windowed-decay mode.
+#   2. $window_context_aref (array ref): The @time_windows array.
+#   3. $state_context_aref (array ref): The $states_by_vm->{$vm} array.
+#
+# RETURNS:
+#   - A coderef. When called, it returns the next bin's metadata hash:
+#     { id => "key", start_obj => Time::Piece, end_obj => Time::Piece }
+#     or undef if iteration is complete.
+# ==============================================================================
+sub _create_bin_iterator {
+    my ($model_is_windowed, $window_context_aref, $state_context_aref) = @_;
+
+    my $index = 0;
+    my $context_aref;
+    my $is_state_based;
+
+    if ($model_is_windowed) {
+        # --- Windowed-Decay Model ---
+        # The context is the array of time windows.
+        $context_aref = $window_context_aref;
+        $is_state_based = 0;
+    } else {
+        # --- Hybrid-Decay or Standard Model ---
+        # The context is the array of configuration states.
+        $context_aref = $state_context_aref;
+        $is_state_based = 1;
+    }
+
+    # Return an iterator (a closure)
+    return sub {
+        return undef if $index > $#{$context_aref};
+
+        my $bin_data = $context_aref->[$index];
+        $index++;
+
+        if ($is_state_based) {
+            # Adapt the state object to the iterator's interface
+            return {
+                id        => $bin_data->{state_id} - 1, # Use 0-based index as key
+                start_obj => $bin_data->{start_time},
+                end_obj   => $bin_data->{end_time}
+            };
+        } else {
+            # The window object already matches the interface (id, start_obj, end_obj)
+            # Note: window end_obj is already exclusive, which is fine
+            return $bin_data;
+        }
+    };
+}
+
 # Helper for hash references (with safe fallback)
 sub _safe_get {
     my ($href, $key, $fallback) = @_;
@@ -3141,7 +3393,7 @@ sub _safe_dig {
 #             This is the dedicated output path for decay/growth models.
 # ==============================================================================
 sub assemble_aggregated_output {
-    my ($vm_name, $aggregated_metrics_href, $growth_results_href, $states_by_vm_href, $args_ref, $final_metrics_href, $manifest_href) = @_;
+    my ($vm_name, $aggregated_metrics_href, $growth_results_href, $states_by_vm_href, $args_ref, $final_metrics_href, $manifest_href, $raw_peak_tracker_ref) = @_;
 
     my $rounding_method = 'none';
     my $round_increment;
@@ -3168,6 +3420,13 @@ sub assemble_aggregated_output {
         debug        => {}
     };
 
+    # --- Add Bin-Basis Metadata (Point 11) ---
+    if ($args_ref->{enable_windowed_decay}) {
+        $output_obj->{metadata}{binBasis} = "window_" . $args_ref->{process_window_unit} . "_" . $args_ref->{process_window_size};
+    } else {
+        $output_obj->{metadata}{binBasis} = "state";
+    }
+
     # Populate profileLabel (when it is defined)
     if (defined $profile_label && $profile_label ne '') {
         $output_obj->{profileLabel} = $profile_label;
@@ -3185,7 +3444,7 @@ sub assemble_aggregated_output {
 
         # Do NOT apply growth adjustments to the P-99W1 profile (similar as for Peak - this is an empirical value, not a prediction)
         if ($profile_name ne $MANDATORY_PEAK_PROFILE_FOR_HINT) {
-            if (my $growth_res = _safe_dig($growth_results_href, $vm_name, $profile_name)) {
+            if (my $growth_res = _safe_dig($growth_results_href, $profile_name)) {
                 $growth_adj = $growth_res->{growth_adj} // 0;
                 $growth_rationale = $growth_res->{rationale} // {};
             }
@@ -3225,396 +3484,383 @@ sub assemble_aggregated_output {
     }
 
     # Populate Peak and RunQ metrics
-    $output_obj->{metadata}{peakPhyscFromLatestState} = apply_rounding($aggregated_metrics_href->{Peak}, $round_increment, $rounding_method) if exists $aggregated_metrics_href->{Peak};
+    # Use the TRUE raw peak from the tracker (Point 10, Peak Invariant)
+    if (exists $raw_peak_tracker_ref->{$vm_name}) {
+        $output_obj->{metadata}{peakPhyscFromLatestState} = apply_rounding($raw_peak_tracker_ref->{$vm_name}, $round_increment, $rounding_method);
+    }
     $output_obj->{metrics}{runq} = $aggregated_metrics_href->{_RunQ} if exists $aggregated_metrics_href->{_RunQ};
 
     return $output_obj;
 }
 
 # ==============================================================================
-# SUBROUTINE: calculate_per_profile_growth_adjustments (CORRECTED - v3)
-# PURPOSE:    Calculates growth adjustment for each profile using Theil-Sen.
-#             Implements the correct, model-aware time-series construction
-#             as defined in "nFit - Robust Trend Analysis (Theil-Sen) Design.md"
-#             and applies engine-side percentage capping.
+# SUBROUTINE: calculate_per_profile_growth_adjustments
+# PURPOSE:    Calculate statistically robust growth adjustments for each profile
+#             using Theil-Sen robust trend analysis with Hamed-Rao autocorrelation
+#             correction on daily re-aggregated time-series data.
+#
 # ARGUMENTS:
-#   1. $aggregated_results_href - Hash of baseline values per VM/profile (WITHOUT growth)
-#   2. $analysis_data_href - The %analysis_data hash containing packed timeseries
-#   3. $final_metrics_href - Per-state/window aggregated metrics
-#   4. $manifest_href - The manifest to identify which profiles need growth
-#   5. $states_by_vm_href - The hydrated states hash for time context
-#   6. $args_ref - Hash with growth parameters (projection_days, etc.)
-#   7. $analysis_ref_obj - The analysis reference date
+#   1. $vm_name              - VM identifier (string)
+#   2. $aggregated_results   - Hash ref: profile results from aggregation phase
+#   3. $analysis_data_href   - Hash ref: packed binary arrays of smoothed data per bin
+#   4. $manifest_href        - Hash ref: transform metadata including time filters
+#   5. $model_is_windowed    - Boolean: true for windowed decay, false for hybrid
+#   6. $window_context_aref  - Array ref: window bins (if windowed model)
+#   7. $state_context_aref   - Array ref: state bins (if hybrid model)
+#   8. $args_ref             - Hash ref: analysis parameters and flags
+#   9. $analysis_ref_obj     - Time::Piece object: reference date for analysis
+#
+# RETURNS:
+#   Hash ref: { profile_name => { growth_adj => N, rationale => {...} } }
+#
+# METHODOLOGY:
+#   1. Extract profile-filtered, smoothed samples from packed binary arrays.
+#   2. **Profile-aware duration calculation**: Calculate a 'profile_aware_bin_duration'
+#      based on the profile's active duration (9h/12h/24h) and the bin's
+#      number of days (1-day state vs 7-day window).
+#   3. **Profile-aware interval calculation**: Calculate the correct *average*
+#      sample interval using the profile-aware duration.
+#   4. **Profile-aware daily QC**: Apply completeness thresholds based on each
+#      profile's active duration (e.g., 75% of 9 hours, not 24 hours).
+#   5. Reconstruct timestamps using the correct interval and bucket samples by day.
+#   6. Calculate daily percentiles from each *valid* day's bucket.
+#   7. Apply Theil-Sen robust trend analysis with Hamed-Rao correction.
+#   8. Cap growth inflation to configured maximum percentage.
+#
+# CRITICAL FIX 1: PROFILE-AWARE DURATION (Fixes "Temporal Smearing")
+#   - This is the primary fix for the "Hamed-Rao adjustment factor is non-positive"
+#     warnings, which were caused by a corrupted, artificial time-series.
+#   - Fixes "Temporal Smearing" (e.g., 9h 'online' vs 24h 'general').
+#     The bug was stretching 9 hours of data across a 24-hour bin duration.
+#   - Fixes "Multi-Day Bin Smearing" (e.g., 7-day window vs 1-day).
+#     The bug was "smearing" 7 days of data onto the first day of the bin.
+#   - This version correctly calculates a 'profile_aware_bin_duration' based on both
+#     the profile's time_filter and the bin's number of days, resulting in a
+#     statistically valid interval and time-series.
+#
+# CRITICAL FIX 2: PROFILE-AWARE QC (Fixes Data Gap Bias)
+#   - Calculates a 'min_samples_threshold' based on the profile's
+#     active duration (e.g., 75% of 9 hours, not 24 hours).
+#   - This prevents valid 'online' or 'batch' days from being discarded
+#     as "incomplete" and ensures partial-data days (e.g., due to a
+#     VM restart) do not corrupt the trend analysis.
+#
+# PROFILE TIME FILTERS:
+#   - 'online': 08:00-17:00 (9 hours) - applied in process_data_point
+#   - 'batch':  18:00-06:00 (12 hours) - applied in process_data_point
+#   - 'none':   00:00-24:00 (24 hours) - no filtering
+#
 # NOTES:
-#   - Uses MODEL-AGNOSTIC trend calculation with daily re-aggregation
-#   - Model identity lives in BaseValue calculation (state-decay vs window-decay)
-#   - Both models synthesise daily percentiles from smoothed timeseries
-#   - Applies Hamed-Rao correction for autocorrelation
+#   - Requires minimum $GROWTH_MIN_HISTORICAL_PERIODS days for trend calculation.
+#   - Growth adjustments are capped per profile's max_growth_inflation_percent.
+#   - All decisions logged in rationale hash for audit trail.
+#   - Compatible with both windowed and hybrid (state-based) decay models.
 # ==============================================================================
 sub calculate_per_profile_growth_adjustments {
-    my ($aggregated_results_href, $analysis_data_href, $final_metrics_href,
-        $manifest_href, $states_by_vm_href, $args_ref, $analysis_ref_obj) = @_;
-
-    my %growth_results;
-
-    foreach my $vm_name (keys %{$aggregated_results_href}) {
-       foreach my $profile_name (keys %{$aggregated_results_href->{$vm_name}}) {
-
-            # Find the PhysC transform key for this profile
-            my ($transform_key) = grep {
-                $manifest_href->{$_}{metric} eq 'PhysC' &&
-                exists $manifest_href->{$_}{profiles}{$profile_name} &&
-                exists $manifest_href->{$_}{profiles}{$profile_name}{enable_growth}
-            } keys %$manifest_href;
-            next unless $transform_key;
-
-            my $baseline_val = $aggregated_results_href->{$vm_name}{$profile_name}{aggregated_value};
-            next unless (defined $baseline_val && $baseline_val > $FLOAT_EPSILON);
-
-            # Get max growth % from manifest for this profile
-            my $max_growth_perc = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'max_growth_inflation_percent') // $max_growth_inflation_percent;
-
-            # -------------------------------------------------
-            # BUILD MODEL-AGNOSTIC DAILY SERIES FOR TREND ANALYSIS
-            # -------------------------------------------------
-
-            my @series_for_trend;
-            my $slope_is_per_day = 1; # Flag to track slope units
-            my $window_days = 1;      # Days per x-axis unit
-
-            if ($args_ref->{decay_over_states}) {
-                # -------------------------------------------------
-                # HYBRID MODEL (Model 3): Build daily percentile series
-                # -------------------------------------------------
-                # Re-aggregate smoothed timeseries into daily percentile values.
-                # This provides genuine intra-day variation capture, not state-level stamping.
-                #
-                # Key principle: The model identity (Hybrid vs Windowed) lives in
-                # how BaseValue is calculated (state-decay vs window-decay).
-                # Growth trend calculation is model-agnostic and uses daily re-aggregation.
-                # -------------------------------------------------
-
-                my $states_aref = $states_by_vm_href->{$vm_name} // [];
-
-                # Get percentile value for this profile
-                my $percentiles = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'percentiles');
-                next unless (defined $percentiles && ref $percentiles eq 'ARRAY' && @$percentiles);
-                my $p_val = $percentiles->[0];
-
-                # Find the earliest state start time as the reference point (day 0)
-                my $earliest_epoch = undef;
-                my $latest_epoch = undef;
-                foreach my $state (@{$states_aref}) {
-                    my $start_epoch = $state->{start_time}->epoch;
-                    my $end_epoch = $state->{end_time}->epoch;
-                    if (!defined $earliest_epoch || $start_epoch < $earliest_epoch) {
-                        $earliest_epoch = $start_epoch;
-                    }
-                    if (!defined $latest_epoch || $end_epoch > $latest_epoch) {
-                        $latest_epoch = $end_epoch;
-                    }
-                }
-                next unless (defined $earliest_epoch && defined $latest_epoch);
-
-                # ═══════════════════════════════════════════════════════════════
-                # ADAPTIVE PROJECTION CALCULATION
-                # ═══════════════════════════════════════════════════════════════
-                # Calculate analysis window and sampling characteristics for
-                # adaptive projection horizon determination
-
-                my $analysis_days = int(($latest_epoch - $earliest_epoch) / 86400) + 1;
-
-                # Determine average sampling interval from first state with data
-                # (representative sample, no need to scan entire dataset)
-                my $avg_interval_mins = 60;  # Default fallback (hourly)
-
-                for my $state_idx (0 .. $#{$states_aref}) {
-                    my $state = $states_aref->[$state_idx];
-                    my $packed_data = $analysis_data_href->{$vm_name}{$state_idx}{$transform_key};
-                    next unless defined $packed_data;
-
-                    # Use first state with data as representative sample
-                    my @samples = unpack('f<*', $packed_data);
-                    my $num_samples = scalar(@samples);
-
-                    if ($num_samples > 1) {
-                        my $state_duration = $state->{end_time}->epoch - $state->{start_time}->epoch;
-                        $avg_interval_mins = int(($state_duration / ($num_samples - 1)) / 60);
-                        $avg_interval_mins = 1 if $avg_interval_mins < 1;  # Floor at 1 minute
-                        last;  # Got representative sample, exit loop
-                    }
-                }
-
-                # Determine projection days: user override > adaptive > default
-                my $projection_days;
-                my $projection_days_source;
-
-                if (exists $args_ref->{growth_projection_days_user_override} &&
-                    $args_ref->{growth_projection_days_user_override}) {
-                    # User explicitly specified --growth-projection-days
-                    $projection_days = $args_ref->{growth_projection_days};
-                    $projection_days_source = 'user_specified';
-                } else {
-                    # Calculate adaptive projection days
-                    $projection_days = calculate_adaptive_projection_days(
-                        $analysis_days,
-                        $avg_interval_mins
-                    );
-                    $projection_days_source = 'adaptive';
-                }
-
-                # Store projection metadata for use in growth calculation
-                $args_ref->{growth_projection_days_calculated} = $projection_days;
-                $args_ref->{growth_projection_days_source} = $projection_days_source;
-                $args_ref->{analysis_days} = $analysis_days;
-                $args_ref->{avg_sampling_interval_mins} = $avg_interval_mins;
-
-                # ═══════════════════════════════════════════════════════════════
-                # END ADAPTIVE PROJECTION CALCULATION
-                # ═══════════════════════════════════════════════════════════════
-
-
-                # Build daily buckets from smoothed timeseries values
-                my %daily_buckets;
-
-                foreach my $state_idx (0 .. $#{$states_aref}) {
-                    my $state = $states_aref->[$state_idx];
-                    my $state_start_epoch = $state->{start_time}->epoch;
-                    my $state_end_epoch   = $state->{end_time}->epoch;
-
-                    # Get the smoothed timeseries for this state
-                    my $packed_data = $analysis_data_href->{$vm_name}{$state_idx}{$transform_key};
-                    next unless defined $packed_data;
-
-                    my @rolling_avg_values = unpack('f<*', $packed_data);
-                    next unless @rolling_avg_values;
-
-                    # Reconstruct timestamps assuming uniform sampling
-                    my $num_samples = scalar(@rolling_avg_values);
-                    my $interval = ($state_end_epoch - $state_start_epoch) / ($num_samples - 1);
-
-                    # Bucket each sample by day
-                    for my $i (0 .. $#rolling_avg_values) {
-                        my $timestamp_epoch = $state_start_epoch + ($i * $interval);
-                        my $day_index = int(($timestamp_epoch - $earliest_epoch) / 86400);
-                        push @{$daily_buckets{$day_index}}, $rolling_avg_values[$i];
-                    }
-                }
-
-                # Calculate daily percentile from each bucket
-                foreach my $day_idx (sort {$a <=> $b} keys %daily_buckets) {
-                    my $bucket_aref = $daily_buckets{$day_idx};
-                    next unless @$bucket_aref;
-
-                    # Calculate the requested percentile for this day's samples
-                    my $daily_percentile = calculate_percentile($bucket_aref, $p_val);
-                    push @series_for_trend, [$day_idx, $daily_percentile];
-                }
-
-                # This series is [day, daily_percentile], so slope is cores/day
-                $slope_is_per_day = 1;
-                $window_days = 1;
-                $args_ref->{use_hamed_rao} = 1; # Enable Hamed-Rao for autocorrelation correction
-                $args_ref->{aggregation_basis} = 'per_day';
-
-            } elsif ($args_ref->{enable_windowed_decay}) {
-                # -------------------------------------------------
-                # WINDOWED MODEL (Model 2): Build daily percentile series
-                # -------------------------------------------------
-                # Same as Hybrid - trend calculation is model-agnostic.
-                # Model identity lives in BaseValue calculation (window-decay vs state-decay).
-                # For trend analysis, both models use daily re-aggregation from smoothed timeseries.
-                # -------------------------------------------------
-
-                my $windows_aref = $states_by_vm_href->{$vm_name} // [];
-
-                # Get percentile value for this profile
-                my $percentiles = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'percentiles');
-                next unless (defined $percentiles && ref $percentiles eq 'ARRAY' && @$percentiles);
-                my $p_val = $percentiles->[0];
-
-                # Find the earliest window start time as the reference point (day 0)
-                my $earliest_epoch = undef;
-                my $latest_epoch = undef;
-                foreach my $window (@{$windows_aref}) {
-                    my $start_epoch = $window->{start_time}->epoch;
-                    my $end_epoch = $window->{end_time}->epoch;
-                    if (!defined $earliest_epoch || $start_epoch < $earliest_epoch) {
-                        $earliest_epoch = $start_epoch;
-                    }
-                    if (!defined $latest_epoch || $end_epoch > $latest_epoch) {
-                        $latest_epoch = $end_epoch;
-                    }
-                }
-                next unless (defined $earliest_epoch && defined $latest_epoch);
-
-                # ═══════════════════════════════════════════════════════════════
-                # ADAPTIVE PROJECTION CALCULATION (Windowed Model)
-                # ═══════════════════════════════════════════════════════════════
-
-                my $analysis_days = int(($latest_epoch - $earliest_epoch) / 86400) + 1;
-
-                # Determine average sampling interval from first window with data
-                my $avg_interval_mins = 60;  # Default fallback
-
-                for my $window_idx (0 .. $#{$windows_aref}) {
-                    my $packed_data = $analysis_data_href->{$vm_name}{$window_idx}{$transform_key};
-                    next unless defined $packed_data;
-
-                    # Use first window with data as representative sample
-                    my @samples = unpack('f<*', $packed_data);
-                    my $num_samples = scalar(@samples);
-
-                    if ($num_samples > 1) {
-                        my $window = $windows_aref->[$window_idx];
-                        my $window_duration = $window->{end_time}->epoch - $window->{start_time}->epoch;
-                        $avg_interval_mins = int(($window_duration / ($num_samples - 1)) / 60);
-                        $avg_interval_mins = 1 if $avg_interval_mins < 1;
-                        last;  # Got representative sample, exit loop
-                    }
-                }
-
-                # Determine projection days
-                my $projection_days;
-                my $projection_days_source;
-
-                if (exists $args_ref->{growth_projection_days_user_override} &&
-                    $args_ref->{growth_projection_days_user_override}) {
-                    $projection_days = $args_ref->{growth_projection_days};
-                    $projection_days_source = 'user_specified';
-                } else {
-                    $projection_days = calculate_adaptive_projection_days(
-                        $analysis_days,
-                        $avg_interval_mins
-                    );
-                    $projection_days_source = 'adaptive';
-                }
-
-                # Store projection metadata
-                $args_ref->{growth_projection_days_calculated} = $projection_days;
-                $args_ref->{growth_projection_days_source} = $projection_days_source;
-                $args_ref->{analysis_days} = $analysis_days;
-                $args_ref->{avg_sampling_interval_mins} = $avg_interval_mins;
-
-                # ═══════════════════════════════════════════════════════════════
-                # END ADAPTIVE PROJECTION CALCULATION
-                # ═══════════════════════════════════════════════════════════════
-
-                # Build daily buckets from smoothed timeseries values (same as Hybrid)
-                my %daily_buckets;
-
-                foreach my $window_idx (0 .. $#{$windows_aref}) {
-                    my $window = $windows_aref->[$window_idx];
-                    my $window_start_epoch = $window->{start_time}->epoch;
-                    my $window_end_epoch   = $window->{end_time}->epoch;
-
-                    # Get the smoothed timeseries for this window
-                    my $packed_data = $analysis_data_href->{$vm_name}{$window_idx}{$transform_key};
-                    next unless defined $packed_data;
-
-                    my @rolling_avg_values = unpack('f<*', $packed_data);
-                    next unless @rolling_avg_values;
-
-                    # Reconstruct timestamps assuming uniform sampling
-                    my $num_samples = scalar(@rolling_avg_values);
-                    my $interval = ($window_end_epoch - $window_start_epoch) / ($num_samples - 1);
-
-                    # Bucket each sample by day
-                    for my $i (0 .. $#rolling_avg_values) {
-                        my $timestamp_epoch = $window_start_epoch + ($i * $interval);
-                        my $day_index = int(($timestamp_epoch - $earliest_epoch) / 86400);
-                        push @{$daily_buckets{$day_index}}, $rolling_avg_values[$i];
-                    }
-                }
-
-                # Calculate daily percentile from each bucket
-                foreach my $day_idx (sort {$a <=> $b} keys %daily_buckets) {
-                    my $bucket_aref = $daily_buckets{$day_idx};
-                    next unless @$bucket_aref;
-
-                    # Calculate the requested percentile for this day's samples
-                    my $daily_percentile = calculate_percentile($bucket_aref, $p_val);
-                    push @series_for_trend, [$day_idx, $daily_percentile];
-                }
-
-                # This series is [day, daily_percentile], so slope is cores/day
-                $slope_is_per_day = 1;
-                $window_days = 1;  # Not used when slope_is_per_day = 1
-                $args_ref->{use_hamed_rao} = 1; # Enable Hamed-Rao for autocorrelation correction
-                $args_ref->{aggregation_basis} = 'per_day';
-            }
-
-            # -------------------------------------------------
-            # CALCULATE ROBUST TREND
-            # -------------------------------------------------
-
-            if (scalar(@series_for_trend) >= $GROWTH_MIN_HISTORICAL_PERIODS) {
-
-                # Call the robust trend analysis function
-                my $robust_rationale_hash = calculate_growth_trend_robust_v1(
-                    \@series_for_trend,
-                    $args_ref->{growth_projection_days} || $DEFAULT_GROWTH_PROJECTION_DAYS,
-                    $args_ref
-                );
-
-                my $final_growth_adj = $robust_rationale_hash->{growth_adj} // 0;
-                my $sen_slope = $robust_rationale_hash->{sen_slope} // 0;
-
-                # --- START FIX: Canonicalise slope and apply cap ---
-                if ($final_growth_adj > 0 && $sen_slope > 0) {
-                    my $sen_slope_per_day = $sen_slope;
-
-                    # If slope was cores/window, convert to cores/day
-                    if (!$slope_is_per_day && $window_days > 0) {
-                        $sen_slope_per_day = $sen_slope / $window_days;
-                    }
-
-                    # Recalculate projection using the per-day slope
-                    my $projection_days = $args_ref->{growth_projection_days} || $DEFAULT_GROWTH_PROJECTION_DAYS;
-                    my $raw_growth_adj = $sen_slope_per_day * $projection_days;
-
-                    # Apply the percent cap (gating)
-                    my $cap_abs = $baseline_val * ($max_growth_perc / 100.0);
-
-                    if ($raw_growth_adj > $cap_abs) {
-                        $final_growth_adj = $cap_abs;
-                        # Add capping info to the rationale log
-                        $robust_rationale_hash->{was_capped} = 1;
-                        $robust_rationale_hash->{original_growth_adj} = $raw_growth_adj;
-                        $robust_rationale_hash->{cap_value_applied} = $cap_abs;
-                        $robust_rationale_hash->{cap_percent_applied} = $max_growth_perc;
-                    } else {
-                        $final_growth_adj = $raw_growth_adj;
-                    }
-
-                    # Store the canonical per-day slope in the rationale
-                    $robust_rationale_hash->{sen_slope_per_day} = $sen_slope_per_day;
-                    $robust_rationale_hash->{growth_adj} = $final_growth_adj;
-                }
-                # --- END FIX ---
-
-                # Package results in the expected format
-                $growth_results{$vm_name}{$profile_name} = {
-                    growth_adj => $final_growth_adj, # Use the capped, per-day value
-                    rationale  => $robust_rationale_hash
-                };
-
-            } else {
-                # Insufficient data points for trend analysis
-                $growth_results{$vm_name}{$profile_name} = {
-                    growth_adj => 0,
-                    rationale  => {
-                        method_used => 'none',
-                        skip_reason => 'Insufficient data points for trend analysis (n=' . scalar(@series_for_trend) . ' < ' . $GROWTH_MIN_HISTORICAL_PERIODS . ')',
-                        sample_points => scalar(@series_for_trend),
-                        aggregation_basis => $args_ref->{aggregation_basis} || 'unknown',
-                    }
-                };
-            }
+    my ($vm_name, $aggregated_results_href, $analysis_data_href,
+        $manifest_href, $model_is_windowed, $window_context_aref, $state_context_aref,
+        $args_ref, $analysis_ref_obj) = @_;
+
+    my %growth_results_for_vm;
+
+    # Calculate analysis bounds
+    my $earliest_epoch = undef;
+    my $latest_epoch = undef;
+
+    my $bin_iterator = _create_bin_iterator(
+        $model_is_windowed, $window_context_aref, $state_context_aref
+    );
+    while (my $bin_meta = $bin_iterator->()) {
+        my $start_epoch = $bin_meta->{start_obj}->epoch;
+        my $end_epoch = $bin_meta->{end_obj}->epoch;
+        if (!defined $earliest_epoch || $start_epoch < $earliest_epoch) {
+            $earliest_epoch = $start_epoch;
+        }
+        if (!defined $latest_epoch || $end_epoch > $latest_epoch) {
+            $latest_epoch = $end_epoch;
+        }
+    }
+    return {} unless (defined $earliest_epoch && defined $latest_epoch);
+
+    # Adaptive projection calculation (unchanged)
+    my $analysis_days = int(($latest_epoch - $earliest_epoch) / 86400) + 1;
+    my $avg_interval_mins = 60; # Default fallback
+
+    # ═════════════════════════════════════════════════════════════════════
+    # CRITICAL: Validate detected sampling interval before use
+    # ═════════════════════════════════════════════════════════════════════
+    my $detected_interval_mins = $args_ref->{avg_sampling_interval_mins} // $avg_interval_mins;
+    my $expected_interval_seconds;
+
+    if (defined $detected_interval_mins &&
+        $detected_interval_mins >= 0.5 &&
+        $detected_interval_mins <= 30) {
+        $expected_interval_seconds = $detected_interval_mins * 60;
+    } else {
+        if ($args_ref->{verbose} && defined $detected_interval_mins) {
+            # Log a warning if the detected value is nonsensical (British English)
+            warn sprintf(
+                "WARNING: Detected sampling interval (%.2f min) is outside " .
+                "reasonable range [0.5-30]. Using 60s default for growth logic.\n",
+                $detected_interval_mins
+            );
+        }
+        $expected_interval_seconds = 60; # Safe default: 1-minute sampling
+    }
+
+    my $found_samples = 0;
+    $bin_iterator = _create_bin_iterator(
+        $model_is_windowed, $window_context_aref, $state_context_aref
+    );
+    while (my $bin_meta = $bin_iterator->() and !$found_samples) {
+        my ($any_transform_key) = keys %{ _safe_get($analysis_data_href->{$vm_name}, $bin_meta->{id}, {}) };
+        next unless $any_transform_key;
+        my $packed_data = $analysis_data_href->{$vm_name}{$bin_meta->{id}}{$any_transform_key};
+        next unless defined $packed_data;
+        my @samples = unpack('f<*', $packed_data);
+        my $num_samples = scalar(@samples);
+        if ($num_samples > 1) {
+            my $bin_duration = $bin_meta->{end_obj}->epoch - $bin_meta->{start_obj}->epoch;
+            $bin_duration = max($bin_duration, $num_samples * $expected_interval_seconds);
+            $avg_interval_mins = int(($bin_duration / ($num_samples - 1)) / 60);
+            $avg_interval_mins = 1 if $avg_interval_mins < 1;
+            $found_samples = 1;
         }
     }
 
-    return \%growth_results;
+    my $projection_days;
+    my $projection_days_source;
+    if (exists $args_ref->{growth_projection_days_user_override} && $args_ref->{growth_projection_days_user_override}) {
+        $projection_days = $args_ref->{growth_projection_days};
+        $projection_days_source = 'user_specified';
+    } else {
+        $projection_days = calculate_adaptive_projection_days($analysis_days, $avg_interval_mins);
+        $projection_days_source = 'adaptive';
+    }
+
+    my %growth_args = (
+        %{$args_ref},
+        growth_projection_days_calculated => $projection_days,
+        growth_projection_days_source     => $projection_days_source,
+        analysis_days                     => $analysis_days,
+        avg_sampling_interval_mins        => $avg_interval_mins,
+        use_hamed_rao                     => 1,
+        aggregation_basis                 => 'per_day',
+    );
+
+
+    foreach my $profile_name (keys %{$aggregated_results_href}) {
+        next if $profile_name eq '_RunQ' or $profile_name eq 'Peak';
+
+        my ($transform_key) = grep {
+            $manifest_href->{$_}{metric} eq 'PhysC' &&
+            exists $manifest_href->{$_}{profiles}{$profile_name} &&
+            exists $manifest_href->{$_}{profiles}{$profile_name}{enable_growth}
+        } keys %$manifest_href;
+        next unless $transform_key;
+
+        my $baseline_val = $aggregated_results_href->{$profile_name}{aggregated_value};
+        next unless (defined $baseline_val && $baseline_val > $FLOAT_EPSILON);
+
+        my $max_growth_perc = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'max_growth_inflation_percent') // $max_growth_inflation_percent;
+        my $percentiles = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'percentiles');
+        next unless (defined $percentiles && ref $percentiles eq 'ARRAY' && @$percentiles);
+        my $p_val = $percentiles->[0];
+
+        # ═════════════════════════════════════════════════════════════════════
+        # PROFILE-AWARE DURATION LOGIC (FIX FOR TEMPORAL SMEARING)
+        # ═════════════════════════════════════════════════════════════════════
+        my $transform_info = $manifest_href->{$transform_key};
+        my $time_filter = _safe_dig($transform_info, 'time_filter') // 'none';
+
+        my %profile_active_duration_seconds = (
+            'none'   => 86400, # 24 hours
+            'online' => 32400, # 9 hours (08:00-17:00)
+            'batch'  => 43200, # 12 hours (18:00-06:00)
+        );
+
+        my $active_duration_per_day_seconds = $profile_active_duration_seconds{$time_filter} // 86400;
+
+        # ═════════════════════════════════════════════════════════════════════
+        # PROFILE-AWARE DAILY QC THRESHOLD (From Claude's v1)
+        # ═════════════════════════════════════════════════════════════════════
+        my $expected_samples_per_day = int($active_duration_per_day_seconds / $expected_interval_seconds);
+        # Use a 75% completeness threshold
+        my $min_samples_threshold = int($expected_samples_per_day * 0.75);
+
+
+        # ═════════════════════════════════════════════════════════════════════
+        # PER-BIN TIMESTAMP RECONSTRUCTION (Daily Re-aggregation)
+        # ═════════════════════════════════════════════════════════════════════
+        my %daily_buckets;
+
+        $bin_iterator = _create_bin_iterator(
+            $model_is_windowed, $window_context_aref, $state_context_aref
+        );
+
+        while (my $bin_meta = $bin_iterator->()) {
+            my $bin_id = $bin_meta->{id};
+            my $bin_start_epoch = $bin_meta->{start_obj}->epoch;
+            my $bin_end_epoch   = $bin_meta->{end_obj}->epoch;
+
+            my $packed_data = _safe_dig($analysis_data_href, $vm_name, $bin_id, $transform_key);
+            next unless defined $packed_data;
+
+            my @rolling_avg_values = unpack('f<*', $packed_data);
+            my $num_samples = scalar(@rolling_avg_values);
+            next unless $num_samples > 0;
+
+            # ═══════════════════════════════════════════════════════════════════
+            # DURATION & INTERVAL CALCULATION (from Gemini v5)
+            # This logic correctly handles both profile filters and multi-day bins.
+            # ═══════════════════════════════════════════════════════════════════
+
+            # 1. Calculate the physical duration of the bin in days (handles partial days).
+            my $physical_bin_duration_seconds = $bin_end_epoch - $bin_start_epoch;
+            my $bin_duration_days = ($physical_bin_duration_seconds + $FLOAT_EPSILON) / 86400.0;
+
+            # 2. Calculate the profile's total *active* duration within this bin.
+            #    e.g., For a 7-day bin and an 'online' (9h/day) profile:
+            #    $profile_aware_bin_duration = 7.0 * 32400 = 226800 seconds
+            my $profile_aware_bin_duration = $bin_duration_days * $active_duration_per_day_seconds;
+
+            # 3. Corrected "Adaptive Guard"
+            #    The profile's active duration cannot be less than the duration
+            #    implied by the sample count and the original sampling interval.
+            my $min_reasonable_duration = ($num_samples - 1) * $expected_interval_seconds * 0.9; # 90% tolerance
+
+            my $final_duration_for_interval_calc;
+            if ($num_samples > 1 && $profile_aware_bin_duration < $min_reasonable_duration) {
+                # This bin has significant data gaps (e.g., VM was offline).
+                # Use the sample-based duration to avoid "reverse smearing".
+                $final_duration_for_interval_calc = $min_reasonable_duration;
+
+                if ($args_ref->{verbose}) {
+                    warn sprintf(
+                        "WARNING: Bin %s (Profile: %s) has fewer samples (%d) than expected for " .
+                        "its active duration (%.1f min). Using sample-derived duration (%.1f min) " .
+                        "for interval calculation.\n",
+                        $bin_id,
+                        $profile_name,
+                        $num_samples,
+                        $profile_aware_bin_duration / 60,
+                        $min_reasonable_duration / 60
+                    );
+                }
+            } else {
+                # Standard case: Use the calculated profile-aware duration.
+                $final_duration_for_interval_calc = $profile_aware_bin_duration;
+            }
+
+            # 4. Calculate the profile-aware *average* interval for this bin.
+            #    e.g. (Online, 1-day bin): $interval = 32400 / (540 - 1) ≈ 60.1s. Correct.
+            #    e.g. (Online, 7-day bin): $interval = 226800 / (3780 - 1) ≈ 60.0s. Correct.
+            my $interval = 0;
+            if ($num_samples > 1) {
+                $interval = $final_duration_for_interval_calc / ($num_samples - 1);
+            }
+
+            # 5. Reconstruct timestamps and bucket into daily bins.
+            for (my $i = 0; $i < $num_samples; $i++) {
+                # This places samples at their correct average temporal position.
+                my $approx_timestamp_epoch = $bin_start_epoch + ($i * $interval);
+
+                # Convert the reconstructed epoch to a day-based key
+                my $day_key = int($approx_timestamp_epoch / 86400);
+                push @{$daily_buckets{$day_key}}, $rolling_avg_values[$i];
+            }
+        } # end while (bin_meta)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # DAILY AGGREGATION & TREND ANALYSIS
+        # ═══════════════════════════════════════════════════════════════════
+
+        # Calculate daily percentile from each day's bucket
+        my @series_for_trend;
+        foreach my $day_key (sort {$a <=> $b} keys %daily_buckets) {
+            my $bucket_aref = $daily_buckets{$day_key};
+            my $samples_in_day = scalar(@$bucket_aref);
+            next unless $samples_in_day > 0;
+
+            # Apply the Profile-Aware QC check here
+            if ($samples_in_day < $min_samples_threshold) {
+                if ($args_ref->{verbose}) {
+                    warn sprintf(
+                        "INFO: Day %d for profile '%s' (filter=%s) has insufficient data: " .
+                        "%d samples < %d threshold (%.0f%% of %d expected). Excluding from trend.\n",
+                        $day_key,
+                        $profile_name,
+                        $time_filter,
+                        $samples_in_day,
+                        $min_samples_threshold,
+                        75,
+                        $expected_samples_per_day
+                    );
+                }
+                next; # Skip this day
+            }
+
+            my $daily_percentile = calculate_percentile($bucket_aref, $p_val);
+            # Day index relative to the start of the analysis
+            my $day_index = $day_key - int($earliest_epoch / 86400);
+            push @series_for_trend, [$day_index, $daily_percentile];
+        }
+
+        # Calculate Robust Trend
+        if (scalar(@series_for_trend) >= $GROWTH_MIN_HISTORICAL_PERIODS) {
+            my $robust_rationale_hash = calculate_growth_trend_robust_v1(
+                \@series_for_trend,
+                $projection_days,
+                \%growth_args
+                );
+
+            # Get the raw calculated growth from the rationale
+            my $raw_growth_adj = $robust_rationale_hash->{growth_adj} // 0;
+            my $sen_slope = $robust_rationale_hash->{sen_slope} // 0;
+
+            # Default final_growth_adj to the raw calculated value (which can be negative)
+            my $final_growth_adj = $raw_growth_adj;
+
+            # Apply Capping ONLY if the trend is POSITIVE
+            if ($raw_growth_adj > 0 && $sen_slope > 0) {
+                my $sen_slope_per_day = $sen_slope;
+                # $raw_growth_adj is already set from the rationale
+                my $cap_abs = $baseline_val * ($max_growth_perc / 100.0);
+
+                if ($raw_growth_adj > $cap_abs) {
+                    $final_growth_adj = $cap_abs;
+                    $robust_rationale_hash->{was_capped} = 1;
+                    $robust_rationale_hash->{original_growth_adj} = $raw_growth_adj;
+                    $robust_rationale_hash->{cap_value_applied} = $cap_abs;
+                    $robust_rationale_hash->{cap_percent_applied} = $max_growth_perc;
+                }
+                # (If not capped, $final_growth_adj remains $raw_growth_adj)
+
+                $robust_rationale_hash->{sen_slope_per_day} = $sen_slope_per_day;
+            }
+
+            # Store the (now potentially negative) final growth value
+            $robust_rationale_hash->{growth_adj} = $final_growth_adj;
+
+            $growth_results_for_vm{$profile_name} = {
+                growth_adj => $final_growth_adj,
+                rationale  => $robust_rationale_hash
+            };
+        } else {
+            # Not enough data points to run a trend analysis
+            $growth_results_for_vm{$profile_name} = {
+                growth_adj => 0,
+                rationale  => {
+                    method_used => 'none',
+                    skip_reason => 'Insufficient daily data points for trend analysis (n=' . scalar(@series_for_trend) . ' < ' . $GROWTH_MIN_HISTORICAL_PERIODS . ')',
+                    sample_points => scalar(@series_for_trend),
+                    aggregation_basis => $growth_args{aggregation_basis} || 'unknown',
+                }
+            };
+        }
+    } # end foreach profile
+
+    return \%growth_results_for_vm;
 }
 
 # ==============================================================================
@@ -3888,6 +4134,147 @@ sub mann_kendall_test_hamed_rao {
         adjustment_factor => sprintf("%.4f", $adjustment_factor),
         rho_1      => scalar(@rho_values) > 0 ? sprintf("%.4f", $rho_values[0]) : undef,
     };
+}
+
+# ==============================================================================
+# SUBROUTINE: _get_effective_cache_range
+# PURPOSE:    Finds the first and last timestamps in the L1 cache and intersects
+#             them with the user's --startdate/--enddate flags to determine
+#             the actual period for analysis.
+#
+# ARGUMENTS:
+#   1. $data_file (string): Path to the .nfit.cache.data file
+#   2. $start_date_str (string, optional): User's --startdate
+#   3. $end_date_str (string, optional): User's --enddate
+#
+# RETURNS:
+#   - A list of two Time::Piece objects: (effective_start_obj, effective_end_obj)
+#   - Returns (undef, undef) on failure.
+#
+# NOTES:
+#   This is a port of the logic from nfit-profile.pl, adapted for nfit.pl
+# ==============================================================================
+sub _get_effective_cache_range {
+    my ($data_file, $start_date_str, $end_date_str) = @_;
+
+    return (undef, undef) unless (-f $data_file && -s $data_file);
+
+    my ($cache_start_obj, $cache_end_obj);
+    my $first_valid_ts;
+
+    # --- Find first timestamp ---
+    open my $fh, '<:raw', $data_file or die "FATAL: Could not open $data_file: $!";
+    my $header = <$fh>; # Skip header
+
+    while (my $line = <$fh>) {
+        # Fast check for YYYY-MM-DD HH:MM:SS format
+        if ($line =~ /^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}),/) {
+            $first_valid_ts = $1;
+            last;
+        }
+    }
+    # If we found a start, seek to end. Otherwise, file is empty/corrupt.
+    return (undef, undef) unless $first_valid_ts;
+
+    # --- Find last timestamp (fast seek) ---
+    my $last_valid_ts;
+    my $pos = -s $fh;
+    my $line_buffer = '';
+    my $chunk_size = 1024;
+
+    while ($pos > 0 && !$last_valid_ts) {
+        my $seek_pos = ($pos < $chunk_size) ? 0 : $pos - $chunk_size;
+        $chunk_size = $pos if $seek_pos == 0;
+        last if $chunk_size <= 0;
+
+        seek $fh, $seek_pos, 0;
+        my $chunk;
+        read $fh, $chunk, $chunk_size;
+        $pos = $seek_pos; # Update position for next iteration
+
+        $line_buffer = $chunk . $line_buffer;
+        my @lines = split /\n/, $line_buffer;
+        $line_buffer = shift @lines if $pos > 0; # Keep partial line
+
+        for (my $i = $#lines; $i >= 0; $i--) {
+            if ($lines[$i] =~ /^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}),/) {
+                $last_valid_ts = $1;
+                last;
+            }
+        }
+    }
+    close $fh;
+    return (undef, undef) unless $last_valid_ts;
+
+    # --- Parse cache bounds ---
+    eval {
+        $cache_start_obj = Time::Piece->strptime($first_valid_ts, "%Y-%m-%d %H:%M:%S");
+        $cache_end_obj   = Time::Piece->strptime($last_valid_ts,   "%Y-%m-%d %H:%M:%S");
+    };
+    if ($@) {
+        warn "Warning: Could not parse cache boundary timestamps ($first_valid_ts, $last_valid_ts). Error: $@";
+        return (undef, undef);
+    }
+
+    # --- Intersect with user flags ---
+    my $effective_start = $cache_start_obj;
+    my $effective_end   = $cache_end_obj;
+
+    if ($start_date_str) {
+        my $user_start_obj = Time::Piece->strptime($start_date_str, "%Y-%m-%d")->truncate(to => 'day');
+        $effective_start = $user_start_obj if $user_start_obj > $effective_start;
+    }
+    if ($end_date_str) {
+        # User end date is inclusive, so we find the end of that day
+        my $user_end_obj = (Time::Piece->strptime($end_date_str, "%Y-%m-%d") + ONE_DAY) - 1;
+        $effective_end = $user_end_obj if $user_end_obj < $effective_end;
+    }
+
+    return ($effective_start, $effective_end) if $effective_start <= $effective_end;
+    return (undef, undef); # No valid overlapping range
+}
+
+# ==============================================================================
+# SUBROUTINE: _binary_search_window_index
+# PURPOSE:    Performs a fast binary search to find the correct time window
+#             for a given timestamp.
+#
+# ARGUMENTS:
+#   1. $ts_epoch (integer): The epoch seconds of the current data point.
+#   2. $windows_aref (array ref): The pre-sorted array of window hashes.
+#
+# RETURNS:
+#   - The window's string ID (e.g., "2025W42") if found.
+#   - undef if not found in any window (e.g., data point is in a gap).
+#
+# NOTES:
+#   Assumes [start, end) boundaries (start inclusive, end exclusive).
+# ==============================================================================
+sub _binary_search_window_index {
+    my ($ts_epoch, $windows_aref) = @_;
+
+    my $low = 0;
+    my $high = $#{$windows_aref};
+    my $found_id = undef;
+
+    while ($low <= $high) {
+        my $mid = int(($low + $high) / 2);
+        my $win = $windows_aref->[$mid];
+
+        # Check against [start, end) boundaries
+        if ($ts_epoch < $win->{start_obj}->epoch) {
+            $high = $mid - 1; # Too high
+        }
+        elsif ($ts_epoch >= $win->{end_obj}->epoch) {
+            $low = $mid + 1; # Too low
+        }
+        else {
+            # Found: ts_epoch >= start_epoch AND ts_epoch < end_epoch
+            $found_id = $win->{id};
+            last;
+        }
+    }
+    return $found_id;
 }
 
 # --- usage ---
