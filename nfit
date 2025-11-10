@@ -1177,6 +1177,21 @@ sub calculate_growth_trend_robust_v1 {
     # STAGE 3: Mann-Kendall significance test (standard version)
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Mann-Kendall Significance Test Selection
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # The Hamed-Rao variant includes intelligent routing:
+    #   1. Trend-dominance pre-check: If |τ| ≥ 0.4, use standard MK
+    #   2. Autocorrelation correction: If trend moderate, apply Hamed-Rao
+    #   3. Reactive fallback: If adjustment unstable, fallback to standard MK
+    #
+    # The 'variant' field in the result indicates which path was taken:
+    #   - 'standard_mk_trend_dominant'           : Strong trend detected (skipped H-R)
+    #   - 'hamed-rao'                            : H-R correction applied successfully
+    #   - 'standard_mk_via_hamed_rao_fallback'   : H-R unstable, fell back
+    #   - 'standard'                             : Standard MK (H-R not requested)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     my $mk_result;
     if ($use_hamed_rao) {
         $mk_result = mann_kendall_test_hamed_rao($vm_name, $profile_name, $time_series_aref, $mk_alpha);
@@ -1236,12 +1251,31 @@ sub calculate_growth_trend_robust_v1 {
         volatility_cv => $stats->{cv},
         volatility_check_passed => $cv_passed,
 
-        #  ----SEN'S SLOPE + MANN-KENDALL (Combined System) ----
+        #  ---- SEN'S SLOPE + MANN-KENDALL (Combined System) ----
         sen_slope => $sen_slope,
         sen_trend => $mk_result ? $mk_result->{trend} : 'none',
         sen_p_value => $mk_result ? $mk_result->{p_value} : undef,
         sen_is_significant => $mk_result ? $mk_result->{passed} : 0,
         sen_tau => $mk_result ? $mk_result->{tau} : undef,
+
+        # ---- MANN-KENDALL VARIANT METADATA ----
+        mk_variant => $mk_result ? ($mk_result->{variant} // 'standard') : 'none',
+        mk_n_effective => $mk_result ? ($mk_result->{n_eff} // $n) : undef,
+
+        # ---- HAMED-RAO SPECIFIC FIELDS (when applicable) ----
+        ($mk_result && $mk_result->{variant} && $mk_result->{variant} =~ /hamed.rao|fallback|trend_dominant/ ? (
+            hamed_rao_adjustment_factor => $mk_result->{adjustment_factor} // $mk_result->{hamed_rao_adjustment_factor},
+            hamed_rao_autocorr_max_lag => $mk_result->{autocorr_max_lag},
+            hamed_rao_lag1_autocorr => $mk_result->{lag1_autocorr},
+        ) : ()),
+
+        # Include skip/fallback reasons when present
+        ($mk_result && $mk_result->{hamed_rao_skip_reason} ? (
+            hamed_rao_skip_reason => $mk_result->{hamed_rao_skip_reason}
+        ) : ()),
+        ($mk_result && $mk_result->{hamed_rao_fallback_reason} ? (
+            hamed_rao_fallback_reason => $mk_result->{hamed_rao_fallback_reason}
+        ) : ()),
 
         # ---- OLS (Legacy Comparison) ----
         ols_slope => $ols_result ? $ols_result->{slope} : undef,
@@ -3499,7 +3533,7 @@ sub assemble_aggregated_output {
 # SUBROUTINE: calculate_per_profile_growth_adjustments
 # PURPOSE:    Calculate statistically robust growth adjustments for each profile
 #             using Theil-Sen robust trend analysis with Hamed-Rao autocorrelation
-#             correction on daily re-aggregated time-series data.
+#             correction on logically-chunked time-series data.
 #
 # ARGUMENTS:
 #   1. $vm_name              - VM identifier (string)
@@ -3515,45 +3549,40 @@ sub assemble_aggregated_output {
 # RETURNS:
 #   Hash ref: { profile_name => { growth_adj => N, rationale => {...} } }
 #
-# METHODOLOGY:
-#   1. Extract profile-filtered, smoothed samples from packed binary arrays.
-#   2. **Profile-aware duration calculation**: Calculate a 'profile_aware_bin_duration'
-#      based on the profile's active duration (9h/12h/24h) and the bin's
-#      number of days (1-day state vs 7-day window).
-#   3. **Profile-aware interval calculation**: Calculate the correct *average*
-#      sample interval using the profile-aware duration.
-#   4. **Profile-aware daily QC**: Apply completeness thresholds based on each
-#      profile's active duration (e.g., 75% of 9 hours, not 24 hours).
-#   5. Reconstruct timestamps using the correct interval and bucket samples by day.
-#   6. Calculate daily percentiles from each *valid* day's bucket.
-#   7. Apply Theil-Sen robust trend analysis with Hamed-Rao correction.
-#   8. Cap growth inflation to configured maximum percentage.
+# METHODOLOGY: "LOGICAL DAY CHUNKING"
+#   This implementation uses a statistically robust approach that abandons the
+#   flawed "temporal smearing" algorithm in favour of direct sample chunking:
 #
-# CRITICAL FIX 1: PROFILE-AWARE DURATION (Fixes "Temporal Smearing")
-#   - This is the primary fix for the "Hamed-Rao adjustment factor is non-positive"
-#     warnings, which were caused by a corrupted, artificial time-series.
-#   - Fixes "Temporal Smearing" (e.g., 9h 'online' vs 24h 'general').
-#     The bug was stretching 9 hours of data across a 24-hour bin duration.
-#   - Fixes "Multi-Day Bin Smearing" (e.g., 7-day window vs 1-day).
-#     The bug was "smearing" 7 days of data onto the first day of the bin.
-#   - This version correctly calculates a 'profile_aware_bin_duration' based on both
-#     the profile's time_filter and the bin's number of days, resulting in a
-#     statistically valid interval and time-series.
+#   1. COLLATE: Gather all smoothed samples from all bins into a time-ordered stream.
+#   2. DEFINE LOGICAL DAY: Calculate expected samples per "logical day" based on
+#      the profile's time filter (e.g., 'online' = 9h × 60 samples/hr = 540 samples).
+#   3. CHUNK: Iterate through the sample stream in chunks of this logical day size.
+#   4. QC & AGGREGATE: Apply 75% completeness check to each chunk. Valid chunks
+#      are aggregated into a single percentile value (one data point per logical day).
+#   5. STATISTICAL ANALYSIS: Pass the resulting clean, autocorrelated time-series
+#      to Theil-Sen robust trend analysis with Hamed-Rao correction.
+#   6. CAPPING: Cap positive growth to configured maximum percentage.
 #
-# CRITICAL FIX 2: PROFILE-AWARE QC (Fixes Data Gap Bias)
-#   - Calculates a 'min_samples_threshold' based on the profile's
-#     active duration (e.g., 75% of 9 hours, not 24 hours).
-#   - This prevents valid 'online' or 'batch' days from being discarded
-#     as "incomplete" and ensures partial-data days (e.g., due to a
-#     VM restart) do not corrupt the trend analysis.
+# WHY THIS APPROACH IS CORRECT:
+#   - Preserves Natural Autocorrelation: Correctly "stitches" active workload
+#     periods together, maintaining the day-to-day correlation that Hamed-Rao
+#     requires (typically ρ ≈ 0.3-0.5 for real workloads).
+#   - Handles Gaps Gracefully: Data gaps (VM shutdowns, NMON errors) become
+#     partial chunks that fail QC and are correctly excluded.
+#   - Statistically Valid: Avoids the "temporal smearing" bug that created
+#     pathological gappy series (e.g., 46 points followed by 45 NULLs).
+#   - Works for All Profiles: Single algorithm handles 'none' (24h), 'online' (9h),
+#     and 'batch' (12h) profiles correctly.
 #
 # PROFILE TIME FILTERS:
-#   - 'online': 08:00-17:00 (9 hours) - applied in process_data_point
-#   - 'batch':  18:00-06:00 (12 hours) - applied in process_data_point
-#   - 'none':   00:00-24:00 (24 hours) - no filtering
+#   Time filtering is applied upstream in process_data_point, so the packed
+#   samples already contain only active-period data:
+#   - 'online': 08:00-17:00 (9 hours)  → ~540 samples/day @ 1-min interval
+#   - 'batch':  18:00-06:00 (12 hours) → ~720 samples/day @ 1-min interval
+#   - 'none':   00:00-24:00 (24 hours) → ~1440 samples/day @ 1-min interval
 #
 # NOTES:
-#   - Requires minimum $GROWTH_MIN_HISTORICAL_PERIODS days for trend calculation.
+#   - Requires minimum $GROWTH_MIN_HISTORICAL_PERIODS logical days for trend analysis.
 #   - Growth adjustments are capped per profile's max_growth_inflation_percent.
 #   - All decisions logged in rationale hash for audit trail.
 #   - Compatible with both windowed and hybrid (state-based) decay models.
@@ -3565,7 +3594,10 @@ sub calculate_per_profile_growth_adjustments {
 
     my %growth_results_for_vm;
 
-    # Calculate analysis bounds
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STAGE 1: Calculate analysis bounds
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     my $earliest_epoch = undef;
     my $latest_epoch = undef;
 
@@ -3584,14 +3616,13 @@ sub calculate_per_profile_growth_adjustments {
     }
     return {} unless (defined $earliest_epoch && defined $latest_epoch);
 
-    # Adaptive projection calculation (unchanged)
     my $analysis_days = int(($latest_epoch - $earliest_epoch) / 86400) + 1;
-    my $avg_interval_mins = 60; # Default fallback
 
-    # ═════════════════════════════════════════════════════════════════════
-    # CRITICAL: Validate detected sampling interval before use
-    # ═════════════════════════════════════════════════════════════════════
-    my $detected_interval_mins = $args_ref->{avg_sampling_interval_mins} // $avg_interval_mins;
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STAGE 2: Determine expected sampling interval
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    my $detected_interval_mins = $args_ref->{avg_sampling_interval_mins} // 60;
     my $expected_interval_seconds;
 
     if (defined $detected_interval_mins &&
@@ -3600,42 +3631,28 @@ sub calculate_per_profile_growth_adjustments {
         $expected_interval_seconds = $detected_interval_mins * 60;
     } else {
         if ($args_ref->{verbose} && defined $detected_interval_mins) {
-            # Log a warning if the detected value is nonsensical (British English)
             warn sprintf(
                 "WARNING: Detected sampling interval (%.2f min) is outside " .
                 "reasonable range [0.5-30]. Using 60s default for growth logic.\n",
                 $detected_interval_mins
             );
         }
-        $expected_interval_seconds = 60; # Safe default: 1-minute sampling
+        $expected_interval_seconds = 60;
     }
 
-    my $found_samples = 0;
-    $bin_iterator = _create_bin_iterator(
-        $model_is_windowed, $window_context_aref, $state_context_aref
-    );
-    while (my $bin_meta = $bin_iterator->() and !$found_samples) {
-        my ($any_transform_key) = keys %{ _safe_get($analysis_data_href->{$vm_name}, $bin_meta->{id}, {}) };
-        next unless $any_transform_key;
-        my $packed_data = $analysis_data_href->{$vm_name}{$bin_meta->{id}}{$any_transform_key};
-        next unless defined $packed_data;
-        my @samples = unpack('f<*', $packed_data);
-        my $num_samples = scalar(@samples);
-        if ($num_samples > 1) {
-            my $bin_duration = $bin_meta->{end_obj}->epoch - $bin_meta->{start_obj}->epoch;
-            $bin_duration = max($bin_duration, $num_samples * $expected_interval_seconds);
-            $avg_interval_mins = int(($bin_duration / ($num_samples - 1)) / 60);
-            $avg_interval_mins = 1 if $avg_interval_mins < 1;
-            $found_samples = 1;
-        }
-    }
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STAGE 3: Calculate adaptive projection days
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     my $projection_days;
     my $projection_days_source;
-    if (exists $args_ref->{growth_projection_days_user_override} && $args_ref->{growth_projection_days_user_override}) {
+    if (exists $args_ref->{growth_projection_days_user_override} &&
+        $args_ref->{growth_projection_days_user_override}) {
         $projection_days = $args_ref->{growth_projection_days};
         $projection_days_source = 'user_specified';
     } else {
+        # Use a reasonable fallback for avg_interval_mins in adaptive calculation
+        my $avg_interval_mins = int($expected_interval_seconds / 60) || 1;
         $projection_days = calculate_adaptive_projection_days($analysis_days, $avg_interval_mins);
         $projection_days_source = 'adaptive';
     }
@@ -3645,15 +3662,26 @@ sub calculate_per_profile_growth_adjustments {
         growth_projection_days_calculated => $projection_days,
         growth_projection_days_source     => $projection_days_source,
         analysis_days                     => $analysis_days,
-        avg_sampling_interval_mins        => $avg_interval_mins,
+        avg_sampling_interval_mins        => int($expected_interval_seconds / 60),
         use_hamed_rao                     => 1,
         aggregation_basis                 => 'per_day',
     );
 
+    # Profile active duration lookup table (in seconds per logical day)
+    my %profile_active_duration_seconds = (
+        'none'   => 86400, # 24 hours
+        'online' => 32400, # 9 hours (08:00-17:00)
+        'batch'  => 43200, # 12 hours (18:00-06:00)
+    );
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STAGE 4: Per-profile logical day chunking and trend analysis
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     foreach my $profile_name (keys %{$aggregated_results_href}) {
         next if $profile_name eq '_RunQ' or $profile_name eq 'Peak';
 
+        # Find the transform key for this profile
         my ($transform_key) = grep {
             $manifest_href->{$_}{metric} eq 'PhysC' &&
             exists $manifest_href->{$_}{profiles}{$profile_name} &&
@@ -3664,37 +3692,34 @@ sub calculate_per_profile_growth_adjustments {
         my $baseline_val = $aggregated_results_href->{$profile_name}{aggregated_value};
         next unless (defined $baseline_val && $baseline_val > $FLOAT_EPSILON);
 
-        my $max_growth_perc = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'max_growth_inflation_percent') // $max_growth_inflation_percent;
-        my $percentiles = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'percentiles');
+        my $max_growth_perc = _safe_dig($manifest_href, $transform_key, 'profiles',
+                                        $profile_name, 'max_growth_inflation_percent')
+                              // $max_growth_inflation_percent;
+        my $percentiles = _safe_dig($manifest_href, $transform_key, 'profiles',
+                                    $profile_name, 'percentiles');
         next unless (defined $percentiles && ref $percentiles eq 'ARRAY' && @$percentiles);
         my $p_val = $percentiles->[0];
 
-        # ═════════════════════════════════════════════════════════════════════
-        # PROFILE-AWARE DURATION LOGIC (FIX FOR TEMPORAL SMEARING)
-        # ═════════════════════════════════════════════════════════════════════
+        # ──────────────────────────────────────────────────────────────────────
+        # Define profile's "logical day" parameters based on time filter
+        # ──────────────────────────────────────────────────────────────────────
+
         my $transform_info = $manifest_href->{$transform_key};
         my $time_filter = _safe_dig($transform_info, 'time_filter') // 'none';
 
-        my %profile_active_duration_seconds = (
-            'none'   => 86400, # 24 hours
-            'online' => 32400, # 9 hours (08:00-17:00)
-            'batch'  => 43200, # 12 hours (18:00-06:00)
-        );
+        my $active_duration_per_day_seconds = $profile_active_duration_seconds{$time_filter}
+                                              // 86400;
+        my $samples_per_logical_day = int($active_duration_per_day_seconds /
+                                          $expected_interval_seconds);
 
-        my $active_duration_per_day_seconds = $profile_active_duration_seconds{$time_filter} // 86400;
+        # Quality control threshold: require 75% completeness (minimum 1 sample)
+        my $min_samples_threshold = max(1, int($samples_per_logical_day * 0.75));
 
-        # ═════════════════════════════════════════════════════════════════════
-        # PROFILE-AWARE DAILY QC THRESHOLD (From Claude's v1)
-        # ═════════════════════════════════════════════════════════════════════
-        my $expected_samples_per_day = int($active_duration_per_day_seconds / $expected_interval_seconds);
-        # Use a 75% completeness threshold
-        my $min_samples_threshold = int($expected_samples_per_day * 0.75);
+        # ──────────────────────────────────────────────────────────────────────
+        # Collate all smoothed samples from all bins into a single time-ordered stream
+        # ──────────────────────────────────────────────────────────────────────
 
-
-        # ═════════════════════════════════════════════════════════════════════
-        # PER-BIN TIMESTAMP RECONSTRUCTION (Daily Re-aggregation)
-        # ═════════════════════════════════════════════════════════════════════
-        my %daily_buckets;
+        my @all_smoothed_samples;
 
         $bin_iterator = _create_bin_iterator(
             $model_is_windowed, $window_context_aref, $state_context_aref
@@ -3702,113 +3727,76 @@ sub calculate_per_profile_growth_adjustments {
 
         while (my $bin_meta = $bin_iterator->()) {
             my $bin_id = $bin_meta->{id};
-            my $bin_start_epoch = $bin_meta->{start_obj}->epoch;
-            my $bin_end_epoch   = $bin_meta->{end_obj}->epoch;
-
             my $packed_data = _safe_dig($analysis_data_href, $vm_name, $bin_id, $transform_key);
             next unless defined $packed_data;
 
-            my @rolling_avg_values = unpack('f<*', $packed_data);
-            my $num_samples = scalar(@rolling_avg_values);
-            next unless $num_samples > 0;
+            # Unpack all samples from this bin
+            my @bin_samples = unpack('f<*', $packed_data);
+            my $bin_sample_count = scalar(@bin_samples);
 
-            # ═══════════════════════════════════════════════════════════════════
-            # DURATION & INTERVAL CALCULATION (from Gemini v5)
-            # This logic correctly handles both profile filters and multi-day bins.
-            # ═══════════════════════════════════════════════════════════════════
+            if ($bin_sample_count > 0) {
 
-            # 1. Calculate the physical duration of the bin in days (handles partial days).
-            my $physical_bin_duration_seconds = $bin_end_epoch - $bin_start_epoch;
-            my $bin_duration_days = ($physical_bin_duration_seconds + $FLOAT_EPSILON) / 86400.0;
-
-            # 2. Calculate the profile's total *active* duration within this bin.
-            #    e.g., For a 7-day bin and an 'online' (9h/day) profile:
-            #    $profile_aware_bin_duration = 7.0 * 32400 = 226800 seconds
-            my $profile_aware_bin_duration = $bin_duration_days * $active_duration_per_day_seconds;
-
-            # 3. Corrected "Adaptive Guard"
-            #    The profile's active duration cannot be less than the duration
-            #    implied by the sample count and the original sampling interval.
-            my $min_reasonable_duration = ($num_samples - 1) * $expected_interval_seconds * 0.9; # 90% tolerance
-
-            my $final_duration_for_interval_calc;
-            if ($num_samples > 1 && $profile_aware_bin_duration < $min_reasonable_duration) {
-                # This bin has significant data gaps (e.g., VM was offline).
-                # Use the sample-based duration to avoid "reverse smearing".
-                $final_duration_for_interval_calc = $min_reasonable_duration;
-
-                if ($args_ref->{verbose}) {
-                    warn sprintf(
-                        "WARNING: Bin %s (Profile: %s) has fewer samples (%d) than expected for " .
-                        "its active duration (%.1f min). Using sample-derived duration (%.1f min) " .
-                        "for interval calculation.\n",
-                        $bin_id,
-                        $profile_name,
-                        $num_samples,
-                        $profile_aware_bin_duration / 60,
-                        $min_reasonable_duration / 60
-                    );
+                # ═══════════════════════════════════════════════════════════════
+                # CRITICAL: Check for and trim trailing zeros (InfluxDB lag handling)
+                # ═══════════════════════════════════════════════════════════════
+                # Scan backwards from end to find last non-zero sample
+                my $last_valid_idx = $#bin_samples;
+                while ($last_valid_idx >= 0 && abs($bin_samples[$last_valid_idx]) < 1e-6) {
+                    $last_valid_idx--;
                 }
-            } else {
-                # Standard case: Use the calculated profile-aware duration.
-                $final_duration_for_interval_calc = $profile_aware_bin_duration;
-            }
 
-            # 4. Calculate the profile-aware *average* interval for this bin.
-            #    e.g. (Online, 1-day bin): $interval = 32400 / (540 - 1) ≈ 60.1s. Correct.
-            #    e.g. (Online, 7-day bin): $interval = 226800 / (3780 - 1) ≈ 60.0s. Correct.
-            my $interval = 0;
-            if ($num_samples > 1) {
-                $interval = $final_duration_for_interval_calc / ($num_samples - 1);
-            }
-
-            # 5. Reconstruct timestamps and bucket into daily bins.
-            for (my $i = 0; $i < $num_samples; $i++) {
-                # This places samples at their correct average temporal position.
-                my $approx_timestamp_epoch = $bin_start_epoch + ($i * $interval);
-
-                # Convert the reconstructed epoch to a day-based key
-                my $day_key = int($approx_timestamp_epoch / 86400);
-                push @{$daily_buckets{$day_key}}, $rolling_avg_values[$i];
-            }
-        } # end while (bin_meta)
-
-        # ═══════════════════════════════════════════════════════════════════
-        # DAILY AGGREGATION & TREND ANALYSIS
-        # ═══════════════════════════════════════════════════════════════════
-
-        # Calculate daily percentile from each day's bucket
-        my @series_for_trend;
-        foreach my $day_key (sort {$a <=> $b} keys %daily_buckets) {
-            my $bucket_aref = $daily_buckets{$day_key};
-            my $samples_in_day = scalar(@$bucket_aref);
-            next unless $samples_in_day > 0;
-
-            # Apply the Profile-Aware QC check here
-            if ($samples_in_day < $min_samples_threshold) {
-                if ($args_ref->{verbose}) {
-                    warn sprintf(
-                        "INFO: Day %d for profile '%s' (filter=%s) has insufficient data: " .
-                        "%d samples < %d threshold (%.0f%% of %d expected). Excluding from trend.\n",
-                        $day_key,
-                        $profile_name,
-                        $time_filter,
-                        $samples_in_day,
-                        $min_samples_threshold,
-                        75,
-                        $expected_samples_per_day
-                    );
+                my $trimmed_count = 0;
+                if ($last_valid_idx < $#bin_samples) {
+                    $trimmed_count = $#bin_samples - $last_valid_idx;
+                    @bin_samples = @bin_samples[0 .. $last_valid_idx];
                 }
-                next; # Skip this day
-            }
 
-            my $daily_percentile = calculate_percentile($bucket_aref, $p_val);
-            # Day index relative to the start of the analysis
-            my $day_index = $day_key - int($earliest_epoch / 86400);
-            push @series_for_trend, [$day_index, $daily_percentile];
+                # Append valid samples to the stream
+                push @all_smoothed_samples, @bin_samples;
+            }
         }
 
-        # Calculate Robust Trend
+        # ──────────────────────────────────────────────────────────────────────
+        # Chunk the sample stream by logical day size and build time series
+        # ──────────────────────────────────────────────────────────────────────
+
+        my @series_for_trend;
+        my $total_samples = scalar(@all_smoothed_samples);
+        my $days_processed = 0;
+
+        for (my $i = 0; $i < $total_samples; $i += $samples_per_logical_day) {
+            # Extract chunk (may be partial at the end of the data stream)
+            my $chunk_end = min($i + $samples_per_logical_day - 1, $total_samples - 1);
+            my @chunk = @all_smoothed_samples[$i .. $chunk_end];
+
+            my $chunk_size = scalar(@chunk);
+
+            # Quality control: require minimum 75% completeness for this logical day
+            if ($chunk_size >= $min_samples_threshold) {
+                my $daily_percentile = calculate_percentile(\@chunk, $p_val);
+
+                # Add this logical day's aggregated value to the time series
+                push @series_for_trend, [$days_processed, $daily_percentile];
+                $days_processed++;
+            } elsif ($args_ref->{verbose}) {
+                warn sprintf(
+                    "INFO: Logical day %d for profile '%s' (filter=%s) has insufficient data: " .
+                    "%d samples < %d threshold (%.0f%% of %d expected). Excluding from trend.\n",
+                    $days_processed,
+                    $profile_name,
+                    $time_filter,
+                    $chunk_size,
+                    $min_samples_threshold,
+                    75,
+                    $samples_per_logical_day
+                );
+            }
+        }
+
+        # ──────────────────────────────────────────────────────────────────────
+        # Statistical trend analysis with Theil-Sen + Hamed-Rao
+        # ──────────────────────────────────────────────────────────────────────
+
         if (scalar(@series_for_trend) >= $GROWTH_MIN_HISTORICAL_PERIODS) {
             my $robust_rationale_hash = calculate_growth_trend_robust_v1(
                 $vm_name,
@@ -3816,47 +3804,50 @@ sub calculate_per_profile_growth_adjustments {
                 \@series_for_trend,
                 $projection_days,
                 \%growth_args
-                );
+            );
 
-            # Get the raw calculated growth from the rationale
+            # Retrieve the raw calculated growth from the statistical engine
             my $raw_growth_adj = $robust_rationale_hash->{growth_adj} // 0;
             my $sen_slope = $robust_rationale_hash->{sen_slope} // 0;
 
-            # Default final_growth_adj to the raw calculated value (which can be negative)
+            # Default final growth to the raw value (which may be negative)
             my $final_growth_adj = $raw_growth_adj;
 
-            # Apply Capping ONLY if the trend is POSITIVE
+            # ── Capping Logic: Apply ONLY to positive growth ──
+            # Negative trends are preserved as-is for capacity planning insight
             if ($raw_growth_adj > 0 && $sen_slope > 0) {
                 my $sen_slope_per_day = $sen_slope;
-                # $raw_growth_adj is already set from the rationale
                 my $cap_abs = $baseline_val * ($max_growth_perc / 100.0);
 
                 if ($raw_growth_adj > $cap_abs) {
+                    # Growth exceeds configured maximum - apply cap
                     $final_growth_adj = $cap_abs;
                     $robust_rationale_hash->{was_capped} = 1;
                     $robust_rationale_hash->{original_growth_adj} = $raw_growth_adj;
                     $robust_rationale_hash->{cap_value_applied} = $cap_abs;
                     $robust_rationale_hash->{cap_percent_applied} = $max_growth_perc;
                 }
-                # (If not capped, $final_growth_adj remains $raw_growth_adj)
 
                 $robust_rationale_hash->{sen_slope_per_day} = $sen_slope_per_day;
             }
 
-            # Store the (now potentially negative) final growth value
+            # Update the rationale with the final (potentially capped) growth value
             $robust_rationale_hash->{growth_adj} = $final_growth_adj;
 
+            # Store results for this profile
             $growth_results_for_vm{$profile_name} = {
                 growth_adj => $final_growth_adj,
                 rationale  => $robust_rationale_hash
             };
         } else {
-            # Not enough data points to run a trend analysis
+            # Insufficient data points for statistical trend analysis
             $growth_results_for_vm{$profile_name} = {
                 growth_adj => 0,
                 rationale  => {
                     method_used => 'none',
-                    skip_reason => 'Insufficient daily data points for trend analysis (n=' . scalar(@series_for_trend) . ' < ' . $GROWTH_MIN_HISTORICAL_PERIODS . ')',
+                    skip_reason => 'Insufficient data points for trend analysis (n=' .
+                                   scalar(@series_for_trend) . ' < ' .
+                                   $GROWTH_MIN_HISTORICAL_PERIODS . ')',
                     sample_points => scalar(@series_for_trend),
                     aggregation_basis => $growth_args{aggregation_basis} || 'unknown',
                 }
@@ -3865,67 +3856,6 @@ sub calculate_per_profile_growth_adjustments {
     } # end foreach profile
 
     return \%growth_results_for_vm;
-}
-
-# ==============================================================================
-# SUBROUTINE: synthesize_daily_timeseries_for_growth (DEPRECATED)
-# PURPOSE:    [DEPRECATED] This function is NO LONGER USED in the Theil-Sen implementation.
-#             The corrected calculate_per_profile_growth_adjustments() now builds a
-#             "compressed state series" directly, which is statistically correct.
-# LEGACY USE: Previously used to create a "stamped daily series" for Hybrid model,
-#             which was incompatible with Sen's slope due to step-function problem.
-# STATUS:     Kept for reference only. May be removed in future version.
-# ==============================================================================
-sub synthesize_daily_timeseries_for_growth {
-    my ($vm_name, $profile_name, $final_metrics_href, $states_by_vm_href,
-        $manifest_href, $analysis_ref_date) = @_;
-
-    # Find the PhysC transform key for this profile
-    my ($transform_key) = grep {
-        $manifest_href->{$_}{metric} eq 'PhysC' &&
-        exists $manifest_href->{$_}{profiles}{$profile_name}
-    } keys %$manifest_href;
-    return [] unless $transform_key;
-
-    # Get the percentile key for this profile
-    my $percentiles = _safe_dig($manifest_href, $transform_key, 'profiles', $profile_name, 'percentiles');
-    # GUARD: Ensure the percentiles array exists and is not empty
-    return [] unless (defined $percentiles && ref $percentiles eq 'ARRAY' && @$percentiles);
-
-    my $p_val = $percentiles->[0]; # Assumes first percentile is the primary one
-    my $p_key = "P" . clean_perc_label($p_val);
-
-    # Build a hash of dates to metric values
-    my %date_to_value;
-
-    foreach my $state (@{ $states_by_vm_href->{$vm_name} }) {
-        my $state_id = $state->{state_id} - 1; # Convert to zero-based index
-
-        # Get the aggregated metric for this state
-        my $state_metrics = $final_metrics_href->{$vm_name}{$state_id}{$transform_key};
-        next unless $state_metrics;
-
-        my $metric_value = $state_metrics->{$p_key};
-        next unless defined $metric_value;
-
-        # Iterate through each day this state was active
-        my $current_date = $state->{start_time}->truncate(to => 'day');
-        my $end_date = $state->{end_time}->truncate(to => 'day');
-
-        while ($current_date <= $end_date && $current_date <= $analysis_ref_date) {
-            my $date_key = $current_date->ymd;
-            $date_to_value{$date_key} = $metric_value;
-            $current_date += ONE_DAY;
-        }
-    }
-
-    # Convert to chronologically sorted array
-    my @daily_timeseries;
-    foreach my $date_key (sort keys %date_to_value) {
-        push @daily_timeseries, $date_to_value{$date_key};
-    }
-
-    return \@daily_timeseries;
 }
 
 # ==============================================================================
@@ -4014,9 +3944,9 @@ sub mann_kendall_test_hamed_rao {
     # Extract y-values (the actual measurements)
     my @y_values = map { $_->[1] } @{$series_aref};
 
-    # ───────────────────────────────────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # STEP 1: Calculate Kendall's S statistic (same as standard MK)
-    # ───────────────────────────────────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     my $S = 0;
     my $n_ties = 0;
@@ -4035,15 +3965,78 @@ sub mann_kendall_test_hamed_rao {
         }
     }
 
-    # ───────────────────────────────────────────────────────────────────────
-    # STEP 2: Calculate standard variance (unadjusted)
-    # ───────────────────────────────────────────────────────────────────────
+    # Calculate Kendall's tau for trend-dominance assessment
+    my $tau = $S / ($n * ($n - 1) / 2);
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 2: Trend-Dominance Pre-Check
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # For strongly trending data (|τ| ≥ 0.4), Hamed-Rao's stationarity assumption
+    # is violated. Higher-lag autocorrelations become negative due to trend,
+    # causing unstable adjustment factors. Skip H-R and use standard MK instead.
+    #
+    # RATIONALE: When trend dominates, autocorrelation correction is inappropriate.
+    # Standard MK is the correct test for monotonic trending data.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    if (abs($tau) >= 0.4) {
+        # Calculate standard variance (no autocorrelation correction)
+        my $var_S_standard = ($n * ($n - 1) * (2 * $n + 5)) / 18;
+
+        # Calculate Z-statistic
+        my $Z;
+        if ($S > 0) {
+            $Z = ($S - 1) / sqrt($var_S_standard);
+        } elsif ($S < 0) {
+            $Z = ($S + 1) / sqrt($var_S_standard);
+        } else {
+            $Z = 0;
+        }
+
+        # Calculate p-value
+        my $p_value = 2 * (1 - _standard_normal_cdf(abs($Z)));
+        $p_value = 0.0 if $p_value < 0;
+        $p_value = 1.0 if $p_value > 1;
+
+        # Determine trend
+        my $passed = ($p_value < $alpha) ? 1 : 0;
+        my $trend;
+        if ($passed) {
+            $trend = ($tau > 0) ? 'increasing' : 'decreasing';
+        } else {
+            $trend = 'none';
+        }
+
+        return {
+            # Standard Mann-Kendall fields
+            statistic  => $S,
+            tau        => $tau,
+            z_score    => $Z,
+            p_value    => $p_value,
+            trend      => $trend,
+            passed     => $passed,
+            alpha      => $alpha,
+            n_ties     => $n_ties,
+
+            # Metadata indicating trend-dominance path
+            variant    => 'standard_mk_trend_dominant',
+            n_eff      => $n,
+            hamed_rao_skipped => 1,
+            hamed_rao_skip_reason => sprintf('Strong trend detected (|τ|=%.4f ≥ 0.4)', abs($tau)),
+            lag1_autocorr => undef,  # Not calculated for trend-dominant series
+        };
+    }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 3: Calculate standard variance (unadjusted)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     my $var_S_standard = ($n * ($n - 1) * (2 * $n + 5)) / 18;
 
-    # ───────────────────────────────────────────────────────────────────────
-    # STEP 3: Calculate Hamed-Rao autocorrelation adjustment
-    # ───────────────────────────────────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 4: Calculate Hamed-Rao autocorrelation adjustment
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     # Maximum lag K (typically n/3 as per Hamed & Rao)
     my $K = int($n / 3);
     $K = max(1, min($K, $n - 1));  # Ensure valid range: 1 ≤ K < n
@@ -4064,13 +4057,74 @@ sub mann_kendall_test_hamed_rao {
     # Hamed-Rao adjustment factor: 1 + 2·Σ[ρₖ·(n-k)/n]
     my $adjustment_factor = 1 + 2 * $autocorr_sum;
 
-    # Guard against invalid adjustment (should always be positive)
-    if ($adjustment_factor <= 0) {
-        warn sprintf(
-            "Warning: Hamed-Rao adjustment factor is non-positive (%.4f) for VM '%s', Profile '%s'. Using unadjusted variance.\n",
-            $adjustment_factor, $vm_name // 'unknown', $profile_name // 'unknown'
-        );
-        $adjustment_factor = 1;
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 5: Guard - Fallback to Standard MK for Unstable Adjustment
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # When adjustment_factor ≤ 0.5, higher-lag autocorrelations are strongly
+    # negative due to residual trend effects. Hamed-Rao's stationarity assumption
+    # is violated. Fallback to standard MK which handles trending data correctly.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    if ($adjustment_factor <= 0.5) {
+        # Calculate Z with unadjusted variance
+        my $Z;
+        if ($S > 0) {
+            $Z = ($S - 1) / sqrt($var_S_standard);
+        } elsif ($S < 0) {
+            $Z = ($S + 1) / sqrt($var_S_standard);
+        } else {
+            $Z = 0;
+        }
+
+        # Calculate p-value
+        my $p_value = 2 * (1 - _standard_normal_cdf(abs($Z)));
+        $p_value = 0.0 if $p_value < 0;
+        $p_value = 1.0 if $p_value > 1;
+
+        # Determine trend
+        my $passed = ($p_value < $alpha) ? 1 : 0;
+        my $trend;
+        if ($passed) {
+            $trend = ($tau > 0) ? 'increasing' : 'decreasing';
+        } else {
+            $trend = 'none';
+        }
+
+        # Emit warning for diagnostics
+        if ($adjustment_factor <= 0) {
+            warn sprintf(
+                "Warning: Hamed-Rao adjustment factor is non-positive (%.4f) for VM '%s', Profile '%s'.\n" .
+                "         Falling back to standard Mann-Kendall (appropriate for trending data).\n",
+                $adjustment_factor, $vm_name // 'unknown', $profile_name // 'unknown'
+            );
+        }
+
+        return {
+            # Standard Mann-Kendall fields
+            statistic  => $S,
+            tau        => $tau,
+            z_score    => $Z,
+            p_value    => $p_value,
+            trend      => $trend,
+            passed     => $passed,
+            alpha      => $alpha,
+            n_ties     => $n_ties,
+
+            # Metadata indicating fallback path
+            variant    => 'standard_mk_via_hamed_rao_fallback',
+            n_eff      => $n,
+            hamed_rao_attempted => 1,
+            hamed_rao_adjustment_factor => sprintf("%.4f", $adjustment_factor),
+            hamed_rao_fallback_reason => 'Adjustment factor unstable (≤ 0.5)',
+            autocorr_max_lag => $K,
+            lag1_autocorr => scalar(@rho_values) > 0 ? sprintf("%.4f", $rho_values[0]) : undef,
+        };
+    }
+
+    # Additional guard: Clamp adjustment factor to reasonable upper bound [0.5, 3.0]
+    # This prevents extreme corrections while preserving validity
+    if ($adjustment_factor > 3.0) {
+        $adjustment_factor = 3.0;
     }
 
     # Adjusted variance: Var(S)* = Var(S) / adjustment_factor
@@ -4079,9 +4133,9 @@ sub mann_kendall_test_hamed_rao {
     # Effective sample size
     my $n_eff = $n / $adjustment_factor;
 
-    # ───────────────────────────────────────────────────────────────────────
-    # STEP 4: Calculate Z-statistic with adjusted variance
-    # ───────────────────────────────────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 6: Calculate Z-statistic with adjusted variance
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     my $Z;
     if ($S > 0) {
@@ -4092,9 +4146,9 @@ sub mann_kendall_test_hamed_rao {
         $Z = 0;
     }
 
-    # ───────────────────────────────────────────────────────────────────────
-    # STEP 5: Calculate two-tailed p-value
-    # ───────────────────────────────────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 7: Calculate two-tailed p-value
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     my $p_value = 2 * (1 - _standard_normal_cdf(abs($Z)));
 
@@ -4102,15 +4156,9 @@ sub mann_kendall_test_hamed_rao {
     $p_value = 0.0 if $p_value < 0;
     $p_value = 1.0 if $p_value > 1;
 
-    # ───────────────────────────────────────────────────────────────────────
-    # STEP 6: Calculate Kendall's tau
-    # ───────────────────────────────────────────────────────────────────────
-
-    my $tau = $S / ($n * ($n - 1) / 2);
-
-    # ───────────────────────────────────────────────────────────────────────
-    # STEP 7: Determine trend direction and significance
-    # ───────────────────────────────────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 8: Determine trend direction and significance
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     my $passed = ($p_value < $alpha) ? 1 : 0;
 
@@ -4121,9 +4169,9 @@ sub mann_kendall_test_hamed_rao {
         $trend = 'none';
     }
 
-    # ───────────────────────────────────────────────────────────────────────
-    # STEP 8: Return complete test results with Hamed-Rao metadata
-    # ───────────────────────────────────────────────────────────────────────
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # STEP 9: Return complete test results with Hamed-Rao metadata
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     return {
         # Standard Mann-Kendall fields
@@ -4139,9 +4187,9 @@ sub mann_kendall_test_hamed_rao {
         # Hamed-Rao specific fields
         variant    => 'hamed-rao',
         n_eff      => sprintf("%.2f", $n_eff),
-        autocorr_k => $K,
+        autocorr_max_lag => $K,
         adjustment_factor => sprintf("%.4f", $adjustment_factor),
-        rho_1      => scalar(@rho_values) > 0 ? sprintf("%.4f", $rho_values[0]) : undef,
+        lag1_autocorr => scalar(@rho_values) > 0 ? sprintf("%.4f", $rho_values[0]) : undef,
     };
 }
 
