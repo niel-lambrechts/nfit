@@ -2628,6 +2628,10 @@ sub run_single_pass_from_manifest {
     my %persistent_transform_states;
     my %raw_peak_tracker; # Track true raw peak per VM
 
+    # Out-of-Band Storage for Daily Series
+    # Structure: $daily_raw_data{$vm}{$transform_key}{$date_str} = packed_binary
+    my %daily_raw_data;
+
     # --- Load or build cache index for date-range optimisation ---
     my $cache_index;
     my $seek_offset = 0;
@@ -2715,7 +2719,7 @@ sub run_single_pass_from_manifest {
                 $ts_str, $pct;
         }
 
-        process_data_point($tp, $vm, $physc, $runq, $manifest, $states_by_vm, \%analysis_data, \%raw_data, \%transform_states, \%persistent_transform_states, {
+        process_data_point($tp, $vm, $physc, $runq, $manifest, $states_by_vm, \%analysis_data, \%raw_data, \%transform_states, \%persistent_transform_states, \%daily_raw_data, {
             vms_to_process            => \%vms_to_process,
             start_date_str            => $start_date_str,
             end_date_str              => $end_date_str,
@@ -2742,6 +2746,8 @@ sub run_single_pass_from_manifest {
         $states_by_vm,
         { enable_clipping_detection => $enable_clipping_detection }
     );
+    # --- Finalise Daily Metrics separately ---
+    my $daily_final_metrics = finalize_daily_metrics(\%daily_raw_data, $manifest, $args_ref);
 
     # 9. Determine if this is an aggregated run and choose the correct output path
     my @output_objects;
@@ -2816,13 +2822,22 @@ sub run_single_pass_from_manifest {
                 $args_ref,
                 $final_metrics,
                 $manifest,
-                \%raw_peak_tracker # Pass raw peak tracker
+                \%raw_peak_tracker, # Pass raw peak tracker
+                $daily_final_metrics
             );
             push @output_objects, $output_obj if defined $output_obj;
         }
     } else {
         # --- PATH B: STANDARD PER-STATE RUNS ---
-        @output_objects = @{ assemble_output($final_metrics, $manifest, $states_by_vm, \%transform_states, $args_ref) };
+        @output_objects = @{ assemble_output(
+            $final_metrics,
+            $manifest,
+            $states_by_vm,
+            \%transform_states,
+            \%raw_peak_tracker, # Note: ensure you are passing raw_peak_tracker if not already
+            $args_ref,
+            $daily_final_metrics
+        ) };
     }
 
     # 10. Save new result to L2 Cache and print to STDOUT
@@ -2843,7 +2858,7 @@ sub run_single_pass_from_manifest {
 #             transform streams.
 # ==============================================================================
 sub process_data_point {
-    my ($tp, $vm, $physc, $runq, $manifest, $states_by_vm, $analysis_data, $raw_data, $transform_states, $persistent_transform_states, $filters) = @_;
+    my ($tp, $vm, $physc, $runq, $manifest, $states_by_vm, $analysis_data, $raw_data, $transform_states, $persistent_transform_states, $daily_raw_data_ref, $filters) = @_;
 
     # --- FIX: TRACK TRUE RAW PEAK ---
     # For every valid data point, before any filtering, update the absolute max
@@ -2948,6 +2963,15 @@ sub process_data_point {
         # 4e. Store the rolling average in the packed array for percentile calculation.
         if (defined $rolling_avg) {
             update_packed_array($analysis_data, $vm, $bin_key, $key, $rolling_avg, $t_state);
+
+            # --- NEW: Out-of-Band Daily Bucketing ---
+            # We store this in a completely separate structure to avoid polluting the main analysis hash.
+            if ($entry->{metric} eq 'PhysC') {
+                my $date_key = $tp->ymd;
+                # Store directly: VM -> TransformKey -> Date -> PackedData
+                $daily_raw_data_ref->{$vm}{$key}{$date_key} //= '';
+                $daily_raw_data_ref->{$vm}{$key}{$date_key} .= pack('f<', $rolling_avg);
+            }
         }
 
         # 4f. Conditionally gather raw data if clipping detection is enabled.
@@ -3018,6 +3042,49 @@ sub update_packed_array {
     $hash_ref->{$vm}{$state_id}{$transform_key} .= pack('f<', $value);
 }
 
+# Processes %daily_raw_data for DailyProfileSeries
+sub finalize_daily_metrics {
+    my ($daily_raw_data, $manifest, $args_ref) = @_;
+    my %daily_final;
+
+    my $round_increment = (defined $args_ref->{round_arg}) ? $args_ref->{round_arg} : $DEFAULT_ROUND_INCREMENT;
+    my $rounding_method = (defined $args_ref->{round_arg}) ? 'standard' : 'none'; # Simplified for brevity
+
+    foreach my $vm (keys %$daily_raw_data) {
+        foreach my $transform_key (keys %{$daily_raw_data->{$vm}}) {
+            my $transform_info = $manifest->{$transform_key};
+            next unless $transform_info; # Should always exist, but safe to check
+
+            foreach my $date_str (keys %{$daily_raw_data->{$vm}{$transform_key}}) {
+                my $packed = $daily_raw_data->{$vm}{$transform_key}{$date_str};
+                my @values = unpack('f<*', $packed);
+                next unless @values;
+
+                # Process each profile attached to this transform
+                foreach my $profile_name (keys %{$transform_info->{profiles}}) {
+                    my $directives = $transform_info->{profiles}{$profile_name};
+
+                    # Use the first configured percentile
+                    if (defined $directives->{percentiles} && @{$directives->{percentiles}}) {
+                        my $p_val = $directives->{percentiles}->[0];
+
+                        # Calculate simple percentile for the day
+                        # (Re-using existing calculation logic)
+                        my $val = calculate_percentile(\@values, $p_val);
+
+                        if (defined $val) {
+                             # Apply rounding
+                             $val = apply_rounding($val, $round_increment, $rounding_method);
+                             $daily_final{$vm}{$profile_name}{$date_str} = $val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return \%daily_final;
+}
+
 # ==============================================================================
 # SUBROUTINE: finalize_results
 # PURPOSE:    Iterates through all processed data, calculates final percentile
@@ -3033,6 +3100,7 @@ sub finalize_results {
     foreach my $vm (keys %$analysis_data) {
         foreach my $state_id (keys %{$analysis_data->{$vm}}) {
             foreach my $key (keys %{$analysis_data->{$vm}{$state_id}}) {
+
                 my $packed_data = $analysis_data->{$vm}{$state_id}{$key};
                 my $transform_info = $manifest->{$key};
 
@@ -3128,7 +3196,7 @@ sub calculate_percentiles_from_packed {
 #             ensuring the output format is correct for the analysis model used.
 # ==============================================================================
 sub assemble_output {
-    my ($final_metrics_href, $manifest_href, $states_by_vm_href, $transform_states_href, $raw_peak_tracker_ref, $args_ref) = @_;
+    my ($final_metrics_href, $manifest_href, $states_by_vm_href, $transform_states_href, $raw_peak_tracker_ref, $args_ref, $daily_metrics_href) = @_;
 
     my @output_objects;
 
@@ -3296,6 +3364,24 @@ sub assemble_output {
             if (@output_objects && exists $raw_peak_tracker_ref->{$vm_name}) {
                 $output_objects[-1]->{metadata}{peakPhyscFromLatestState} = apply_rounding($raw_peak_tracker_ref->{$vm_name}, $round_increment, $rounding_method);
             }
+
+            # --- NEW: Inject Daily Profile Series into the latest state ---
+            # Since standard runs break data into states, we attach the VM-wide daily series
+            # to the final state object for the VM. This ensures it is accessible to
+            # nfit-profile without duplicating it across every state object.
+            if (@output_objects && defined $daily_metrics_href && exists $daily_metrics_href->{$vm_name}) {
+                my $last_obj = $output_objects[-1];
+                # Safety check to ensure we are modifying the correct VM object
+                if ($last_obj->{vmName} eq $vm_name) {
+                    foreach my $profile_name (keys %{$daily_metrics_href->{$vm_name}}) {
+                        # Only inject if we have metrics for this profile in the final object
+                        # (Avoids autovivification of empty profile keys)
+                        if (exists $last_obj->{metrics}{physc}{$profile_name}) {
+                            $last_obj->{metrics}{physc}{$profile_name}{DailySeries} = $daily_metrics_href->{$vm_name}{$profile_name};
+                        }
+                    }
+                }
+            }
         }
     }
     return \@output_objects;
@@ -3429,7 +3515,7 @@ sub _safe_dig {
 #             This is the dedicated output path for decay/growth models.
 # ==============================================================================
 sub assemble_aggregated_output {
-    my ($vm_name, $aggregated_metrics_href, $growth_results_href, $states_by_vm_href, $args_ref, $final_metrics_href, $manifest_href, $raw_peak_tracker_ref) = @_;
+    my ($vm_name, $aggregated_metrics_href, $growth_results_href, $states_by_vm_href, $args_ref, $final_metrics_href, $manifest_href, $raw_peak_tracker_ref, $daily_metrics_href) = @_;
 
     my $rounding_method = 'none';
     my $round_increment;
@@ -3494,6 +3580,12 @@ sub assemble_aggregated_output {
             GrowthAdj       => sprintf("%.4f", $growth_adj),
             FinalValue      => apply_rounding($final_val_with_growth, $round_increment, $rounding_method),
         };
+
+        # --- DailyProfileSeries block ---
+        # Inject the daily granular data into the profile block if available.
+        if (defined $daily_metrics_href && exists $daily_metrics_href->{$vm_name}{$profile_name}) {
+            $output_obj->{metrics}{physc}{$profile_name}{DailySeries} = $daily_metrics_href->{$vm_name}{$profile_name};
+        }
 
         # --- GrowthRationale block ---
         # Inject the rationale directly into this profile's block,
@@ -4091,7 +4183,7 @@ sub mann_kendall_test_hamed_rao {
         }
 
         # Emit warning for diagnostics
-        if ($adjustment_factor <= 0) {
+        if ($adjustment_factor <= 0 && $verbose) {
             warn sprintf(
                 "Warning: Hamed-Rao adjustment factor is non-positive (%.4f) for VM '%s', Profile '%s'.\n" .
                 "         Falling back to standard Mann-Kendall (appropriate for trending data).\n",
