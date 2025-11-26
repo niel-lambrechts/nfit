@@ -6911,13 +6911,22 @@ sub update_monthly_history {
         my $days_in_period = ($effective_start_obj <= $effective_end_obj) ? (int(($effective_end_obj->epoch - $effective_start_obj->epoch) / 86400) + 1) : 0;
 
         my $should_process = 0;
+
+        # Logic: Process if new, if data is more complete, OR if forced.
         if (exists $history_data->{$month_key}) {
             my $stored_days = $history_data->{$month_key}{Metadata}{ProcessedDays} // 0;
-            if ($days_in_period > $stored_days) {
+
+            # --- FIX: Check force_flag here ---
+            if ($force_flag) {
+                print STDERR "  - INFO: Forcing reprocessing of $month_key (User Request).\n";
+                $should_process = 1;
+            }
+            elsif ($days_in_period > $stored_days) {
                  print STDERR "  - INFO: Found more complete data for $month_key ($days_in_period > $stored_days days). Queueing for reprocessing.\n";
                  $should_process = 1;
             }
         } elsif ($days_in_period >= $min_days_for_history) {
+            # New month detected
             $should_process = 1;
         }
 
@@ -7778,12 +7787,28 @@ sub _enrich_history_with_growth_rationale {
                     $vm_analysis->{TacticalValues} //= {};
                     $vm_analysis->{TacticalValues}{$profile_name} //= {};
 
-                    # Check if the Rationale data is new or different.
-                    if (!exists $vm_analysis->{growthRationale}{$profile_name}{$model_type} ||
-                        Dumper($vm_analysis->{growthRationale}{$profile_name}{$model_type}) ne Dumper($new_rationale))
-                    {
+                    # --- Check if the Rationale data is new or different ---
+                    # We use JSON generation to compare structures. This handles:
+                    # 1. Deep nesting (recursive)
+                    # 2. Key sorting (canonical)
+                    # 3. Numeric/String normalization (mostly)
+
+                    my $json_cmp = JSON->new->canonical->allow_nonref;
+
+                    if (!exists $vm_analysis->{growthRationale}{$profile_name}{$model_type}) {
+                        $was_modified = 1;
+                    } else {
+                        # Compare the serialized canonical strings
+                        my $existing_json = $json_cmp->encode($vm_analysis->{growthRationale}{$profile_name}{$model_type});
+                        my $new_json      = $json_cmp->encode($new_rationale);
+
+                        if ($existing_json ne $new_json) {
+                            $was_modified = 1;
+                        }
+                    }
+
+                    if ($was_modified) {
                          $vm_analysis->{growthRationale}{$profile_name}{$model_type} = $new_rationale;
-                         $was_modified = 1;
                     }
 
                     # --- Harvest BaseValue and FinalValue ---
@@ -7886,6 +7911,8 @@ sub _generate_l2_cache_key_for_nfit {
 # ARGUMENTS:
 #   1. $parsed_results_href (hash ref): Parsed JSON from nfit (VM -> [states])
 #   2. $adaptive_runq_saturation_thresh (float): Adaptive saturation threshold
+#   3. Start time of analysis time-range
+#   4. End time of analysis time-range
 #
 # RETURNS:
 #   - Hash reference containing the complete MonthlyWorkloadAnalysis structure
@@ -7897,12 +7924,16 @@ sub _generate_l2_cache_key_for_nfit {
 #   assembly and RunQ metrics extraction.
 # ==============================================================================
 sub _assemble_monthly_analysis {
-    my ($parsed_results_href, $adaptive_runq_saturation_thresh) = @_;
+    my ($parsed_results_href, $adaptive_runq_saturation_thresh, $states_db, $month_start_str, $month_end_str) = @_;
 
     # Validate inputs
     unless (ref($parsed_results_href) eq 'HASH') {
         die "FATAL: _assemble_monthly_analysis requires parsed results hash reference";
     }
+
+    # Parse boundaries for monthly configuration state overlap check
+    my $month_start_obj = Time::Piece->strptime($month_start_str, "%Y-%m-%d");
+    my $month_end_obj   = Time::Piece->strptime($month_end_str, "%Y-%m-%d") + ONE_DAY - 1;
 
     my %analysis_results;
     my %collated_results_table;  # Temporary table for hint generation
@@ -7966,10 +7997,93 @@ sub _assemble_monthly_analysis {
         my $last_state_data = $states_aref->[-1] // {};
 
         # ------------------------------------------------------------------
-        # Extract configuration metadata from the last state
+        # Extract configuration metadata
         # ------------------------------------------------------------------
-        my $max_cpu_from_state = _safe_dig($last_state_data, 'metadata', 'configuration', 'maxCpu') // 0;
-        my $smt_from_state     = _safe_dig($last_state_data, 'metadata', 'configuration', 'smt') // $default_smt_arg;
+        my @config_timeline;
+        my $last_state_generic = {};
+
+        # Retrieve authoritative states from cache
+        my $auth_states = $states_db->{$vm_name};
+
+        if (defined $auth_states && ref($auth_states) eq 'ARRAY') {
+            foreach my $state (@$auth_states) {
+                # 1. Check Date Overlap
+                my $s_start = $state->{start_epoch};
+                my $s_end   = $state->{end_epoch};
+
+                # Logic: State overlaps Month if (StateEnd >= MonthStart) AND (StateStart <= MonthEnd)
+                next unless ($s_end >= $month_start_obj->epoch && $s_start <= $month_end_obj->epoch);
+
+                my $md = $state->{metadata} || {};
+
+                # 2. Extract Raw Attributes (Snake_Case from .states file)
+                my $ent       = $md->{entitlement} // 0;
+                my $vcpu      = $md->{virtual_cpus} // 0;
+                my $pool_cpu  = $md->{pool_cpu} // 0;
+                my $is_capped = $md->{capped} // 0;
+                my $smt       = $md->{smt} // $default_smt_arg;
+                my $proc_type = $md->{proc_type} // "Unknown";
+
+                # 3. Calculate MaxUsableCPU (Replicating nfit logic)
+                # If capped: Entitlement
+                # If uncapped: min(vCPU, Pool)
+                my $calc_max;
+                if ($is_capped) {
+                    $calc_max = $ent;
+                } else {
+                    # Uncapped logic
+                    if ($pool_cpu > 0 && $vcpu > 0) {
+                        $calc_max = ($vcpu < $pool_cpu) ? $vcpu : $pool_cpu;
+                    } else {
+                        $calc_max = ($vcpu > 0) ? $vcpu : $ent; # Fallback to Ent if vCPU missing
+                    }
+                }
+                # Safety clamps
+                $calc_max = 0 if $calc_max < 0;
+
+                # 4. Build Generic Shape
+                my $generic = {
+                    Architecture => 'ppc64',
+                    OS_Type      => $md->{os_type} // 'AIX', # Default per your note
+                    MaxUsableCPU => 0 + sprintf("%.2f", $calc_max),
+                    VirtualCPUs  => 0 + $vcpu,
+                    SMT_Level    => 0 + $smt,
+                    RAM_GB       => undef
+                };
+
+                # 5. Build Platform Shape
+                my $platform = {
+                    AIX => {
+                        Entitlement   => 0 + $ent,
+                        Capped        => $is_capped ? JSON::true : JSON::false,
+                        Pool_ID       => $md->{pool_id},
+                        Shared_Weight => $md->{shared_weight} // 128,
+                        Proc_Type     => $proc_type
+                    }
+                };
+
+                $last_state_generic = $generic;
+
+                push @config_timeline, {
+                    Start        => gmtime($s_start)->datetime . "Z",
+                    End          => gmtime($s_end)->datetime . "Z",
+                    DurationDays => sprintf("%.2f", ($s_end - $s_start) / 86400) + 0,
+                    Generic      => $generic,
+                    Platform     => $platform
+                };
+            }
+        }
+
+        # Assemble the Configuration Block
+        my $configuration_block = {
+            Generic => $last_state_generic,
+            Configuration_States => \@config_timeline
+        };
+
+        # --- Legacy Support for Hint Generation ---
+        # We still use the MaxUsableCPU we just calculated for the hint logic
+        my $max_cpu_from_state = $last_state_generic->{MaxUsableCPU} // 0;
+        my $smt_from_state     = $last_state_generic->{SMT_Level} // $default_smt_arg;
 
         # ------------------------------------------------------------------
         # Build the VM map structure for sizing hint generation
@@ -8068,6 +8182,7 @@ sub _assemble_monthly_analysis {
             Pattern        => $pattern,
             Pressure       => $pressure,
             PressureDetail => $pressure_detail,
+            Configuration  => $configuration_block,
             RunQMetrics    => {
                 # Extract the specific RunQ metrics needed by downstream logic
                 AbsRunQ_P90  => _safe_dig($runq_metrics_block, 'absolute', $MANDATORY_PEAK_PROFILE_FOR_HINT, 'P90'),
@@ -8100,6 +8215,17 @@ sub _generate_monthly_workload_analysis {
     my ($system_cache_dir, $start_date_str, $end_date_str, $adaptive_runq_saturation_thresh) = @_;
 
     print STDERR "    - Using Single Pass Engine for monthly analysis\n";
+
+    # --- Load Configuration States Cache (for this analysis cycle) ---
+    my $states_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.states');
+    my $states_db = {};
+    if (-f $states_cache_file) {
+        my $json_text = do {
+            open my $fh, '<:encoding(utf8)', $states_cache_file or die "Cannot open states cache: $!";
+            local $/; <$fh>;
+        };
+        $states_db = decode_json($json_text);
+    }
 
     # ======================================================================
     # STEP 1: Build the tactical manifest
@@ -8196,7 +8322,10 @@ sub _generate_monthly_workload_analysis {
     # ======================================================================
     my $analysis_results = _assemble_monthly_analysis(
         $parsed_results,
-        $adaptive_runq_saturation_thresh
+        $adaptive_runq_saturation_thresh,
+        $states_db,       # Configuration states
+        $start_date_str,  # Boundary for filtering
+        $end_date_str     # Boundary for filtering
     );
 
     return $analysis_results;
