@@ -25,6 +25,8 @@ use JSON;
 use Fcntl qw(:DEFAULT :flock);
 use constant ONE_SECOND => 1;
 use Data::Dumper;
+use Archive::Tar;
+use IO::Zlib; # Standard in Perl core since 5.9.3
 
 # --- Store original ARGV for logging ---
 my @original_argv = @ARGV;
@@ -53,7 +55,6 @@ my $DEFAULT_NFIT_RUNQ_AVG_METHOD = "ema";
 # This profile's CPU value is used for MaxCPU pressure checks,
 # and its RunQ metrics will now be used for global RunQ pressure hints.
 my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1";
-
 
 # Windowed Decay Defaults (for when nfit-profile instructs nfit to use its internal decay)
 my $DEFAULT_PROCESS_WINDOW_UNIT_FOR_NFIT = "weeks";
@@ -216,6 +217,9 @@ my $update_history_flag = 0; # New unified history update flag
 my $min_history_days_arg;    # New flag for partial month processing
 my $reset_seasonal_cache = 0;
 my $DEFAULT_SEASONALITY_CONFIG_FILE = "nfit.seasonality.cfg";
+
+# The Global Lock ensures atomic access to the history directory.
+my $HISTORY_LOCK_FILENAME = ".nfit.history.lock";
 
 GetOptions(
     'nmondir=s'                  => \$nmon_dir,
@@ -6342,39 +6346,73 @@ sub calculate_manual_linear_regression
 
 # ==============================================================================
 # SUBROUTINE: read_unified_history
-# PURPOSE:    Reads the new, unified monthly history cache file. This file
-#             serves as the single source of truth for all historical analysis
-#             for predictive models.
+## PURPOSE:   Reads history from either legacy file or partitioned directory.
+#             Stitches partitioned files into a single "Virtual Monolith" hash
+#             to ensure zero regression for downstream logic.
 # ARGUMENTS:
 #   1. $system_cache_dir (string): The path to a specific system's cache directory.
 # RETURNS:
 #   - A hash reference of the decoded JSON data.
 #   - Returns an empty hash reference if the file does not exist, is empty,
 #     or is corrupt, ensuring a safe default.
-# ==============================================================================
 sub read_unified_history {
     my ($system_cache_dir) = @_;
 
-    my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
-    my $history_data = {}; # Default to an empty hash.
+    my $legacy_file   = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
+    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
 
-    # A non-existent or empty file is a valid state for a new system.
-    return $history_data unless (-f $history_file && -s $history_file);
+    my $history_data = {};
 
-    eval {
-        my $json = JSON->new->allow_nonref;
-        local $/; # Enable slurp mode to read the entire file.
-        open my $fh, '<:encoding(utf8)', $history_file or die "Could not open '$history_file' for reading: $!";
-        my $json_text = <$fh>;
-        close $fh;
-        $history_data = $json->decode($json_text);
-    };
-    if ($@) {
-        warn "Warning: Could not decode JSON from unified history cache '$history_file'. It may be corrupt. Treating as empty. Error: $@";
-        return {}; # Return an empty hash on error to prevent downstream failures.
+    # PATH A: Partitioned History (Preferred)
+    if (-d $partition_dir) {
+        opendir(my $dh, $partition_dir) or die "FATAL: Cannot open history dir: $!";
+        my @files = grep { /^nfit\.hist\.\d{4}-\d{2}\.json$/ } readdir($dh);
+        closedir($dh);
+
+        my $json_decoder = JSON->new->allow_nonref;
+
+        foreach my $file (@files) {
+            my $path = File::Spec->catfile($partition_dir, $file);
+            my $json_text = do {
+                open my $fh, '<:encoding(utf8)', $path or next; # Skip unreadable
+                local $/; <$fh>;
+            };
+            next unless $json_text;
+
+            my $chunk = eval { $json_decoder->decode($json_text) };
+            if ($@) {
+                warn "Warning: Corrupt history partition $file: $@";
+                next;
+            }
+
+            # Merge chunk into main hash (Structure: { "YYYY-MM": { ... } })
+            my ($key) = keys %$chunk;
+            if ($key) {
+                $history_data->{$key} = $chunk->{$key};
+            }
+        }
+        return $history_data;
     }
 
-    return $history_data;
+    # PATH B: Legacy Monolith (Fallback)
+    if (-f $legacy_file && -s $legacy_file) {
+        eval {
+            my $json = JSON->new->allow_nonref;
+            local $/;
+            open my $fh, '<:encoding(utf8)', $legacy_file or die "Error: $!";
+            my $json_text = <$fh>;
+            close $fh;
+            $history_data = $json->decode($json_text);
+        };
+        if ($@) {
+            warn "Warning: Could not decode legacy history cache. Treating as empty. Error: $@";
+            return {};
+        }
+        return $history_data;
+    }
+
+    # PATH C: New System (Empty)
+    return {};
 }
 
 # ==============================================================================
@@ -6394,18 +6432,17 @@ sub write_unified_history {
     my ($system_cache_dir, $month_key, $new_data_for_month_href) = @_;
 
     my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
-    my $lock_file    = File::Spec->catfile($system_cache_dir, '.nfit.history.lock');
 
-    # Acquire an exclusive lock to ensure an atomic read-modify-write operation.
-    open my $lock_fh, '>', $lock_file or do {
-        warn "Warning: Could not create lock file '$lock_file' for writing history cache: $!. Skipping cache write.";
-        return 0;
+    # Acquire global lock
+    my ($lock_fh, $lock_path);
+    eval {
+        ($lock_fh, $lock_path) = _acquire_history_lock($system_cache_dir);
     };
-    flock($lock_fh, LOCK_EX) or do {
-        warn "Warning: Could not acquire exclusive lock on '$lock_file': $!. Skipping cache write.";
-        close $lock_fh;
+    if ($@) {
+        warn "Warning: Skipping history write due to lock failure: $@";
         return 0;
-    };
+    }
+    # ------------------------------------------------
 
     my $success = 0;
     eval {
@@ -6431,7 +6468,9 @@ sub write_unified_history {
 
     # Release the lock.
     close $lock_fh;
-    unlink $lock_file;
+
+    # Note: We do NOT unlink the global lock file in the new architecture
+    # to prevent race conditions on file creation. It remains as a sentinel.
 
     return $success;
 }
@@ -6831,6 +6870,22 @@ sub update_monthly_history {
     my ($system_cache_dir, $system_identifier, $seasonality_config, $min_days_for_history, $adaptive_runq_saturation_thresh, $force_flag) = @_;
     print STDERR "\n--- Updating Unified Monthly History for system: $system_identifier ---\n";
 
+    # In-Flight auto-migration to per-month history
+    # We acquire the lock here to perform the check and potential migration atomically.
+    {
+        my ($lock_fh, $lock_path);
+        eval { ($lock_fh, $lock_path) = _acquire_history_lock($system_cache_dir); };
+        if (!$@) {
+            if (-f File::Spec->catfile($system_cache_dir, '.nfit.history.json') &&
+                !-d File::Spec->catfile($system_cache_dir, '.nfit.history')) {
+
+                _migrate_history_to_partitioned($system_cache_dir);
+            }
+            close $lock_fh;
+        }
+    }
+    # --------------------------------------------
+
     my $data_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
     my ($cache_start_obj, $cache_end_obj) = _get_cache_date_range($data_cache_file);
 
@@ -7223,14 +7278,21 @@ sub _validate_history_structure {
 }
 
 # ==============================================================================
-# SUBROUTINE: _write_full_history
-# PURPOSE:    A simple wrapper for writing the entire history data structure.
-#             This is a simplified version of write_unified_history for clarity.
-#             Now includes structural validation before writing to prevent corruption.
+# SUBROUTINE: _write_full_history (Partition Aware)
+# PURPOSE:    Writes the in-memory history hash to the partitioned directory structure.
+#             Creates the directory if missing. Enforces Global Lock.
+#             Includes structural validation before writing to prevent corruption.
+#             Refactored to use the standardised _acquire_history_lock for safety.
+# ARGUMENTS:
+#   1. $system_cache_dir (string): The path to a system's cache directory.
+#   2. $history_data_href (hash ref): The complete history data structure.
+# RETURNS:
+#   - None
 # ==============================================================================
 sub _write_full_history {
     my ($system_cache_dir, $history_data_href) = @_;
 
+    # 1. Validation
     # ======================================================================
     # CRITICAL SAFETY CHECK: Validate structure before writing
     # ======================================================================
@@ -7238,113 +7300,176 @@ sub _write_full_history {
     # persisted to disk. It's better to fail fast with a clear error
     # than to write broken data that silently breaks downstream consumers.
     # ======================================================================
-    eval {
-        _validate_history_structure($history_data_href);
-    };
+    eval { _validate_history_structure($history_data_href); };
     if ($@) {
-        die "FATAL: Aborting history write due to validation failure:\n$@\n"
-            . "This prevents corruption of the history cache.\n";
+        die "FATAL: Aborting history write due to validation failure:\n$@";
     }
 
-    # Add lightweight metadata for audit trails
     _add_lightweight_metadata($history_data_href, 'nfit-profile');
 
-    # Proceed with validated data
-    my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
-    my $lock_file    = File::Spec->catfile($system_cache_dir, '.nfit.history.lock');
+    # 2. Global Lock Acquisition
+    my ($lock_fh, $lock_path);
+    eval { ($lock_fh, $lock_path) = _acquire_history_lock($system_cache_dir); };
+    if ($@) { die "FATAL: Could not acquire global history lock: $@"; }
 
-    open my $lock_fh, '>', $lock_file or die "Cannot create lock file '$lock_file': $!";
-    flock($lock_fh, LOCK_EX) or die "Cannot acquire lock on '$lock_file': $!";
+    # 3. Directory Setup
+    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    unless (-d $partition_dir) {
+        make_path($partition_dir) or die "FATAL: Cannot create history directory: $!";
+    }
 
-    eval {
-        my $json = JSON->new->pretty->canonical;
-        my $json_text = $json->encode($history_data_href);
-        open my $fh, '>:encoding(utf8)', $history_file or die "Could not open '$history_file' for writing: $!";
-        print $fh $json_text;
-        close $fh;
-    };
-    if ($@) {
-        warn "An error occurred while writing to unified history cache '$history_file': $@";
+    # 4. Write Partitions
+    my $json_encoder = JSON->new->pretty->canonical;
+    my $write_errors = 0;
+
+    foreach my $month_key (keys %$history_data_href) {
+        # Skip metadata/non-month keys if any creep in
+        next unless $month_key =~ /^\d{4}-\d{2}$/;
+
+        my $filename = "nfit.hist.${month_key}.json";
+        my $filepath = File::Spec->catfile($partition_dir, $filename);
+
+        # Wrap in month key for consistency
+        my $payload = { $month_key => $history_data_href->{$month_key} };
+
+        eval {
+            open my $fh, '>:encoding(utf8)', $filepath or die "Open failed: $!";
+            print $fh $json_encoder->encode($payload);
+            close $fh;
+        };
+        if ($@) {
+            warn "Error writing partition $filename: $@";
+            $write_errors++;
+        }
+    }
+
+    # 5. Legacy Cleanup (Soft)
+    # If we successfully wrote partitions, we ensure no stale monolith exists
+    # to confuse readers, though _migrate should have handled this.
+    my $legacy_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
+    if (-f $legacy_file && !$write_errors) {
+        rename($legacy_file, $legacy_file . ".migrated");
     }
 
     close $lock_fh;
-    unlink $lock_file;
+
+    if ($write_errors) {
+        die "FATAL: Errors occurred writing history partitions. Check logs.";
+    }
 }
 
 # ==============================================================================
-# SUBROUTINE: _create_checkpoint_backup
-# PURPOSE:    Creates a versioned backup of critical cache files to an external
-#             backup directory, using rolling numbering to prevent collisions.
-#             This is automatically called before any write operation that could
-#             corrupt the history cache.
+# SUBROUTINE: _create_checkpoint_backup (Directory Aware & Compressed)
+# PURPOSE:    Creates an atomic, compressed snapshot of the history.
+#             Handles both Legacy (File) and Modern (Directory) structures.
+#             Uses Archive::Tar for cross-platform (AIX/Linux) compatibility.
 # ARGUMENTS:
-#   1. $system_cache_dir (string): Path to the system's staging cache directory
-#   2. $checkpoint_type (string): "pre-tactical" or "pre-forecast"
-#   3. $include_l2_cache (boolean): Whether to also backup L2 results cache
+#   1. $system_cache_dir: Path to the staging cache
+#   2. $checkpoint_type:  Label for the backup (e.g., 'pre-tactical')
+#   3. $include_l2_cache: Boolean, whether to include L2 results
 # RETURNS:
-#   - Path to created backup file on success, undef on failure (with warning)
+#   Path to the created backup file, or undef on failure.
 # ==============================================================================
 sub _create_checkpoint_backup {
     my ($system_cache_dir, $checkpoint_type, $include_l2_cache) = @_;
 
-    # Derive serial number from staging path (e.g., ROOT/staging/12345ABC)
+    # Derive serial number and paths
     my $serial = basename($system_cache_dir);
-    my $root_dir = dirname(dirname($system_cache_dir)); # Go up from staging/<serial>
+    my $root_dir = dirname(dirname($system_cache_dir));
     my $backup_root = File::Spec->catfile($root_dir, 'backups', $serial);
 
     make_path($backup_root) unless -d $backup_root;
 
     my $timestamp = localtime->strftime('%Y%m%d_%H%M%S');
-    my $history_source = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
 
-    # Skip if source doesn't exist (first run scenario)
-    unless (-f $history_source) {
-        print "  - No existing history file to backup (first run)\n";
+    # Identify the source (Directory takes precedence over File)
+    my $history_dir_source  = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $history_file_source = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
+
+    my $source_path;
+    my $is_directory = 0;
+
+    if (-d $history_dir_source) {
+        $source_path = $history_dir_source;
+        $is_directory = 1;
+    } elsif (-f $history_file_source) {
+        $source_path = $history_file_source;
+        $is_directory = 0;
+    } else {
+        print "  - No existing history found to backup (First Run)\n";
         return undef;
     }
 
-    # Generate backup filename with rolling collision prevention
-    my $backup_file = _get_next_available_filename(
+    # Generate unique backup filename (.tar.gz for dirs, .json.gz for files)
+    my $extension = $is_directory ? "tar.gz" : "json.gz";
+    my $backup_target = _get_next_available_filename(
         $backup_root,
         ".nfit.history.${timestamp}",
-        'json'
+        $extension
     );
 
-    # Create the backup
+    # Perform the Backup
+    print "  - Creating compressed checkpoint (${checkpoint_type}).\n";
+
     eval {
-        require File::Copy;
-        File::Copy::copy($history_source, $backup_file)
-            or die "Copy failed: $!";
-        print "  ✓ Created checkpoint backup: " . basename($backup_file) . " (${checkpoint_type})\n";
+        if ($is_directory) {
+            # Create a compressed tarball of the directory contents
+            my $tar = Archive::Tar->new;
+
+            # We cd into the directory to keep paths relative inside the tar
+            my $cwd = Cwd::getcwd();
+            chdir($system_cache_dir);
+
+            # Add the folder (e.g., .nfit.history)
+            # This recursively adds contents
+            $tar->add_files(basename($source_path));
+
+            # Write compressed file
+            $tar->write($backup_target, COMPRESS_GZIP);
+
+            chdir($cwd); # Restore PWD
+        } else {
+            # Gzip the single legacy file
+            # We use IO::Zlib or just simple system gzip if we want to be lazy,
+            # but let's stick to Perl for safety.
+            # Actually, for a single file, copying then gzipping is safest
+            # to avoid race conditions reading the source.
+
+            require File::Copy;
+            # Copy to .tmp first
+            my $tmp_target = "$backup_target.tmp";
+            File::Copy::copy($source_path, $tmp_target) or die "Copy failed: $!";
+
+            # Compress in place
+            system("gzip -f \"$tmp_target\""); # Standard on AIX/Linux
+            rename("$tmp_target.gz", $backup_target);
+        }
+        print "  ✓ Created: " . basename($backup_target) . "\n";
     };
+
     if ($@) {
-        warn "Warning: Could not create backup at '$backup_file': $@";
+        warn "Warning: Could not create backup at '$backup_target': $@";
         return undef;
     }
 
-    # Optionally backup L2 cache and manifest
+    # Backup L2 Cache (Standard Copy - these are transient/rebuildable)
     if ($include_l2_cache) {
         foreach my $cache_file ('.nfit.cache.results', '.nfit.cache.manifest') {
             my $source = File::Spec->catfile($system_cache_dir, $cache_file);
             next unless -f $source;
 
+            # We don't compress L2 cache backups to keep this step fast,
+            # as these files are smaller than history.
             my $ext = ($cache_file =~ /\.(\w+)$/) ? $1 : '';
-            my $cache_backup = _get_next_available_filename(
-                $backup_root,
-                "${cache_file}.${timestamp}",
-                $ext
-            );
+            my $cache_backup = _get_next_available_filename($backup_root, "${cache_file}.${timestamp}", $ext);
 
-            File::Copy::copy($source, $cache_backup)
-                or warn "Could not backup $cache_file: $!";
-            print "  ✓ Backed up " . basename($cache_file) . "\n";
+            require File::Copy;
+            File::Copy::copy($source, $cache_backup) or warn "Could not backup $cache_file: $!";
         }
     }
 
-    # Prune old backups to prevent unbounded growth
-    _prune_old_backups($backup_root, 24); # Keep last 24 backups (~2 years)
-
-    return $backup_file;
+    _prune_old_backups($backup_root, 24);
+    return $backup_target;
 }
 
 # ==============================================================================
@@ -8936,6 +9061,87 @@ sub build_assimilation_map {
         }
     }
     return \%assimilation_map;
+}
+
+# ==============================================================================
+# SUBROUTINE: _acquire_history_lock
+# PURPOSE:    Acquires an EXCLUSIVE lock on the history infrastructure.
+#             This enables safe read-modify-write operations across the
+#             transition from Monolith -> Partitioned architecture.
+# RETURNS:    ($fh, $lock_path) - Filehandle and path. Keep $fh open to hold lock.
+# ==============================================================================
+sub _acquire_history_lock {
+    my ($system_cache_dir) = @_;
+
+    my $lock_file = File::Spec->catfile($system_cache_dir, $HISTORY_LOCK_FILENAME);
+
+    open my $lock_fh, '>', $lock_file
+        or die "FATAL: Could not create lock file '$lock_file': $!";
+
+    # Blocking lock - wait until acquired
+    flock($lock_fh, LOCK_EX)
+        or die "FATAL: Could not acquire exclusive lock on '$lock_file': $!";
+
+    # Auto-flush to ensure lock intent is registered if we write pid later
+    my $old_fh = select($lock_fh); $| = 1; select($old_fh);
+
+    return ($lock_fh, $lock_file);
+}
+
+# ==============================================================================
+# SUBROUTINE: _migrate_history_to_partitioned
+# PURPOSE:    One-time migration of monolithic history file to partitioned layout.
+#             Preserves data integrity by creating the directory, populating it,
+#             and renaming the legacy file only upon success.
+# ==============================================================================
+sub _migrate_history_to_partitioned {
+    my ($system_cache_dir) = @_;
+
+    my $legacy_file = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
+    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+
+    return unless -f $legacy_file; # Nothing to migrate
+
+    # This function is called INSIDE a lock, so we don't re-acquire it here.
+
+    print "  - Migrating legacy history to partitioned format.\n";
+
+    # 1. Load Legacy Data
+    my $json_text = do {
+        open my $fh, '<:encoding(utf8)', $legacy_file or die "FATAL: Cannot read legacy history: $!";
+        local $/; <$fh>;
+    };
+    my $data = JSON->new->decode($json_text);
+
+    # 2. Create Directory
+    unless (-d $partition_dir) {
+        make_path($partition_dir) or die "FATAL: Cannot create history partition directory: $!";
+    }
+
+    # 3. Write Partition Files
+    my $json_encoder = JSON->new->pretty->canonical;
+
+    foreach my $month_key (keys %$data) {
+        # We wrap the data in the month key to maintain the exact structure
+        # { "YYYY-MM": { ... } } inside the file. This simplifies stitching.
+        my $month_payload = { $month_key => $data->{$month_key} };
+
+        # Naming Convention: nfit.hist.YYYY-MM.json
+        my $filename = "nfit.hist.${month_key}.json";
+        my $filepath = File::Spec->catfile($partition_dir, $filename);
+
+        open my $fh, '>:encoding(utf8)', $filepath
+            or die "FATAL: Cannot write partition file $filename: $!";
+        print $fh $json_encoder->encode($month_payload);
+        close $fh;
+    }
+
+    # 4. Rename Legacy File (The "Commit" operation)
+    my $migrated_name = $legacy_file . ".migrated";
+    rename($legacy_file, $migrated_name)
+        or die "FATAL: Failed to rename legacy file after migration: $!";
+
+    print "  - Migration complete. Legacy file renamed to .migrated.\n";
 }
 
 # --- usage_wrapper ---
