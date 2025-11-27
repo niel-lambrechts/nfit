@@ -4,6 +4,52 @@ This document details the major milestones and feature introductions throughout 
 
 ---
 
+### **Version 6 - Single Pass Engine and Business Cycle Awareness (Seasonality Engine)**
+
+nFit v6 represents the culmination of four months of intensive development focused on performance, forecasting sophistication, and production-readiness. Building upon the enterprise integration capabilities introduced in v5, this release addresses two critical challenges in large-scale capacity planning:
+
+1. **Performance at Scale:** The new Single Pass Engine reduces analysis time by up to 16× for typical configurations, transforming multi-hour history priming operations into sub-hour workflows.
+2. **Business Cycle Awareness:** The Seasonality Engine enables capacity planners to model and forecast the impact of known business events (month-end processing, product launches, seasonal peaks) with statistical rigour, moving beyond simple linear growth projections.
+
+This release also includes major improvements to RunQ-based sizing recommendations, introducing tier-aware upsizing logic that appropriately balances business criticality against operational constraints, and clipping detection that identifies workloads constrained by available processor capacity.
+
+#### The Performance Problem
+
+Prior to v6, generating historical records for a system with 16 workload profiles across 3 months required **48 separate nfit invocations** (16 profiles × 3 months). Each invocation scanned the entire L1 data cache from the beginning, resulting in massive I/O redundancy:
+
+```plaintext
+Month 1 (April):  16 nfit runs × full cache scan = 16× I/O
+Month 2 (May):    16 nfit runs × full cache scan = 16× I/O
+Month 3 (June):   16 nfit runs × full cache scan = 16× I/O
+Total: 48 nfit invocations, 48× full cache scans
+```
+
+For seasonal events (which analyse baseline, peak, and residual periods), this multiplied to **144 invocations** for the same 3-month period.
+
+#### The Single Pass Solution
+
+The Single Pass Engine uses **manifest-driven unified analysis**, executing nfit once with a manifest describing all profiles simultaneously:
+```
+Month 1 (April):  1 nfit run (all 16 profiles) = 1× I/O
+Month 2 (May):    1 nfit run (all 16 profiles) = 1× I/O
+Month 3 (June):   1 nfit run (all 16 profiles) = 1× I/O
+Total: 3 nfit invocations, 3× full cache scans
+```
+
+**Result:** 16× I/O reduction per analysis period.
+
+#### Seasonality and Business Cycle Forecasting Engine
+
+nFit v6 introduces a sophisticated **Seasonality and Business Cycle Forecasting Engine** designed to model and predict the impact of known business events on CPU demand. This addresses a fundamental limitation of traditional capacity planning: linear growth models cannot account for massive, cyclical spikes like month-end processing, Black Friday, or quarterly financial close.
+
+
+### **Version 5 - Abstracted Cache Connector Architecture**
+
+nFit v5 represents a major leap forward in enterprise data integration, building upon the high-performance caching engine introduced in v4. The cornerstone of this release is a new **Abstracted Cache Connector Architecture**, which decouples data ingestion from analysis and introduces native support for **InfluxDB**, allowing capacity planners to connect nFit directly to their strategic monitoring platforms.
+
+This release refactors `nfit-stage-nmon` and introduces `nfit-stage-influxdb` as dedicated, high-performance tools that create a standardised, persistent cache. This enhancement, combined with architectural improvements to support hierarchical caches, allows nFit to analyse entire estates composed of multiple managed systems, making it a true enterprise-grade capacity planning platform.
+
+
 ### **Version 4.x - The Performance Release**
 
 Version 4 represents a landmark architectural overhaul focused on delivering game-changing performance and efficiency, especially for large-scale enterprise environments.
