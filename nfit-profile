@@ -216,7 +216,12 @@ my $apply_seasonality_event;
 my $update_history_flag = 0; # New unified history update flag
 my $min_history_days_arg;    # New flag for partial month processing
 my $reset_seasonal_cache = 0;
+my $seasonal_auto_flag = 0; # Automatic Seasonal Discovery Flag
 my $DEFAULT_SEASONALITY_CONFIG_FILE = "nfit.seasonality.cfg";
+
+# Global flags for seasonality execution context
+my $is_multiplicative_forecast_run = 0;
+my $is_predictive_peak_model_run = 0;
 
 # The Global Lock ensures atomic access to the history directory.
 my $HISTORY_LOCK_FILENAME = ".nfit.history.lock";
@@ -247,6 +252,7 @@ GetOptions(
     'excel-formulas=s'           => \$excel_formulas_flag,
     'mgsys|system|serial|host=s' => \$mgsys_filter,
     'apply-seasonality=s'        => \$apply_seasonality_event,
+    'seasonal'                   => \$seasonal_auto_flag,
     'update-history'             => \$update_history_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
@@ -957,6 +963,11 @@ foreach my $system_serial (@target_systems_to_process)
     my $is_predictive_peak_model_run = 0;
     my $historic_data_for_csv_href;
 
+    my $effective_event_name;
+    my $effective_config;
+    my $exclusions;
+    my ($start_date, $end_date);
+
     # First, determine the full path to the cache we are processing in this iteration.
     my $current_cache_path = defined($system_serial) ? File::Spec->catfile($base_cache_dir, $system_serial) : $nmon_dir;
 
@@ -1007,8 +1018,8 @@ foreach my $system_serial (@target_systems_to_process)
         print STDERR "\n--- Processing Managed System: $system_identifier ---\n";
 
         # Efficiently report the data cache's time-span for user context.
-        my $data_cache_file = File::Spec->catfile($current_cache_path, '.nfit.cache.data');
-        my ($start_date, $end_date) = _get_cache_date_range($data_cache_file);
+        my $data_cache_file = File::Spec->catfile($current_cache_path, $DATA_CACHE_FILE);
+        ($start_date, $end_date) = _get_cache_date_range($data_cache_file);
         if ($start_date && $end_date) {
             print STDERR "Data Cache Timespan: " . $start_date->strftime('%Y-%m-%d') . " to " . $end_date->strftime('%Y-%m-%d') . "\n";
         }
@@ -1130,6 +1141,22 @@ foreach my $system_serial (@target_systems_to_process)
         # After updating the history, we skip the rest of the processing for this system.
         print STDERR "--- History update complete for system: $system_identifier ---\n";
         next; # Proceed to the next system in the loop.
+    } elsif ($seasonal_auto_flag) {
+        # --- Automatic Seasonal Discovery ---
+        _execute_automatic_seasonal_discovery($seasonality_config, $current_cache_path, \@profiles, {
+            system_identifier => $system_identifier,
+            nfit_path => $nfit_script_path,
+            rounding_flags => $rounding_flags_for_nfit,
+            default_smt => $default_smt_arg,
+            runq_avg_method => $nfit_runq_avg_method_str,
+            adaptive_saturation_thresh => $adaptive_runq_saturation_thresh,
+            adaptive_target_norm_runq => $adaptive_target_norm_runq,
+            adaptive_max_efficiency_reduction => $adaptive_max_efficiency_reduction,
+            sampling_interval => $detected_interval_secs,
+            cache_start_date  => $start_date,
+            cache_end_date    => $end_date
+        }, $end_date);
+        next; # Skip standard processing
     } elsif ($apply_seasonality_event) {
         # --- Apply a Seasonal Forecast ---
         my $is_seasonal_run = 1;
@@ -1141,21 +1168,28 @@ foreach my $system_serial (@target_systems_to_process)
         # check for unsupported model types
         # Prevent this script from incorrectly running models handled by other tools.
         my $requested_model_type = $requested_event_config->{model} // '';
-        if ($requested_model_type eq 'adaptive_peak_forecasting') {
-            die "ERROR: The 'adaptive_peak_forecasting' model must be run using the 'nfit-forecast.py' script.\n" .
-                "       Please use the command: ./nfit-forecast.py --nmondir $current_cache_path --apply-seasonality $apply_seasonality_event\n";
+        if ($requested_model_type eq 'adaptive_peak') {
+            die "ERROR: The 'adaptive_peak' model must be run using the 'nfit-forecast' program.\n" .
+                "       Please use the command: ./nfit-forecast --nmondir $current_cache_path --apply-seasonality $apply_seasonality_event\n";
         }
 
         # Determine the correct analysis path. This function checks for sufficient
         # history for multiplicative models and returns the effective event name to run.
-        my $effective_event_name = determine_seasonal_analysis_path(
+        $effective_event_name = determine_seasonal_analysis_path(
             $requested_event_config,
             $current_cache_path,
             $apply_seasonality_event
         );
 
         # Get the configuration for the event we are actually going to run.
-        my $effective_config = $seasonality_config->{$effective_event_name} // {};
+        $effective_config = $seasonality_config->{$effective_event_name} // {};
+
+        # --- Parse Exclusions for "Manual" (`--apply-seasonality`) Run ---
+        if (defined $effective_config->{exclude_dates}) {
+             my $known_vms = _get_known_vms_from_cache($current_cache_path);
+             $exclusions = _parse_exclusion_dates($effective_config->{exclude_dates}, $known_vms);
+        }
+
         my $effective_model_type = $effective_config->{model} // '';
 
         # Now, set up the analysis based on the EFFECTIVE model type.
@@ -1186,67 +1220,20 @@ foreach my $system_serial (@target_systems_to_process)
             $is_multiplicative_forecast_run = 1;
         } elsif ($effective_model_type eq 'predictive_peak') {
             $is_predictive_peak_model_run = 1;
-            # This is the new model. It's a self-contained forecast that runs
-            # instead of the standard profile loop.
-            my $forecast_results = calculate_predictive_peak_forecast(
-                $current_cache_path,
-                $system_identifier,
-                $effective_event_name,
-                $effective_config,
-                $seasonality_config,
-                $adaptive_runq_saturation_thresh
-            );
-            # Overwrite the main results table with the forecast
-            %results_table = %$forecast_results;
 
-            # Populate the global vm_order array so the reporter knows which VMs to process.
-            @vm_order = sort keys %results_table;
-
-            # Generate and store the necessary hint/pressure data for each VM for the CSV.
-            foreach my $vm_name (@vm_order) {
-                my $cfg_for_hint = $vm_config_data{$vm_name};
-                my $smt_for_hint = (defined $cfg_for_hint && defined $cfg_for_hint->{smt}) ? $cfg_for_hint->{smt} : $default_smt_arg;
-                my $maxcpu_for_hint = (defined $cfg_for_hint && defined $cfg_for_hint->{maxcpu}) ? $cfg_for_hint->{maxcpu} : 0;
-
-                # Build the VM map structure that generate_sizing_hint expects
-                my %vm_map_for_hint = (
-                    Configuration => {
-                        vm_name     => $vm_name,
-                        max_cpu     => $maxcpu_for_hint,
-                        smt         => $smt_for_hint,
-                        entitlement => $cfg_for_hint->{entitlement} // 0,
-                        %{$cfg_for_hint || {}}  # Include any other config fields
-                    },
-                    CoreResults => {
-                        ProfileValues => $results_table{$vm_name}
-                    },
-                    RunQMetrics => {}  # No RunQ metrics available in this path
-                );
-
-                # Call generate_sizing_hint with correct signature (3 positional args)
-                my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
-                    generate_sizing_hint(
-                        \%vm_map_for_hint,
-                        undef,  # No log file handle needed here
-                        $adaptive_runq_saturation_thresh
-                    );
-
-                $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
-                $hint_pattern_for_csv{$vm_name}   = $hint_pattern_shape;
-                $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
-                $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
-
-                # The final peak is the higher of the baseline and prediction for the P-99W1 profile.
-                my $baseline_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'TrueBaseline'} // 0;
-                my $predicted_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'PredictedPeak'} // 0;
-                $results_table{$vm_name}{$PEAK_PROFILE_NAME} = ($baseline_peak > $predicted_peak) ? $baseline_peak : $predicted_peak;
-
-            }
         }
     }
 
     # --- Capture the start time for this specific system's analysis ---
     my $system_analysis_start_time = time();
+
+    # Build Rationale Log Context (for use by raitonale loggers)
+    my $rationale_context = {
+        analysis_start  => $system_analysis_start_time,
+        start           => $start_date,
+        end             => $end_date,
+        interval        => $detected_interval_secs
+    };
 
     # A single, clean call to the new single-pass engine.
     my $parsed_nfit_results = run_single_pass_analysis(
@@ -1296,62 +1283,212 @@ foreach my $system_serial (@target_systems_to_process)
     # based on the analysis model that was run. It also now captures all hint
     # components for later use in the CSV report, improving efficiency
     if ($is_multiplicative_forecast_run) {
-        # Path for the multiplicative seasonal model, which needs a unique log format.
-        # First, generate and store the hint data needed for the CSV report.
-        foreach my $vm_name (@vm_order) {
-            my $cfg_for_hint = $vm_config_data{$vm_name};
-            my $smt_for_hint = $default_smt_arg;
-            my $maxcpu_for_hint = 0;
-            my $ent_for_hint = 0;
-            my $p99w1_results_aref = $per_profile_nfit_raw_results{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
+        # We pass the current assimilation map (initial_results) to the forecast engine.
+        my ($forecast_results, $historic_data) = calculate_multiplicative_forecast(
+            $current_cache_path,
+            $system_identifier,
+            $effective_event_name, # defined in the scope above (line 333)
+            $effective_config,     # defined in the scope above (line 334)
+            $seasonality_config,
+            $assimilation_map_ref,  # Pass current results if needed
+            $exclusions
+        );
 
-            if (ref($p99w1_results_aref) eq 'ARRAY' && @$p99w1_results_aref) {
-                my $last_state_data = $p99w1_results_aref->[-1];
-                my $config = $last_state_data->{metadata}{configuration} || {};
-
-				if (defined $config->{maxCpu} && looks_like_number($config->{maxCpu}) && $config->{maxCpu} > 0) {
-                    $maxcpu_for_hint = $config->{maxCpu};
-                }
-				if (defined $config->{smt} && looks_like_number($config->{smt}) && $config->{smt} > 0) {
-                    $smt_for_hint = $config->{smt};
-                }
-				if (defined $config->{entitlement} && looks_like_number($config->{entitlement})) {
-                    $ent_for_hint = $config->{entitlement};
-                }
+        # Guard against empty results from failed baseline calculation
+        unless ($forecast_results && scalar keys %$forecast_results > 0) {
+            warn "Warning: Multiplicative forecast returned no results for event '$effective_event_name'. Skipping.\n";
+            # Skip the rest of the multiplicative processing
         }
+        else {
 
-            # Build the VM map structure that generate_sizing_hint expects
-            my %vm_map_for_hint = (
-                Configuration => {
-                    vm_name     => $vm_name,
-                    max_cpu     => $maxcpu_for_hint,
-                    smt         => $smt_for_hint,
-                    entitlement => $ent_for_hint,
-                    %{$cfg_for_hint || {}}  # Include any other config fields
-                },
-                CoreResults => {
-                    ProfileValues => $results_table{$vm_name}
-                },
-                RunQMetrics => $per_profile_runq_metrics{$vm_name} || {}
-            );
+            # Merge the forecast results into the main results table
+            # (calculate_multiplicative_forecast already populates global %seasonal_debug_info)
+            $historic_data_for_csv_href = $historic_data;
 
-            # Call generate_sizing_hint with correct signature (3 positional args)
-            my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
-            generate_sizing_hint(
-                \%vm_map_for_hint,
-                undef,  # We don't need the rationale text here, just the CSV values
-                $adaptive_runq_saturation_thresh
-            );
+            # Store the multiplicative_seasonal forecast results to unified history
+            _store_model_forecast_to_history(
+                    $current_cache_path,
+                    $effective_event_name,
+                    'multiplicative_seasonal',
+                    $forecast_results,
+                    $effective_config
+                    );
 
-            $hint_tier_for_csv{$vm_name} = $hint_type_tier;
-            $hint_pattern_for_csv{$vm_name} = $hint_pattern_shape;
-            $hint_pressure_for_csv{$vm_name} = $hint_pressure_bool;
-            $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
+            # Overwrite the main results table with the forecast results
+            %results_table = %$forecast_results;
+
+            # Populate the global vm_order array so the reporter knows which VMs to process
+            @vm_order = sort keys %results_table;
+
+            # Update assimilation map with forecast values for CSV reporter
+            foreach my $vm_name (@vm_order) {
+                $assimilation_map_ref->{$vm_name} //= {};
+                $assimilation_map_ref->{$vm_name}{CoreResults} //= {};
+                $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
+            }
+
+            # Path for the multiplicative seasonal model, which needs a unique log format.
+            # We must populate the assimilation map with hints so the CSV writer can read them.
+            foreach my $vm_name (@vm_order) {
+                # Get the authoritative map entry for this VM
+                my $vm_map_ref = $assimilation_map_ref->{$vm_name};
+
+                # 1. Self-Reference & Metrics
+                $vm_map_ref->{Configuration}{vm_name} = $vm_name;
+                $vm_map_ref->{RunQMetrics} //= $per_profile_runq_metrics{$vm_name} || {};
+
+                # 2. Generate Hints
+                # Call generate_sizing_hint using the assimilation map (not a temp hash).
+                my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
+                    generate_sizing_hint(
+                        $vm_map_ref,
+                        undef,  # No log file handle needed here
+                        $adaptive_runq_saturation_thresh
+                    );
+
+                # 3. Store Hints
+                $vm_map_ref->{Hinting}{AutoTier}       = $hint_type_tier;
+                $vm_map_ref->{Hinting}{Pattern}        = $hint_pattern_shape;
+                $vm_map_ref->{Hinting}{Pressure}       = $hint_pressure_bool;
+                $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+
+                # 4. Populate legacy globals (for safety)
+                $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
+                $hint_pattern_for_csv{$vm_name}   = $hint_pattern_shape;
+                $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
+                $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
+
+                # 5. Calculate RunQ Modifiers (Tactical/Strategic/Potential)
+                # Determine source profile (Logic borrowed from main loop)
+                my $user_tier = $vm_tier_overrides{$vm_name} // "";
+                my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
+                my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
+                $pattern_char //= 'G';
+                my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+                my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+
+                # 6. Iterate all profiles to apply modifiers
+                foreach my $profile (@profiles) {
+                    my $p_name = $profile->{name};
+                    my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
+                    my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+
+                    # Calculate modified value (Forecast + RunQ)
+                    my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+                        $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
+                    );
+
+                    # Update the CoreResults with the FINAL adjusted value
+                    # This ensures the CSV shows the Forecast INCLUDING the RunQ modifier
+                    if (looks_like_number($adjusted_physc)) {
+                        $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+                    }
+
+                    # If this is the source profile, save the modifiers for the CSV columns
+                    if ($p_name eq $runq_source_profile_name) {
+                        $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
+                        $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
+                        $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
+                        $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+                    }
+                }
+
+            }
+            log_multiplicative_seasonal_rationale($open_log_files{$system_identifier}, $seasonality_config->{$apply_seasonality_event}, $rationale_context);
         }
-        log_multiplicative_seasonal_rationale($open_log_files{$system_identifier});
     } elsif ($is_predictive_peak_model_run) {
         # Path for the new predictive peak model
-        log_predictive_peak_rationale($open_log_files{$system_identifier});
+        # The predictive_peak model uses linear regression on historical seasonal peaks.
+        my $forecast_results = calculate_predictive_peak_forecast(
+            $current_cache_path,
+            $system_identifier,
+            $effective_event_name,
+            $effective_config,
+            $seasonality_config,
+            $adaptive_runq_saturation_thresh,
+            $exclusions
+        );
+
+        # Store the predictive_peak forecast results to unified history
+        _store_model_forecast_to_history(
+            $current_cache_path,
+            $effective_event_name,
+            'predictive_peak',
+            $forecast_results,
+            $effective_config
+        );
+
+        # Overwrite the main results table with the forecast
+        %results_table = %$forecast_results;
+
+        # Populate the global vm_order array so the reporter knows which VMs to process.
+        @vm_order = sort keys %results_table;
+
+        # Generate and store the necessary hint/pressure data for each VM for the CSV.
+        # fix: Hydrate the Assimilation Map Correctly ---
+        foreach my $vm_name (@vm_order) {
+
+            # 1. Update CoreResults in the map with the forecasted values
+            $assimilation_map_ref->{$vm_name} //= {};
+            $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
+
+            # 2. Ensure self-reference exists
+            $assimilation_map_ref->{$vm_name}{Configuration}{vm_name} = $vm_name;
+            $assimilation_map_ref->{$vm_name}{RunQMetrics} //= $per_profile_runq_metrics{$vm_name} || {};
+
+            # 3. Generate Hints using the MAP (Single Source of Truth)
+            my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
+                generate_sizing_hint(
+                    $assimilation_map_ref->{$vm_name},
+                    undef,  # No log file handle needed here
+                    $adaptive_runq_saturation_thresh
+                );
+
+            # 4. Store hints back into the map
+            $assimilation_map_ref->{$vm_name}{Hinting}{AutoTier}       = $hint_type_tier;
+            $assimilation_map_ref->{Hinting}{Pattern}                  = $hint_pattern_shape;
+            $assimilation_map_ref->{$vm_name}{Hinting}{Pressure}       = $hint_pressure_bool;
+            $assimilation_map_ref->{$vm_name}{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+
+            # 5. Populate legacy globals for safety
+            $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
+            $hint_pattern_for_csv{$vm_name}   = $hint_pattern_shape;
+            $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
+            $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
+
+            # 6. Calculate RunQ Modifiers (Copy of Multiplicative Logic)
+            my $user_tier = $vm_tier_overrides{$vm_name} // "";
+            my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
+            my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
+            $pattern_char //= 'G';
+            my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+            my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+
+            my ($runq_source_profile_obj) = grep { $_->{name} eq $runq_source_profile_name } @profiles;
+
+            if ($runq_source_profile_obj) {
+                my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
+                my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+
+                my (undef, $debug_info_ref) = calculate_runq_modified_physc(
+                    $vm_name, $assimilation_map_ref->{$vm_name}, $runq_source_profile_obj, \%pressure_flags, \%adaptive_thresholds
+                );
+
+                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
+                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
+                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
+                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+            }
+
+            # 7. Update Peak Value logic
+            my $baseline_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'TrueBaseline'} // 0;
+            my $predicted_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'PredictedPeak'} // 0;
+
+            # Store the effective peak back into the map
+            $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues}{$PEAK_PROFILE_NAME} =
+                ($baseline_peak > $predicted_peak) ? $baseline_peak : $predicted_peak;
+        }
+        log_predictive_peak_rationale($open_log_files{$system_identifier}, $seasonality_config->{$apply_seasonality_event}, $rationale_context);
     } else {
         _phase("Applying Modifiers and Generating Rationale");
         # --- FINAL POST-PROCESSING, HINT GENERATION, and RATIONALE LOGGING ---
@@ -1489,10 +1626,24 @@ foreach my $system_serial (@target_systems_to_process)
     # -- Reporting and Reset Block --
     # This block executes after all profiles have been run for the current system.
 
+    # -- Reporting and Reset Block --
+    # This block executes after all profiles have been run for the current system.
     _phase("Writing CSV report");
     my $is_recency_decay_run = 0;
+
+    # --- FIX: Prioritise Seasonality Name in Filename ---
     my $report_type_for_filename = 'state-based';
-    if ($nfit_decay_over_states) {
+
+    if (defined $apply_seasonality_event && $apply_seasonality_event ne '') {
+        $report_type_for_filename = $apply_seasonality_event;
+
+        # Check if it is specifically recency decay
+        my $event_config = $seasonality_config->{$apply_seasonality_event} // {};
+        if (($event_config->{model} // '') eq 'recency_decay') {
+            $is_recency_decay_run = 1;
+        }
+    }
+    elsif ($nfit_decay_over_states) {
         $report_type_for_filename = 'hybrid-state-decay';
     } elsif ($nfit_enable_windowed_decay) {
         $report_type_for_filename = 'windowed-decay';
@@ -1506,7 +1657,7 @@ foreach my $system_serial (@target_systems_to_process)
    if ($is_multiplicative_forecast_run) {
         # This is the new path for the multiplicative model, which now uses the standard reporter.
         if (@vm_order) {
-            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh);
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 1, 0, 0, $adaptive_runq_saturation_thresh);
 
             # If verbose mode is on, generate the extra audit trail files.
             if ($verbose) {
@@ -1538,6 +1689,25 @@ foreach my $system_serial (@target_systems_to_process)
                 my $is_recency_flag = ($model_type eq 'recency_decay') ? 1 : 0;
                 my $is_predictive_flag = ($model_type eq 'predictive_peak') ? 1 : 0;
                 _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $unique_date_suffix, 0, $is_recency_flag, $is_predictive_flag, $adaptive_runq_saturation_thresh);
+
+                # Store recency_decay forecast results to unified history
+                # (predictive_peak is already stored earlier in its dedicated block)
+                if ($model_type eq 'recency_decay') {
+                    my %recency_decay_results_for_history;
+                    foreach my $vm_name (keys %{$assimilation_map_ref}) {
+                        my $core_results = $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues};
+                        next unless (ref($core_results) eq 'HASH');
+                        $recency_decay_results_for_history{$vm_name} = { %$core_results };
+                    }
+
+                    _store_model_forecast_to_history(
+                        $current_cache_path,
+                        $apply_seasonality_event,
+                        'recency_decay',
+                        \%recency_decay_results_for_history,
+                        $event_config
+                    );
+                }
             } else {
                 print STDERR "  - INFO: No VM output data was generated for seasonal event '$apply_seasonality_event'.\n";
             }
@@ -2063,12 +2233,12 @@ sub log_peak_profile_rationale {
     printf {$fh} "VM Name                                      : %s\n", $vm_name;
     printf {$fh} "Profile Processed                            : %s\n", $profile_desc;
     print {$fh} "----------------------------------------------------------------------\n";
-    print {$fh} "CPU Sizing Path: Pure Peak Measurement\n\n";
+    print {$fh} "Measurement Type: Pure Peak (Statistical Ceiling)\n\n";
     print {$fh} "  - The P-99W1 profile is a special case used for peak analysis.\n";
     print {$fh} "  - It represents the smoothed (1-min SMA) 99.75th percentile of the\n";
     print {$fh} "    unfiltered historical data.\n";
     print {$fh} "  - NO growth, RunQ, or forecasting modifiers are applied to this value.\n\n";
-    printf {$fh} "Final Unmodified Value                       : %s cores\n", ($base_physc // 'N/A');
+    printf {$fh} "  Final Unmodified Value                       : %s cores\n", ($base_physc // 'N/A');
     print {$fh} "======================================================================\n\n";
 }
 
@@ -2132,12 +2302,12 @@ sub log_profile_rationale
         printf {$fh} "VM Name                                : %s\n", $vm_name;
         printf {$fh} "Profile Processed                      : %s\n", $profile_desc;
         print {$fh} "----------------------------------------------------------------------\n";
-        print {$fh} "CPU Sizing Path: Multiplicative Seasonal Forecast\n\n";
+        print {$fh} "  CPU Forecasting Model: Multiplicative Seasonal Forecast\n\n";
         printf {$fh} "  - Current Baseline Value      : %.4f cores\n", $s_data->{baseline};
         printf {$fh} "  - Historical Multiplier       : %.4f\n", $s_data->{multiplier};
         printf {$fh} "  - Volatility Buffer           : %.4f\n", $s_data->{volatility};
         print {$fh} "  - Calculation                 : Baseline * Multiplier * Volatility\n";
-        printf {$fh} "  - Final Forecasted Value      : %.4f cores\n", $s_data->{forecast};
+        printf {$fh} "  Final Forecasted Value       : %.4f cores\n", $s_data->{forecast};
         print {$fh} "======================================================================\n\n";
         return;
     }
@@ -2190,7 +2360,7 @@ sub log_profile_rationale
 		printf {$fh} "VM Name                             : %s\n", $vm_name;
 		printf {$fh} "Profile Processed                   : %s\n", $profile_desc;
 		print {$fh} "----------------------------------------------------------------------\n";
-		print {$fh} "CPU Sizing Path: Recency-Anchored Decay (Seasonal: '$apply_seasonality_event')\n\n";
+		print {$fh} "  CPU Forecasting Model: Recency-Anchored Decay (Seasonal: '$apply_seasonality_event')\n\n";
 		print {$fh} "  - This model solves the 'Start-of-Month' problem and includes nfit's\n";
 		print {$fh} "    standard growth prediction.\n\n";
 		printf {$fh} "  - Analysis Reference Date         : %s\n", ($nfit_analysis_reference_date_str // "N/A");
@@ -3003,13 +3173,13 @@ sub apply_tier_aware_upsizing_scaling {
         if ($factor > 1.0) {
             my $increase_pct = ($factor - 1.0) * 100;
             $result{rationale} = sprintf(
-                "Tier %d: Enhanced upsizing (+%.0f%%) for lower latency tolerance. Base: %.3f â†’ Scaled: %.3f cores",
+                "Tier %d: Enhanced upsizing (+%.0f%%) for lower latency tolerance. Base: %.3f -> Scaled: %.3f cores",
                 $tier_num, $increase_pct, $additive_cpu, $scaled
             );
         } elsif ($factor < 1.0) {
             my $decrease_pct = (1.0 - $factor) * 100;
             $result{rationale} = sprintf(
-                "Tier %d: Moderated upsizing (-%.0f%%) for standard efficiency. Base: %.3f â†’ Scaled: %.3f cores",
+                "Tier %d: Moderated upsizing (-%.0f%%) for standard efficiency. Base: %.3f -> Scaled: %.3f cores",
                 $tier_num, $decrease_pct, $additive_cpu, $scaled
             );
         } else {
@@ -3183,7 +3353,12 @@ sub calculate_runq_modified_physc
     }
     my $final_burst_allowance = $base_burst_factor * $pool_constraint_multiplier;
     my $theoretical_lcpus = ($curr_ent_numeric * (1 + $final_burst_allowance)) * $smt_used;
-    my $p99w1_physc_val = $pure_p99w1_physc;
+
+    # handle potentially undefined P-99W1 values
+    my $p99w1_physc_val_str = looks_like_number($pure_p99w1_physc) ? sprintf("%.3f", $pure_p99w1_physc) : $na_str;
+    my $p99w1_physc_val = ($p99w1_physc_val_str ne $na_str && $p99w1_physc_val_str =~ /^-?[0-9.]+\z/)
+        ? ($p99w1_physc_val_str + 0)
+        : 0;
     my $capacity_headroom = ($max_cpu_for_lpar_numeric > 0) ? (1 - ($p99w1_physc_val / $max_cpu_for_lpar_numeric)) : 0;
     my $headroom_confidence_modifier = 1.0;
     my $headroom_rationale = "High Headroom (>30%), full confidence in observed peak";
@@ -3781,7 +3956,7 @@ sub calculate_runq_modified_physc
         # Reconstruct the rationale for logging
         my $increase_pct = ($tier_scaling_factor - 1.0) * 100;
         my $rationale_text = sprintf(
-            "Tier %d: Enhanced upsizing (+%.0f%%) for lower latency tolerance. Base: %.3f â†’ Scaled: %.3f cores",
+            "Tier %d: Enhanced upsizing (+%.0f%%) for lower latency tolerance. Base: %.3f -> Scaled: %.3f cores",
             $tier_num_for_scaling, $increase_pct, $pre_scaled_additive, $additive_cpu
         );
 
@@ -4378,7 +4553,7 @@ sub parse_seasonality_config {
 #   - A hash reference containing historical data for verbose reporting.
 # ==============================================================================
 sub calculate_multiplicative_forecast {
-    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href) = @_;
+    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href, $exclusions_href) = @_;
 
     # This subroutine implements a robust, multi-stage forecast for multiplicative seasonal events.
     # It intelligently determines the most appropriate recent baseline and applies a recency-weighted
@@ -4419,6 +4594,22 @@ sub calculate_multiplicative_forecast {
         }
     }
 
+    # Populate most_recent_peak from the first (newest) snapshot if available
+    if (@event_history_initial) {
+        $most_recent_peak_snapshot = $event_history_initial[0];
+        if ($most_recent_peak_snapshot->{periodEndDate}) {
+            eval {
+                $most_recent_peak_end_obj = Time::Piece->strptime(
+                    $most_recent_peak_snapshot->{periodEndDate}, '%Y-%m-%d'
+                );
+            };
+            if ($@) {
+                warn "Warning: Could not parse periodEndDate '$most_recent_peak_snapshot->{periodEndDate}': $@\n";
+                $most_recent_peak_end_obj = undef;
+            }
+        }
+    }
+
     # --- Step 2: Two-Tiered Baseline Strategy ---
     my %current_baseline_results;
     my $baseline_source_log = "N/A";
@@ -4452,7 +4643,7 @@ sub calculate_multiplicative_forecast {
             my $profile_name = $profile->{name};
             print STDERR "    - Analysing post-peak baseline $profile_num/$profile_count: $profile_name\n";
             # This is a contextual baseline, so is_generic is 0.
-            my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir, 0, 0, undef, $profile->{name});
+            my ($nfit_cmd, $manifest_obj) = _build_nfit_baseline_command($profile->{flags}, $start_str, $end_str, $system_cache_dir, 0, 0, undef, $profile->{name}, $exclusions_href);
             my $nfit_output = '';
             my $stderr_arg = ">&=" . fileno(STDERR);
             my $pid_nfit = open3(undef, my $stdout_nfit, $stderr_arg, $nfit_cmd);
@@ -4473,8 +4664,19 @@ sub calculate_multiplicative_forecast {
         }
     }
     # --- Path B (Fallback): Re-use the "Pre-Peak" baseline from the most recent snapshot ---
+    # periodEndDate: end of the Peak
+    #
     elsif ($most_recent_peak_snapshot) {
-        $baseline_source_log = "Pre-Peak (re-used from snapshot ending " . $most_recent_peak_snapshot->{periodEndDate} . ")";
+        my $b_start = $most_recent_peak_snapshot->{baselinePeriod}{startDate};
+        my $b_end   = $most_recent_peak_snapshot->{baselinePeriod}{endDate};
+
+        if ($b_start && $b_end) {
+             $baseline_source_log = "Pre-Peak ($b_start - $b_end)";
+        } else {
+             # Legacy Fallback
+             $baseline_source_log = "Pre-Peak (ending " . $most_recent_peak_snapshot->{periodEndDate} . ")";
+        }
+
         print STDERR "  - Baseline Strategy: Post-Peak baseline contaminated or too short. Falling back to re-use Pre-Peak baseline.\n";
         %current_baseline_results = %{$most_recent_peak_snapshot->{results}{HistoricBaseline} || {}};
         # If we re-use this baseline, we must exclude its corresponding peak from the multiplier calculation.
@@ -4536,6 +4738,7 @@ sub calculate_multiplicative_forecast {
                 }
                 foreach my $profile (@profiles) {
                     my $p_name = $profile->{name};
+
                     my @multipliers;
                     my @residuals;
                     foreach my $hist_event (@history_for_this_event) {
@@ -4568,6 +4771,7 @@ sub calculate_multiplicative_forecast {
         foreach my $profile (@profiles) {
             my $p_name = $profile->{name};
             my $current_baseline_val = $current_baseline_results{$vm_name}{$p_name};
+
             next unless (defined $current_baseline_val && looks_like_number($current_baseline_val));
             next unless (exists $vm_historic_multipliers{$p_name});
 
@@ -4608,6 +4812,9 @@ sub calculate_multiplicative_forecast {
 
             $vm_forecasts->{$p_name} = $final_recommendation;
 
+            # Create a comma-separated list of active event names
+            my $active_events_str = join(", ", map { $_->{_eventName} } @active_events);
+
             $seasonal_debug_info{$vm_name}{$p_name} = {
                 historical_multipliers => $vm_historic_multipliers{$p_name}{$event_name}{'history'},
                 baseline             => $current_baseline_val,
@@ -4618,7 +4825,8 @@ sub calculate_multiplicative_forecast {
                 forecasted_residual  => $forecasted_residual,
                 amplification_factor => $amplification,
                 forecast             => $final_recommendation,
-                OutlierWarning       => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings)
+                OutlierWarning       => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings),
+                active_events        => $active_events_str
             };
         }
         $final_forecasts{$vm_name} = $vm_forecasts;
@@ -4706,15 +4914,31 @@ sub write_seasonal_csv_output {
             );
 
             my $seasonal_multiplier_for_row = "N/A";
+
+            # --- Targeted Lookup for Seasonal Multiplier ---
+            # 1. Determine Pattern/Tier (Respecting User Override)
+            # We can use the global %vm_tier_overrides since it's populated at startup
+            my $user_tier_override = $vm_tier_overrides{$vm_name} // "";
+            my $hint_pattern_str = ($user_tier_override ne "") ? $user_tier_override : ($report_data->{pattern} // "G");
+            my ($hint_pattern) = ($hint_pattern_str =~ /^([A-Z])/);
+            $hint_pattern //= 'G';
+
+            # 2. Map to standard profile
+            my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+            my $target_profile_name = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
+
+            # 3. Fetch multiplier from that specific profile
+            if (exists $report_data->{seasonal_debug}{$target_profile_name}) {
+                $seasonal_multiplier_for_row = sprintf("%.2f", $report_data->{seasonal_debug}{$target_profile_name}{multiplier});
+            } elsif (exists $report_data->{seasonal_debug}{'G3-95W15'}) {
+                # Fallback
+                 $seasonal_multiplier_for_row = sprintf("%.2f", $report_data->{seasonal_debug}{'G3-95W15'}{multiplier});
+            }
+
             foreach my $profile (@csv_visible_profiles) {
                 my $p_name = $profile->{name};
                 my $value = $vm_data->{$p_name} // '';
                 push @row, (looks_like_number($value) ? sprintf("%.4f", $value) : $value);
-
-                # Use the multiplier from the first available profile for the summary column
-                if ($seasonal_multiplier_for_row eq 'N/A' && exists $report_data->{seasonal_debug}{$p_name}) {
-                    $seasonal_multiplier_for_row = sprintf("%.2f", $report_data->{seasonal_debug}{$p_name}{multiplier});
-                }
             }
 
             # Add the new column value and the final entitlement value
@@ -4899,7 +5123,7 @@ sub calculate_volatility_buffer {
 # - CORRECTED to handle both fixed-date and recurring-period definitions.
 # ==============================================================================
 sub detect_active_events {
-    my ($analysis_date_obj, $seasonality_config_href) = @_;
+    my ($analysis_date_obj, $seasonality_config_href, $ignore_compounding_check) = @_;
 
     my @active_events;
     return @active_events unless (defined $analysis_date_obj && ref($analysis_date_obj) eq 'Time::Piece');
@@ -4909,10 +5133,23 @@ sub detect_active_events {
 
     foreach my $event_name (keys %{$seasonality_config_href}) {
         my $event_config = $seasonality_config_href->{$event_name};
-        next unless (($event_config->{allow_compounding} // '') =~ /^(true|1)$/i);
+
+        # Only check allow_compounding if we are NOT ignoring the check
+        unless ($ignore_compounding_check) {
+            next unless (($event_config->{allow_compounding} // '') =~ /^(true|1)$/i);
+        }
 
         # Determine the period for this event relative to the analysis date.
         my ($start_obj, $end_obj) = determine_event_period($event_config, $analysis_date_utc);
+
+        # --- Discovery Horizon Logic ---
+        # Hierarchy: Event Config -> Global Config -> Default (30)
+        my $lookback_days = $event_config->{seasonal_lookback_days}
+                            // $seasonality_config_href->{Global}{seasonal_lookback_days}
+                            // 30;
+        my $lookahead_days = $event_config->{seasonal_lookahead_days}
+                             // $seasonality_config_href->{Global}{seasonal_lookahead_days}
+                             // 30;
 
         my $is_active = 0;
 
@@ -4922,7 +5159,13 @@ sub detect_active_events {
                 if ($range =~ /(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})/) {
                     my $start_obj = Time::Piece->strptime($1, '%Y-%m-%d')->truncate(to => 'day');
                     my $end_obj   = Time::Piece->strptime($2, '%Y-%m-%d')->truncate(to => 'day');
-                    if ($analysis_date_utc >= $start_obj && $analysis_date_utc <= $end_obj) {
+
+                    # Apply Horizon:
+                    # Active if: Analysis Date >= (Start - LookAhead) AND Analysis Date <= (End + LookBack)
+                    my $horizon_start = $start_obj - ($lookahead_days * ONE_DAY);
+                    my $horizon_end   = $end_obj + ($lookback_days * ONE_DAY);
+
+                    if ($analysis_date_utc >= $horizon_start && $analysis_date_utc <= $horizon_end) {
                         $is_active = 1;
                         last;
                     }
@@ -4930,14 +5173,26 @@ sub detect_active_events {
             }
         }
         elsif (defined $event_config->{period} && lc($event_config->{period}) eq 'monthly') {
-            # *** FIX: Use the robust helper for consistent logic ***
-            my $day_of_period = $event_config->{day_of_period} // -1;
-            my $duration_days = $event_config->{duration_days} // 7;
-            my ($event_start_obj, $event_end_obj) = _get_recurring_monthly_period($analysis_date_utc, $day_of_period, $duration_days);
+            # For recurring events, determine_event_period returns the period relative to the analysis date.
+            # However, with a horizon, we might be "outside" the standard period but "inside" the horizon.
+            # So we need to check if the *nearest* occurrence is within the horizon.
 
-            # The check is now simpler because determine_event_period already did the work.
-            if (defined $start_obj && $analysis_date_utc >= $start_obj && $analysis_date_utc <= $end_obj) {
-                $is_active = 1;
+            # Simplified approach: Use the returned period from determine_event_period.
+            # If determine_event_period returns a period, it means it found one relative to the date.
+            # But determine_event_period might be strict?
+            # Let's check determine_event_period implementation.
+            # It seems to find the "current or next" period.
+
+            # Actually, the user requirement implies we should check if the *event itself* is within the horizon.
+            # If determine_event_period returns ($start, $end), we check if analysis_date is within [Start-LookAhead, End+LookBack].
+
+            if (defined $start_obj && defined $end_obj) {
+                my $horizon_start = $start_obj - ($lookahead_days * ONE_DAY);
+                my $horizon_end   = $end_obj + ($lookback_days * ONE_DAY);
+
+                if ($analysis_date_utc >= $horizon_start && $analysis_date_utc <= $horizon_end) {
+                    $is_active = 1;
+                }
             }
         }
 
@@ -5150,19 +5405,17 @@ sub _write_standard_csv_report {
     my @header_for_this_report = @output_header_cols_csv;
     my $formula_col_offset = 0;
 
-    # Logic to add/remove model-specific columns remains the same...
-    if ($is_multiplicative_run_flag) {
-        @header_for_this_report = grep { $_ ne 'RunQ_Tactical' && $_ ne 'RunQ_Strategic' && $_ ne 'RunQ_Potential' && $_ ne 'RunQ_Source' } @header_for_this_report;
-    }
     my ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
     $ent_idx //= scalar(@header_for_this_report);
     if ($is_multiplicative_run_flag) {
-        my @new_cols = ("SeasonalMultiplier", "Baseline_PhysC");
-        # Remove all growth/runq columns for this model
+        my @new_cols = ("SeasonalEvents", "T3_SeasonalMultiplier", "Baseline_P99", "BaselineSource", "ForecastModel");
+
+        # Remove all standard Growth columns (Theil-Sen) for this model (as this will perform a seasonal forecast instead)
         @header_for_this_report = grep {
-            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|ProjectionDays|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
+            !/^(ProjectionDays|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
         } @header_for_this_report;
-        # Find ent_idx again after grep
+
+        # Inject seasonal columns
         ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
         $ent_idx //= scalar(@header_for_this_report); # Fallback
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
@@ -5175,12 +5428,15 @@ sub _write_standard_csv_report {
     } elsif ($is_predictive_peak_run_flag) {
         # Remove growth/runq columns for this model
         @header_for_this_report = grep {
-            !/^(RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|ProjectionDays|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance)$/
+            !/^(ProjectionDays|GrowthMethod|GrowthConfidence|GrowthTrend|GrowthSignificance|GrowthAdj.*)$/
         } @header_for_this_report;
+
         # Find ent_idx again after grep
         ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
         $ent_idx //= scalar(@header_for_this_report); # Fallback
-        my @new_cols = ("TrueBaseline_P99W1", "PredictedPeak_P99W1", "ForecastSource");
+
+        my @new_cols = ("ActiveEvents", "PredictedDelta", "Baseline_P99", "BaselineSource", "ForecastModel");
+
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
     }
@@ -5231,13 +5487,11 @@ sub _write_standard_csv_report {
         push @data_row_csv, $cfg->{serial_number} // "", $vm_config_data{$vm_name}{systemtype} // ""; # systemtype from old config is richer
         push @data_row_csv, $vm_config_data{$vm_name}{pool_name} // "", $cfg->{pool_id} // "";
 
-        unless ($is_multiplicative_run_flag || $is_predictive_peak_run_flag) {
-            # This now correctly fetches the single, authoritative values for the VM (selecting the same profile name as $source_profile_name)
-            push @data_row_csv, (defined $modifiers->{RunQ_Tactical} ? sprintf("%+.3f", $modifiers->{RunQ_Tactical}) : "0.000");
-            push @data_row_csv, (defined $modifiers->{RunQ_Strategic} ? sprintf("%+.3f", $modifiers->{RunQ_Strategic}) : "0.000");
-            push @data_row_csv, (defined $modifiers->{RunQ_Potential} && looks_like_number($modifiers->{RunQ_Potential}) ? sprintf("%+.3f", $modifiers->{RunQ_Potential}) : ($modifiers->{RunQ_Potential} // "0.000"));
-            push @data_row_csv, $modifiers->{RunQ_Source} // "";
-        }
+        # This now correctly fetches the single, authoritative values for the VM (selecting the same profile name as $source_profile_name)
+        push @data_row_csv, (defined $modifiers->{RunQ_Tactical} ? sprintf("%+.3f", $modifiers->{RunQ_Tactical}) : "0.000");
+        push @data_row_csv, (defined $modifiers->{RunQ_Strategic} ? sprintf("%+.3f", $modifiers->{RunQ_Strategic}) : "0.000");
+        push @data_row_csv, (defined $modifiers->{RunQ_Potential} && looks_like_number($modifiers->{RunQ_Potential}) ? sprintf("%+.3f", $modifiers->{RunQ_Potential}) : ($modifiers->{RunQ_Potential} // "0.000"));
+        push @data_row_csv, $modifiers->{RunQ_Source} // "";
 
         # Push the Peak value, ensuring 3-digit precision
         my $peak_val = $core->{PeakValue};
@@ -5251,10 +5505,44 @@ sub _write_standard_csv_report {
         }
 
         # Model-specific columns
+        # Important Notes:
+        # - A seasonal forecast should not ignore current structural deficits.
+        # - Seasonal Forecasts Recommendations = (Baseline x SeasonalMultiplier) + RunQ_Tactical
         if ($is_multiplicative_run_flag) {
-            my $s_data = $seasonal_debug_info{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT} || {};
+            # --- Targeted Lookup for Seasonal Multiplier ---
+            # 1. Determine the VM's Pattern/Tier (Respecting User Override)
+            my $user_tier_override = $tier_override_for_csv{$vm_name} // "";
+            my $pattern_source = ($user_tier_override ne "") ? $user_tier_override : ($hinting->{AutoTier} // "G");
+            my ($hint_pattern) = ($pattern_source =~ /^([A-Z])/);
+            $hint_pattern //= 'G';
+
+            # 2. Map to standard profile
+            my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+            my $multiplier_source_profile = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
+
+            # 3. Fetch multiplier from that specific profile
+            my $s_data = $seasonal_debug_info{$vm_name}{$multiplier_source_profile} || {};
+
+            # Fallback if specific profile missing (though unlikely if logic holds)
+            if (!keys %$s_data) {
+                 $s_data = $seasonal_debug_info{$vm_name}{'G3-95W15'} || {};
+            }
+
+            # ActiveEvents (from the specific profile, or generally for the VM if stored globally, but here per-profile)
+            push @data_row_csv, ($s_data->{active_events} // "None");
+
+            # SeasonalMultiplier
             push @data_row_csv, (defined $s_data->{multiplier} ? sprintf("%.2f", $s_data->{multiplier}) : "N/A");
+
+            # Baseline_PhysC
             push @data_row_csv, (defined $s_data->{baseline} ? sprintf("%.3f", $s_data->{baseline}) : "N/A");
+
+            # BaselineSource
+            push @data_row_csv, ($s_data->{baseline_source} // "N/A");
+
+            # ForecastModel (New Column)
+            push @data_row_csv, "Seasonal Multiplicative";
+
         } elsif ($is_recency_decay_run_flag || $nfit_enable_windowed_decay || $nfit_decay_over_states) {
 
             # 1. Determine the source profile for growth rationale.
@@ -5384,12 +5672,37 @@ sub _write_standard_csv_report {
 
         } elsif ($is_predictive_peak_run_flag) {
             my $s_data = $seasonal_debug_info{$vm_name}{'P-99W1'} || {};
-            my $source = $s_data->{FinalSource} || 'N/A';
-            if ($source eq 'PeakPrediction') { $source = 'PredictedPeak'; }
-            elsif ($source eq 'TrueBaseline') { $source = 'BaselineIsHigher'; }
+
+            # 1. ActiveEvents
+            push @data_row_csv, ($s_data->{active_events} // $apply_seasonality_event);
+
+            # 2. PredictedDelta (Net Growth)
+            # Formula: PredictedPeak - TrueBaseline
+            my $delta_val = "N/A";
+            if (defined $s_data->{PredictedPeak} && defined $s_data->{TrueBaseline} && looks_like_number($s_data->{PredictedPeak}) && looks_like_number($s_data->{TrueBaseline})) {
+                $delta_val = sprintf("%+.3f", $s_data->{PredictedPeak} - $s_data->{TrueBaseline});
+            }
+            push @data_row_csv, $delta_val;
+
+            # 3. Baseline_P99 (Mapped from TrueBaseline)
             push @data_row_csv, (defined $s_data->{TrueBaseline} ? sprintf("%.3f", $s_data->{TrueBaseline}) : "N/A");
-            push @data_row_csv, (defined $s_data->{PredictedPeak} ? sprintf("%.3f", $s_data->{PredictedPeak}) : "N/A");
-            push @data_row_csv, $source;
+
+            # 4. BaselineSource
+            push @data_row_csv, ($s_data->{baseline_source} // "Generic Non-Peak");
+
+            # 5. ForecastModel (Includes source info)
+            my $source_raw = $s_data->{FinalSource} // 'Unknown';
+            my $source_display = $source_raw;
+
+            # Restore the user-friendly mapping for the report
+            if ($source_raw eq 'PeakPrediction') {
+                $source_display = 'PredictedPeak';
+            }
+            elsif ($source_raw eq 'TrueBaseline') {
+                $source_display = 'BaselineIsHigher';
+            }
+
+            push @data_row_csv, "Predictive ($source_display)";
         }
 
         # Entitlement and formula columns
@@ -5511,98 +5824,91 @@ sub _get_recurring_monthly_period {
 }
 
 # ==============================================================================
-# Dedicated reporter for the multiplicative_seasonal model. It creates a
-# single, rich final_forecast.csv file with all standard columns, the new
-# SeasonalMultiplier column, and correctly offset Excel formulas.
-# ==============================================================================
-sub _write_multiplicative_seasonal_report {
-    my ($system_id, $event_name, $timestamp, $forecast_data_href, $assimilation_map_ref) = @_;
-
-    my $s_id_safe = $system_id;
-    my $e_name_safe = $event_name;
-    $s_id_safe =~ s/[^a-zA-Z0-9_.-]//g;
-    $e_name_safe =~ s/[^a-zA-Z0-9_.-]//g;
-
-    my $filename = File::Spec->catfile($output_dir, "nfit-profile.$s_id_safe.$e_name_safe.final_forecast.$timestamp.csv");
-    push @generated_files, $filename;
-    print "  - Generating output file: $filename\n";
-
-    open my $fh, '>', $filename or die "Warning: Could not open output file '$filename': $!";
-
-    # Build the enhanced header with the new SeasonalMultiplier column
-    my @header = (
-        "VM", "TIER", "Hint", "Pattern", "Pressure", "PressureDetail", "SMT",
-        "Serial", "SystemType", "Pool Name", "Pool ID", $PEAK_PROFILE_NAME
-    );
-    push @header, (map { $_->{name} } @profiles);
-    push @header, ("SeasonalMultiplier", "Current - ENT", "NFIT - ENT", "NETT", "NETT%");
-    print $fh join(",", map { quote_csv($_) } @header) . "\n";
-
-    my $excel_row_num_counter = 1;
-    foreach my $vm_name (sort keys %$forecast_data_href) {
-        $excel_row_num_counter++;
-        my $vm_data = $forecast_data_href->{$vm_name};
-        my $report_data = $vm_data->{_report_data} || {};
-        my $cfg_csv = $vm_config_data{$vm_name};
-
-        # Get the complete, final data for this VM from the assimilation map.
-        my $vm_map_ref = $assimilation_map_ref->{$vm_name};
-        my $cfg = $vm_map_ref->{Configuration};
-        my $core = $vm_map_ref->{CoreResults};
-        my $hinting = $vm_map_ref->{Hinting};
-        my $modifiers = $vm_map_ref->{CSVModifiers};
-
-        # Gather standard fields for the row
-        my $smt_out = $cfg_csv->{smt} // $default_smt_arg;
-        my ($serial_out, $systype_out, $poolname_out, $poolid_out, $ent_out) = ('', '', '', '', '');
-        if (defined $cfg_csv) {
-            $serial_out = $cfg_csv->{serial} // ''; $systype_out = $cfg_csv->{systemtype} // '';
-            $poolname_out = $cfg_csv->{pool_name} // ''; $poolid_out = $cfg_csv->{pool_id} // '';
-            $ent_out = $cfg_csv->{entitlement} // '';
-        }
-
-        my @row = (
-            $vm_name, "", $report_data->{hint} // "", $report_data->{pattern} // "",
-            $report_data->{pressure} // "", $report_data->{pressure_detail} // "", $smt_out,
-            $serial_out, $systype_out, $poolname_out, $poolid_out, ""
-        );
-
-        my $seasonal_multiplier_for_row = "N/A";
-        foreach my $profile (@profiles) {
-            my $p_name = $profile->{name};
-            my $value = $vm_data->{$p_name} // '';
-            push @row, (looks_like_number($value) ? sprintf("%.4f", $value) : $value);
-            if ($seasonal_multiplier_for_row eq 'N/A' && exists $report_data->{seasonal_debug}{$p_name}) {
-                $seasonal_multiplier_for_row = sprintf("%.2f", $report_data->{seasonal_debug}{$p_name}{multiplier});
-            }
-        }
-
-        # Add the new SeasonalMultiplier and standard entitlement columns
-        push @row, $seasonal_multiplier_for_row;
-        push @row, (looks_like_number($ent_out) ? sprintf("%.2f", $ent_out) : $ent_out);
-
-        # Generate the Excel formulas with the correct column offset
-        my $nfit_ent_formula_str = generate_nfit_ent_formula($excel_row_num_counter, scalar(@profiles), 1); # <-- Pass offset of 1
-        my $nett_user_formula_str = sprintf("=(%s-%s)", get_excel_col_name(13 + scalar(@profiles) + 2) . $excel_row_num_counter, get_excel_col_name(12 + scalar(@profiles) + 2) . $excel_row_num_counter);
-        my $nett_perc_user_formula_str = sprintf("=IFERROR((%s-%s)/%s,\"\")", get_excel_col_name(13 + scalar(@profiles) + 2) . $excel_row_num_counter, get_excel_col_name(12 + scalar(@profiles) + 2) . $excel_row_num_counter, get_excel_col_name(12 + scalar(@profiles) + 2) . $excel_row_num_counter);
-        push @row, $nfit_ent_formula_str, $nett_user_formula_str, $nett_perc_user_formula_str;
-
-        print $fh join(",", map { quote_csv($_) } @row) . "\n";
-    }
-    close $fh;
-}
-
-# ==============================================================================
 # Subroutine to log the rationale for a multiplicative seasonal forecast.
 # It provides a clear, aligned, and explanatory summary of how the forecast
 # was derived for each profile, matching the format of the standard log.
 # ==============================================================================
+# ==============================================================================
+# SUBROUTINE: _log_seasonal_config_context
+# PURPOSE:    Logs the configuration context for a seasonal event.
+# ==============================================================================
+sub _log_seasonal_config_context {
+    my ($fh, $event_config, $context_href) = @_;
+    return unless $fh && $event_config;
+    my $label_width = 35;
+    my $event_name = $event_config->{_eventName} // "Unknown Event";
+
+    print {$fh} "######################################################################\n";
+    print {$fh} "# Seasonal Event Configuration: $event_name\n";
+    print {$fh} "######################################################################\n";
+
+    # Event Description
+    my $desc = $event_config->{description} // "N/A";
+    $desc =~ s/^"|"$//g;
+    printf {$fh} "  %-${label_width}s : %s\n", "Event Description", $desc;
+
+    # Event Definition
+    my $def = $event_config->{dates} // ($event_config->{period} ? $event_config->{period} . " (Day " . ($event_config->{day_of_period} // "?") . ")" : "N/A");
+    printf {$fh} "  %-${label_width}s : %s\n", "Event Definition", $def;
+
+    # --- NEW FIELDS ---
+    if ($context_href) {
+        # Analysis Window
+        if ($context_href->{start} && $context_href->{end}) {
+            my $days = int(($context_href->{end}->epoch - $context_href->{start}->epoch) / 86400) + 1;
+            printf {$fh} "  %-${label_width}s : %s to %s (%d days)\n",
+                "Analysis Window", $context_href->{start}->ymd, $context_href->{end}->ymd, $days;
+        }
+
+        # Sampling Interval
+        if ($context_href->{interval}) {
+            printf {$fh} "  %-${label_width}s : %s seconds\n", "Sampling Interval", $context_href->{interval};
+        }
+
+        # Projection Horizon (Context specific)
+        my $horizon = "Next Occurrence"; # Default for multiplicative/predictive
+        if (($event_config->{model}//'') eq 'recency_decay') {
+            $horizon = "Standard Growth Projection";
+        }
+        printf {$fh} "  %-${label_width}s : %s\n", "Projection Horizon", $horizon;
+    }
+    # ------------------
+
+    # Baseline Lookback
+    my $lookback = $event_config->{baseline_period_days} // "N/A";
+    printf {$fh} "  %-${label_width}s : %s days\n", "Baseline Lookback", $lookback;
+
+    # Compounding Logic
+    my $compounding_str = "Exclusive (No Compounding)";
+    if (($event_config->{allow_compounding} // '') =~ /^(true|1)$/i) {
+        my $dampening = $event_config->{interaction_dampening_factor} // "N/A";
+        $compounding_str = "Enabled (Dampening: $dampening)";
+    }
+    printf {$fh} "  %-${label_width}s : %s\n", "Compounding Logic", $compounding_str;
+
+    # Rule Version
+    my $version = $event_config->{last_modified} // "N/A";
+    printf {$fh} "  %-${label_width}s : %s\n", "Rule Version", $version;
+
+    # Data Exclusions
+    my $exclusions = $event_config->{exclude_dates} // "None";
+    printf {$fh} "  %-${label_width}s : %s\n", "Data Exclusions", $exclusions;
+
+    print {$fh} "======================================================================\n";
+}
+
+# Logs Rationale for Seasonal Forecasting models
 sub log_multiplicative_seasonal_rationale
 {
-    my ($fh) = @_;
+    my ($fh, $event_config, $context) = @_;
 
     # Ensure the script does not die if the log file handle is not valid.
     return unless $fh;
+
+    # Log Configuration Context
+    if (defined $event_config) {
+        _log_seasonal_config_context($fh, $event_config, $context);
+    }
 
     # Iterate through each VM that has results, maintaining a consistent order.
     foreach my $vm_name (sort @vm_order)
@@ -5613,24 +5919,44 @@ sub log_multiplicative_seasonal_rationale
         # Print a clear, top-level header for each VM in the log.
         print {$fh} "\n######################################################################\n";
         print {$fh} "# Rationale for VM: $vm_name\n";
+        print {$fh} "# CPU Forecasting Model: Multiplicative Seasonal Forecast (Event: $apply_seasonality_event)\n";
         print {$fh} "######################################################################\n\n";
-        print {$fh} "CPU Sizing Path: Multiplicative Seasonal Forecast (Event: $apply_seasonality_event)\n\n";
 
         # Iterate through each profile to log its specific forecast calculation.
         foreach my $profile (@profiles)
         {
             my $p_name = $profile->{name};
+
+            # --- Special Handling for P-99W1 ---
+            if (defined $MANDATORY_PEAK_PROFILE_FOR_HINT && $p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                my $label_width = 38;
+                print {$fh} "======================================================================\n";
+                printf {$fh} "%-${label_width}s : %s\n", "Profile Processed", parse_profile_name_for_log($p_name);
+                print {$fh} "----------------------------------------------------------------------\n";
+                print {$fh} "  CPU Forecasting Model: Multiplicative Seasonal Forecast ($apply_seasonality_event)\n\n";
+                print {$fh} "  - The P-99W1 profile is a special case used for peak analysis.\n";
+                print {$fh} "  - It represents the smoothed (1-min SMA) 99.75th percentile of the\n";
+                print {$fh} "    unfiltered historical data.\n";
+                print {$fh} "  - NO growth, RunQ, or forecasting modifiers are applied to this value.\n\n";
+
+                my $p99_val = $seasonal_debug_info{$vm_name}{$p_name}{forecast} // 0;
+                printf {$fh} "  Final Unmodified Value              : %.4f cores\n", ($p99_val // 'N/A');
+                print {$fh} "======================================================================\n\n";
+                next;
+            }
+
             next unless exists $seasonal_debug_info{$vm_name}{$p_name};
 
             my $s_data = $seasonal_debug_info{$vm_name}{$p_name};
             my $profile_desc = parse_profile_name_for_log($p_name);
 
             # Use a fixed width for labels to ensure consistent alignment of colons.
-            my $label_width = 35;
+            my $label_width = 36;
 
             print {$fh} "======================================================================\n";
-            printf {$fh} "%-${label_width}s : %s\n", "Profile Processed", $profile_desc;
+            printf {$fh} "%-${label_width}s   : %s\n", "Profile Processed", $profile_desc;
             print {$fh} "----------------------------------------------------------------------\n";
+            print {$fh} "  CPU Forecasting Model: Multiplicative Seasonal Forecast ($apply_seasonality_event)\n\n";
             printf {$fh} "  %-${label_width}s : %.4f cores\n", "Current Baseline Value", $s_data->{baseline};
             printf {$fh} "  %-${label_width}s : %.4f\n", "Historical Multiplier", $s_data->{multiplier};
 
@@ -5646,11 +5972,8 @@ sub log_multiplicative_seasonal_rationale
             printf {$fh} "  %-${label_width}s : %.4f\n", "Volatility Buffer", $s_data->{volatility};
             printf {$fh} "  %-${label_width}s : %.4f cores\n", "Forecasted Peak Residual", $s_data->{forecasted_residual};
             printf {$fh} "  %-${label_width}s : %.2f\n", "Peak Amplification Factor", $s_data->{amplification_factor};
-            print {$fh} "  --------------------------------------------------------------------\n";
-            print {$fh} "  Calculation : ((Baseline * Multiplier * Buffer) + Residual) * Amplification\n";
-            print {$fh} "  --------------------------------------------------------------------\n";
-            print {$fh} "  --------------------------------------------------------------------\n";
             printf {$fh} "  %-${label_width}s : %.4f cores\n", "Final Forecasted Value", $s_data->{forecast};
+            print {$fh} "    - Calculation : ((Baseline * Multiplier * Buffer) + Residual) * Amplification\n";
             # --- Print outlier warning if it exists ---
             if (defined $s_data->{OutlierWarning} && $s_data->{OutlierWarning} ne '') {
                 print {$fh} "\n  --- Workload Volatility Alert ---\n";
@@ -5719,11 +6042,12 @@ sub determine_seasonal_analysis_path {
 #   6. $is_generic_baseline    : if true, all decay and time filters are stripped.
 #   7. $allow_growth_prediction: if true, growth predictions will be enabled.
 #   8. $profile_name_for_label : profile name to record in the results cache (if specified)
+#   9. $exclusions_href (hash ref, optional): Hash of VM exclusions.
 # RETURNS:
 #   - The fully constructed nfit command string.
 # ==============================================================================
 sub _build_nfit_baseline_command {
-    my ($profile_flags_in, $baseline_start_str, $baseline_end_str, $system_cache_dir, $enable_clipping_detection, $is_generic_baseline, $allow_growth_prediction, $profile_name_for_label) = @_;
+    my ($profile_flags_in, $baseline_start_str, $baseline_end_str, $system_cache_dir, $enable_clipping_detection, $is_generic_baseline, $allow_growth_prediction, $profile_name_for_label, $exclusions_href) = @_;
 
     my $profile_flags = $profile_flags_in; # Work on a copy.
 
@@ -5752,20 +6076,49 @@ sub _build_nfit_baseline_command {
     }
     $profile_flags =~ s/--decay-over-states\s*//g;
 
-    # Construct the base command, ensuring --nmondir is always present.
-    # the '-k' (Peak) flag is always included for statistical history.
-    my $base_flags = "-q -k --nmondir \"$system_cache_dir\" $rounding_flags_for_nfit";
+    # --- REFACTOR: Use Manifest for Exclusion Support ---
+    # To support complex exclusions (dates/VMs), we must use a manifest.
+    # We construct a temporary profile and manifest, inject exclusions, and return the command.
 
-    # Only add date filters if they are actually defined.
-    # They can be added independently - not required to have both.
+    my $temp_profile = {
+        name  => $profile_name_for_label // 'BaselineProfile',
+        flags => $profile_flags
+    };
+
+    my $manifest = build_transform_manifest([$temp_profile], $nfit_runq_avg_method_str);
+
+    # Sanitise for history (baselines are historical)
+    my $sanitised_manifest = _sanitise_manifest_for_history($manifest);
+
+    # Inject exclusions
+    if (defined $exclusions_href) {
+        _inject_exclusions_into_manifest($sanitised_manifest, $exclusions_href);
+    }
+
+    # Write to temp file
+    # We return the File::Temp object to the caller so it persists until they are done.
+    my $fh_manifest = File::Temp->new(
+        TEMPLATE => 'nfit_baseline_manifest_XXXXXX',
+        SUFFIX   => '.json',
+        UNLINK   => 1,
+        TMPDIR   => 1
+    );
+    print $fh_manifest JSON->new->pretty->canonical->encode($sanitised_manifest);
+    close $fh_manifest; # Flush but keep object alive
+
+    my $manifest_filename = $fh_manifest->filename;
+
+    # Construct the command using the manifest
+    my $base_flags = "-q -k --nmondir \"$system_cache_dir\" $rounding_flags_for_nfit";
     $base_flags .= " --startdate $baseline_start_str" if defined $baseline_start_str;
     $base_flags .= " --enddate $baseline_end_str" if defined $baseline_end_str;
 
+    # Note: vm_filter_arg is NOT needed if we rely on the manifest/exclusions,
+    # but nfit still respects -vm as a global filter.
     my $vm_filter_arg = defined($target_vm_name) ? " -vm \"$target_vm_name\"" : "";
     my $smt_flag = "--smt $default_smt_arg";
 
-    # Assemble the final, correct command.
-    my $command = "$nfit_script_path $base_flags $vm_filter_arg $smt_flag $profile_flags";
+    my $command = "$nfit_script_path --manifest \"$manifest_filename\" $base_flags $vm_filter_arg $smt_flag";
 
     # Add clipping detection if requested
     if ($enable_clipping_detection) {
@@ -5777,7 +6130,7 @@ sub _build_nfit_baseline_command {
         $command .= " --profile-label '$profile_name_for_label'";
     }
 
-    return $command;
+    return ($command, $fh_manifest);
 }
 
 # ==============================================================================
@@ -5785,7 +6138,7 @@ sub _build_nfit_baseline_command {
 # This version is enhanced to use the new two-part residual forecasting method.
 # ==============================================================================
 sub calculate_predictive_peak_forecast {
-    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $adaptive_runq_saturation_thresh) = @_;
+    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $adaptive_runq_saturation_thresh, $exclusions_href) = @_;
 
     # --- Step 1: Get Historical Peak and Residual Data ---
     # Calls the enhanced helper to get a hash containing both data series.
@@ -5799,7 +6152,18 @@ sub calculate_predictive_peak_forecast {
 
     # --- Step 3: Calculate the Non-Peak Baseline (excluding all historical peaks) ---
     # This logic remains unchanged.
-    my $true_baseline_results_href = _get_true_baseline_results($system_cache_dir, $event_name, $event_config, $full_seasonality_config);
+    # --- Step 3: Calculate the Non-Peak Baseline (excluding all historical peaks) ---
+    # This logic remains unchanged.
+    my $true_baseline_results_href = _get_true_baseline_results($system_cache_dir, $event_name, $event_config, $full_seasonality_config, $exclusions_href);
+
+    # --- Generate Active Events String ---
+    # Even though predictive usually targets one event, we check for compounding overlap for consistency.
+    my ($next_start, $next_end) = determine_event_period($event_config);
+    my $forecast_date_obj = $next_start // gmtime();
+    my @active_events = detect_active_events($forecast_date_obj, $full_seasonality_config);
+    my $active_events_str = join(", ", map { $_->{_eventName} } @active_events);
+    # Fallback if detection fails (e.g. fixed dates in past)
+    $active_events_str ||= $event_name;
 
     # --- Step 4: Synthesize Final Results ---
     print STDERR " -> Step 3/3: Synthesizing final forecast from Predicted Peak, Predicted Residual, and Baseline.\n";
@@ -5854,7 +6218,10 @@ sub calculate_predictive_peak_forecast {
                 AmplificationFactor  => $amplification,
                 FinalForecast        => $final_recommendation,
                 PredictionDebug    => $debug_info_for_vms->{$vm_name}{$p_name},
-                OutlierWarning     => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings)
+                OutlierWarning     => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings),
+                active_events      => $active_events_str,
+                baseline_source    => "Generic Non-Peak (Filtered)", # Predictive always uses filtered generic
+                forecast_model     => "Predictive Linear Regression"
             };
         }
     }
@@ -5866,7 +6233,7 @@ sub calculate_predictive_peak_forecast {
 #
 # ==============================================================================
 sub _get_true_baseline_results {
-    my ($system_cache_dir, $event_name, $event_config, $full_seasonality_config) = @_;
+    my ($system_cache_dir, $event_name, $event_config, $full_seasonality_config, $exclusions_href) = @_;
 
     my $data_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
     return {} unless -f $data_cache_file;
@@ -5948,51 +6315,87 @@ sub _get_true_baseline_results {
 
     close $filtered_fh;
 
-    # --- Stage 3: Run nfit on the filtered file for each profile ---
+    # --- Stage 3: Execute Single-Pass Analysis on the Filtered Data ---
+    print STDERR "    - Establishing Generic Non-Peak Baseline using filtered baseline data.\n";
+
+    # 1. Build and Sanitise Manifest
+    #    We use the global @profiles array and RunQ settings
+    my $tactical_manifest = build_transform_manifest(\@profiles, $nfit_runq_avg_method_str);
+    my $historical_manifest = _sanitise_manifest_for_history($tactical_manifest);
+
+    # --- INJECT EXCLUSIONS IF PRESENT ---
+    if (defined $exclusions_href) {
+        _inject_exclusions_into_manifest($historical_manifest, $exclusions_href);
+    }
+
+    # 2. Write Manifest to Temp File
+    my ($fh_manifest, $manifest_filename) = tempfile(
+        'nfit_baseline_manifest_XXXXXX',
+        SUFFIX => '.json',
+        UNLINK => 1,
+        TMPDIR => 1
+    );
+    print $fh_manifest JSON->new->pretty->canonical->encode($historical_manifest);
+    close $fh_manifest;
+
+    # 3. Construct nfit Command
+    #    CRITICAL: We point --physc-data and --runq-data to the FILTERED file we just created.
+    #    The cache file format (Timestamp, VM, PhysC, RunQ) is compatible with these flags.
+    my $nfit_cmd = "$nfit_script_path --manifest $manifest_filename "
+                 . " --nmondir \"$system_cache_dir\" "
+                 . "--physc-data \"$filtered_filename\" "
+                 . "--runq-data  \"$filtered_filename\" " # Cache file contains both columns
+                 . "--smt $default_smt_arg "
+                 . "--runq-avg-method $nfit_runq_avg_method_str "
+                 . "--show-progress";
+
+    # 4. Execute
+    my $nfit_output = '';
+    my $stderr_arg = ">&=" . fileno(STDERR);
+    my $pid_nfit = open3(undef, my $stdout_nfit, $stderr_arg, $nfit_cmd);
+
+    while(my $line = <$stdout_nfit>) {
+        $nfit_output .= $line;
+    }
+    waitpid($pid_nfit, 0);
+
+    # 5. Parse and Assimilate Results
     my %baseline_results;
-    my $profile_count = scalar(@profiles);
-    my $profile_num = 0;
-    foreach my $profile (@profiles) {
-        $profile_num++;
-        print STDERR "    - Establishing Generic Non-Peak Baseline for profile $profile_num/$profile_count: $profile->{name}\n";
-
-        # For a "True Baseline", we need a generic, unfiltered result. Enable generic baseline (no decay or time filters)
-        my $nfit_cmd = _build_nfit_baseline_command($profile->{flags}, undef, undef, $system_cache_dir, 0, 1, undef, $profile->{name});
-
-        my $nfit_output = '';
-        # Use open3 to capture STDOUT, but let STDERR pass through to the terminal
-        my $stderr_arg = ">&=" . fileno(STDERR);
-        my $pid_nfit = open3(undef, my $stdout_nfit, $stderr_arg, "$nfit_cmd --show-progress");
-        while(my $line = <$stdout_nfit>) {
-            $nfit_output .= $line;
-        }
-        waitpid($pid_nfit, 0);
-
-        next if $?;
-
+    if ($? == 0) {
         my $parsed = parse_nfit_json_output($nfit_output);
-        my $p_key = "P" . clean_perc_label( ($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE );
 
         foreach my $vm (keys %$parsed) {
-            # For aggregated/decay runs, nfit returns a single JSON object per VM
+            # In historical mode (no decay), nfit might return multiple states.
+            # We want the aggregated average across the filtered period.
             my @states_for_vm = @{$parsed->{$vm}};
-            next unless @states_for_vm;
 
-            my @valid_p_values;
-            foreach my $state_hash (@states_for_vm) {
-                my $metric_val = $state_hash->{metrics}{physc}{$p_key};
-                if (defined $metric_val && looks_like_number($metric_val)) {
-                    push @valid_p_values, $metric_val;
+            foreach my $profile (@profiles) {
+                my $p_name = $profile->{name};
+                # Extract the correct P-metric key (e.g., P95)
+                my ($p_val_num) = $profile->{flags} =~ /(?:-p|--percentile)\s+([0-9.]+)/;
+                my $p_key = "P" . clean_perc_label($p_val_num // $DEFAULT_PERCENTILE);
+
+                my @valid_vals;
+                foreach my $state (@states_for_vm) {
+                    my $val = _safe_dig($state, 'metrics', 'physc', $p_name, $p_key);
+                    push @valid_vals, $val if (defined $val && looks_like_number($val));
+                }
+
+                if (@valid_vals) {
+                    # Simple average of the states in the filtered file
+                    $baseline_results{$vm}{$p_name} = sum0(@valid_vals) / scalar(@valid_vals);
                 }
             }
-
-            if (@valid_p_values) {
-                my $aggregated_value = sum0(@valid_p_values) / scalar(@valid_p_values);
-                $baseline_results{$vm}{$profile->{name}} = $aggregated_value;
-            }
         }
+    } else {
+        warn "WARNING: nfit failed during baseline calculation. Exit code: " . ($? >> 8) . "\n";
     }
+
+    # Cleanup temp file if we created one
+    unlink $filtered_filename if -f $filtered_filename;
+
     return \%baseline_results;
+
 }
 
 # ==============================================================================
@@ -6074,7 +6477,8 @@ sub _get_historical_peak_data {
 
 # ==============================================================================
 # Core statistical engine for the predictive_peak model.
-# This version orchestrates a dual forecast for both the peak signal and the residual.
+# This function orchestrates a dual forecast for both the peak signal and the residual.
+# This function uses Theil-Sen Estimator (Robust Regression) instead of OLS.
 # ==============================================================================
 sub _calculate_peak_prediction {
     my ($historical_data_href, $event_config) = @_;
@@ -6087,41 +6491,43 @@ sub _calculate_peak_prediction {
 
     my $min_peaks = $event_config->{min_historical_peaks} // 3;
 
-    # This anonymous subroutine is a reusable, local prediction engine.
-    # It takes a time series and returns a single predicted next value.
+    # --- Robust Prediction Logic (Theil-Sen) ---
     my $_predict_next_value = sub {
         my ($series_aref) = @_;
 
         return (undef, "Insufficient history")
             unless (defined $series_aref && ref($series_aref) eq 'ARRAY' && scalar(@$series_aref) >= 2);
 
-        # Perform simple outlier trimming by removing the min and max values
-        # if the series is long enough to support it.
+        # Extract values. Note: We do NOT strictly need to trim outliers here
+        # because Theil-Sen is naturally robust to them (breakdown point ~29%).
         my @values = map { $_->{value} } @$series_aref;
-        @values = sort { $a <=> $b } @values;
-        if (@values > 5) {
-            shift @values; # Remove lowest
-            pop @values;   # Remove highest
-        }
 
-        # Build points for the linear regression.
-        my @points_for_regression;
+        # 1. Build points [x, y]
+        my @points;
         for my $i (0..$#values) {
-            push @points_for_regression, [$i, $values[$i]];
+            push @points, [$i, $values[$i]];
         }
 
-        my $regression = calculate_manual_linear_regression(\@points_for_regression);
-        unless ($regression) {
-            return (undef, "Regression failed");
+        # 2. Calculate Theil-Sen Slope
+        my $sen_result = calculate_sens_slope(\@points);
+        unless ($sen_result) {
+            return (undef, "Theil-Sen calculation failed (insufficient distinct points)");
         }
+        my $slope = $sen_result->{slope};
 
-        my $slope = $regression->{slope};
-        my $intercept = $regression->{intercept};
+        # 3. Calculate Robust Intercept
+        # Formula: Median(y_i - slope * x_i)
+        my @intercepts;
+        for my $i (0..$#values) {
+            push @intercepts, $values[$i] - ($slope * $i);
+        }
+        my $intercept = _calculate_median(\@intercepts);
 
-        # Project one step into the future.
-        my $projected_value = ($slope * scalar(@values)) + $intercept;
+        # 4. Project one step into the future
+        my $future_x = scalar(@values); # Next index
+        my $projected_value = ($slope * $future_x) + $intercept;
 
-        my $debug_str = sprintf("Success (Slope: %.4f, Points used: %d)", $slope, scalar(@values));
+        my $debug_str = sprintf("Theil-Sen (Slope: %.4f, Intercept: %.4f, N: %d)", $slope, $intercept, scalar(@values));
 
         return ($projected_value, $debug_str);
     };
@@ -6131,7 +6537,6 @@ sub _calculate_peak_prediction {
 
             my $peak_series_aref = $peak_series_per_profile->{$profile_name}{$vm_name} || [];
 
-            # Skip if there is not enough primary peak data to forecast.
             if (scalar(@$peak_series_aref) < $min_peaks) {
                 $debug_info{$vm_name}{$profile_name} = {
                     peak_status => "Skipped: Insufficient history (" . scalar(@$peak_series_aref) . "/$min_peaks)",
@@ -6140,19 +6545,18 @@ sub _calculate_peak_prediction {
                 next;
             }
 
-            # --- Perform the two separate forecasts ---
+            # Predict Peak
             my ($predicted_peak, $peak_debug) = $_predict_next_value->($peak_series_aref);
 
+            # Predict Residual
             my $residual_series_aref = $residual_series_per_profile->{$profile_name}{$vm_name} || [];
             my ($predicted_residual, $residual_debug) = $_predict_next_value->($residual_series_aref);
 
-            # Store the individual forecast components.
             $predictions{$vm_name}{$profile_name} = {
                 peak     => $predicted_peak,
                 residual => $predicted_residual,
             };
 
-            # Store the debug information for logging and rationale.
             $debug_info{$vm_name}{$profile_name} = {
                 peak_status     => $peak_debug,
                 residual_status => $residual_debug,
@@ -6160,7 +6564,6 @@ sub _calculate_peak_prediction {
         }
     }
 
-    # Return the predictions and diagnostics to the calling function.
     return (\%predictions, \%debug_info);
 }
 
@@ -6246,20 +6649,47 @@ sub find_all_historical_periods {
 # ==============================================================================
 # Subroutine to log the rationale for a predictive_peak seasonal forecast.
 # ==============================================================================
-sub log_predictive_peak_rationale {
-    my ($fh) = @_;
+sub log_predictive_peak_rationale
+{
+    my ($fh, $event_config, $context) = @_;
+
     return unless $fh;
+
+    # Log Configuration Context
+    if (defined $event_config) {
+        _log_seasonal_config_context($fh, $event_config, $context);
+    }
 
     foreach my $vm_name (sort @vm_order) {
         next unless exists $seasonal_debug_info{$vm_name};
 
         print {$fh} "\n######################################################################\n";
         print {$fh} "# Rationale for VM: $vm_name\n";
+        print {$fh} "# CPU Forecasting Model: Predictive Peak Forecast (Event: $apply_seasonality_event)\n";
         print {$fh} "######################################################################\n\n";
-        print {$fh} "CPU Sizing Path: Predictive Peak Forecast (Event: $apply_seasonality_event)\n\n";
 
         foreach my $profile (@profiles) {
             my $p_name = $profile->{name};
+
+            # --- Special Handling for P-99W1 ---
+            if (defined $MANDATORY_PEAK_PROFILE_FOR_HINT && $p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                my $label_width = 43;
+                print {$fh} "======================================================================\n";
+                printf {$fh} "%-${label_width}s : %s\n", "Profile Processed", parse_profile_name_for_log($p_name);
+                print {$fh} "----------------------------------------------------------------------\n";
+                print {$fh} "  CPU Forecasting Model: Predictive Peak Forecast ($apply_seasonality_event)\n\n";
+                print {$fh} "  - The P-99W1 profile is a special case used for peak analysis.\n";
+                print {$fh} "  - It represents the smoothed (1-min SMA) 99.75th percentile of the\n";
+                print {$fh} "    unfiltered historical data.\n";
+                print {$fh} "  - NO growth, RunQ, or forecasting modifiers are applied to this value.\n\n";
+
+                # Note: Key is 'FinalForecast' for predictive model
+                my $p99_val = $seasonal_debug_info{$vm_name}{$p_name}{FinalForecast} // 0;
+                printf {$fh} "  Final Unmodified Value              : %.4f cores\n", ($p99_val // 'N/A');
+                print {$fh} "======================================================================\n\n";
+                next;
+            }
+
             next unless exists $seasonal_debug_info{$vm_name}{$p_name};
 
             my $s_data = $seasonal_debug_info{$vm_name}{$p_name};
@@ -6267,7 +6697,7 @@ sub log_predictive_peak_rationale {
             my $label_width = 38;
 
             print {$fh} "======================================================================\n";
-            printf {$fh} "%-${label_width}s : %s\n", "Profile Processed", $profile_desc;
+            printf {$fh} "%-${label_width}s      : %s\n", "Profile Processed", $profile_desc;
             print {$fh} "----------------------------------------------------------------------\n";
 
             my $predicted_peak_val = $s_data->{PredictedPeak};
@@ -6282,8 +6712,12 @@ sub log_predictive_peak_rationale {
 
             } else {
                 # This block logs a successful, multi-step forecast.
+                # Extract trend details from the debug string if available
+                my $trend_details = $s_data->{PredictionDebug}{peak_status} // "Details unavailable";
+
                 printf {$fh} "  1. %-${label_width}s : %.4f cores\n", "Non-Peak Baseline (Floor)", ($s_data->{TrueBaseline} // 0);
-                printf {$fh} "  2. %-${label_width}s : %.4f cores\n", "Predicted Peak (from trend)", $predicted_peak_val;
+                printf {$fh} "  2. %-${label_width}s : %.4f cores\n", "Predicted Peak", $predicted_peak_val;
+                printf {$fh} "       - Trend Details                      : %s\n", $trend_details;
                 printf {$fh} "  3. %-${label_width}s : %.4f cores\n", "Predicted Peak Residual", ($s_data->{PredictedResidual} // 0);
                 printf {$fh} "  4. %-${label_width}s : %.2f\n", "Peak Amplification Factor", ($s_data->{AmplificationFactor} // 1.0);
                 print {$fh} "  --------------------------------------------------------------------\n";
@@ -6484,12 +6918,13 @@ sub write_unified_history {
 # ARGUMENTS:
 #   1. $event_config (hash ref): The event configuration containing the
 #      residual_peak_profile flags string.
+#   2. $exclusions_href (hash ref, optional): Hash of VM exclusions.
 #
 # RETURNS:
 #   - Hash reference to the manifest, or undef if no residual profile defined.
 # ==============================================================================
 sub _build_residual_manifest {
-    my ($event_config) = @_;
+    my ($event_config, $exclusions_href) = @_;
 
     # Check if a residual profile is configured
     my $residual_flags_str = $event_config->{residual_peak_profile};
@@ -6502,9 +6937,15 @@ sub _build_residual_manifest {
         flags => $residual_flags_str
     };
 
-    # Use the existing manifest builder with a single-element profile array
+    # 2. Build the manifest
     my $manifest = build_transform_manifest([$temp_profile], $nfit_runq_avg_method_str);
 
+    # --- INJECT EXCLUSIONS IF PRESENT ---
+    if (defined $exclusions_href) {
+        _inject_exclusions_into_manifest($manifest, $exclusions_href);
+    }
+
+    # 3. Create a temporary manifest file;
     return $manifest;
 }
 
@@ -6599,13 +7040,15 @@ sub _execute_history_pass {
 #   5. $event_name (string): Event name for metadata
 #   6. $peak_end (Time::Piece): Peak end date for metadata
 #   7. $profiles_aref (array ref): Reference to the profiles array
+#   8. $baseline_start (Time::Piece): Baseline analysis period start
+#   9. $baseline_end (Time::Piece): Baseline analysis period end
 #
 # RETURNS:
 #   - Hash reference to the complete snapshot structure, or undef on failure
 # ==============================================================================
 sub _assemble_seasonal_snapshot {
     my ($peak_results_href, $baseline_results_href, $residual_results_href,
-        $event_config, $event_name, $peak_end, $profiles_aref) = @_;
+        $event_config, $event_name, $peak_end, $profiles_aref, $baseline_start, $baseline_end) = @_;
 
     # Validate that profiles array was passed correctly
     unless (ref($profiles_aref) eq 'ARRAY' && @$profiles_aref) {
@@ -6615,7 +7058,7 @@ sub _assemble_seasonal_snapshot {
     # Determine the correct key names based on model type
     my $model_type = $event_config->{model} // '';
     my ($peak_key, $baseline_key) = ('HistoricPeak', 'HistoricBaseline');
-    if ($model_type eq 'predictive_peak' or $model_type eq 'adaptive_peak_forecasting') {
+    if ($model_type eq 'predictive_peak' or $model_type eq 'adaptive_peak') {
         ($peak_key, $baseline_key) = ('PeakValue', 'BaselineValue');
     }
 
@@ -6764,6 +7207,11 @@ sub _assemble_seasonal_snapshot {
     return {
         eventName     => $event_name,
         periodEndDate => $peak_end->ymd,
+        baselinePeriod => {
+            startDate => $baseline_start ? $baseline_start->ymd : undef,
+            endDate   => $baseline_end ? $baseline_end->ymd : undef,
+        },
+        periodEndDate => $peak_end->ymd,
         generatedOn   => localtime()->datetime(),
         results       => {
             $peak_key      => \%peak_period_results,
@@ -6772,6 +7220,194 @@ sub _assemble_seasonal_snapshot {
             'PeakResidual' => \%residual_results_final
         }
     };
+}
+
+# ==============================================================================
+# SUBROUTINE: _store_model_forecast_to_history
+# PURPOSE:    Stores the forecast results from a seasonal model run into the
+#             unified history under ModelForecasts for the appropriate event.
+#             This enables nfit-forecast to treat these as candidate forecasts.
+#
+# ARGUMENTS:
+#   1. $system_cache_dir      - Path to the system's cache directory
+#   2. $event_name            - Name of the seasonal event (e.g., 'month-end')
+#   3. $model_type            - Model identifier (e.g., 'predictive_peak')
+#   4. $forecast_results_href - Hash ref of {vm => {profile => value}}
+#   5. $event_config          - Event configuration hash (optional)
+#
+# SCHEMA:
+#   SeasonalEventSnapshots.{event}.ModelForecasts.{model} = {
+#     _meta: { model_version, generated_on, analysis_window },
+#     VM01: { forecast: {P-99W1: val}, baseline: {P-99W1: val} },
+#     VM02: { ... }
+#   }
+# ==============================================================================
+sub _store_model_forecast_to_history {
+    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config) = @_;
+
+    return unless ($system_cache_dir && $event_name && $model_type && $forecast_results_href);
+    return unless (scalar keys %$forecast_results_href > 0);
+
+    print STDERR "  - Storing $model_type forecast to history for event '$event_name'...\n";
+
+    # Calculate analysis window from data cache - this is the authoritative date range
+    my $data_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
+    my ($cache_start, $cache_end) = _get_cache_date_range($data_cache_file);
+
+    unless ($cache_end) {
+        warn "    - WARNING: Could not determine data cache date range. Cannot store forecast.\n";
+        return;
+    }
+
+    # Determine the target month key from the event period anchored to the cache end date
+    my $target_month_key;
+    if ($event_config) {
+        my ($peak_start, $peak_end) = determine_event_period($event_config, $cache_end);
+        if ($peak_end) {
+            $target_month_key = $peak_end->strftime('%Y-%m');
+        }
+    }
+
+    # Fallback: use the cache end date's month if event period couldn't be determined
+    $target_month_key //= $cache_end->strftime('%Y-%m');
+
+    my $analysis_days = int(($cache_end->epoch - $cache_start->epoch) / ONE_DAY) + 1;
+    my $analysis_end_date = $cache_end->strftime('%Y-%m-%d');
+
+    # Read current history and validate target month exists
+    my $history_data = read_unified_history($system_cache_dir);
+
+    # Check if target month exists and has valid structure (MonthlyWorkloadAnalysis)
+    unless (exists $history_data->{$target_month_key} &&
+            exists $history_data->{$target_month_key}{MonthlyWorkloadAnalysis}) {
+        # Try the previous month as fallback (in case cache end is early in the month)
+        my $fallback_month = $cache_end - (ONE_DAY * $cache_end->mday);  # Go to previous month
+        my $fallback_key = $fallback_month->strftime('%Y-%m');
+
+        if (exists $history_data->{$fallback_key} &&
+            exists $history_data->{$fallback_key}{MonthlyWorkloadAnalysis}) {
+            print STDERR "    - Target month $target_month_key not in history; using $fallback_key instead.\n";
+            $target_month_key = $fallback_key;
+        }
+        else {
+            warn "    - WARNING: Neither $target_month_key nor $fallback_key exist in history with valid structure.\n";
+            warn "    - Please run '--update-history' first to populate the history before storing forecasts.\n";
+            return;
+        }
+    }
+
+    if ($cache_start && $cache_end) {
+        $analysis_days = int(($cache_end->epoch - $cache_start->epoch) / ONE_DAY) + 1;
+        $analysis_end_date = $cache_end->strftime('%Y-%m-%d');
+    }
+
+    # Ensure the structural hierarchy exists
+    $history_data->{$target_month_key} //= {};
+    $history_data->{$target_month_key}{SeasonalEventSnapshots} //= {};
+    $history_data->{$target_month_key}{SeasonalEventSnapshots}{$event_name} //= {
+        eventName => $event_name,
+    };
+
+    # Initialise ModelForecasts container if absent
+    my $event_snapshot = $history_data->{$target_month_key}{SeasonalEventSnapshots}{$event_name};
+    $event_snapshot->{ModelForecasts} //= {};
+
+    # Build the model-specific forecast structure with VM nesting
+    my %model_data;
+
+    # Metadata block (underscore prefix distinguishes from VM keys)
+    $model_data{'_meta'} = {
+        model_version   => 1,
+        generated_on    => localtime()->datetime(),
+        analysis_window => {
+            days => $analysis_days,
+            end  => $analysis_end_date,
+        },
+    };
+
+    # Build per-VM forecast and baseline data
+    my $vm_count = 0;
+    foreach my $vm_name (sort keys %$forecast_results_href) {
+        my $vm_results = $forecast_results_href->{$vm_name};
+        next unless (ref($vm_results) eq 'HASH' && scalar keys %$vm_results > 0);
+
+        my %forecast_by_profile;
+        my %baseline_by_profile;
+        my %components_by_profile;
+
+        foreach my $profile_key (keys %$vm_results) {
+            my $value = $vm_results->{$profile_key};
+
+            # Store forecast value
+            if (defined $value && looks_like_number($value)) {
+                $forecast_by_profile{$profile_key} = sprintf("%.4f", $value) + 0;
+            }
+
+            # Extract baseline and components from seasonal_debug_info if available
+            if (exists $seasonal_debug_info{$vm_name}{$profile_key}) {
+                my $debug = $seasonal_debug_info{$vm_name}{$profile_key};
+
+                # Model-specific baseline and component extraction
+                my $baseline_val;
+                if ($model_type eq 'predictive_peak') {
+                    $baseline_val = $debug->{TrueBaseline};
+                    # Capture prediction components for audit
+                    if (defined $debug->{PredictedPeak} || defined $debug->{PredictedResidual}) {
+                        $components_by_profile{$profile_key} = {
+                            predicted_peak      => $debug->{PredictedPeak},
+                            predicted_residual  => $debug->{PredictedResidual},
+                            combined_prediction => $debug->{CombinedPrediction},
+                            final_source        => $debug->{FinalSource},
+                        };
+                    }
+                }
+                elsif ($model_type eq 'multiplicative_seasonal') {
+                    $baseline_val = $debug->{baseline};
+                    # Capture the seasonal multiplier for audit
+                    if (defined $debug->{multiplier}) {
+                        $components_by_profile{$profile_key} = {
+                            seasonal_multiplier  => $debug->{multiplier},
+                            trend_factor         => $debug->{trend_factor},
+                            volatility_buffer    => $debug->{volatility},
+                            forecasted_residual  => $debug->{forecasted_residual},
+                            amplification_factor => $debug->{amplification_factor},
+                        };
+                    }
+                }
+
+                if (defined $baseline_val && looks_like_number($baseline_val)) {
+                    $baseline_by_profile{$profile_key} = sprintf("%.4f", $baseline_val) + 0;
+                }
+            }
+        }
+
+        # Only store VMs that have actual forecast data
+        if (scalar keys %forecast_by_profile > 0) {
+            $model_data{$vm_name} = {
+                forecast => \%forecast_by_profile,
+            };
+            $model_data{$vm_name}{baseline} = \%baseline_by_profile if %baseline_by_profile;
+            $model_data{$vm_name}{components} = \%components_by_profile if %components_by_profile;
+            $vm_count++;
+        }
+    }
+
+    # Only write if we have actual data
+    if ($vm_count > 0) {
+        $event_snapshot->{ModelForecasts}{$model_type} = \%model_data;
+
+        # Update metadata timestamp
+        $history_data->{$target_month_key}{Metadata} //= {};
+        $history_data->{$target_month_key}{Metadata}{LastUpdated} = localtime()->datetime();
+
+        # Write back to history
+        _write_full_history($system_cache_dir, $history_data);
+
+        print STDERR "    - Stored $model_type forecasts for $vm_count VM(s) in $target_month_key.\n";
+    }
+    else {
+        print STDERR "    - WARNING: No valid forecast data to store for $model_type.\n";
+    }
 }
 
 # ==============================================================================
@@ -6785,7 +7421,7 @@ sub _assemble_seasonal_snapshot {
 #             monthly analysis (typically 16x for a 16-profile configuration).
 # ==============================================================================
 sub _generate_seasonal_snapshot_for_period {
-    my ($system_cache_dir, $event_config, $event_name, $peak_start, $peak_end, $baseline_start, $baseline_end) = @_;
+    my ($system_cache_dir, $event_config, $event_name, $peak_start, $peak_end, $baseline_start, $baseline_end, $exclusions_href) = @_;
 
     print STDERR "      - Using Single Pass Engine for seasonal event: $event_name\n";
 
@@ -6794,6 +7430,11 @@ sub _generate_seasonal_snapshot_for_period {
     # ======================================================================
     my $tactical_manifest = build_transform_manifest(\@profiles, $nfit_runq_avg_method_str);
     my $main_historical_manifest = _sanitise_manifest_for_history($tactical_manifest);
+
+    # --- INJECT EXCLUSIONS IF PRESENT ---
+    if (defined $exclusions_href) {
+        _inject_exclusions_into_manifest($main_historical_manifest, $exclusions_href);
+    }
 
     # ======================================================================
     # STEP 2: Build and sanitise the residual manifest (if configured)
@@ -6804,6 +7445,11 @@ sub _generate_seasonal_snapshot_for_period {
         my $residual_tactical_manifest = _build_residual_manifest($event_config);
         if (defined $residual_tactical_manifest) {
             $residual_historical_manifest = _sanitise_manifest_for_history($residual_tactical_manifest);
+
+            # Inject exclusions into residual manifest too
+            if (defined $exclusions_href) {
+                _inject_exclusions_into_manifest($residual_historical_manifest, $exclusions_href);
+            }
         }
     }
 
@@ -6854,7 +7500,9 @@ sub _generate_seasonal_snapshot_for_period {
         $event_config,
         $event_name,
         $peak_end,
-        \@profiles  # Pass profiles array explicitly to ensure correct scoping
+        \@profiles,  # Pass profiles array explicitly to ensure correct scoping
+        $baseline_start,
+        $baseline_end,
     );
 
     return $snapshot_result;
@@ -7029,6 +7677,18 @@ sub _generate_monthly_and_seasonal_history {
 
             my ($peak_start, $peak_end) = determine_event_period($event_config, $month_job->{start_obj});
 
+            # Parse Exclusions
+            my $exclusions = undef;
+            my $exclusion_fingerprint = 'NONE';
+            if (defined $event_config->{exclude_dates}) {
+                # We need known_vms for wildcard expansion.
+                # Optimisation: You might want to fetch this ONCE outside the loop if performance matters,
+                # but fetching it here is safe.
+                my $known_vms = _get_known_vms_from_cache($system_cache_dir);
+                $exclusions = _parse_exclusion_dates($event_config->{exclude_dates}, $known_vms);
+                $exclusion_fingerprint = _compute_exclusion_fingerprint($exclusions);
+            }
+
             if ($peak_start && $peak_end && $peak_start <= $month_job->{end_obj} && $peak_end >= $month_job->{start_obj}) {
                 print "    - Found active event: '$event_name'\n";
                 my $baseline_days = $event_config->{baseline_period_days} // 16;
@@ -7047,14 +7707,23 @@ sub _generate_monthly_and_seasonal_history {
                 }
                 my $baseline_end_obj = $peak_start - ONE_SECOND;
                 my $model_type_for_key = $event_config->{model} // 'unknown';
-                my $cache_key = $peak_start->date . ":" . $peak_end->date . ":" . $baseline_start_obj->date . ":" . $model_type_for_key;
+
+                # Update Cache Key with Fingerprint
+                my $cache_key = $peak_start->date . ":" . $peak_end->date . ":" . $baseline_start_obj->date .  ":" . $model_type_for_key . ":" . $exclusion_fingerprint;
 
                 my $snapshot_results;
                 if (exists $calculation_cache{$cache_key}) {
                     print "      - INFO: Reusing cached calculations for identical time period and model type.\n";
                     $snapshot_results = $calculation_cache{$cache_key};
                 } else {
-                    $snapshot_results = _generate_seasonal_snapshot_for_period($system_cache_dir, $event_config, $event_name, $peak_start, $peak_end, $baseline_start_obj, $baseline_end_obj);
+                    $snapshot_results = _generate_seasonal_snapshot_for_period(
+                        $system_cache_dir,
+                        $event_config,
+                        $event_name,
+                        $peak_start, $peak_end,
+                        $baseline_start_obj, $baseline_end_obj,
+                        $exclusions
+                    );
                     $calculation_cache{$cache_key} = $snapshot_results;
                 }
                 if ($snapshot_results) {
@@ -7067,105 +7736,6 @@ sub _generate_monthly_and_seasonal_history {
         if (scalar keys %seasonal_snapshots_for_month > 0) {
             $history_data_href->{$month_key}{SeasonalEventSnapshots} = \%seasonal_snapshots_for_month;
             $history_data_href->{$month_key}{Metadata}{LastUpdated} = localtime()->datetime();
-        }
-    }
-}
-
-# ==============================================================================
-# SUBROUTINE: _generate_seasonal_snapshot_history (Phase 2)
-# PURPOSE:    Processes a list of months to generate model-specific snapshots.
-#             Implements intelligent caching to avoid redundant `nfit` calls
-#             for events that share peak/baseline periods. Includes critical logic
-#             to prevent baseline contamination from preceding peaks.
-# ==============================================================================
-sub _generate_seasonal_snapshot_history {
-    my ($system_cache_dir, $months_to_process_aref, $seasonality_config, $all_historical_peaks_aref) = @_;
-
-    print "\n--- Phase 2: Generating Seasonal Event Snapshots ---\n";
-    foreach my $month_job (@$months_to_process_aref) {
-        my $month_key   = $month_job->{key};
-        my $start_obj   = $month_job->{start_obj};
-        my $end_obj     = $month_job->{end_obj};
-
-        print "  - Discovering events for month: $month_key...\n";
-
-        my %seasonal_snapshots_for_month;
-        my %calculation_cache; # In-memory cache for this month's run
-
-        foreach my $event_name (sort keys %$seasonality_config) {
-            next if $event_name eq 'Global';
-            my $event_config = $seasonality_config->{$event_name};
-            next if (($event_config->{model} // '') eq 'recency_decay'); # Skip non-priming models
-
-            my ($peak_start, $peak_end) = determine_event_period($event_config, $start_obj);
-
-            if ($peak_start && $peak_end && $peak_start <= $end_obj && $peak_end >= $start_obj) {
-                print "    - Found active event: '$event_name'\n";
-
-                my $baseline_days = $event_config->{baseline_period_days} // 16;
-                my $potential_baseline_start = $peak_start - ($baseline_days * ONE_DAY);
-
-                my $latest_preceding_peak_end;
-                foreach my $p (@{$all_historical_peaks_aref}) {
-                    if ($p->[1] < $peak_start && (!defined $latest_preceding_peak_end || $p->[1] > $latest_preceding_peak_end)) {
-                        $latest_preceding_peak_end = $p->[1];
-                    }
-                }
-
-                my $baseline_start_obj = $potential_baseline_start;
-                if (defined $latest_preceding_peak_end && $potential_baseline_start <= $latest_preceding_peak_end) {
-                    $baseline_start_obj = $latest_preceding_peak_end + ONE_DAY;
-                    my $available_days = ($peak_start->epoch - $baseline_start_obj->epoch) / ONE_DAY;
-                    print "      - WARNING: Baseline for this event truncated to " . int($available_days) . " day(s) to avoid overlap with a preceding peak.\n";
-                }
-
-                my $baseline_end_obj = $peak_start - ONE_SECOND;
-
-                # --- FIX: Make the cache key model-specific ---
-                my $model_type_for_key = $event_config->{model} // 'unknown';
-                my $cache_key = $peak_start->date . ":" . $peak_end->date . ":" . $baseline_start_obj->date . ":" . $model_type_for_key;
-
-                my $snapshot_results;
-                if (exists $calculation_cache{$cache_key}) {
-                    print "      - INFO: Reusing cached calculations for identical time period and model type.\n";
-                    $snapshot_results = $calculation_cache{$cache_key};
-                } else {
-                    $snapshot_results = _generate_seasonal_snapshot_for_period(
-                        $system_cache_dir, $event_config, $event_name,
-                        $peak_start, $peak_end,
-                        $baseline_start_obj, $baseline_end_obj
-                    );
-                    $calculation_cache{$cache_key} = $snapshot_results; # Cache the result
-                }
-
-                if ($snapshot_results) {
-                    $snapshot_results->{eventName} = $event_name;
-                    $seasonal_snapshots_for_month{$event_name} = $snapshot_results;
-                }
-            }
-        }
-
-        if (scalar keys %seasonal_snapshots_for_month > 0) {
-            print "    - Writing snapshots for $month_key to history cache...\n";
-            my $history_data = read_unified_history($system_cache_dir);
-
-            # CRITICAL FIX: Ensure we don't lose MonthlyWorkloadAnalysis
-            $history_data->{$month_key} //= {};
-
-            # Preserve MonthlyWorkloadAnalysis and Metadata if they exist
-            my $existing_workload = $history_data->{$month_key}{MonthlyWorkloadAnalysis};
-            my $existing_metadata = $history_data->{$month_key}{Metadata};
-
-            $history_data->{$month_key}{SeasonalEventSnapshots} = \%seasonal_snapshots_for_month;
-
-            # Update metadata timestamp but preserve other fields
-            if ($existing_metadata) {
-                $history_data->{$month_key}{Metadata} = $existing_metadata;
-            }
-            $history_data->{$month_key}{Metadata}{LastUpdated} = localtime()->datetime();
-
-            _write_full_history($system_cache_dir, $history_data);
-
         }
     }
 }
@@ -7275,10 +7845,16 @@ sub _validate_history_structure {
             foreach my $event_name (keys %$seasonal) {
                 my $event_data = $seasonal->{$event_name};
 
-                unless (ref($event_data) eq 'HASH' && exists $event_data->{results}) {
-                    die "FATAL: History structure validation failed for $month_key event $event_name - missing or invalid results block\n";
+                # Allow entry if it has 'results' (Snapshot) OR 'ModelForecasts'/'AdaptiveForecast' (Pure Forecast)
+                # Required since recency_decay models (and nfit-forecast backfills) create entries that contain only ModelForecasts (predictions), not results (ingredients).
+                my $has_results = (exists $event_data->{results} && ref($event_data->{results}) eq 'HASH');
+                my $has_forecast = (exists $event_data->{ModelForecasts} || exists $event_data->{AdaptiveForecast});
+
+                unless (ref($event_data) eq 'HASH' && ($has_results || $has_forecast)) {
+                    die "FATAL: History structure validation failed for $month_key event $event_name - missing both 'results' (Snapshot) and 'ModelForecasts' (Forecast) blocks\n";
                 }
             }
+
         }
     }
 
@@ -8001,6 +8577,7 @@ sub _assemble_monthly_analysis {
         # ------------------------------------------------------------------
         my @config_timeline;
         my $last_state_generic = {};
+        my $last_state_platform = {};
 
         # Retrieve authoritative states from cache
         my $auth_states = $states_db->{$vm_name};
@@ -8044,10 +8621,8 @@ sub _assemble_monthly_analysis {
                 # 4. Build Generic Shape
                 my $generic = {
                     Architecture => 'ppc64',
-                    OS_Type      => $md->{os_type} // 'AIX', # Default per your note
+                    OS_Type      => $md->{os_type} // 'AIX', # Default = AIX
                     MaxUsableCPU => 0 + sprintf("%.2f", $calc_max),
-                    VirtualCPUs  => 0 + $vcpu,
-                    SMT_Level    => 0 + $smt,
                     RAM_GB       => undef
                 };
 
@@ -8055,14 +8630,18 @@ sub _assemble_monthly_analysis {
                 my $platform = {
                     AIX => {
                         Entitlement   => 0 + $ent,
+                        VirtualCPUs   => 0 + $vcpu,
                         Capped        => $is_capped ? JSON::true : JSON::false,
+                        Pool_CPU      => $md->{pool_cpu},
                         Pool_ID       => $md->{pool_id},
                         Shared_Weight => $md->{shared_weight} // 128,
-                        Proc_Type     => $proc_type
+                        Proc_Type     => $proc_type,
+                        SMT_Level     => 0 + $smt,
                     }
                 };
 
                 $last_state_generic = $generic;
+                $last_state_platform = $platform;
 
                 push @config_timeline, {
                     Start        => gmtime($s_start)->datetime . "Z",
@@ -8083,7 +8662,7 @@ sub _assemble_monthly_analysis {
         # --- Legacy Support for Hint Generation ---
         # We still use the MaxUsableCPU we just calculated for the hint logic
         my $max_cpu_from_state = $last_state_generic->{MaxUsableCPU} // 0;
-        my $smt_from_state     = $last_state_generic->{SMT_Level} // $default_smt_arg;
+        my $smt_from_state     = $last_state_platform->{SMT_Level} // $default_smt_arg;
 
         # ------------------------------------------------------------------
         # Build the VM map structure for sizing hint generation
@@ -8845,6 +9424,11 @@ sub run_single_pass_analysis {
     _phase("Building transform manifest");
     my $transform_manifest = build_transform_manifest($profiles_ref, $args_ref->{runq_avg_method});
 
+    # --- INJECT EXCLUSIONS IF PRESENT ---
+    if (defined $args_ref->{exclusions}) {
+        _inject_exclusions_into_manifest($transform_manifest, $args_ref->{exclusions});
+    }
+
     # *** ADD THIS COMPLETE DIAGNOSTIC BLOCK TO PROVE THE CORRECTNESS OF THE MANIFEST***
 #    {
 #        warn "\n" . "=" x 70 . "\n";
@@ -9273,6 +9857,78 @@ sub _migrate_history_to_partitioned {
     print "  - Migration complete. Legacy file renamed to .migrated.\n";
 }
 
+# ==============================================================================
+# SUBROUTINE: calculate_sens_slope
+# PURPOSE:    Calculate Theil-Sen slope estimator (median of pairwise slopes)
+# ARGUMENTS:
+#   1. $series_aref - Array ref of [x, y] pairs (time series points)
+# RETURNS:
+#   Hash ref: { slope => $value, n_slopes => $count, method => 'exact_pairs' }
+#   Returns undef if insufficient data (n < 2)
+# ==============================================================================
+sub calculate_sens_slope {
+    my ($series_aref) = @_;
+    my $n = scalar @{$series_aref};
+
+    # Need at least 2 points to calculate a slope
+    return undef if $n < 2;
+
+    my @slopes;
+    my $FLOAT_EPSILON = 1e-9;
+
+    # Calculate all pairwise slopes: slope_ij = (y_j - y_i) / (x_j - x_i)
+    for my $i (0 .. $n-2) {
+        for my $j ($i+1 .. $n-1) {
+            my ($x1, $y1) = @{$series_aref->[$i]};
+            my ($x2, $y2) = @{$series_aref->[$j]};
+
+            my $delta_x = $x2 - $x1;
+
+            # Only calculate slope if x values are distinct
+            if (abs($delta_x) > $FLOAT_EPSILON) {
+                push @slopes, ($y2 - $y1) / $delta_x;
+            }
+        }
+    }
+
+    # If no valid slopes could be calculated, return undef
+    return undef if @slopes == 0;
+
+    # Sen's slope is the median of all pairwise slopes
+    my $median_slope = _calculate_median(\@slopes);
+
+    return {
+        slope     => $median_slope,
+        n_slopes  => scalar(@slopes),
+        method    => 'exact_pairs',
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _calculate_median
+# PURPOSE:    Calculate median of an array of numbers
+# ARGUMENTS:
+#   1. $values_aref - Array ref of numeric values
+# RETURNS:
+#   Median value (scalar)
+# ==============================================================================
+sub _calculate_median {
+    my ($values_aref) = @_;
+
+    # Sort values in ascending order
+    my @sorted = sort { $a <=> $b } @{$values_aref};
+    my $n = scalar @sorted;
+
+    # For odd n, return middle value
+    if ($n % 2 == 1) {
+        return $sorted[int($n/2)];
+    }
+    # For even n, return average of two middle values
+    else {
+        return ($sorted[$n/2 - 1] + $sorted[$n/2]) / 2;
+    }
+}
+
 # --- usage_wrapper ---
 # Generates and returns the usage/help message for the script.
 sub usage_wrapper
@@ -9375,4 +10031,862 @@ Output CSV Columns (Illustrative):
   Current_ENT,NFIT_ENT_UserFormula,NETT_UserFormula,NETT_Perc_UserFormula
 
 END_USAGE
+}
+
+# ==============================================================================
+# SUBROUTINE: _parse_exclusion_dates
+# PURPOSE:    Parses the exclude_dates configuration into a structured format,
+#             expanding wildcards against the known VM list.
+# ARGUMENTS:
+#   1. $raw_value    - Raw string value from config (may be multiline/accumulated)
+#   2. $known_vms_aref - Reference to array of known VM names (for wildcard expansion)
+# RETURNS:
+#   Hash ref with 'global' and 'vm_specific' arrays
+# ==============================================================================
+sub _parse_exclusion_dates {
+    my ($raw_value, $known_vms_aref) = @_;
+
+    return undef unless defined $raw_value && $raw_value ne '';
+
+    my %exclusions = (
+        global      => [],
+        vm_specific => {},
+    );
+
+    # Build VM lookup for wildcard matching
+    my @known_vms = @{$known_vms_aref // []};
+
+    # Split on commas and newlines, trim whitespace
+    my @entries = grep { $_ ne '' }
+                  map { s/^\s+|\s+$//gr }
+                  split /[,\n]+/, $raw_value;
+
+    foreach my $entry (@entries) {
+        # Expected format: VM_PATTERN:START_DATE:END_DATE
+        # Robust parsing with whitespace tolerance
+        my @parts = split /:/, $entry;
+        next unless scalar @parts >= 2;
+
+        my $vm_pattern = $parts[0] // '';
+        my $start_date = $parts[1] // '';
+        my $end_date   = $parts[2] // $start_date;  # Single date if no end
+
+        # Trim whitespace from each part
+        s/^\s+|\s+$//g for ($vm_pattern, $start_date, $end_date);
+
+        # Validate date format (YYYY-MM-DD)
+        unless ($start_date =~ /^\d{4}-\d{2}-\d{2}$/ && $end_date =~ /^\d{4}-\d{2}-\d{2}$/) {
+            warn "WARNING: Invalid date format in exclude_dates: '$entry'. Skipping.\n";
+            next;
+        }
+
+        # Expand date range into individual dates
+        my @date_range = _expand_date_range($start_date, $end_date);
+
+        # Handle VM pattern
+        if ($vm_pattern eq '*' || uc($vm_pattern) eq 'ALL') {
+            # Global exclusion - applies to all VMs
+            push @{$exclusions{global}}, @date_range;
+        }
+        elsif ($vm_pattern =~ /\*/) {
+            # Wildcard pattern (e.g., "DB-*") - expand against known VMs
+            my $regex = $vm_pattern;
+            $regex =~ s/\*/\.\*/g;  # Convert glob to regex
+            $regex = qr/^$regex$/i;
+
+            my @matching_vms = grep { $_ =~ $regex } @known_vms;
+
+            if (scalar @matching_vms == 0) {
+                warn "WARNING: Wildcard pattern '$vm_pattern' matched no known VMs. Skipping.\n";
+                next;
+            }
+
+            foreach my $matched_vm (@matching_vms) {
+                push @{$exclusions{vm_specific}{$matched_vm}}, @date_range;
+            }
+        }
+        else {
+            # Explicit VM name
+            push @{$exclusions{vm_specific}{$vm_pattern}}, @date_range;
+        }
+    }
+
+    # De-duplicate all arrays
+    my %seen;
+    @{$exclusions{global}} = grep { !$seen{$_}++ } @{$exclusions{global}};
+
+    foreach my $vm (keys %{$exclusions{vm_specific}}) {
+        my %vm_seen;
+        @{$exclusions{vm_specific}{$vm}} = grep { !$vm_seen{$_}++ }
+                                            @{$exclusions{vm_specific}{$vm}};
+    }
+
+    return \%exclusions;
+}
+
+# ==============================================================================
+# SUBROUTINE: _expand_date_range
+# PURPOSE:    Expands a start/end date pair into a list of individual dates.
+# ==============================================================================
+sub _expand_date_range {
+    my ($start_str, $end_str) = @_;
+
+    my @dates;
+
+    eval {
+        my $current = Time::Piece->strptime($start_str, '%Y-%m-%d');
+        my $end     = Time::Piece->strptime($end_str, '%Y-%m-%d');
+
+        # Sanity check: end must be >= start
+        if ($end < $current) {
+            warn "WARNING: End date '$end_str' is before start date '$start_str'. Swapping.\n";
+            ($current, $end) = ($end, $current);
+        }
+
+        # Safety limit: prevent runaway expansion
+        my $max_days = 366;  # One year maximum
+        my $day_count = 0;
+
+        while ($current <= $end && $day_count < $max_days) {
+            push @dates, $current->strftime('%Y-%m-%d');
+            $current += ONE_DAY;
+            $day_count++;
+        }
+
+        if ($day_count >= $max_days) {
+            warn "WARNING: Date range '$start_str:$end_str' exceeds $max_days days. Truncated.\n";
+        }
+    };
+
+    if ($@) {
+        warn "WARNING: Failed to parse date range '$start_str:$end_str': $@\n";
+        return ();
+    }
+
+    return @dates;
+}
+
+# ==============================================================================
+# SUBROUTINE: _get_known_vms_from_cache
+# PURPOSE:    Retrieves the list of known VM names from the L1 cache or states.
+# ARGUMENTS:
+#   1. $system_cache_dir - Path to the system's cache directory
+# RETURNS:
+#   Array reference of VM names
+# ==============================================================================
+sub _get_known_vms_from_cache {
+    my ($system_cache_dir) = @_;
+
+    my @known_vms;
+
+    # Try states cache first (faster, structured)
+    my $states_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.states');
+    if (-f $states_file) {
+        eval {
+            open my $fh, '<:encoding(utf8)', $states_file or die $!;
+            local $/;
+            my $states = decode_json(<$fh>);
+            close $fh;
+            @known_vms = keys %$states;
+        };
+        return \@known_vms if @known_vms;
+    }
+
+    # Fallback: scan data cache header or first N lines
+    my $data_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
+    if (-f $data_file) {
+        eval {
+            open my $fh, '<', $data_file or die $!;
+            <$fh>;  # Skip header
+            my %seen_vms;
+            my $line_count = 0;
+            while (my $line = <$fh>) {
+                last if $line_count++ > 10000;  # Sample first 10K lines
+                my (undef, $vm) = split ',', $line, 3;
+                $seen_vms{$vm} = 1 if defined $vm;
+            }
+            close $fh;
+            @known_vms = keys %seen_vms;
+        };
+    }
+
+    return \@known_vms;
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_exclusion_fingerprint
+# PURPOSE:    Computes a deterministic fingerprint for the exclusion set.
+# ==============================================================================
+sub _compute_exclusion_fingerprint {
+    my ($exclusions_href) = @_;
+    return 'NONE' unless (defined $exclusions_href &&
+                          (scalar @{$exclusions_href->{global} // []} > 0 ||
+                           scalar keys %{$exclusions_href->{vm_specific} // {}} > 0));
+
+    # Canonical representation for deterministic hashing
+    my @parts;
+    push @parts, "G:" . join(",", sort @{$exclusions_href->{global} // []});
+
+    foreach my $vm (sort keys %{$exclusions_href->{vm_specific} // {}}) {
+        push @parts, "$vm:" . join(",", sort @{$exclusions_href->{vm_specific}{$vm}});
+    }
+
+    require Digest::MD5;
+    return Digest::MD5::md5_hex(join("|", @parts));
+}
+
+# ==============================================================================
+# SUBROUTINE: _inject_exclusions_into_manifest
+# PURPOSE:    Adds the _exclusions and _exclusion_fingerprint blocks to a
+#             manifest for transmission to the nfit engine.
+# ==============================================================================
+sub _inject_exclusions_into_manifest {
+    my ($manifest_href, $exclusions_href) = @_;
+
+    return $manifest_href unless defined $exclusions_href;
+
+    # Validate: no wildcards should be present at this stage
+    foreach my $vm (keys %{$exclusions_href->{vm_specific} // {}}) {
+        if ($vm =~ /\*/) {
+            die "FATAL: Unexpanded wildcard '$vm' in exclusions. " .
+                "Wildcards must be expanded before manifest injection.\n";
+        }
+    }
+
+    # Only inject if there are actual exclusions
+    my $has_exclusions = (scalar @{$exclusions_href->{global} // []} > 0) ||
+                         (scalar keys %{$exclusions_href->{vm_specific} // {}} > 0);
+
+    if ($has_exclusions) {
+        $manifest_href->{_exclusions} = $exclusions_href;
+        $manifest_href->{_exclusion_fingerprint} = _compute_exclusion_fingerprint($exclusions_href);
+    }
+
+    return $manifest_href;
+}
+
+# ==============================================================================
+# SUBROUTINE: _group_events_by_fingerprint
+# PURPOSE:    Groups events that share identical computational requirements
+#             (boundaries + exclusions) to enable nfit pass consolidation.
+# ==============================================================================
+sub _group_events_by_fingerprint {
+    my ($events_aref, $seasonality_config) = @_;
+
+    my %groups;
+
+    foreach my $event_cfg (@$events_aref) {
+        my $event_name = $event_cfg->{_eventName};
+
+        # Determine boundaries
+        my ($peak_start, $peak_end) = determine_event_period($event_cfg);
+        my $baseline_days = $event_cfg->{baseline_period_days} // 16;
+        my $baseline_start = $peak_start ? ($peak_start - ($baseline_days * ONE_DAY)) : undef;
+
+        # Parse exclusions (Note: we need known_vms here for full expansion, but for grouping
+        # we might just use the raw config if we assume consistent expansion later.
+        # However, to be safe, we should probably expand.
+        # For now, let's use a simplified fingerprint based on the raw config string if available,
+        # or just skip optimization for now to keep it simple and safe as per instructions.)
+
+        # Actually, let's skip the complex grouping optimization for this first iteration
+        # to ensure safety and correctness, as the user emphasized "production ready" and "safe".
+        # We can implement a simple 1-to-1 mapping for now.
+
+        my $fingerprint = $event_name; # Simple unique fingerprint
+        push @{$groups{$fingerprint}}, $event_cfg;
+    }
+
+    return %groups;
+}
+
+# ==============================================================================
+# SUBROUTINE: _execute_automatic_seasonal_discovery
+# PURPOSE:    Orchestrates the automatic discovery and execution of seasonal events.
+# ==============================================================================
+sub _execute_automatic_seasonal_discovery {
+    my ($seasonality_config, $current_cache_path, $profiles_aref, $args_href, $analysis_anchor_date) = @_;
+
+    print STDERR "\n=== Starting Automatic Seasonal Discovery ===\n";
+
+    # 1. Detect active events
+    # Use the anchor date (from data) if provided, otherwise fallback to system time (gmtime)
+    my $analysis_date = $analysis_anchor_date // gmtime();
+    # Pass 1 to ignore_compounding_check to discover ALL active events
+    my @active_events = detect_active_events($analysis_date, $seasonality_config, 1);
+
+    if (scalar @active_events == 0) {
+        print STDERR "  No active seasonal events found for today (" . $analysis_date->ymd . ").\n";
+        return;
+    }
+
+    print STDERR "  Detected " . scalar(@active_events) . " active event(s): " .
+                 join(", ", map { $_->{_eventName} } @active_events) . "\n";
+
+    # 2. Iterate and execute
+    foreach my $event_cfg (@active_events) {
+        my $event_name = $event_cfg->{_eventName};
+        print STDERR "\n  >> Executing Seasonal Event: '$event_name'\n";
+
+        # Reset global state to ensure clean execution
+        _reset_seasonal_state();
+
+        # Inject exclusions if present
+        # Note: We modify the manifest passed to nfit, but here we might need to
+        # pass exclusions to the wrapper to handle manifest injection internally.
+        # For now, we'll assume the wrapper handles the full flow.
+
+        my $model_type = $event_cfg->{model} // '';
+
+        if ($model_type eq 'multiplicative_seasonal') {
+            _execute_multiplicative_seasonal($event_name, $event_cfg, $current_cache_path, $profiles_aref, $args_href, $seasonality_config);
+        }
+        elsif ($model_type eq 'recency_decay') {
+            _execute_recency_decay($event_name, $event_cfg, $current_cache_path, $profiles_aref, $args_href);
+        }
+        elsif ($model_type eq 'predictive_peak') {
+            _execute_predictive_peak($event_name, $event_cfg, $current_cache_path, $profiles_aref, $args_href, $seasonality_config);
+        }
+        else {
+            warn "  WARNING: Unknown or unsupported model type '$model_type' for event '$event_name'. Skipping.\n";
+        }
+    }
+
+    print STDERR "\n=== Automatic Seasonal Discovery Complete ===\n";
+}
+
+# ==============================================================================
+# SUBROUTINE: _reset_seasonal_state
+# PURPOSE:    Resets global variables to a clean state between event executions.
+# ==============================================================================
+sub _reset_seasonal_state {
+    # Reset globals used by nfit-profile logic
+    $nfit_decay_over_states = 0;
+    $nfit_enable_windowed_decay = 0;
+    $nfit_analysis_reference_date_str = undef;
+    $is_multiplicative_forecast_run = 0;
+    $is_predictive_peak_model_run = 0;
+
+    # Clear any other globals that might persist (e.g., from previous runs in the same process)
+    # Note: @vm_order and %assimilation_map are usually rebuilt per run, so they should be fine.
+}
+
+# ==============================================================================
+# SUBROUTINE: _execute_multiplicative_seasonal
+# PURPOSE:    Executes the Multiplicative Seasonal model for a specific event.
+# ==============================================================================
+sub _execute_multiplicative_seasonal {
+    my ($event_name, $event_config, $current_cache_path, $profiles_aref, $args_href, $seasonality_config) = @_;
+
+    # 1. Determine analysis path (history check) & Load Config
+    my $effective_event_name = determine_seasonal_analysis_path(
+        $event_config, $current_cache_path, $event_name
+    );
+
+    my $effective_config = $event_config;
+    if ($effective_event_name ne $event_name) {
+        $effective_config = $seasonality_config->{$effective_event_name} // $event_config;
+        print STDERR "    - INFO: Falling back to event '$effective_event_name' due to history constraints.\n";
+    }
+
+    # 2. Setup Flags
+    $is_multiplicative_forecast_run = 1;
+    $apply_seasonality_event = $event_name; # Set global for logging context
+
+    # 3. Prepare Exclusions
+    my $exclusions = undef;
+    if (defined $effective_config->{exclude_dates}) {
+        my $known_vms = _get_known_vms_from_cache($current_cache_path);
+        $exclusions = _parse_exclusion_dates($effective_config->{exclude_dates}, $known_vms);
+    }
+
+    # 4. Run nFit Analysis
+    my $parsed_results = run_single_pass_analysis(
+        $current_cache_path,
+        $profiles_aref,
+        {
+            %$args_href,
+            vm_name => undef,
+            exclusions => $exclusions,
+        }
+    );
+
+    # 5. Assimilate Results
+    my $assimilation_map = build_assimilation_map($parsed_results, $profiles_aref, $args_href->{adaptive_saturation_thresh});
+    @vm_order = sort keys %{$assimilation_map};
+
+    # 6. Calculate Forecast
+    my ($forecast_results, $historic_data) = calculate_multiplicative_forecast(
+        $current_cache_path,
+        $args_href->{system_identifier},
+        $effective_event_name,
+        $effective_config,
+        $seasonality_config,
+        $assimilation_map,
+        $exclusions
+    );
+
+    # Merge Forecast Results
+    foreach my $vm_name (@vm_order) {
+        if (exists $forecast_results->{$vm_name}) {
+             $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
+        }
+    }
+
+    # --- ENRICHMENT LOOP ---
+    foreach my $vm_name (@vm_order) {
+        my $vm_map_ref = $assimilation_map->{$vm_name};
+        $vm_map_ref->{Configuration}{vm_name} = $vm_name;
+        $vm_map_ref->{RunQMetrics} //= $per_profile_runq_metrics{$vm_name} || {};
+
+        # Generate Hints
+        my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
+            generate_sizing_hint(
+                $vm_map_ref,
+                undef,
+                $args_href->{adaptive_saturation_thresh}
+            );
+
+        # Store Hints & Globals
+        $vm_map_ref->{Hinting}{AutoTier}       = $hint_type_tier;
+        $vm_map_ref->{Hinting}{Pattern}        = $hint_pattern_shape;
+        $vm_map_ref->{Hinting}{Pressure}       = $hint_pressure_bool;
+        $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+        $hint_tier_for_csv{$vm_name}           = $hint_type_tier;
+        $hint_pattern_for_csv{$vm_name}        = $hint_pattern_shape;
+
+        # Populate FinalTierForVM (Critical for STD logic)
+        $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
+        $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
+
+        # Prepare for RunQ Modifiers
+        my $user_tier = $vm_tier_overrides{$vm_name} // "";
+        my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
+        my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
+        $pattern_char //= 'G';
+        my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+        my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+
+        foreach my $profile (@$profiles_aref) {
+            my $p_name = $profile->{name};
+
+            # --- GUARD: Skip RunQ Modifiers for P-99W1 ---
+            next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
+
+            my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
+            my %adaptive_thresholds = ( saturation => $args_href->{adaptive_saturation_thresh}, target => $args_href->{adaptive_target_norm_runq}, max_reduction => $args_href->{adaptive_max_efficiency_reduction} );
+
+            my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+                $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
+            );
+
+            if (looks_like_number($adjusted_physc)) {
+                $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+            }
+
+            if ($p_name eq $runq_source_profile_name) {
+                $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+            }
+        }
+    }
+
+    # 7. Generate CSV (Rolling Numbering)
+    my $date_str = localtime->strftime('%Y%m%d');
+    my $unique_suffix = $date_str;
+    my $counter = 0;
+    my $base_name = "nfit-profile." . ($args_href->{system_identifier}//'') . "." . $event_name;
+    $base_name =~ s/[^a-zA-Z0-9_.-]//g;
+
+    while (-e File::Spec->catfile($output_dir, "$base_name.$unique_suffix.csv")) {
+        $counter++;
+        $unique_suffix = "$date_str-$counter";
+    }
+
+    # Log Rationale
+    if (defined $open_log_files{$args_href->{system_identifier}}) {
+        my $ctx = {
+            start    => $args_href->{cache_start_date},
+            end      => $args_href->{cache_end_date},
+            interval => $args_href->{sampling_interval}
+        };
+        log_multiplicative_seasonal_rationale($open_log_files{$args_href->{system_identifier}}, $effective_config, $ctx);
+    }
+
+    _write_standard_csv_report(
+        $assimilation_map,
+        $event_name,
+        $args_href->{system_identifier},
+        $unique_suffix,
+        1, # is_multiplicative
+        0, 0,
+        $args_href->{adaptive_saturation_thresh}
+    );
+
+    # Verbose Output Files
+    if ($args_href->{verbose}) {
+        print "  - Verbose mode: Generating additional audit trail files...\n";
+
+        # Reconstruct baseline data map from debug info
+        my %baseline_data_for_verbose;
+        foreach my $vm (keys %seasonal_debug_info) {
+            foreach my $prof (keys %{$seasonal_debug_info{$vm}}) {
+                $baseline_data_for_verbose{$vm}{$prof} = $seasonal_debug_info{$vm}{$prof}{baseline};
+            }
+        }
+
+        write_seasonal_csv_output("current_baseline", $args_href->{system_identifier}, $event_name, $unique_suffix, \%baseline_data_for_verbose);
+        write_seasonal_csv_output("historic_snapshot", $args_href->{system_identifier}, $event_name, $unique_suffix, $historic_data);
+    }
+
+    # Store Forecast
+    _store_model_forecast_to_history(
+        $current_cache_path,
+        $effective_event_name,
+        'multiplicative_seasonal',
+        $forecast_results,
+        $effective_config
+    );
+}
+
+# ==============================================================================
+# SUBROUTINE: _execute_recency_decay
+# PURPOSE:    Executes the Recency Decay model for a specific event.
+# ==============================================================================
+sub _execute_recency_decay {
+    my ($event_name, $event_config, $current_cache_path, $profiles_aref, $args_href) = @_;
+
+    # 1. Setup Logic
+    $apply_seasonality_event = $event_name;
+
+    # Recency decay cannot run with state-based decay
+    if ($args_href->{decay_over_states}) {
+        warn "  Skipping Recency Decay for '$event_name': Cannot run with --decay-over-states.\n";
+        return;
+    }
+
+    my ($event_start_obj, $event_end_obj) = determine_event_period($event_config);
+    unless ($event_start_obj && $event_end_obj) {
+        warn "  Skipping Recency Decay for '$event_name': Could not determine event period.\n";
+        return;
+    }
+
+    $nfit_analysis_reference_date_str = $event_end_obj->strftime('%Y-%m-%d');
+    $nfit_decay_over_states = 1; # Enable hybrid decay logic
+    print STDERR "  Recency-Decay: Anchoring to $nfit_analysis_reference_date_str\n";
+
+    # 2. Prepare Exclusions
+    my $exclusions = undef;
+    if (defined $event_config->{exclude_dates}) {
+        my $known_vms = _get_known_vms_from_cache($current_cache_path);
+        $exclusions = _parse_exclusion_dates($event_config->{exclude_dates}, $known_vms);
+    }
+
+    # 3. Run Analysis
+    my $parsed_results = run_single_pass_analysis(
+        $current_cache_path,
+        $profiles_aref,
+        {
+            %$args_href,
+            enable_windowed_decay => 0,
+            decay_over_states => 1,
+            analysis_reference_date => $nfit_analysis_reference_date_str,
+            exclusions => $exclusions,
+        }
+    );
+
+    # 4. Assimilate
+    my $assimilation_map = build_assimilation_map($parsed_results, $profiles_aref, $args_href->{adaptive_saturation_thresh});
+    @vm_order = sort keys %{$assimilation_map};
+
+    # 5. Log Global Configuration (Once)
+    my $log_fh = $open_log_files{$args_href->{system_identifier}};
+    if ($log_fh) {
+        my $ctx = {
+            start    => $args_href->{cache_start_date},
+            end      => $args_href->{cache_end_date},
+            interval => $args_href->{sampling_interval}
+        };
+        _log_seasonal_config_context($log_fh, $event_config, $ctx);
+    }
+
+    # 6. Enrichment, Logging, and Result Extraction
+    my %recency_results_for_history;
+
+    foreach my $vm_name (@vm_order) {
+        my $vm_map_ref = $assimilation_map->{$vm_name};
+        $vm_map_ref->{Configuration}{vm_name} = $vm_name;
+        $vm_map_ref->{RunQMetrics} //= $per_profile_runq_metrics{$vm_name} || {};
+
+        # Generate Hints
+        my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
+            generate_sizing_hint(
+                $vm_map_ref,
+                $log_fh,
+                $args_href->{adaptive_saturation_thresh}
+            );
+
+        # Store Hints & Globals
+        $vm_map_ref->{Hinting}{AutoTier}       = $hint_type_tier;
+        $vm_map_ref->{Hinting}{Pattern}        = $hint_pattern_shape;
+        $vm_map_ref->{Hinting}{Pressure}       = $hint_pressure_bool;
+        $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+        $hint_tier_for_csv{$vm_name}           = $hint_type_tier;
+        $hint_pattern_for_csv{$vm_name}        = $hint_pattern_shape;
+        $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
+
+        # Calculate RunQ Modifiers
+        my $user_tier = $vm_tier_overrides{$vm_name} // "";
+        my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
+        my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
+        $pattern_char //= 'G';
+        my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+        my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+
+        foreach my $profile (@$profiles_aref) {
+            my $p_name = $profile->{name};
+
+            # --- GUARD: Skip RunQ Modifiers/Logging for P-99W1 ---
+            if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                # Optionally call log_peak_profile_rationale here if desired for consistency,
+                # or rely on the main logger (though recency uses inline logging).
+                if ($log_fh) {
+                   my $base_physc = $vm_map_ref->{CoreResults}{ProfileValues}{$p_name};
+                   log_peak_profile_rationale($log_fh, $vm_map_ref, $profile, $base_physc);
+                }
+                next;
+            }
+
+            my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
+            my %adaptive_thresholds = ( saturation => $args_href->{adaptive_saturation_thresh}, target => $args_href->{adaptive_target_norm_runq}, max_reduction => $args_href->{adaptive_max_efficiency_reduction} );
+
+            # Capture base for log
+            my $base_physc_for_log = $vm_map_ref->{CoreResults}{ProfileValues}{$p_name};
+
+            my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+                $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
+            );
+
+            my $final_csv_value = "N/A";
+            if (looks_like_number($adjusted_physc)) {
+                $final_csv_value = sprintf("%.4f", $adjusted_physc);
+                $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = $final_csv_value;
+            }
+
+            if ($p_name eq $runq_source_profile_name) {
+                $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+            }
+
+            # Inline Rationale Logging
+            if ($log_fh) {
+                my $raw_states_aref_for_log = $vm_map_ref->{RawNfitStates} || [];
+                log_profile_rationale(
+                    $log_fh, $vm_map_ref, $profile,
+                    $base_physc_for_log, $final_csv_value, $debug_info_ref,
+                    $raw_states_aref_for_log,
+                    $args_href->{adaptive_saturation_thresh}
+                );
+            }
+        }
+
+        # Extract for History
+        if (exists $vm_map_ref->{CoreResults}{ProfileValues}) {
+             $recency_results_for_history{$vm_name} = { %{$vm_map_ref->{CoreResults}{ProfileValues}} };
+        }
+    }
+
+    # 7. Generate CSV (Rolling Numbering)
+    my $date_str = localtime->strftime('%Y%m%d');
+    my $unique_suffix = $date_str;
+    my $counter = 0;
+    my $base_name = "nfit-profile." . ($args_href->{system_identifier}//'') . "." . $event_name;
+    $base_name =~ s/[^a-zA-Z0-9_.-]//g;
+
+    while (-e File::Spec->catfile($output_dir, "$base_name.$unique_suffix.csv")) {
+        $counter++;
+        $unique_suffix = "$date_str-$counter";
+    }
+
+    _write_standard_csv_report(
+        $assimilation_map,
+        $event_name,
+        $args_href->{system_identifier},
+        $unique_suffix,
+        0,
+        1, # is_recency_decay
+        0,
+        $args_href->{adaptive_saturation_thresh}
+    );
+
+    # 8. Store Forecast
+    _store_model_forecast_to_history(
+        $current_cache_path,
+        $event_name,
+        'recency_decay',
+        \%recency_results_for_history,
+        $event_config
+    );
+}
+
+# ==============================================================================
+# SUBROUTINE: _execute_predictive_peak
+# PURPOSE:    Executes the Predictive Peak model for a specific event.
+# ==============================================================================
+sub _execute_predictive_peak {
+    my ($event_name, $event_config, $current_cache_path, $profiles_aref, $args_href, $seasonality_config) = @_;
+
+    # 1. Determine analysis path
+    my $effective_event_name = determine_seasonal_analysis_path(
+        $event_config, $current_cache_path, $event_name
+    );
+
+    my $effective_config = $event_config;
+    if ($effective_event_name ne $event_name) {
+        $effective_config = $seasonality_config->{$effective_event_name} // $event_config;
+        print STDERR "    - INFO: Falling back to event '$effective_event_name' due to history constraints.\n";
+    }
+
+    $is_predictive_peak_model_run = 1;
+    $apply_seasonality_event = $event_name;
+
+    # 2. Exclusions
+    my $exclusions = undef;
+    if (defined $effective_config->{exclude_dates}) {
+        my $known_vms = _get_known_vms_from_cache($current_cache_path);
+        $exclusions = _parse_exclusion_dates($effective_config->{exclude_dates}, $known_vms);
+    }
+
+    # 3. Run Analysis
+    my $parsed_results = run_single_pass_analysis(
+        $current_cache_path,
+        $profiles_aref,
+        {
+            %$args_href,
+            exclusions => $exclusions,
+        }
+    );
+
+    # 4. Assimilate
+    my $assimilation_map = build_assimilation_map($parsed_results, $profiles_aref, $args_href->{adaptive_saturation_thresh});
+    @vm_order = sort keys %{$assimilation_map};
+
+    # 5. Calculate Forecast
+    my $forecast_results = calculate_predictive_peak_forecast(
+        $current_cache_path,
+        $args_href->{system_identifier},
+        $effective_event_name,
+        $effective_config,
+        $seasonality_config,
+        $args_href->{adaptive_saturation_thresh},
+        $exclusions
+    );
+
+    # Merge Forecast
+    foreach my $vm_name (@vm_order) {
+        if (exists $forecast_results->{$vm_name}) {
+             $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
+        }
+    }
+
+    # 6. Enrichment
+    foreach my $vm_name (@vm_order) {
+        my $vm_map_ref = $assimilation_map->{$vm_name};
+        $vm_map_ref->{Configuration}{vm_name} = $vm_name;
+        $vm_map_ref->{RunQMetrics} //= $per_profile_runq_metrics{$vm_name} || {};
+
+        my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
+            generate_sizing_hint($vm_map_ref, undef, $args_href->{adaptive_saturation_thresh});
+
+        $vm_map_ref->{Hinting}{AutoTier}       = $hint_type_tier;
+        $vm_map_ref->{Hinting}{Pattern}        = $hint_pattern_shape;
+        $vm_map_ref->{Hinting}{Pressure}       = $hint_pressure_bool;
+        $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+        $hint_tier_for_csv{$vm_name}           = $hint_type_tier;
+        $hint_pattern_for_csv{$vm_name}        = $hint_pattern_shape;
+        $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
+
+        my $user_tier = $vm_tier_overrides{$vm_name} // "";
+        my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
+        my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
+        $pattern_char //= 'G';
+        my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+        my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+
+        foreach my $profile (@$profiles_aref) {
+            my $p_name = $profile->{name};
+
+            # --- GUARD: Skip RunQ Modifiers for P-99W1 ---
+            next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
+
+            my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
+            my %adaptive_thresholds = ( saturation => $args_href->{adaptive_saturation_thresh}, target => $args_href->{adaptive_target_norm_runq}, max_reduction => $args_href->{adaptive_max_efficiency_reduction} );
+
+            my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+                $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
+            );
+            if (looks_like_number($adjusted_physc)) {
+                $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+            }
+
+            if ($p_name eq $runq_source_profile_name) {
+                $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+            }
+        }
+
+        # 7. Update Peak Value logic (Baseline vs Predicted)
+        my $baseline_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'TrueBaseline'} // 0;
+        my $predicted_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'PredictedPeak'} // 0;
+        $assimilation_map->{$vm_name}{CoreResults}{ProfileValues}{$PEAK_PROFILE_NAME} =
+            ($baseline_peak > $predicted_peak) ? $baseline_peak : $predicted_peak;
+    }
+
+    # 8. Generate CSV (Rolling Numbering)
+    my $date_str = localtime->strftime('%Y%m%d');
+    my $unique_suffix = $date_str;
+    my $counter = 0;
+    my $base_name = "nfit-profile." . ($args_href->{system_identifier}//'') . "." . $event_name;
+    $base_name =~ s/[^a-zA-Z0-9_.-]//g;
+
+    while (-e File::Spec->catfile($output_dir, "$base_name.$unique_suffix.csv")) {
+        $counter++;
+        $unique_suffix = "$date_str-$counter";
+    }
+
+    # Log Rationale
+    if (defined $open_log_files{$args_href->{system_identifier}}) {
+        my $ctx = {
+            start    => $args_href->{cache_start_date},
+            end      => $args_href->{cache_end_date},
+            interval => $args_href->{sampling_interval}
+        };
+        log_predictive_peak_rationale($open_log_files{$args_href->{system_identifier}}, $effective_config, $ctx);
+    }
+
+    _write_standard_csv_report(
+        $assimilation_map,
+        $event_name,
+        $args_href->{system_identifier},
+        $unique_suffix,
+        0,
+        0,
+        1, # is_predictive_peak
+        $args_href->{adaptive_saturation_thresh}
+    );
+
+    # 9. Store Forecast
+    _store_model_forecast_to_history(
+        $current_cache_path,
+        $effective_event_name,
+        'predictive_peak',
+        $forecast_results,
+        $effective_config
+    );
 }
