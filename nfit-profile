@@ -1305,13 +1305,24 @@ foreach my $system_serial (@target_systems_to_process)
             # (calculate_multiplicative_forecast already populates global %seasonal_debug_info)
             $historic_data_for_csv_href = $historic_data;
 
+            # Calculate Horizon Metadata
+            my ($next_start, $next_end) = determine_event_period($effective_config);
+            my $horizon_meta = undef;
+            if ($next_end) {
+                my $gen_time = Time::Piece->new();
+                my $days_diff = int(($next_end->epoch - $gen_time->epoch) / 86400);
+                $days_diff = 0 if $days_diff < 0;
+                $horizon_meta = { target_date => $next_end->ymd, days => $days_diff };
+            }
+
             # Store the multiplicative_seasonal forecast results to unified history
             _store_model_forecast_to_history(
                     $current_cache_path,
                     $effective_event_name,
                     'multiplicative_seasonal',
                     $forecast_results,
-                    $effective_config
+                    $effective_config,
+                    $horizon_meta
                     );
 
             # Overwrite the main results table with the forecast results
@@ -1358,6 +1369,10 @@ foreach my $system_serial (@target_systems_to_process)
                 $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
                 $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
 
+                # Populate Tier Override for CSV and Logic
+                $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
+                $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
+
                 # 5. Calculate RunQ Modifiers (Tactical/Strategic/Potential)
                 # Determine source profile (Logic borrowed from main loop)
                 my $user_tier = $vm_tier_overrides{$vm_name} // "";
@@ -1370,6 +1385,11 @@ foreach my $system_serial (@target_systems_to_process)
                 # 6. Iterate all profiles to apply modifiers
                 foreach my $profile (@profiles) {
                     my $p_name = $profile->{name};
+
+                    # Guard P-99W1 (Pure Signal)
+                    # Ensure we do not apply RunQ modifiers to the statistical ceiling.
+                    next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
+
                     my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
                     my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
 
@@ -1409,13 +1429,24 @@ foreach my $system_serial (@target_systems_to_process)
             $exclusions
         );
 
+        # Calculate Horizon Metadata
+        my ($next_start, $next_end) = determine_event_period($effective_config);
+        my $horizon_meta = undef;
+        if ($next_end) {
+            my $gen_time = Time::Piece->new();
+            my $days_diff = int(($next_end->epoch - $gen_time->epoch) / 86400);
+            $days_diff = 0 if $days_diff < 0;
+            $horizon_meta = { target_date => $next_end->ymd, days => $days_diff };
+        }
+
         # Store the predictive_peak forecast results to unified history
         _store_model_forecast_to_history(
             $current_cache_path,
             $effective_event_name,
             'predictive_peak',
             $forecast_results,
-            $effective_config
+            $effective_config,
+            $horizon_meta
         );
 
         # Overwrite the main results table with the forecast
@@ -1449,12 +1480,15 @@ foreach my $system_serial (@target_systems_to_process)
             $assimilation_map_ref->{Hinting}{Pattern}                  = $hint_pattern_shape;
             $assimilation_map_ref->{$vm_name}{Hinting}{Pressure}       = $hint_pressure_bool;
             $assimilation_map_ref->{$vm_name}{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+            $assimilation_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
 
             # 5. Populate legacy globals for safety
             $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
             $hint_pattern_for_csv{$vm_name}   = $hint_pattern_shape;
             $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
             $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
+            # Populate Tier Override for CSV and Logic
+            $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
 
             # 6. Calculate RunQ Modifiers (Copy of Multiplicative Logic)
             my $user_tier = $vm_tier_overrides{$vm_name} // "";
@@ -1480,7 +1514,26 @@ foreach my $system_serial (@target_systems_to_process)
                 $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
             }
 
-            # 7. Update Peak Value logic
+            # 7. Iterate all profiles to apply modifiers (FIX: Was missing in manual path)
+            foreach my $profile (@profiles) {
+                my $p_name = $profile->{name};
+
+                # --- GUARD: Skip RunQ Modifiers for P-99W1 ---
+                next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
+
+                my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
+                my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+
+                my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+                    $vm_name, $assimilation_map_ref->{$vm_name}, $profile, \%pressure_flags, \%adaptive_thresholds
+                );
+
+                if (looks_like_number($adjusted_physc)) {
+                    $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+                }
+            }
+
+            # 8. Update Peak Value logic
             my $baseline_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'TrueBaseline'} // 0;
             my $predicted_peak = $seasonal_debug_info{$vm_name}{'P-99W1'}{'PredictedPeak'} // 0;
 
@@ -1691,21 +1744,41 @@ foreach my $system_serial (@target_systems_to_process)
                 _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $unique_date_suffix, 0, $is_recency_flag, $is_predictive_flag, $adaptive_runq_saturation_thresh);
 
                 # Store recency_decay forecast results to unified history
-                # (predictive_peak is already stored earlier in its dedicated block)
                 if ($model_type eq 'recency_decay') {
                     my %recency_decay_results_for_history;
-                    foreach my $vm_name (keys %{$assimilation_map_ref}) {
-                        my $core_results = $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues};
-                        next unless (ref($core_results) eq 'HASH');
-                        $recency_decay_results_for_history{$vm_name} = { %$core_results };
+                    # Calculate Horizon Metadata from Growth Rationale
+                    my $horizon_meta = undef;
+                    foreach my $vm (keys %{$assimilation_map_ref}) {
+                        # Extract core results for storage
+                        my $core_res = $assimilation_map_ref->{$vm}{CoreResults}{ProfileValues};
+                        if (ref($core_res) eq 'HASH') {
+                            $recency_decay_results_for_history{$vm} = { %$core_res };
+                        }
+
+                        # Extract horizon from growth rationale (first valid VM wins)
+                        if (!$horizon_meta) {
+                            my $rationale_map = $assimilation_map_ref->{$vm}{GrowthRationaleByProfile};
+                            if ($rationale_map && ref($rationale_map) eq 'HASH') {
+                                foreach my $prof (keys %$rationale_map) {
+                                    my $days = $rationale_map->{$prof}{projection_days};
+                                    if (defined $days) {
+                                        my $target_dt = localtime() + ($days * 86400);
+                                        $horizon_meta = { target_date => $target_dt->ymd, days => $days };
+                                        last;
+                                    }
+                                }
+                            }
+                        }
                     }
+                    $horizon_meta //= { target_date => localtime()->ymd, days => 0 };
 
                     _store_model_forecast_to_history(
                         $current_cache_path,
                         $apply_seasonality_event,
                         'recency_decay',
                         \%recency_decay_results_for_history,
-                        $event_config
+                        $event_config,
+                        $horizon_meta
                     );
                 }
             } else {
@@ -5435,7 +5508,7 @@ sub _write_standard_csv_report {
         ($ent_idx) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
         $ent_idx //= scalar(@header_for_this_report); # Fallback
 
-        my @new_cols = ("ActiveEvents", "PredictedDelta", "Baseline_P99", "BaselineSource", "ForecastModel");
+        my @new_cols = ("ActiveEvents", "P99_PredictedDelta", "Baseline_P99", "BaselineSource", "ForecastModel");
 
         splice @header_for_this_report, $ent_idx, 0, @new_cols;
         $formula_col_offset = scalar(@new_cols);
@@ -6343,8 +6416,6 @@ sub _get_true_baseline_results {
     #    The cache file format (Timestamp, VM, PhysC, RunQ) is compatible with these flags.
     my $nfit_cmd = "$nfit_script_path --manifest $manifest_filename "
                  . " --nmondir \"$system_cache_dir\" "
-                 . "--physc-data \"$filtered_filename\" "
-                 . "--runq-data  \"$filtered_filename\" " # Cache file contains both columns
                  . "--smt $default_smt_arg "
                  . "--runq-avg-method $nfit_runq_avg_method_str "
                  . "--show-progress";
@@ -7243,7 +7314,7 @@ sub _assemble_seasonal_snapshot {
 #   }
 # ==============================================================================
 sub _store_model_forecast_to_history {
-    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config) = @_;
+    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config, $horizon_meta) = @_;
 
     return unless ($system_cache_dir && $event_name && $model_type && $forecast_results_href);
     return unless (scalar keys %$forecast_results_href > 0);
@@ -7312,11 +7383,10 @@ sub _store_model_forecast_to_history {
     my $event_snapshot = $history_data->{$target_month_key}{SeasonalEventSnapshots}{$event_name};
     $event_snapshot->{ModelForecasts} //= {};
 
-    # Build the model-specific forecast structure with VM nesting
     my %model_data;
 
     # Metadata block (underscore prefix distinguishes from VM keys)
-    $model_data{'_meta'} = {
+    my $meta_block = {
         model_version   => 1,
         generated_on    => localtime()->datetime(),
         analysis_window => {
@@ -7324,6 +7394,14 @@ sub _store_model_forecast_to_history {
             end  => $analysis_end_date,
         },
     };
+
+    # Inject Horizon Metadata if provided
+    if ($horizon_meta) {
+        $meta_block->{forecast_target_date}  = $horizon_meta->{target_date};
+        $meta_block->{forecast_horizon_days} = $horizon_meta->{days};
+    }
+
+    $model_data{'_meta'} = $meta_block;
 
     # Build per-VM forecast and baseline data
     my $vm_count = 0;
@@ -10541,13 +10619,29 @@ sub _execute_multiplicative_seasonal {
         write_seasonal_csv_output("historic_snapshot", $args_href->{system_identifier}, $event_name, $unique_suffix, $historic_data);
     }
 
+    # Determine Forecast Horizon for Metadata
+    my ($next_start, $next_end) = determine_event_period($effective_config); # Defaults to next from now
+    my $horizon_meta = undef;
+
+    if ($next_end) {
+        my $gen_time = Time::Piece->new();
+        my $days_diff = int(($next_end->epoch - $gen_time->epoch) / 86400);
+        $days_diff = 0 if $days_diff < 0;
+
+        $horizon_meta = {
+            target_date => $next_end->ymd,
+            days        => $days_diff
+        };
+    }
+
     # Store Forecast
     _store_model_forecast_to_history(
         $current_cache_path,
         $effective_event_name,
         'multiplicative_seasonal',
         $forecast_results,
-        $effective_config
+        $effective_config,
+        $horizon_meta
     );
 }
 
@@ -10723,13 +10817,40 @@ sub _execute_recency_decay {
         $args_href->{adaptive_saturation_thresh}
     );
 
+    # Determine Forecast Horizon from Growth Rationale
+    my $horizon_meta = undef;
+
+    # Inspect the first VM/Profile to find the projection days used
+    foreach my $vm (keys %{$assimilation_map}) {
+        my $rationale_map = $assimilation_map->{$vm}{GrowthRationaleByProfile};
+        if ($rationale_map && ref($rationale_map) eq 'HASH') {
+            # Look for any profile with valid projection metadata
+            foreach my $prof (keys %$rationale_map) {
+                my $days = $rationale_map->{$prof}{projection_days};
+                if (defined $days) {
+                    my $target_dt = localtime() + ($days * 86400);
+                    $horizon_meta = {
+                        target_date => $target_dt->ymd,
+                        days        => $days
+                    };
+                    last;
+                }
+            }
+        }
+        last if $horizon_meta;
+    }
+
+    # Fallback if no growth prediction was active
+    $horizon_meta //= { target_date => localtime()->ymd, days => 0 };
+
     # 8. Store Forecast
     _store_model_forecast_to_history(
         $current_cache_path,
         $event_name,
         'recency_decay',
         \%recency_results_for_history,
-        $event_config
+        $event_config,
+        $horizon_meta
     );
 }
 
@@ -10881,12 +11002,28 @@ sub _execute_predictive_peak {
         $args_href->{adaptive_saturation_thresh}
     );
 
+    # Determine Forecast Horizon for Metadata
+    my ($next_start, $next_end) = determine_event_period($effective_config);
+    my $horizon_meta = undef;
+
+    if ($next_end) {
+        my $gen_time = Time::Piece->new();
+        my $days_diff = int(($next_end->epoch - $gen_time->epoch) / 86400);
+        $days_diff = 0 if $days_diff < 0;
+
+        $horizon_meta = {
+            target_date => $next_end->ymd,
+            days        => $days_diff
+        };
+    }
+
     # 9. Store Forecast
     _store_model_forecast_to_history(
         $current_cache_path,
         $effective_event_name,
         'predictive_peak',
         $forecast_results,
-        $effective_config
+        $effective_config,
+        $horizon_meta
     );
 }
