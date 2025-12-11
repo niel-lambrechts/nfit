@@ -1084,7 +1084,7 @@ foreach my $system_serial (@target_systems_to_process)
     }
 
     # --- Open Log File for this specific system ---
-    my $log_fh_for_system = IO::File->new($log_file_path_for_run, '>')
+    my $log_fh_for_system = IO::File->new($log_file_path_for_run, '>:encoding(UTF-8)')
         or warn "Error: Cannot open rationale log for '$system_serial' at '$log_file_path_for_run': $!. Rationale logging will be skipped for this system.\n";
 
     if ($log_fh_for_system)
@@ -1173,13 +1173,17 @@ foreach my $system_serial (@target_systems_to_process)
                 "       Please use the command: ./nfit-forecast --nmondir $current_cache_path --apply-seasonality $apply_seasonality_event\n";
         }
 
-        # Determine the correct analysis path. This function checks for sufficient
-        # history for multiplicative models and returns the effective event name to run.
         $effective_event_name = determine_seasonal_analysis_path(
             $requested_event_config,
             $current_cache_path,
             $apply_seasonality_event
         );
+
+        # Handle cold-start graceful skip
+        unless (defined $effective_event_name) {
+            print STDERR "  • Skipping '$apply_seasonality_event' - run --update-history first.\n";
+            next;  # Skip to next system
+        }
 
         # Get the configuration for the event we are actually going to run.
         $effective_config = $seasonality_config->{$effective_event_name} // {};
@@ -4761,6 +4765,66 @@ sub calculate_multiplicative_forecast {
         shift @event_history_final;
     }
 
+    # --- Path C (Cold Start Recovery): Calculate generic baseline from full L1 cache ---
+    # This path activates when:
+    #   1. Path A produced no results (possibly due to date anchoring issues), AND
+    #   2. Path B cannot run (no historical snapshots exist)
+    # It provides a statistically valid baseline using the entire available cache.
+    #
+    unless (%current_baseline_results) {
+        if (!$most_recent_peak_snapshot && $cache_end_date_obj) {
+            print STDERR "  - Baseline Strategy: Cold start recovery - calculating baseline from full L1 cache.\n";
+
+            # Use the full cache range for a generic baseline
+            my $data_cache_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.data');
+            my ($cache_start_date_obj, undef) = _get_cache_date_range($data_cache_file);
+
+            if ($cache_start_date_obj) {
+                my $start_str = $cache_start_date_obj->strftime('%Y-%m-%d');
+                my $end_str   = $cache_end_date_obj->strftime('%Y-%m-%d');
+                $baseline_source_log = "Full Cache ($start_str to $end_str) [Cold Start]";
+
+                print STDERR "    - Baseline window: $start_str to $end_str\n";
+
+                foreach my $profile (@profiles) {
+                    my $profile_name = $profile->{name};
+                    # Use is_generic_baseline=1 to strip time filters that might exclude data
+                    my $nfit_cmd = _build_nfit_baseline_command(
+                        $profile->{flags}, $start_str, $end_str, $system_cache_dir,
+                        0,    # enable_clipping_detection
+                        1,    # is_generic_baseline (strips time filters)
+                        undef, # allow_growth_prediction
+                        $profile_name
+                    );
+
+                    my $nfit_output = '';
+                    my $stderr_arg = ">&=" . fileno(STDERR);
+                    my $pid_nfit = open3(undef, my $stdout_nfit, $stderr_arg, $nfit_cmd);
+                    while (my $line = <$stdout_nfit>) { $nfit_output .= $line; }
+                    waitpid($pid_nfit, 0);
+                    next if $?;  # Skip if nfit command failed
+
+                    my $parsed = parse_nfit_json_output($nfit_output);
+                    my $p_key = "P" . clean_perc_label(
+                        ($profile->{flags} =~ /-p\s+([0-9.]+)/) ? $1 : $DEFAULT_PERCENTILE
+                    );
+
+                    foreach my $vm (keys %$parsed) {
+                        my @vals = map { $_->{metrics}{physc}{$p_key} } @{$parsed->{$vm}};
+                        my @valid_vals = grep { defined $_ && looks_like_number($_) } @vals;
+                        if (@valid_vals) {
+                            $current_baseline_results{$vm}{$profile_name} = sum0(@valid_vals) / scalar(@valid_vals);
+                        }
+                    }
+                }
+
+                if (%current_baseline_results) {
+                    print STDERR "    ✓ Cold start baseline calculated for " . scalar(keys %current_baseline_results) . " VM(s).\n";
+                }
+            }
+        }
+    }
+
     unless (%current_baseline_results) {
         warn "Warning: Could not determine a valid baseline. Cannot proceed with forecast.\n";
         return ({}, {});
@@ -6067,6 +6131,7 @@ sub log_multiplicative_seasonal_rationale
 # It checks if a multiplicative model has enough historical data to run. If not,
 # it switches to the defined fallback event. This makes the tool resilient.
 # It returns the name of the event that should ultimately be executed.
+# Returns undef on cold-start to signal graceful skip.
 # ==============================================================================
 sub determine_seasonal_analysis_path {
     my ($event_config, $system_cache_dir, $event_name) = @_;
@@ -6079,6 +6144,8 @@ sub determine_seasonal_analysis_path {
 
     # Read the unified history to count available snapshots for this event.
     my $unified_history = read_unified_history($system_cache_dir);
+    my $total_history_months = scalar(keys %$unified_history);
+
     my $history_count = 0;
     foreach my $month_data (values %$unified_history) {
         if (exists $month_data->{SeasonalEventSnapshots}{$event_name}) {
@@ -6099,7 +6166,16 @@ sub determine_seasonal_analysis_path {
             print STDERR "  - Executing fallback event: '$fallback_event_name'\n\n";
             return $fallback_event_name;
         } else {
-            die "FATAL: Cannot run forecast for '$event_name' due to insufficient history, and no 'fallback_event' is configured.\n";
+            # Check for cold-start scenario
+            if ($total_history_months == 0) {
+                print STDERR "\n  [INFO] Cold start detected - no history exists yet.\n";
+                print STDERR "         Run 'nfit-profile --update-history' first to bootstrap history,\n";
+                print STDERR "         then re-run '--seasonal' to generate forecasts.\n";
+                print STDERR "         Skipping event '$event_name'.\n\n";
+                return undef;  # Signal graceful skip
+            } else {
+                die "FATAL: Cannot run forecast for '$event_name' due to insufficient history, and no 'fallback_event' is configured.\n";
+            }
         }
     }
 }
@@ -7383,6 +7459,9 @@ sub _store_model_forecast_to_history {
     $history_data->{$target_month_key}{SeasonalEventSnapshots}{$event_name} //= {
         eventName => $event_name,
     };
+
+    # Ensure periodEndDate is populated if missing (crucial for time-series plotting)
+    $history_data->{$target_month_key}{SeasonalEventSnapshots}{$event_name}{periodEndDate} //= $analysis_end_date;
 
     # Initialise ModelForecasts container if absent
     my $event_snapshot = $history_data->{$target_month_key}{SeasonalEventSnapshots}{$event_name};
@@ -10490,6 +10569,12 @@ sub _execute_multiplicative_seasonal {
         $event_config, $current_cache_path, $event_name
     );
 
+    # Handle cold-start graceful skip
+    unless (defined $effective_event_name) {
+        print STDERR "    • Skipping '$event_name' (cold start - run --update-history first).\n";
+        return;
+    }
+
     my $effective_config = $event_config;
     if ($effective_event_name ne $event_name) {
         $effective_config = $seasonality_config->{$effective_event_name} // $event_config;
@@ -10912,6 +10997,12 @@ sub _execute_predictive_peak {
     my $effective_event_name = determine_seasonal_analysis_path(
         $event_config, $current_cache_path, $event_name
     );
+
+    # Handle cold-start graceful skip
+    unless (defined $effective_event_name) {
+        print STDERR "    • Skipping '$event_name' (cold start - run --update-history first).\n";
+        return;
+    }
 
     my $effective_config = $event_config;
     if ($effective_event_name ne $event_name) {
