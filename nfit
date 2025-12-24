@@ -32,6 +32,7 @@ use File::Basename qw(dirname);
 use Cwd 'abs_path';
 use Digest::SHA qw(sha256_hex);
 use Storable qw(freeze dclone);
+use File::Copy;
 my $MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1";
 
 # --- Force STDERR to be unbuffered for real-time progress updates ---
@@ -416,8 +417,10 @@ if ($rounding_method ne 'none')
 }
 
 # --- Main Execution Path ---
-print STDERR "\nnfit version $VERSION\n";
-print STDERR "-------------------------\n";
+if (!$quiet) {
+    print STDERR "\nnfit version $VERSION\n";
+    print STDERR "-------------------------\n";
+}
 
 # --- Legacy Invocation Handler ---
 # If this script is called without a manifest, it means it's being used by an
@@ -517,7 +520,42 @@ unless ($manifest_file) {
 # --- End: Legacy Handler ---
 
 if ($manifest_file) {
-    # New single-pass engine entry point.
+    # Backup manifest and invocation arguments to cache dir for inspection
+    if (defined $nmon_dir && -d $nmon_dir) {
+        my $debug_manifest_path = File::Spec->catfile($nmon_dir, '.nfit.engine.last_manifest');
+        copy($manifest_file, $debug_manifest_path) or warn "Warning: Failed to create debug manifest at $debug_manifest_path: $!\n";
+        chmod 0644, $debug_manifest_path; # Ensure it is readable
+
+        # Backup Global Arguments to cache dir for inspection
+        # This captures the Start/End dates and Analysis Reference Date which are NOT in the manifest.
+        my $debug_args_path = File::Spec->catfile($nmon_dir, '.nfit.engine.last_args');
+        if (open my $dbg_fh, '>', $debug_args_path) {
+            # Manually format key args for readability (avoiding Data::Dumper dependency if preferred,
+            # though Data::Dumper is standard).
+            print $dbg_fh "Start Date:                      " . ($start_date_str // 'undef') . "\n";
+            print $dbg_fh "End Date:                        " . ($end_date_str // 'undef') . "\n";
+            print $dbg_fh "Analysis Reference Date:         " . ($analysis_reference_date_str // 'undef') . "\n";
+            print $dbg_fh "Windowed Decay:                  " . ($enable_windowed_decay // '0') . "\n";
+            print $dbg_fh "Growth Enabled:                  " . ($enable_growth_prediction // '0') . "\n";
+            print $dbg_fh "Target VM:                       " . ($target_vm_name // 'all') . "\n";
+            print $dbg_fh "RunQ Avg Method:                 " . ($runq_avg_method_str // 'undef') . "\n";
+            print $dbg_fh "Clipping Detection:              " . ($enable_clipping_detection // 'undef') . "\n";
+            print $dbg_fh "Decay Settings:\n";
+            print $dbg_fh "process_window_unit:             " . ($process_window_unit_str // 'undef') . "\n";
+            print $dbg_fh "process_window_size:             " . ($process_window_size_val // 'undef') . "\n";
+            print $dbg_fh "decay_half_life_days:            " . ($decay_half_life_days_val // 'undef') . "\n";
+            print $dbg_fh "Growth Prediction Settings:\n";
+            print $dbg_fh "growth_projection_days:          " . ($growth_projection_days // 'undef') . "\n";
+            print $dbg_fh "growth_projection_override:      " . ($growth_projection_days_user_override // 'undef') . "\n";
+            print $dbg_fh "max_growth_inflation_percent:    " . ($max_growth_inflation_percent // 'undef') . "\n";
+            print $dbg_fh "Rounding:\n";
+            print $dbg_fh "round_arg:                       " . ($round_arg // 'undef') . "\n";
+            print $dbg_fh "roundup_arg:                     " . ($roundup_arg // 'undef') . "\n";
+            close $dbg_fh;
+        }
+    }
+
+   # New single-pass engine entry point.
     # We now construct a single hash reference containing all necessary global
     # flags to pass to the engine. This keeps the function call clean and
     # ensures all original functionality is preserved.
@@ -2640,6 +2678,46 @@ sub run_single_pass_from_manifest {
         $cache_index = load_or_build_cache_index($nmon_dir, $data_cache_file);
     }
 
+    # ==========================================================================
+    # SAFETY CHECK: Data Resolution Detection & Window Clamping
+    # ==========================================================================
+    # Uses ported robust detection to prevent Nyquist violations (e.g. 5m window on 15m data)
+    my $detected_interval_secs = detect_sampling_interval($data_cache_file) // 60;
+
+    # Convert to minutes (rounded) for internal logic
+    my $detected_interval_mins = sprintf("%.0f", $detected_interval_secs / 60);
+    $detected_interval_mins = 1 if $detected_interval_mins < 1;
+
+    # Store for downstream logic (e.g. Growth Projection / Adaptive Horizons)
+    $args_ref->{avg_sampling_interval_mins} = $detected_interval_mins;
+
+    # Adjust Manifest Windows based on Resolution
+    # This logic converts "Minutes" (CLI request) to "Samples" (Engine requirement)
+    # and clamps to 1 sample if the window is physically impossible given the resolution.
+    foreach my $key (keys %$manifest) {
+        my $entry = $manifest->{$key};
+        next unless defined $entry->{window};
+
+        my $req_window_mins = $entry->{window};
+
+        # Calculate effective sample count needed for this window size
+        # e.g. Req=5m, Data=1m  -> 5 samples
+        # e.g. Req=5m, Data=15m -> 0.33 samples -> Clamps to 1
+        my $effective_samples = int($req_window_mins / $detected_interval_mins);
+
+        if ($effective_samples < 1) {
+            $effective_samples = 1; # Clamp to disable smoothing
+            if ($verbose) {
+                 warn "Warning: Data resolution (${detected_interval_mins}m) exceeds requested window (${req_window_mins}m) for '$key'.\n" .
+                      "         Clamping window to 1 sample (smoothing disabled).\n";
+            }
+        }
+
+        # Update the manifest logic to use SAMPLES, which the engine expects
+        $entry->{window} = $effective_samples;
+    }
+    # --- end of safety check ---
+
     # --- Open data cache ---
     open my $data_fh, '<:raw', $data_cache_file or die "FATAL: Cannot open $data_cache_file: $!";
     my $header = <$data_fh>; # Read header to determine column indices if needed
@@ -4464,6 +4542,109 @@ sub _binary_search_window_index {
         }
     }
     return $found_id;
+}
+
+# ==============================================================================
+# SUBROUTINE: detect_sampling_interval
+# Robustly detects the NMON sampling interval from the .nfit.cache.data file.
+# It reads the start of the cache, isolates timestamps for the first VM found,
+# calculates the time difference between consecutive samples, and finds the mode
+# of these deltas to determine the most likely interval.
+#
+# Note: This version introduces jitter bucketing: Before counting the frequency,
+#  it checks if a delta is close to a standard interval (60, 300, 600, 900 seconds)
+#  within a tolerance ($EPS = 3). If it is, it snaps the value to that standard
+#  interval before incrementing the count.
+# Returns:
+#   - The detected interval in seconds (e.g., 60, 300), or undef on failure.
+sub detect_sampling_interval {
+    my ($data_cache_file) = @_;
+
+    my $SAMPLES_TO_GATHER       = 50;
+    my $MAX_LINES_TO_SCAN       = 5000;
+    my $MIN_SAMPLES_FOR_DETECTION = 5;   # required count in a single interval bucket
+    my @STD = (60, 300, 600, 900);
+    my $EPS = 3;                          # jitter tolerance (seconds)
+
+    return undef unless (-f $data_cache_file && -s $data_cache_file);
+
+    open my $fh, '<:encoding(utf8)', $data_cache_file or do {
+        warn "Warning: Could not open data cache '$data_cache_file' for interval detection: $!";
+        return undef;
+    };
+
+    <$fh>; # Skip header
+
+    my $target_vm_for_detection;
+    my @timestamps;
+    my $lines_scanned = 0;
+
+    while (my $line = <$fh>) {
+        $lines_scanned++;
+        last if $lines_scanned > $MAX_LINES_TO_SCAN;
+
+        my ($ts_str, $vm_name) = ($line =~ /^(\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}),([^,]+)/);
+        next unless ($ts_str && $vm_name);
+
+        $target_vm_for_detection //= $vm_name;
+        next unless $vm_name eq $target_vm_for_detection;
+
+        eval {
+            push @timestamps, Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S")->epoch;
+        };
+        last if @timestamps >= $SAMPLES_TO_GATHER;
+    }
+    close $fh;
+
+    # Need enough timestamps to produce at least MIN_SAMPLES_FOR_DETECTION deltas
+    return undef if @timestamps < ($MIN_SAMPLES_FOR_DETECTION + 1);
+
+    @timestamps = sort { $a <=> $b } @timestamps;
+
+    my %delta_counts;
+    for (my $i = 1; $i < @timestamps; $i++) {
+        my $delta = $timestamps[$i] - $timestamps[$i-1];
+        next unless ($delta > 10 && $delta < 1810);
+
+        # Jitter bucketing: snap near-standards to the standard value
+        my $bucket = $delta;
+        my $best_d = $EPS + 1;
+        for my $s (@STD) {
+            my $d = abs($delta - $s);
+            if ($d < $best_d) { $best_d = $d; $bucket = ($d <= $EPS) ? $s : $bucket; }
+        }
+        $delta_counts{$bucket}++;
+    }
+
+    return undef unless %delta_counts;
+
+    # Find max frequency
+    my $max_count = 0;
+    foreach my $delta (keys %delta_counts) {
+        $max_count = $delta_counts{$delta} if $delta_counts{$delta} > $max_count;
+    }
+
+    # Require minimum evidence in the winning bucket
+    return undef if $max_count < $MIN_SAMPLES_FOR_DETECTION;
+
+    # Collect all tied winners
+    my @tied_deltas = grep { $delta_counts{$_} == $max_count } keys %delta_counts;
+
+    # Deterministic tie-break: closest to a standard, then smallest delta
+    if (@tied_deltas > 1) {
+        my %distances;
+        for my $delta (@tied_deltas) {
+            my $min_dist = 1e9;
+            foreach my $std (@STD) {
+                my $dist = abs($delta - $std);
+                $min_dist = $dist if $dist < $min_dist;
+            }
+            $distances{$delta} = $min_dist;
+        }
+        @tied_deltas = sort { $distances{$a} <=> $distances{$b} || $a <=> $b } @tied_deltas;
+    }
+
+    return $tied_deltas[0];
 }
 
 # --- usage ---
