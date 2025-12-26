@@ -700,7 +700,7 @@ if (defined $apply_seasonality_event) {
     }
     # Automatically enable the correct decay model if needed
     elsif ($model_type eq 'recency_decay') {
-        print STDERR "  [INFO] Windowed decay processing enabled for recency_decay model\n";
+        # Silently enable wndowed decay processing for recency_decay
         $nfit_enable_windowed_decay = 1; # Use the time-based windowed decay engine.
         $nfit_decay_over_states = 0;     # Ensure the state-based engine is disabled.
     }
@@ -952,10 +952,20 @@ my $LOG_FH;
 my %open_log_files;
 
 my $is_seasonal_run = $apply_seasonality_event || $update_history_flag;
+my $o_nfit_analysis_reference_date_str = $nfit_analysis_reference_date_str;
+my $o_start_date_str = $start_date_str;
+my $o_end_date_str = $end_date_str;
 
 # --- Main Processing Loop (iterates through systems for InfluxDB cache, runs once for standard file source modes) ---
 foreach my $system_serial (@target_systems_to_process)
 {
+    my $system_analysis_start_time = time();
+
+    # Restore user-supplied CLI date options for each managed system, to prevent
+    # seasonal execution and per-event resets from leaking into subsequent systems.
+    $start_date_str = $o_start_date_str;
+    $end_date_str = $o_end_date_str;
+    $nfit_analysis_reference_date_str = $o_nfit_analysis_reference_date_str;
 
     # To store the unique YYYYMMDD[-N] suffix
     my $unique_date_suffix;
@@ -1189,125 +1199,50 @@ foreach my $system_serial (@target_systems_to_process)
             cache_end_date    => $end_date,
             effective_start_date => $effective_start_date_obj,
             effective_end_date   => $effective_end_date_obj,
-        }, $effective_end_date_obj);
+        }, $effective_end_date_obj, undef);
         next; # Skip standard processing
     } elsif ($apply_seasonality_event) {
-        # --- Apply a Seasonal Forecast ---
-        my $is_seasonal_run = 1;
 
-        print STDERR "\n⧉ Executing seasonal forecast for event $apply_seasonality_event\n";
-        # Get the configuration for the event the user requested.
+        # Preserve explicit guard: adaptive_peak is owned by nfit-forecast
         my $requested_event_config = $seasonality_config->{$apply_seasonality_event} // {};
-
-        # check for unsupported model types
-        # Prevent this script from incorrectly running models handled by other tools.
-        my $requested_model_type = $requested_event_config->{model} // '';
+        my $requested_model_type   = $requested_event_config->{model} // '';
         if ($requested_model_type eq 'adaptive_peak') {
             die "[ERROR] The 'adaptive_peak' forecasting model can only be executed using the `nfit-forecast` program.\n" .
                 "        Please use the command: ./nfit-forecast --nmondir $current_cache_path --apply-seasonality $apply_seasonality_event\n";
         }
 
-        $effective_event_name = determine_seasonal_analysis_path(
-            $requested_event_config,
+        _execute_automatic_seasonal_discovery(
+            $seasonality_config,
             $current_cache_path,
+            \@profiles,
+            {
+                system_identifier => $system_identifier,
+                nfit_path => $nfit_script_path,
+                rounding_flags => $rounding_flags_for_nfit,
+                default_smt => $default_smt_arg,
+                runq_avg_method => $nfit_runq_avg_method_str,
+                runq_perc_behavior => $runq_perc_behavior_mode,
+                adaptive_saturation_thresh => $adaptive_runq_saturation_thresh,
+                adaptive_target_norm_runq => $adaptive_target_norm_runq,
+                adaptive_max_efficiency_reduction => $adaptive_max_efficiency_reduction,
+                sampling_interval => $detected_interval_secs,
+                cache_start_date  => $start_date,
+                cache_end_date    => $end_date,
+                effective_start_date => $effective_start_date_obj,
+                effective_end_date   => $effective_end_date_obj,
+            },
+            $effective_end_date_obj,
             $apply_seasonality_event
         );
 
-        # Handle cold-start graceful skip
-        unless (defined $effective_event_name) {
-            print STDERR "  [-] Skipping forecast for '$apply_seasonality_event' (execution of `--update-history` is required)\n";
-            next;  # Skip to next system
-        }
-
-        # Get the configuration for the event we are actually going to run.
-        $effective_config = $seasonality_config->{$effective_event_name} // {};
-
-        # --- Parse Exclusions for "Manual" (`--apply-seasonality`) Run ---
-        if (defined $effective_config->{exclude_dates}) {
-             my $known_vms = _get_known_vms_from_cache($current_cache_path);
-             $exclusions = _parse_exclusion_dates($effective_config->{exclude_dates}, $known_vms);
-        }
-
-        my $effective_model_type = $effective_config->{model} // '';
-
-        # Now, set up the analysis based on the EFFECTIVE model type.
-        if ($effective_model_type eq 'recency_decay') {
-            # This model uses --enable-windowed-decay, making it mutually exclusive
-            # with the state-based decay model.
-            if ($nfit_decay_over_states) {
-                die "[ERROR] The 'recency_decay' model (for event '$effective_event_name') cannot be used with the --decay-over-states flag.\n";
-            }
-
-            my ($event_start_obj, $event_end_obj) = determine_event_period($effective_config, $effective_end_date_obj, 'forecast');
-
-            if ($event_start_obj && $event_end_obj) {
-
-                # --- RESOLVE ANALYSIS REFERENCE DATE (ANCHOR) ---
-                # Priority 1: User specified CLI argument (--analysis-reference-date)
-                # Priority 2: Smart Default for Month-End events (Snap to last completed month)
-                # Priority 3: Fallback to Effective End Date (Current Analysis Point)
-
-                if ($nfit_analysis_reference_date_str) {
-                     print STDERR "  Φ Recency-Decay: Using user-defined analysis reference date: $nfit_analysis_reference_date_str\n";
-                } else {
-                    # CHECK FOR SMART DEFAULT: Is this a Month-End event?
-                    # period = monthly AND day_of_period = -1
-                    my $is_month_end = ($requested_event_config->{period} // '') eq 'monthly'
-                                    && ($requested_event_config->{day_of_period} // 0) == -1;
-
-                    my $smart_anchor = undef;
-                    if ($is_month_end) {
-                        # Calculate the end of the month containing the effective_end_date
-                        # Logic: Start of Current Month + 1 Month - 1 Second
-                        my $current_month_start = $effective_end_date_obj->truncate(to => 'month');
-                        my $current_month_end   = $current_month_start->add_months(1) - 1;
-
-                        # If we are effectively "mid-month" (e.g., July 6 < July 31),
-                        # the last *completed* month-end is the previous month (June 30).
-                        if ($effective_end_date_obj->truncate(to => 'day') < $current_month_end->truncate(to => 'day')) {
-                            $smart_anchor = $current_month_start - 1; # Last second of previous month
-                        } else {
-                            $smart_anchor = $current_month_end; # We are at/after month-end, so use current.
-                        }
-                    }
-
-                    if ($smart_anchor) {
-                        $nfit_analysis_reference_date_str = $smart_anchor->ymd;
-                        # [FIX] If we snap the anchor back to avoid the start-of-month dip,
-                        #  we MUST also stop the analysis at that point.
-                        # Otherwise, nfit treats the future data (the dip) as weight 1.0.
-                        $run_end_date_obj = $smart_anchor;
-                        print STDERR "  Φ Recency-Decay [Temporal anchor]: last completed month-end ($nfit_analysis_reference_date_str)\n";
-                    } else {
-                        # Fallback for non-month-end events
-                        $nfit_analysis_reference_date_str = $effective_end_date_obj->ymd;
-                        print STDERR "  Φ Recency-Decay [Temporal anchor]: effective end date ($nfit_analysis_reference_date_str)\n";
-                    }
-                }
-
-                # --- WINDOW & FLAGS ---
-                # 1. Start Date: Strict adherence to effective window
-                $start_date_str = $effective_start_date_obj->strftime('%Y-%m-%d');
-
-                # 2. Enforce Time-Based Decay
-                $nfit_enable_windowed_decay = 1;
-                $nfit_decay_over_states     = 0;
-
-            } else {
-                 warn "  [WARN] Could not determine a valid period for the '$effective_event_name' model. Analysis will proceed without date anchoring.\n";
-            }
-
-        } elsif ($effective_model_type eq 'multiplicative_seasonal') {
-            # The check passed. Set the flag to run the multiplicative forecast AFTER
-            # the main profile loop has gathered the Peak value.
-            $is_multiplicative_forecast_run = 1;
-        } elsif ($effective_model_type eq 'predictive_peak') {
-            $is_predictive_peak_model_run = 1;
-
-        }
+        next; # Skip standard processing for this system (matches --seasonal behaviour)
     }
 
-    my $system_analysis_start_time = time();
+    # --- Standard (non-seasonal) processing path ---
+    # Executes the single-pass engine and any model-specific post-processing
+    # for non-seasonal runs. Seasonal execution paths MUST `next` before this block.
+
+    _phase("Standard Analysis (Non-Seasonal)");
 
     my $analysis_context = {
         analysis_start  => $system_analysis_start_time,
@@ -2024,9 +1959,6 @@ foreach my $system_serial (@target_systems_to_process)
     %primary_runq_metrics_captured_for_vm = ();
     %per_profile_nfit_raw_results = ();
     %seasonal_debug_info = ();
-    # Reset date filters to avoid them leaking into a subsequent standard run.
-    $start_date_str = undef;
-    $nfit_analysis_reference_date_str = undef;
 
     # Report the duration for the completed system's analysis
     my $system_analysis_duration = time() - $system_analysis_start_time;
@@ -4914,7 +4846,7 @@ sub calculate_multiplicative_forecast {
     # It intelligently determines the most appropriate recent baseline and applies a recency-weighted
     # seasonal multiplier derived from historical, saturation-corrected peak data.
 
-    print STDERR "\n  ⧉ Executing Multiplicative Seasonal Forecast for event $event_name on system $system_identifier\n";
+    print STDERR "    ⧉ Executing Multiplicative Seasonal Forecast for event $event_name on system $system_identifier\n";
 
     # --- Configuration Constants ---
     # The number of days of stable, non-peak activity to use for the baseline.
@@ -5081,12 +5013,13 @@ sub calculate_multiplicative_forecast {
                 foreach my $profile (@profiles) {
                     my $profile_name = $profile->{name};
                     # Use is_generic_baseline=1 to strip time filters that might exclude data
-                    my $nfit_cmd = _build_nfit_baseline_command(
+                    my ($nfit_cmd, $manifest_obj) = _build_nfit_baseline_command(
                         $profile->{flags}, $start_str, $end_str, $system_cache_dir,
                         0,    # enable_clipping_detection
-                        1,    # is_generic_baseline (strips time filters)
+                        0,    # HistoricBaseline: contextual baseline (keeps time filters, matching the logic for peak; ensure "apples to apples" comparison)
                         undef, # allow_growth_prediction
-                        $profile_name
+                        $profile_name,
+                        $exclusions_href
                     );
 
                     my $nfit_output = '';
@@ -9935,10 +9868,10 @@ sub _sanitise_manifest_for_history {
 sub run_single_pass_analysis {
     my ($system_cache_dir, $profiles_ref, $args_ref) = @_;
 
-    print STDERR "\n  [+] Single Pass Engine Analysis\n";
+    print STDERR "    [+] Single Pass Engine Analysis\n";
 
     # 1. Build the manifest using the function already added.
-    _subtask("Building transform manifest");
+    print STDERR "      • Building transform manifest\n";
 
     # [FIX] Extract runq_perc_behavior from args (default to 'none' if missing)
     my $runq_behavior = $args_ref->{runq_perc_behavior} // 'none';
@@ -10080,14 +10013,15 @@ sub run_single_pass_analysis {
     $command .= " --enable-growth-prediction" if $any_profile_has_growth;
     $command .= " --analysis-reference-date $args_ref->{analysis_reference_date}" if defined $args_ref->{analysis_reference_date};
     $command .= " --enable-clipping-detection" if $args_ref->{enable_clipping_detection}; # Pass this through
+    $command .= " -q";  # execute nfit engine silently
 
     # 4. Execute the nfit engine and capture its output.
-     _subtask("Executing nFit Engine");
+    print STDERR "      • Executing nFit Engine\n";
     my $raw_nfit_output = `$command`;
     my $exit_status = $? >> 8;
 
     if ($exit_status != 0) {
-        die "  [ERROR] nFit Single Pass Engine execution failed for system '$system_cache_dir' with exit code $exit_status.\nCommand: $command\nOutput: $raw_nfit_output";
+        die "      [ERROR] nFit Single Pass Engine execution failed for system '$system_cache_dir' with exit code $exit_status.\nCommand: $command\nOutput: $raw_nfit_output";
     }
 
     # --- BEGIN STEP 2 DEBUGGING ---
@@ -10493,7 +10427,7 @@ INPUT SELECTION:
   --default-smt, --smt <N>  : Optional default SMT level for RunQ calculations.
                                (Default: $DEFAULT_SMT_VALUE_PROFILE)
 
-WORKLOAD PROFILING, MODELLING, AND FORECASTING MODES:
+OVERVIEW OF WORKLOAD PROFILING, MODELLING, AND FORECASTING MODES:
   (default)
         Workload Profiling
         State-based, forensic workload characterisation without time decay.
@@ -10515,14 +10449,14 @@ WORKLOAD PROFILING, MODELLING, AND FORECASTING MODES:
 
   --apply-seasonality <event>
         Seasonal Forecasting (Event-Specific)
-        Executes the forecasting model configured for the specified event.
-        Models may include:
-          - Recency-Anchored Decay
-          - Multiplicative Seasonal
-          - Predictive Peak (robust regression: Theil–Sen)
+        Executes the forecasting model configured for a single specified event.
+        Models are configured in `etc/nfit.seasonality.cfg` and may include:
+          - Recency-Anchored Decay (recency_decay)
+          - Multiplicative Seasonal (multiplicative_seasonal)
+          - Predictive Peak (robust regression: Theil–Sen) (predictive_peak)
 
   --seasonal
-        Seasonal Forecasting (Automatic)
+        Seasonal Forecasting (Automatic, comprehensive)
         Executes all applicable seasonal forecasting models mentioned above,
         as defined in etc/nfit.seasonality.cfg.
 
@@ -10556,6 +10490,14 @@ Model behaviour depends on the event configuration:
 
   --seasonal                                : Execute all configured seasonal models applicable to the analysis period.
 
+  --analysis-reference-date <YYYY-MM-DD>    : Seasonal Analysis Reference Date (As-of Anchor)
+                                              Sets the "as-of" date used to evaluate whether seasonal events are
+                                              complete/active and therefore eligible for forecasting.
+
+                                              Default: effective analysis end date (-e), otherwise the last
+                                              recorded date in the staged data cache.
+                                              Must precede --enddate if both are set.
+
   --update-history                          : Populate or extend the historical system snapshot cache.
                                               Discovers completed months and seasonal events from the staged data cache
                                               and records workload and forecasting snapshots for advanced analysis and adaptive scoring.
@@ -10580,10 +10522,6 @@ RECENCY AND DECAY CONTROLS:
   --decay-half-life-days <N>                : Half-life for recency weighting.
                                              (Default: $DEFAULT_DECAY_HALF_LIFE_DAYS_FOR_NFIT)
 
-  --analysis-reference-date <YYYY-MM-DD>    : Reference date for recency calculations.
-                                              Default: last recorded date in staged NMON data cache.
-                                              Must precede --enddate if both are set.
-
   --runq-avg-method <none|sma|ema>          : Averaging method applied to RunQ data before percentile calculation.
                                               (Default: $DEFAULT_NFIT_RUNQ_AVG_METHOD)
 
@@ -10593,14 +10531,16 @@ CONFIGURATION FILES:
                                               Can contain 'runq_modifier_behavior = additive_only' per profile,
                                               and profile-specific 'nfit_flags' including --runq-norm-perc/--runq-abs-perc.
 
-STANDARD ANALYSIS FILTERING OPTIONS:
-  -s, --startdate <YYYY-MM-DD>              : Global start date for analysis (passed to nfit). Optional.
-                                              Defines the earliest date that analysis is allowed to use.
-                                              (Data earlier than this date in the cache will be ignored for this run).
-  -e, --enddate <YYYY-MM-DD>                : Global end date for analysis (passed to nfit). Optional.
-                                              Defines the as-of date for analysis and forecasting.
-                                              All seasonal models and forecasts are anchored to this date,
-                                                even if newer data exists in the cache.
+ANALYSIS FILTERING OPTIONS:
+  -s, --startdate <YYYY-MM-DD>              : Global start date for analysis. Optional.
+                                              Limits the data considered for analysis and forecasting.
+                                              Data earlier than this date will be ignored, even if present
+                                              in the current staged data cache.
+  -e, --enddate <YYYY-MM-DD>                : Global end date for analysis. Optional.
+                                              Limits the data considered for analysis and forecasting.
+                                              Data later than this date will be ignored, even if present
+                                              in the current staged data cache.
+
   -vm, --lpar <name>                        : Analyse only the specified VM/LPAR name (passed to nfit). Optional.
 
 ROUNDING OPTIONS:
@@ -10907,18 +10847,93 @@ sub _group_events_by_fingerprint {
 
 # ==============================================================================
 # SUBROUTINE: _execute_automatic_seasonal_discovery
-# PURPOSE:    Orchestrates the automatic discovery and execution of seasonal events.
+#
+# PURPOSE:
+#   Orchestrates the execution of seasonal forecasting events as-of a specific
+#   analysis reference date.
+#
+#   This subroutine is the single authoritative entry point for all seasonal
+#   model execution in nfit-profile, and is used by both:
+#     - `--seasonal`                : (execute all active seasonal events)
+#     - `--apply-seasonalitaty <E>` : (execute a single explicit event, if active)
+#
+#   Behaviour:
+#     - Determines the effective analysis anchor date (explicit or implicit).
+#     - Discovers which seasonal events are active for that anchor date.
+#     - Optionally restricts execution to a single explicitly requested event.
+#     - Executes the appropriate model-specific _execute_* subroutine(s).
+#     - Ensures per-event isolation by resetting seasonal state between runs.
+#
+#   This function DOES NOT perform forecasting logic itself; it is an
+#   orchestration layer only. All heavy computation, CSV output, and history
+#   storage are performed inside the model-specific executors.
+#
+# ARGUMENTS:
+#   $seasonality_config   (hashref)
+#       Full seasonality configuration map, keyed by event name.
+#
+#   $current_cache_path   (string)
+#       Path to the active data cache being analysed.
+#
+#   $profiles_aref       (arrayref)
+#       List of profile identifiers (e.g. G3-95W15, O3-95W15, etc.).
+#
+#   $args_href            (hashref)
+#       Execution context and tuning parameters passed through to model
+#       executors. Includes (but is not limited to):
+#         - system_identifier
+#         - nfit_path
+#         - rounding_flags
+#         - runq behaviour parameters
+#         - cache bounds
+#         - effective start / end dates
+#
+#   $analysis_anchor_date (Time::Piece | undef)
+#       Explicit analysis reference date ("as-of" date). If undef, the executor
+#       will derive an appropriate anchor date based on cache contents and
+#       model-specific rules.
+#
+#   $event_filter         (string | undef)
+#       Optional explicit event name. If provided, only this event will be
+#       executed, and only if it is active for the analysis reference date.
+#       If the event is not active, execution is skipped with an informational
+#       message.
+#
+# RETURNS:
+#   None.
+#
+# SIDE EFFECTS:
+#   - Executes one or more seasonal model runs.
+#   - Produces CSV output.
+#   - Writes forecast results into history partitions.
+#
+# NOTES:
+#   - Analysis reference date is preserved across event executions.
+#   - Seasonal execution flags are reset between events to prevent model
+#     state leakage.
+#   - This subroutine is safe to call repeatedly (e.g. for month-end backfill).
+#
 # ==============================================================================
 sub _execute_automatic_seasonal_discovery {
-    my ($seasonality_config, $current_cache_path, $profiles_aref, $args_href, $analysis_anchor_date) = @_;
+    my ($seasonality_config, $current_cache_path, $profiles_aref, $args_href, $analysis_anchor_date, $event_filter) = @_;
 
-    _phase("Automatic Seasonal Discovery");
+    _phase('Seasonal Discovery');
 
     # 1. Detect active events
     # Use the anchor date (from data) if provided, otherwise fallback to system time (gmtime)
     my $analysis_date = $analysis_anchor_date // gmtime();
     # Pass 1 to ignore_compounding_check to discover ALL active events
     my @active_events = detect_active_events($analysis_date, $seasonality_config, 1);
+
+    # Filter (in case --apply-seasonality was specified): restrict execution to a single explicitly requested event
+    if (defined $event_filter && length $event_filter) {
+        @active_events = grep { ($_->{_eventName} // '') eq $event_filter } @active_events;
+
+        if (scalar @active_events == 0) {
+            print STDERR "  [INFO] Seasonal event $event_filter is not active for reference date (" . $analysis_date->ymd . ")\n";
+            return;
+        }
+    }
 
     if (scalar @active_events == 0) {
         print STDERR "  [INFO] No active seasonal events found for reference date (" . $analysis_date->ymd . ")\n";
@@ -10930,7 +10945,7 @@ sub _execute_automatic_seasonal_discovery {
     # 2. Iterate and execute
     foreach my $event_cfg (@active_events) {
         my $event_name = $event_cfg->{_eventName};
-        print STDERR "\n  ⧉ Executing Seasonal Forecast for event $event_name\n";
+        print STDERR "\n  ⧉ Executing seasonal forecast for event $event_name\n";
 
         # Reset global state to ensure clean execution
         _reset_seasonal_state();
@@ -10967,7 +10982,6 @@ sub _reset_seasonal_state {
     # Reset globals used by nfit-profile logic
     $nfit_decay_over_states = 0;
     $nfit_enable_windowed_decay = 0;
-    $nfit_analysis_reference_date_str = undef;
     $is_multiplicative_forecast_run = 0;
     $is_predictive_peak_model_run = 0;
 
@@ -10989,7 +11003,7 @@ sub _execute_multiplicative_seasonal {
 
     # Handle cold-start graceful skip
     unless (defined $effective_event_name) {
-        print STDERR "  [-] Skipping '$event_name' (cold start - run --update-history first)\n";
+        print STDERR "  [-] Skipping forecast for event $event_name (cold start; execution of `--update-history` is required)\n";
         return;
     }
 
@@ -11213,7 +11227,7 @@ sub _execute_recency_decay {
 
     # Recency decay cannot run with state-based decay
     if ($args_href->{decay_over_states}) {
-        warn "  Skipping Recency Decay for '$event_name': Cannot run with --decay-over-states.\n";
+        warn "    Skipping Recency Decay for '$event_name': Cannot run with --decay-over-states.\n";
         return;
     }
 
@@ -11224,7 +11238,7 @@ sub _execute_recency_decay {
     my ($event_start_obj, $event_end_obj) = determine_event_period($event_config, $asof_end, 'forecast');
 
     unless ($event_start_obj && $event_end_obj) {
-        warn "  Skipping Recency Decay for '$event_name': Could not determine event period.\n";
+        warn "    Skipping Recency Decay for '$event_name': Could not determine event period.\n";
         return;
     }
 
@@ -11233,8 +11247,9 @@ sub _execute_recency_decay {
     # Priority 2: Smart Default for Month-End events (Snap to last completed month)
     # Priority 3: Fallback to Effective End Date (Current Analysis Point)
 
+    my $run_end_date_obj = $asof_end;
     if ($nfit_analysis_reference_date_str) {
-         print STDERR "  Φ Recency-Decay: Anchoring to user-defined analysis reference date ($nfit_analysis_reference_date_str)\n";
+         print STDERR "    Φ Recency-Decay: Anchoring to user-defined analysis reference date ($nfit_analysis_reference_date_str)\n";
     } else {
         # CHECK FOR SMART DEFAULT: Is this a Month-End event?
         # period = monthly AND day_of_period = -1
@@ -11259,11 +11274,12 @@ sub _execute_recency_decay {
 
         if ($smart_anchor) {
             $nfit_analysis_reference_date_str = $smart_anchor->ymd;
-            print STDERR "  Φ Recency-Decay: Anchoring analysis to last completed month-end ($nfit_analysis_reference_date_str)\n";
+            $run_end_date_obj = $smart_anchor;
+            print STDERR "    Φ Recency-Decay: Anchoring analysis to last completed month-end ($nfit_analysis_reference_date_str)\n";
         } else {
             # Fallback for non-month-end events
             $nfit_analysis_reference_date_str = $asof_end->ymd;
-            print STDERR "  Φ Recency-Decay: Anchoring analysis to effective end date of event ($nfit_analysis_reference_date_str)\n";
+            print STDERR "    Φ Recency-Decay: Anchoring analysis to effective end date of event ($nfit_analysis_reference_date_str)\n";
         }
     }
 
@@ -11297,7 +11313,7 @@ sub _execute_recency_decay {
             analysis_reference_date => $nfit_analysis_reference_date_str,
             exclusions => $exclusions,
 
-            # Use the calculated effective analysis dates from the main loop
+            # Use the calculated effective analysis dates (strings) from the main loop
             start_date => $asof_start->ymd,
             end_date => $run_end_date
         }
@@ -11311,11 +11327,11 @@ sub _execute_recency_decay {
     my $log_fh = $open_log_files{$args_href->{system_identifier}};
     if ($log_fh) {
         my $ctx = {
-            start    => $args_href->{cache_start_date},
-            end      => $args_href->{cache_end_date},
+            start       => $asof_start,
+            end         => $run_end_date_obj,  # anchored end used for decay/time-zero
             cache_start => $args_href->{cache_start_date},
             cache_end   => $args_href->{cache_end_date},
-            interval => $args_href->{sampling_interval}
+            interval    => $args_href->{sampling_interval}
         };
         _log_seasonal_config_context($log_fh, $event_config, $ctx);
     }
@@ -11469,9 +11485,9 @@ sub _execute_recency_decay {
 
     my $horizon_meta = undef;
 
-    if (defined $event_end_obj && defined $asof_end) {
+    if (defined $event_end_obj && defined $run_end_date_obj) {
         # Calculate days between Analysis Anchor (Apr 30) and Target (May 31)
-        my $days_diff = int(($event_end_obj->epoch - $asof_end->epoch) / 86400);
+        my $days_diff = int(($event_end_obj->epoch - $run_end_date_obj->epoch) / 86400);
         $days_diff = 0 if $days_diff < 0;
 
         $horizon_meta = {
@@ -11487,8 +11503,8 @@ sub _execute_recency_decay {
     # Build the context object from existing args
     my $analysis_context = {
         analysis_start  => time(),
-        start       => $args_href->{effective_start_date}, # Must be Time::Piece object
-        end         => $args_href->{effective_end_date},   # Must be Time::Piece object
+        start       => $asof_start,         # Time::Piece object
+        end         => $run_end_date_obj,   # Time::Piece object
         cache_start => $args_href->{cache_start_date},
         cache_end   => $args_href->{cache_end_date},
         interval    => $args_href->{sampling_interval} # Integer
