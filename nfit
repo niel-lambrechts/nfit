@@ -109,6 +109,7 @@ my $mgsys_filter;
 my $start_date_str;
 my $end_date_str;
 my $target_vm_name;
+my $exclude_vms_str;
 my $round_arg;
 my $roundup_arg;
 my $smt_value = $DEFAULT_SMT;
@@ -176,6 +177,7 @@ GetOptions(
     'round|r:f'           => \$round_arg,
     'roundup|u:f'         => \$roundup_arg,
     'vms|vm|lpar|lpars=s' => \$target_vm_name,
+    'exclude-vms|exclude-vm=s' => \$exclude_vms_str,
     'smt=i'               => \$smt_value,
     'runq-avg-method=s'   => \$runq_avg_method_str,
     # Windowed Decay Options
@@ -555,7 +557,7 @@ if ($manifest_file) {
         }
     }
 
-   # New single-pass engine entry point.
+    # New single-pass engine entry point.
     # We now construct a single hash reference containing all necessary global
     # flags to pass to the engine. This keeps the function call clean and
     # ensures all original functionality is preserved.
@@ -566,6 +568,7 @@ if ($manifest_file) {
 
         # --- Filtering Arguments ---
         target_vm_name          => $target_vm_name,
+        exclude_vms_str         => $exclude_vms_str,
         start_date_str          => $start_date_str,
         end_date_str            => $end_date_str,
         include_states          => $include_states_selector,
@@ -2529,6 +2532,7 @@ sub run_single_pass_from_manifest {
     my $manifest_file                = $args_ref->{manifest_file};
     my $nmon_dir                     = $args_ref->{nmon_dir};
     my $target_vm_name               = $args_ref->{target_vm_name};
+    my $exclude_vms_str              = $args_ref->{exclude_vms_str};
     my $start_date_str               = $args_ref->{start_date_str};
     my $end_date_str                 = $args_ref->{end_date_str};
     my $include_states_selector      = $args_ref->{include_states};
@@ -2626,6 +2630,14 @@ sub run_single_pass_from_manifest {
                 if (defined $state->{start_epoch}) { $state->{start_time} = gmtime($state->{start_epoch}); }
                 if (defined $state->{end_epoch})   { $state->{end_time}   = gmtime($state->{end_epoch}); }
 
+                # Populate duration_days for reporting/metadata consistency
+                if (defined $state->{start_epoch} && defined $state->{end_epoch}) {
+                    my $diff = $state->{end_epoch} - $state->{start_epoch};
+                    $state->{duration_days} = ($diff >= 0) ? (int($diff / 86400) + 1) : 0;
+                } else {
+                    $state->{duration_days} = 0 unless defined $state->{duration_days};
+                }
+
                 my $md = $state->{metadata};
                 $md->{smt} //= $smt_value; # USE the unpacked global SMT as a fallback.
 
@@ -2647,6 +2659,62 @@ sub run_single_pass_from_manifest {
         %vms_to_process = map { $_ => 1 } split /,/, $target_vm_name;
     } else {
         %vms_to_process = map { $_ => 1 } keys %$states_by_vm;
+    }
+
+    # Phase 3.3: Apply VM exclusion filter (--exclude-vms)
+    if (defined $exclude_vms_str && $exclude_vms_str =~ /\S/) {
+        my @excluded_vms;
+        foreach my $vm_raw (split /,/, $exclude_vms_str) {
+            my $vm = $vm_raw;
+            $vm =~ s/^\s+//;  # Trim leading whitespace
+            $vm =~ s/\s+$//;  # Trim trailing whitespace
+            next unless length($vm);
+
+            if (exists $vms_to_process{$vm}) {
+                delete $vms_to_process{$vm};
+                push @excluded_vms, $vm;
+            } else {
+                print STDERR "[INFO] Exclusion target '$vm' not in processing set (already excluded or not present)\n"
+                    unless $quiet;
+            }
+        }
+
+        if (@excluded_vms && !$quiet) {
+            my $count = scalar(@excluded_vms);
+            print STDERR "[SCOPE] Excluded $count VM(s) via --exclude-vms: " . join(', ', sort @excluded_vms) . "\n";
+        }
+
+        # Safety check: ensure at least one VM remains
+        unless (%vms_to_process) {
+            die "[ERROR] All VMs excluded by --exclude-vms. No VMs remain for analysis.\n";
+        }
+    }
+
+    if (defined $include_states_selector && lc($include_states_selector) ne 'all') {
+        my @excluded_vms;
+        foreach my $vm_raw (split /,/, $exclude_vms_str) {
+            my $vm = $vm_raw;
+            $vm =~ s/^\s+//;  # Trim leading whitespace
+            $vm =~ s/\s+$//;  # Trim trailing whitespace
+            next unless length($vm);
+
+            if (exists $vms_to_process{$vm}) {
+                delete $vms_to_process{$vm};
+                push @excluded_vms, $vm;
+            } else {
+                print STDERR "[INFO] Exclusion target '$vm' not in processing set (already excluded or not present)\n" if $verbose;
+            }
+        }
+
+        if (@excluded_vms && !$quiet) {
+            my $count = scalar(@excluded_vms);
+            print STDERR "[-] Excluded $count VM(s) via --exclude-vms: " . join(', ', sort @excluded_vms) . "\n";
+        }
+
+        # Safety check: ensure at least one VM remains
+        unless (%vms_to_process) {
+            die "[ERROR] All VMs excluded by --exclude-vms. No VMs remain for analysis.\n";
+        }
     }
 
     if (defined $include_states_selector && lc($include_states_selector) ne 'all') {
@@ -2735,7 +2803,7 @@ sub run_single_pass_from_manifest {
     my $record_counter = 0;
     my $progress_interval = 50_000;
     my $show_progress = ($verbose || -t STDERR); # Show progress if verbose or interactive
-    printf STDERR "\r  -> Processing data cache ..." if ($show_progress);
+    printf STDERR "\r  -> Processing data cache ..." if ($show_progress && !$quiet);
 
     # Figure out total size and calculate actual bytes to process
     my $total_bytes = do {
@@ -2826,8 +2894,17 @@ sub run_single_pass_from_manifest {
                 $pct = 100.0 if $pct > 100.0;
             }
 
-            printf STDERR "\r  -> Processing data cache: %-19s (%.1f%%)",
-                $ts_str, $pct;
+            if ($show_progress && !$quiet) {
+                if (defined $start_date_str && defined $end_date_str) {
+                    printf STDERR "\r  ↳  Processing data cache ($start_date_str - $end_date_str): %-19s (%.1f%%)", $ts_str, $pct;
+                } elsif (defined $start_date_str) {
+                    printf STDERR "\r  ↳  Processing data cache (from $start_date_str): %-19s (%.1f%%)", $ts_str, $pct;
+                } elsif (defined $end_date_str) {
+                    printf STDERR "\r  ↳  Processing data cache (to $end_date_str): %-19s (%.1f%%)", $ts_str, $pct;
+                } else {
+                    printf STDERR "\r  ↳  Processing data cache: %-19s (%.1f%%)", $ts_str, $pct;
+                }
+            }
         }
 
         process_data_point($tp, $vm, $physc, $runq, $manifest, $states_by_vm, \%analysis_data, \%raw_data, \%transform_states, \%persistent_transform_states, \%daily_raw_data, {
@@ -2846,7 +2923,7 @@ sub run_single_pass_from_manifest {
     close $data_fh;
 
     # Print a final newline to clear the progress line
-    printf STDERR "\rProcessing data cache: %-34s\n", "done (100.0%)" if $show_progress;
+    printf STDERR "\r✓ Processed data cache ($start_date_str - $end_date_str): %-40s\n", "completed (100.0%)" if ($show_progress && !$quiet);
 
     # 8. Finalisation (calculates per-state/per-transform metrics)
     my $final_metrics = finalize_results(
@@ -3514,6 +3591,7 @@ sub generate_manifest_key {
         args => {
             # --- Data Scoping & Filtering Flags ---
             target_vm_name          => $args_href->{target_vm_name},
+            exclude_vms_str         => $args_href->{exclude_vms_str},
             start_date_str          => $args_href->{start_date_str},
             end_date_str            => $args_href->{end_date_str},
             include_states_selector => $args_href->{include_states_selector},
@@ -4691,6 +4769,8 @@ Filtering Options (Applied BEFORE windowing if decay enabled):
   -online / -batch           : Shortcut daily time filters.
   -no-weekends               : Exclude data from Saturdays and Sundays.
   -vm, --lpar <name>         : Analyse only the specified VM/LPAR name(s), comma-separated.
+  --exclude-vms <list>       : Exclude the specified VM(s) from analysis, comma-separated.
+                               Applied after --vm filter. Useful for ad-hoc exclusions.
 
 PhysC Calculation Options:
   -p, --percentile <value>   : Final percentile of PhysC (0-100) (Default: $DEFAULT_PERCENTILE).
