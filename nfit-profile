@@ -4845,7 +4845,152 @@ sub parse_seasonality_config {
     }
     close $fh;
 
-    return \%config_data;
+    # --- Deprecation Guard & Normalisation ---
+    # 'allow_compounding' has been removed in favour of the more explicit
+    # 'interaction_policy = exclusive|combined'. We do NOT support both keys,
+    # as mixed semantics are error-prone and undermine auditability.
+    foreach my $section (keys %config_data) {
+        # 1. Deprecation Check (Hard Fail)
+        if (exists $config_data{$section}{allow_compounding}) {
+            die "[ERROR] Config deprecated: 'allow_compounding' is no longer supported (found in section '$section').\n" .
+                "        Use 'interaction_policy = exclusive|combined'.\n";
+        }
+
+        # 2. Alias Resolution (concurrent_interaction -> interaction_policy)
+        # If the user used the alias, map it to the primary key.
+        if ($config_data{$section}{concurrent_interaction}) {
+            $config_data{$section}{interaction_policy} //= $config_data{$section}{concurrent_interaction};
+        }
+
+        # 3. Centralised Defaulting
+        # Ensure the key always exists so downstream code doesn't need '// exclusive'
+        $config_data{$section}{interaction_policy} //= 'exclusive';
+
+        # 4. Input Sanitisation
+        # Handle case variations (Exclusive vs exclusive)
+        $config_data{$section}{interaction_policy} = lc($config_data{$section}{interaction_policy});
+        unless ($config_data{$section}{interaction_policy} =~ /^(exclusive|combined)$/) {
+            warn "[WARN] Invalid interaction_policy in [$section]: '$config_data{$section}{interaction_policy}' (defaulting to 'exclusive')\n";
+            $config_data{$section}{interaction_policy} = 'exclusive';
+        }
+    }
+
+    # ----------------------------------------------------------------------
+    # Resolve inheritance EARLY (centralised): Global defaults + per-event overrides
+    #
+    # Goal: downstream code should consume a fully-resolved event config
+    # hash, so helpers do not need to “know” about inheritance rules.
+    #
+    # Supported early-resolution behaviours:
+    #  - Global fallback for common keys (any key set in [Global])
+    #  - vms/exclude_vms inheritance, with support for "vms = ALL"
+    #  - pre-parsed VM scope filter stored in event config as _vm_scope_filter
+    # ----------------------------------------------------------------------
+    my %resolved;
+
+    # Preserve Global section as-is (raw), but also treat it as defaults.
+    $resolved{Global} = { %{ $config_data{Global} // {} } };
+
+    # Inheritable keys are simply any keys present in [Global]; per-event overrides win.
+    # We additionally support explicit vm-scope semantics (vms/exclude_vms), including
+    # "vms = ALL" to override a Global include restriction.
+    foreach my $section (sort keys %config_data) {
+        next if $section =~ /^(?:Global|Adaptive)$/i;
+
+        my $event_raw  = $config_data{$section} // {};
+        my $global_raw = $config_data{Global}   // {};
+
+        # Start with Global defaults, then overlay event overrides.
+        my %merged = (%$global_raw, %$event_raw);
+
+        # Ensure event name is always available to downstream code.
+        $merged{_eventName} = $section;
+
+        # --- VM Scope Resolution (Phase 3.3) ---
+        # Resolve inheritance and reserved keyword handling here.
+        my $vms_str = exists $event_raw->{vms}
+            ? $event_raw->{vms}
+            : ($global_raw->{vms} // '');
+
+        my $exclude_vms_str = exists $event_raw->{exclude_vms}
+            ? $event_raw->{exclude_vms}
+            : ($global_raw->{exclude_vms} // '');
+
+        $vms_str //= '';
+        $exclude_vms_str //= '';
+
+        # "vms = ALL" explicitly means "include all VMs" and overrides any Global include list.
+        if ($vms_str =~ /^\s*all\s*$/i) {
+            $vms_str = '';
+        }
+
+        my $vm_scope_filter = _build_vm_scope_filter_from_strings(
+            $vms_str,
+            $exclude_vms_str,
+            exists $event_raw->{vms}        ? 'event'  : 'global',
+            exists $event_raw->{exclude_vms}? 'event'  : 'global',
+        );
+
+        # Store resolved strings for audit/logging and the parsed filter for fast use.
+        $merged{vms}            = $vms_str;
+        $merged{exclude_vms}    = $exclude_vms_str;
+        $merged{_vm_scope_filter} = $vm_scope_filter;  # may be undef
+
+        $resolved{$section} = \%merged;
+    }
+
+    return \%resolved;
+
+}
+
+# ------------------------------------------------------------------------------
+# Helper: build a VM scope filter structure from resolved strings.
+# Centralised so parse_seasonality_config can resolve inheritance early.
+# Returns undef if no filters apply.
+# ------------------------------------------------------------------------------
+sub _build_vm_scope_filter_from_strings {
+    my ($vms_str, $exclude_vms_str, $include_source, $exclude_source) = @_;
+
+    $vms_str //= '';
+    $exclude_vms_str //= '';
+
+    return undef unless ($vms_str =~ /\S/ || $exclude_vms_str =~ /\S/);
+
+    my %result = (
+        include => undef,
+        exclude => undef,
+        include_source => $include_source,
+        exclude_source => $exclude_source,
+    );
+
+    # Parse 'vms' (include list)
+    if ($vms_str =~ /\S/) {
+        my %include_lookup;
+        foreach my $vm_raw (split /,/, $vms_str) {
+            my $vm = $vm_raw;
+            $vm =~ s/^\s+//;
+            $vm =~ s/\s+$//;
+            next unless length($vm);
+            $include_lookup{$vm} = 1;
+        }
+        $result{include} = \%include_lookup if %include_lookup;
+    }
+
+    # Parse 'exclude_vms' (exclude list)
+    if ($exclude_vms_str =~ /\S/) {
+        my %exclude_lookup;
+        foreach my $vm_raw (split /,/, $exclude_vms_str) {
+            my $vm = $vm_raw;
+            $vm =~ s/^\s+//;
+            $vm =~ s/\s+$//;
+            next unless length($vm);
+            $exclude_lookup{$vm} = 1;
+        }
+        $result{exclude} = \%exclude_lookup if %exclude_lookup;
+    }
+
+    return undef unless ($result{include} || $result{exclude});
+    return \%result;
 }
 
 # ==============================================================================
@@ -4855,7 +5000,7 @@ sub parse_seasonality_config {
 #             intelligently determines the most appropriate recent baseline and
 #             applies a recency-weighted seasonal multiplier derived from
 #             historical, saturation-corrected peak data. It also includes
-#             logic for volatility, residual peak forecasting, and compounding.
+#             logic for volatility, residual peak forecasting, and concurrent event interaction.
 # RETURNS:
 #   - A hash reference containing the final forecasted results.
 #   - A hash reference containing historical data for verbose reporting.
@@ -5113,26 +5258,46 @@ sub calculate_multiplicative_forecast {
         return ({}, {});
     }
 
-    # --- Step 3: Detect Active Events for Compounding ---
+    # --- Step 3: Detect Concurrent Events for Interaction (Overlap) ---
     my $today_for_recency = (defined $asof_end_obj && ref($asof_end_obj) eq 'Time::Piece') ? $asof_end_obj->truncate(to => 'day') : gmtime()->truncate(to => 'day');
     my ($next_event_start, $next_event_end) = determine_event_period($event_config, $today_for_recency, 'forecast');
 
     my $forecast_date_obj = (defined $next_event_start && ref($next_event_start) eq 'Time::Piece') ? $next_event_start : $today_for_recency;
 
-    # The current event being processed is ALWAYS active (primary event)
-    # detect_active_events finds ADDITIONAL concurrent events for compounding
+    # Interaction policy controls whether this event combines with other concurrent events.
+    # Values: exclusive (default) | combined
+    my $primary_interaction_policy = lc($event_config->{interaction_policy} // 'exclusive');
+    unless ($primary_interaction_policy =~ /^(exclusive|combined)$/) {
+        warn "  [WARN] Invalid interaction_policy '$primary_interaction_policy' for event '$event_name' (defaulting to 'exclusive')\n";
+        $primary_interaction_policy = 'exclusive';
+    }
+
+    # The current event being processed is ALWAYS the primary event.
     my @active_events;
     my $current_event_cfg_copy = { %$event_config, _eventName => $event_name };
     push @active_events, $current_event_cfg_copy;
 
-    # Detect additional concurrent events (for compounding scenarios)
+    # Detect other concurrent events (overlap discovery is always performed for observability).
     my @detected_concurrent = detect_active_events($forecast_date_obj, $full_seasonality_config);
+
+    my @overlap_event_names;
+    my @ignored_overlap_names;
+
     foreach my $detected (@detected_concurrent) {
-        # Skip if it's the same event we're already processing
-        next if (($detected->{_eventName} // '') eq $event_name);
-        # Only add events that participate in compounding
-        next unless ($detected->{allow_compounding});
-        push @active_events, $detected;
+        my $detected_name = ($detected->{_eventName} // '');
+        next if ($detected_name eq '' || $detected_name eq $event_name);
+        push @overlap_event_names, $detected_name;
+
+        if ($primary_interaction_policy eq 'combined') {
+            my $detected_policy = lc($detected->{interaction_policy} // 'exclusive');
+            if ($detected_policy eq 'combined') {
+                push @active_events, $detected;
+            } else {
+                push @ignored_overlap_names, $detected_name;
+            }
+        } else {
+            push @ignored_overlap_names, $detected_name;
+        }
     }
 
     # --- Step 4: Calculate Recency-Weighted Multiplier & Final Forecast ---
@@ -5150,7 +5315,7 @@ sub calculate_multiplicative_forecast {
         return (\%final_forecasts, \%historic_data_for_csv);
     }
 
-    my $is_compound_run = (scalar(@active_events) > 1);
+    my $is_interaction_run = (scalar(@active_events) > 1);
     my @dampening_factors;
 
     my $event_count = scalar(@active_events);
@@ -5158,8 +5323,34 @@ sub calculate_multiplicative_forecast {
 
     print STDERR "  ◆ Active seasonal events: $event_count ($event_list)\n";
 
-    if ($is_compound_run) {
-        print STDERR "  [INFO] Seasonal Compounding mode enabled\n";
+    # Observability: report overlap discovery even when interaction is exclusive.
+    if (@overlap_event_names) {
+        print STDERR "  [INFO] Concurrent Event Overlap detected: " . scalar(@overlap_event_names) . " (" . join(", ", @overlap_event_names) . ")\n";
+    }
+
+    # Interaction: combined means we will multiply in other events' multipliers (with optional dampening).
+    if ($primary_interaction_policy eq 'combined') {
+        if ($is_interaction_run) {
+            my @dampening_candidates = grep { defined $_ && looks_like_number($_) } map { $_->{interaction_dampening_factor} } @active_events;
+            my $dampening_to_apply = @dampening_candidates ? (sort { $a <=> $b } @dampening_candidates)[0] : undef;
+
+            print STDERR "  [INFO] Concurrent Event Interaction: " . scalar(@active_events) . " events active ($event_list)\n";
+            if (defined $dampening_to_apply) {
+                print STDERR "         → Multipliers will be combined with dampening factor $dampening_to_apply\n";
+            } else {
+                print STDERR "         → Multipliers will be combined (no dampening configured)\n";
+            }
+        } else {
+            print STDERR "  [INFO] Concurrent Event Interaction: policy=combined (no concurrent combined events)\n";
+            if (@overlap_event_names) {
+                print STDERR "         → Overlap present but no combined participants: " . join(", ", @overlap_event_names) . "\n";
+            }
+        }
+    } else {
+        print STDERR "  [INFO] Concurrent Event Interaction: policy=exclusive (no multiplier combination)\n";
+        if (@ignored_overlap_names) {
+            print STDERR "         → Ignoring concurrent event(s): " . join(", ", @ignored_overlap_names) . "\n";
+        }
     }
 
     # Main processing loop: iterate through each VM that has a valid baseline.
@@ -5251,7 +5442,7 @@ sub calculate_multiplicative_forecast {
                 }
             }
 
-            if ($is_compound_run && @dampening_factors) {
+            if ($is_interaction_run && @dampening_factors) {
                 my $dampening_to_apply = (sort { $a <=> $b } @dampening_factors)[0];
                 $final_multiplier = 1 + (($final_multiplier - 1) * $dampening_to_apply);
             }
@@ -5595,14 +5786,14 @@ sub calculate_volatility_buffer {
 }
 
 # ==============================================================================
-# Subroutine to detect all active, compoundable seasonal events for a given date.
+# Subroutine to detect all active seasonal events for a given date.
 # Returns:
 # - An array of event configuration hashes, sorted by priority (desc).
 # Notes:
 # - CORRECTED to handle both fixed-date and recurring-period definitions.
 # ==============================================================================
 sub detect_active_events {
-    my ($analysis_date_obj, $seasonality_config_href, $ignore_compounding_check) = @_;
+    my ($analysis_date_obj, $seasonality_config_href) = @_;
 
     my @active_events;
     return @active_events unless (defined $analysis_date_obj && ref($analysis_date_obj) eq 'Time::Piece');
@@ -5611,12 +5802,13 @@ sub detect_active_events {
     my $analysis_date_utc = gmtime($analysis_date_obj->epoch)->truncate(to => 'day');
 
     foreach my $event_name (keys %{$seasonality_config_href}) {
-        my $event_config = $seasonality_config_href->{$event_name};
+        # SAFETY: Skip config metadata sections.
+        # We explicitly skip 'Global' and 'Adaptive' because they are
+        # Attribute Containers (parents), not Schedulable Events (children).
+        # These are not events and have no dates.
+        next if $event_name =~ /^(?:Global|Adaptive)$/i;
 
-        # Only check allow_compounding if we are NOT ignoring the check
-        unless ($ignore_compounding_check) {
-            next unless (($event_config->{allow_compounding} // '') =~ /^(true|1)$/i);
-        }
+        my $event_config = $seasonality_config_href->{$event_name};
 
         # Determine the period for this event relative to the analysis date.
         my ($start_obj, $end_obj) = determine_event_period($event_config, $analysis_date_utc);
@@ -6374,13 +6566,20 @@ sub _log_seasonal_config_context {
     my $lookback = $event_config->{baseline_period_days} // "N/A";
     printf {$fh} "  %-${label_width}s : %s days\n", "Baseline Lookback", $lookback;
 
-    # Compounding Logic
-    my $compounding_str = "Exclusive (No Compounding)";
-    if (($event_config->{allow_compounding} // '') =~ /^(true|1)$/i) {
-        my $dampening = $event_config->{interaction_dampening_factor} // "N/A";
-        $compounding_str = "Enabled (Dampening: $dampening)";
+    # Concurrent Event Interaction
+    my $policy = lc($event_config->{interaction_policy} // 'exclusive');
+    unless ($policy =~ /^(exclusive|combined)$/) {
+        $policy = 'exclusive';
     }
-    printf {$fh} "  %-${label_width}s : %s\n", "Compounding Logic", $compounding_str;
+
+    my $interaction_str = "policy=$policy";
+    if ($policy eq 'combined') {
+        my $dampening = $event_config->{interaction_dampening_factor};
+        if (defined $dampening && looks_like_number($dampening)) {
+            $interaction_str .= " (dampening: $dampening)";
+        }
+    }
+    printf {$fh} "  %-${label_width}s : %s\n", "Concurrent Event Interaction", $interaction_str;
 
     # Rule Version
     my $version = $event_config->{last_modified} // "N/A";
@@ -6667,7 +6866,7 @@ sub calculate_predictive_peak_forecast {
     my $true_baseline_results_href = _get_true_baseline_results($system_cache_dir, $event_name, $event_config, $full_seasonality_config, $exclusions_href, $asof_start_obj, $asof_end_obj);
 
     # --- Generate Active Events String ---
-    # Even though predictive usually targets one event, we check for compounding overlap for consistency.
+    # Even though predictive usually targets one event, we check for concurrent overlap for consistency.
     my ($next_start, $next_end) = determine_event_period($event_config);
     my $forecast_date_obj = $next_start // gmtime();
     my @active_events = detect_active_events($forecast_date_obj, $full_seasonality_config);
@@ -11169,7 +11368,7 @@ sub _execute_automatic_seasonal_discovery {
                                 // gmtime();
 
     # 3. Detect active events using the canonical date
-    my @active_events = detect_active_events($canonical_reference_date, $seasonality_config, 1);
+    my @active_events = detect_active_events($canonical_reference_date, $seasonality_config);
 
     # Filter (in case --apply-seasonality was specified)
     if (defined $event_filter && length $event_filter) {
@@ -11948,7 +12147,7 @@ sub _execute_multiplicative_seasonal {
     @vm_order = sort keys %{$assimilation_map};
 
     # 5a. Phase 3.3: Apply VM scope filter if configured (supports 'vms' and 'exclude_vms')
-    my $vm_scope_filter = _parse_vm_scope_filter($event_config, $seasonality_config);
+    my $vm_scope_filter = _parse_vm_scope_filter($event_config);
     my $vm_scope_meta = _apply_vm_scope_filter(
         $vm_scope_filter,
         \@vm_order,
@@ -12334,7 +12533,7 @@ sub _execute_recency_decay {
     @vm_order = sort keys %{$assimilation_map};
 
     # 4a. Phase 3.3: Apply VM scope filter if configured (supports 'vms' and 'exclude_vms')
-    my $vm_scope_filter = _parse_vm_scope_filter($event_config, $seasonality_config);
+    my $vm_scope_filter = _parse_vm_scope_filter($event_config);
     my $vm_scope_meta = _apply_vm_scope_filter(
         $vm_scope_filter,
         \@vm_order,
@@ -12628,7 +12827,7 @@ sub _execute_predictive_peak {
     @vm_order = sort keys %{$assimilation_map};
 
     # 4a. Phase 3.3: Apply VM scope filter if configured (supports 'vms' and 'exclude_vms')
-    my $vm_scope_filter = _parse_vm_scope_filter($event_config, $seasonality_config);
+    my $vm_scope_filter = _parse_vm_scope_filter($event_config);
     my $vm_scope_meta = _apply_vm_scope_filter(
         $vm_scope_filter,
         \@vm_order,
@@ -12856,7 +13055,7 @@ sub _resolve_effective_window {
     return ($eff_start, $eff_end);
 }
 ###############################################################################
-# Phase 3.2 – True Compounding (Intra-Bucket Aggregation)
+# Phase 3.2 – Intra-Event Aggregation (Within-Bucket)
 #
 # Only multiplicative_seasonal is aggregated across multiple occurrences
 # within a bucket. Other models remain "run once per bucket end".
@@ -12875,6 +13074,7 @@ sub _resolve_aggregation_method {
     }
 
     # Optional global default (if your loader provides it)
+    # this code is deprecated (inheritance is now performed early)
     if ($seasonality_config
         && ref($seasonality_config) eq 'HASH'
         && $seasonality_config->{Global}
@@ -12887,98 +13087,17 @@ sub _resolve_aggregation_method {
     return 'median';
 }
 
-# ==============================================================================
-# SUBROUTINE: _parse_vm_scope_filter
-# PURPOSE:    Phase 3.3 - Parses 'vms' (include) and 'exclude_vms' (exclude)
-#             configuration keys from event config with Global fallback.
-#             Returns a hashref with 'include' and 'exclude' keys, or undef
-#             if no filtering is configured.
-# ARGUMENTS:
-#   $event_config       - hashref of the specific event's configuration
-#   $seasonality_config - hashref of the full seasonality config (optional)
-#                         If provided, Global section is checked as fallback
-# INHERITANCE:
-#   - Per-event setting overrides Global (replacement, not merge)
-#   - If per-event is not defined, Global value is used
-#   - If neither is defined, no filtering occurs
-# ==============================================================================
 sub _parse_vm_scope_filter {
-    my ($event_config, $seasonality_config) = @_;
+    my ($event_config) = @_;
 
     return undef unless (defined $event_config && ref($event_config) eq 'HASH');
 
-    # Resolve effective values with Global fallback
-    my $global_config = ($seasonality_config && ref($seasonality_config) eq 'HASH')
-        ? ($seasonality_config->{Global} // {})
-        : {};
+    # VM scope inheritance and resolution are performed in parse_seasonality_config.
+    # At this stage we only return the already-resolved, already-parsed filter.
+    my $vm_scope_filter = $event_config->{_vm_scope_filter};
+    return undef unless ($vm_scope_filter && ref($vm_scope_filter) eq 'HASH');
 
-    # Per-event overrides Global (check if key exists, even if empty string)
-    my $vms_str = exists $event_config->{vms}
-        ? $event_config->{vms}
-        : $global_config->{vms};
-
-    my $exclude_vms_str = exists $event_config->{exclude_vms}
-        ? $event_config->{exclude_vms}
-        : $global_config->{exclude_vms};
-
-    # Normalise undefined to empty string
-    $vms_str //= '';
-    $exclude_vms_str //= '';
-
-    # Phase 3.3: Support "ALL" as reserved keyword for vms (case-insensitive)
-    # "vms = ALL" explicitly means "include all VMs" (equivalent to not specifying vms)
-    # Useful for per-event override of a Global vms restriction
-    if ($vms_str =~ /^\s*all\s*$/i) {
-        $vms_str = '';  # Treat as "no include filter" = all VMs
-    }
-
-    # Early exit if neither filter is configured
-    return undef unless ($vms_str =~ /\S/ || $exclude_vms_str =~ /\S/);
-
-    my %result = (
-        include => undef,
-        exclude => undef,
-        # Track inheritance source for audit/logging
-        include_source => undef,
-        exclude_source => undef,
-    );
-
-    # Parse 'vms' (include list)
-    if ($vms_str =~ /\S/) {
-        my %include_lookup;
-        foreach my $vm_raw (split /,/, $vms_str) {
-            my $vm = $vm_raw;
-            $vm =~ s/^\s+//;  # Trim leading whitespace
-            $vm =~ s/\s+$//;  # Trim trailing whitespace
-            next unless length($vm);  # Skip empty entries
-            $include_lookup{$vm} = 1;
-        }
-        if (%include_lookup) {
-            $result{include} = \%include_lookup;
-            $result{include_source} = exists $event_config->{vms} ? 'event' : 'global';
-        }
-    }
-
-    # Parse 'exclude_vms' (exclude list)
-    if ($exclude_vms_str =~ /\S/) {
-        my %exclude_lookup;
-        foreach my $vm_raw (split /,/, $exclude_vms_str) {
-            my $vm = $vm_raw;
-            $vm =~ s/^\s+//;  # Trim leading whitespace
-            $vm =~ s/\s+$//;  # Trim trailing whitespace
-            next unless length($vm);  # Skip empty entries
-            $exclude_lookup{$vm} = 1;
-        }
-        if (%exclude_lookup) {
-            $result{exclude} = \%exclude_lookup;
-            $result{exclude_source} = exists $event_config->{exclude_vms} ? 'event' : 'global';
-        }
-    }
-
-    # Return undef if no valid filters after parsing
-    return undef unless ($result{include} || $result{exclude});
-
-    return \%result;
+    return $vm_scope_filter;
 }
 
 # ==============================================================================
@@ -13311,7 +13430,7 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
 
     # Phase 3.3: Apply VM scope filter to aggregated results (supports 'vms' and 'exclude_vms')
     # Filter is applied AFTER aggregation to ensure synthesis stats reflect all occurrences
-    my $vm_scope_filter = _parse_vm_scope_filter($event_cfg, $seasonality_config);
+    my $vm_scope_filter = _parse_vm_scope_filter($event_cfg);
     my $vm_scope_meta = undef;
 
     if ($vm_scope_filter) {
