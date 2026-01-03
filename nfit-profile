@@ -217,6 +217,7 @@ my $nmon_dir;
 my $excel_formulas_flag = "false";
 my $mgsys_filter;
 my $verbose = 0;
+my $debug = 0;
 my $force_update = 0;
 
 # Seasonality related variables
@@ -267,6 +268,7 @@ GetOptions(
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
+    "d|debug"                    => \$debug,
     'force'                      => \$force_update,
 ) or die usage_wrapper();
 
@@ -871,7 +873,7 @@ if ($vm_config_found)
                 pool_name   => $rvals[$vm_config_col_idx{'procpool_name'}],
                 pool_id     => $rvals[$vm_config_col_idx{'procpool_id'}],
                 entitlement => $rvals[$vm_config_col_idx{'entitledcpu'}],
-                maxcpu      => ($max_cpu_val + 0), # Store as number
+                max_capacity      => ($max_cpu_val + 0), # Store as number
                 smt         => $smt_v,
             };
         }
@@ -5114,7 +5116,7 @@ sub calculate_multiplicative_forecast {
 
     if (!$is_contaminated && $clean_days_available >= $MIN_BASELINE_DAYS) {
         $baseline_source_log = "Post-Peak (calculated from " . $post_peak_baseline_start_obj->date . " to " . $analysis_end_obj->date . ")";
-        print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline strategy]: selected post-peak window (" . $post_peak_baseline_start_obj->date . " → " . $analysis_end_obj->date . ")\n";
+        print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline window]: post-peak (" . $post_peak_baseline_start_obj->date . " ↔ " . $analysis_end_obj->date . ")\n";
 
         my $start_str = $post_peak_baseline_start_obj->strftime('%Y-%m-%d');
         my $end_str   = $analysis_end_obj->strftime('%Y-%m-%d');
@@ -5166,11 +5168,11 @@ sub calculate_multiplicative_forecast {
         }
 
         if ($is_contaminated) {
-            print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline strategy]: post-peak window disqualified (contaminated); selected pre-peak baseline\n";
+            print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline window]: pre-peak (post-peak disqualified: contaminated)\n";
         } elsif ($clean_days_available < $MIN_BASELINE_DAYS) {
-            print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline strategy]: post-peak window disqualified (too short); selected pre-peak baseline\n";
+            print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline window]: pre-peak (post-peak disqualified: too short)\n";
         } else {
-            print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline strategy]: post-peak window disqualified; selected pre-peak baseline\n";
+            print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline window]: pre-peak (post-peak disqualified)\n";
         }
 
         %current_baseline_results = %{$most_recent_peak_snapshot->{results}{HistoricBaseline} || {}};
@@ -5283,8 +5285,15 @@ sub calculate_multiplicative_forecast {
     my $current_event_cfg_copy = { %$event_config, _eventName => $event_name };
     push @active_events, $current_event_cfg_copy;
 
-    # Detect other concurrent events (overlap discovery is always performed for observability).
-    my @detected_concurrent = detect_active_events($forecast_date_obj, $full_seasonality_config);
+    # Detect other concurrent events using STRICT overlap detection.
+    # This checks for actual interval intersection with the analysis window,
+    # NOT horizon-expanded discovery ranges.
+    my @detected_concurrent = _detect_concurrent_events_strict(
+        $analysis_start_obj,
+        $analysis_end_obj,
+        $event_name,
+        $full_seasonality_config
+    );
 
     my @overlap_event_names;
     my @ignored_overlap_names;
@@ -5331,7 +5340,21 @@ sub calculate_multiplicative_forecast {
 
     # Observability: report overlap discovery even when interaction is exclusive.
     if (@overlap_event_names) {
-        print STDERR "  [INFO] Concurrent Event Overlap detected: " . scalar(@overlap_event_names) . " (" . join(", ", @overlap_event_names) . ")\n";
+        my $n = scalar(@overlap_event_names);
+        my $names = join(", ", @overlap_event_names);
+
+        # Did overlap actually affect this run?
+        # (You already know whether combined interaction applied: $primary_interaction_policy and $is_interaction_run)
+        my $effect =
+            ($primary_interaction_policy eq 'combined' && $is_interaction_run) ? "effect: applied"
+          : ($primary_interaction_policy eq 'combined' && !$is_interaction_run) ? "effect: none"
+          : "effect: ignored (exclusive)";
+
+        print STDERR "  ◆ Concurrent Event overlap: $n ($effect)\n";
+
+        if (($verbose // 0) >= 1) {
+            print STDERR "    ↳  Overlapping Events: $names\n";
+        }
     }
 
     # Interaction: combined means we will multiply in other events' multipliers (with optional dampening).
@@ -5347,13 +5370,13 @@ sub calculate_multiplicative_forecast {
                 print STDERR "         → Multipliers will be combined (no dampening configured)\n";
             }
         } else {
-            print STDERR "  [INFO] Concurrent Event Interaction: policy=combined (no concurrent combined events)\n";
+            print STDERR "  Φ Concurrent Event Interaction policy: combined (no combined participants)\n";
             if (@overlap_event_names) {
                 print STDERR "         → Overlap present but no combined participants: " . join(", ", @overlap_event_names) . "\n";
             }
         }
     } else {
-        print STDERR "  [INFO] Concurrent Event Interaction: policy=exclusive (no multiplier combination)\n";
+        print STDERR "  Φ Concurrent Event Interaction policy: exclusive (no multiplier combination)\n";
         if (@ignored_overlap_names) {
             print STDERR "         → Ignoring concurrent event(s): " . join(", ", @ignored_overlap_names) . "\n";
         }
@@ -5897,6 +5920,100 @@ sub detect_active_events {
     }
 
     return sort { ($b->{priority} // 0) <=> ($a->{priority} // 0) } @active_events;
+}
+
+# Find the end of detect_active_events (around line 5940, after the closing brace)
+# and insert this new subroutine:
+
+# ------------------------------------------------------------------------------
+# SUBROUTINE: _detect_concurrent_events_strict
+# PURPOSE:    Detect events that ACTUALLY overlap with a specific analysis window.
+#             Unlike detect_active_events(), this does NOT apply horizon expansion.
+#             Used for accurate concurrent event overlap reporting.
+# ARGUMENTS:
+#   $window_start_obj  - Time::Piece object for analysis window start
+#   $window_end_obj    - Time::Piece object for analysis window end
+#   $primary_event_name - Name of the primary event (excluded from results)
+#   $seasonality_config_href - Full seasonality config hash
+# RETURNS:    List of event config hashrefs that overlap the window
+# ------------------------------------------------------------------------------
+sub _detect_concurrent_events_strict {
+    my ($window_start_obj, $window_end_obj, $primary_event_name, $seasonality_config_href) = @_;
+
+    my @overlapping_events;
+    return @overlapping_events unless (
+        defined $window_start_obj && ref($window_start_obj) eq 'Time::Piece' &&
+        defined $window_end_obj   && ref($window_end_obj)   eq 'Time::Piece'
+    );
+
+    # Normalise to UTC day boundaries for consistent comparison
+    my $win_start_epoch = gmtime($window_start_obj->epoch)->truncate(to => 'day')->epoch;
+    my $win_end_epoch   = gmtime($window_end_obj->epoch)->truncate(to => 'day')->epoch;
+
+    foreach my $event_name (keys %{$seasonality_config_href}) {
+        # Skip metadata sections and the primary event itself
+        next if $event_name =~ /^(?:Global|Adaptive)$/i;
+        next if $event_name eq $primary_event_name;
+
+        my $event_config = $seasonality_config_href->{$event_name};
+        my $duration_days = $event_config->{duration_days} // 1;
+
+        # For explicit dates, check each date/range for overlap
+        if (defined $event_config->{dates}) {
+            my @date_ranges = split /\s*,\s*/, $event_config->{dates};
+            foreach my $range (@date_ranges) {
+                $range =~ s/^\s+|\s+$//g;
+
+                my ($evt_start_epoch, $evt_end_epoch);
+
+                if ($range =~ /^(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})$/) {
+                    # Date range: YYYY-MM-DD:YYYY-MM-DD
+                    my $s = eval { Time::Piece->strptime($1, '%Y-%m-%d')->truncate(to => 'day') };
+                    my $e = eval { Time::Piece->strptime($2, '%Y-%m-%d')->truncate(to => 'day') };
+                    next unless ($s && $e);
+                    $evt_start_epoch = $s->epoch;
+                    $evt_end_epoch   = $e->epoch;
+                }
+                elsif ($range =~ /^(\d{4}-\d{2}-\d{2})$/) {
+                    # Single date: apply duration_days
+                    my $d = eval { Time::Piece->strptime($1, '%Y-%m-%d')->truncate(to => 'day') };
+                    next unless $d;
+                    $evt_start_epoch = $d->epoch;
+                    $evt_end_epoch   = $d->epoch + (($duration_days - 1) * 86400);
+                }
+                else {
+                    next;
+                }
+
+                # Check for interval overlap: NOT (A ends before B starts OR A starts after B ends)
+                if (!($evt_end_epoch < $win_start_epoch || $evt_start_epoch > $win_end_epoch)) {
+                    my $cfg_copy = { %$event_config, _eventName => $event_name };
+                    push @overlapping_events, $cfg_copy;
+                    last;  # One overlap is sufficient to include this event
+                }
+            }
+        }
+        # For recurring events (monthly/weekly), determine the occurrence relative to the window
+        elsif (defined $event_config->{period}) {
+            # Use the window midpoint to find the relevant occurrence
+            my $midpoint_epoch = int(($win_start_epoch + $win_end_epoch) / 2);
+            my $midpoint_obj = gmtime($midpoint_epoch)->truncate(to => 'day');
+
+            my ($evt_start_obj, $evt_end_obj) = determine_event_period($event_config, $midpoint_obj);
+            next unless (defined $evt_start_obj && defined $evt_end_obj);
+
+            my $evt_start_epoch = $evt_start_obj->epoch;
+            my $evt_end_epoch   = $evt_end_obj->epoch;
+
+            # Check for interval overlap
+            if (!($evt_end_epoch < $win_start_epoch || $evt_start_epoch > $win_end_epoch)) {
+                my $cfg_copy = { %$event_config, _eventName => $event_name };
+                push @overlapping_events, $cfg_copy;
+            }
+        }
+    }
+
+    return @overlapping_events;
 }
 
 # ==============================================================================
@@ -7031,7 +7148,7 @@ sub _get_true_baseline_results {
     close $filtered_fh;
 
     # --- Stage 3: Execute Single-Pass Analysis on the Filtered Data ---
-    print STDERR "  ⧉ Synthesising non-peak baseline from filtered data\n";
+    print STDERR "\n  ⧉ Synthesising non-peak baseline from filtered data\n";
 
     # 1. Build and Sanitise Manifest
     #    We use the global @profiles array and RunQ settings
@@ -7881,19 +7998,22 @@ sub _assemble_seasonal_snapshot {
             }
 
             # Extract clipping information from the same state where we found the value
+            my $max_capacity = 0;
             if (defined $source_state) {
                 $clipping_metrics = _safe_dig($source_state, 'metrics', 'physc', $profile_name, 'ClippingInfo');
+                # Note: The --config CSV file that is supported by this program captures max_capacity as 'maxcpu'.
+                #       In .nfit.cache.states, the value (of the maximum usable CPU) is stored as 'max_capacity'.
+                $max_capacity = _safe_dig($source_state, 'metadata', 'max_capacity') //  _safe_dig($source_state, 'metadata', 'max_cpu') // 0;
             }
 
             if ($clipping_metrics && ref($clipping_metrics) eq 'HASH' && exists $clipping_metrics->{isClipped}) {
                 my $unmet_demand_est = $clipping_metrics->{unmetDemandEstimate} // 0;
-                my $max_cpu = _safe_dig($source_state, 'metadata', 'max_cpu') // 0;
 
                 # Assemble ClippingInfo with the exact structure expected by consumers
                 $clipping_info_results{$vm_name}{$profile_name} = {
                     isClipped               => $clipping_metrics->{isClipped},
                     clippingConfidence      => $clipping_metrics->{clippingConfidence} // 'unknown',
-                    capacityLimit           => $max_cpu,
+                    capacityLimit           => $max_capacity,
                     unmetDemandEstimate     => $unmet_demand_est,
                     unclippedPeakEstimate   => ($standard_peak_value // 0) + $unmet_demand_est,
                     platformSpecificMarkers => {
@@ -8214,7 +8334,7 @@ sub _store_model_forecast_to_history {
     if ($vm_count > 0) {
         $event_snapshot->{ModelForecasts}{$model_type} = \%model_data;
 
-        # Phase 3.2: Also populate results.HistoricPeak and results.HistoricBaseline
+        # Phase 3.2: Also populate results block (Zone 1) for models that generate observable facts
         # This enables multiplier calculation for subsequent occurrences within the same run
         if ($model_type eq 'multiplicative_seasonal') {
             $event_snapshot->{results} //= {};
@@ -8238,6 +8358,39 @@ sub _store_model_forecast_to_history {
                     my $base_val = $model_data{$vm_name}{baseline}{$profile_key};
                     if (defined $base_val && looks_like_number($base_val)) {
                         $event_snapshot->{results}{HistoricBaseline}{$vm_name}{$profile_key} = $base_val + 0;
+                    }
+                }
+            }
+        }
+
+
+        # Phase 3.3: Capture Zone 1 results for recency_decay
+        # Although recency_decay doesn't consume historical snapshots, recording what it
+        # observed enables historical audit, accuracy analysis, and cross-month comparison.
+        # For recency_decay, the "forecast" IS the observed peak (measurement of last peak period).
+        if ($model_type eq 'recency_decay') {
+            $event_snapshot->{results} //= {};
+            $event_snapshot->{results}{PeakValue} //= {};
+
+            foreach my $vm_name (keys %model_data) {
+                foreach my $profile_key (keys %{ $model_data{$vm_name}{forecast} // {} }) {
+                    # PeakValue: For recency_decay, the forecast IS the observed peak
+                    my $peak_val = $model_data{$vm_name}{forecast}{$profile_key};
+                    if (defined $peak_val && looks_like_number($peak_val)) {
+                        $event_snapshot->{results}{PeakValue}{$vm_name}{$profile_key} = $peak_val + 0;
+                    }
+                }
+            }
+
+            # Capture ClippingInfo from %seasonal_debug_info if available
+            if (%seasonal_debug_info) {
+                $event_snapshot->{results}{ClippingInfo} //= {};
+                foreach my $vm_name (keys %seasonal_debug_info) {
+                    foreach my $profile_key (keys %{$seasonal_debug_info{$vm_name}}) {
+                        my $clip_info = $seasonal_debug_info{$vm_name}{$profile_key}{ClippingInfo};
+                        if (ref($clip_info) eq 'HASH' && scalar keys %$clip_info > 0) {
+                            $event_snapshot->{results}{ClippingInfo}{$vm_name}{$profile_key} = $clip_info;
+                        }
                     }
                 }
             }
@@ -9617,15 +9770,15 @@ sub _assemble_monthly_analysis {
                 my $base_peak_for_unclip = _safe_dig($last_state_data, 'metrics', 'physc', $profile_name, $p_key);
 
                 # Get MaxCPU from VM config
-                # IMPORTANT: ClippingInfo uses 'maxcpu' (lowercase), not 'max_cpu'
-                my $maxcpu = $vm_config_ref->{maxcpu} // 0;
+                # IMPORTANT: ClippingInfo uses 'max_capacity' (lowercase), not 'max_cpu'
+                my $max_capacity = $max_cpu_from_state // $vm_config_ref->{max_capacity} // 0;
 
                 # Assemble the ClippingInfo structure with exact key names
                 # that downstream consumers (nfit-forecast, GUI) expect
                 $clipping_info_for_vm->{$profile_name} = {
                     isClipped               => $clipping_metrics->{isClipped},
                     clippingConfidence      => $clipping_metrics->{clippingConfidence} // 'unknown',
-                    capacityLimit           => $maxcpu,
+                    capacityLimit           => $max_capacity,
                     unmetDemandEstimate     => $unmet_demand_est,
                     unclippedPeakEstimate   => ((defined $base_peak_for_unclip && looks_like_number($base_peak_for_unclip)) ? $base_peak_for_unclip : 0) + $unmet_demand_est,
                     platformSpecificMarkers => {
@@ -11461,12 +11614,11 @@ sub _compute_bucket_fingerprint {
     sub _load_stored_bucket_fingerprint {
         my ($system_cache_dir, $event_name, $model_type, $bucket_key) = @_;
 
-
         # ------------------------------------------------------------------
         # Phase 4 DEBUG: lookup probe (only when -v / -vv)
         # Shows exactly what month key we search, and what we find (or don't).
         # ------------------------------------------------------------------
-        if (($verbose // 0) >= 1) {
+        if ($debug) {
             my $bk_ref = ref($bucket_key) || '';
             my $bucket_preview = $bk_ref ? "$bucket_key" : (defined $bucket_key ? $bucket_key : '(undef)');
             print STDERR "      ↳ [DEBUG] Phase 4 load-stored: event=$event_name model=$model_type bucket_key=$bucket_preview"
@@ -11479,7 +11631,7 @@ sub _compute_bucket_fingerprint {
         unless (exists $_fingerprint_history_cache{$cache_key}) {
             $_fingerprint_history_cache{$cache_key} = read_unified_history($system_cache_dir);
         }
-        if (($verbose // 0) >= 2) {
+        if ($debug) {
             my @months = sort keys %{$_fingerprint_history_cache{$cache_key} // {}};
             print STDERR "      ↳ [DEBUG] Phase 4 load-stored: unified history months=" . scalar(@months)
                 . " first=" . ($months[0] // '(none)') . " last=" . ($months[-1] // '(none)') . "\n";
@@ -11535,20 +11687,19 @@ sub _compute_bucket_fingerprint {
 sub _should_reprocess_bucket {
     my ($system_cache_dir, $event_name, $event_cfg, $model_type, $bucket_key, $exec_ctx, $prev_bucket_fp, $dependency_fp, $force_flag) = @_;
 
-
     # ------------------------------------------------------------------
-    # Phase 4 DEBUG: argument sanity probe (only when -v / -vv)
-    # This is designed to catch the exact issue you're seeing:
+    # Idempotency & Dependency Awareness: DEBUG: argument sanity probe (only when --debug)
+    # This is designed to catch reference issues such as:
     # bucket_key accidentally arriving as a HASH ref -> "HASH(0x...)"
     # ------------------------------------------------------------------
-    if (($verbose // 0) >= 1) {
+    if ($debug) {
         my $bk_ref  = ref($bucket_key) || '';
         my $ec_ref  = ref($exec_ctx)   || '';
         my $ev_ref  = ref($event_cfg)  || '';
         my $sc_ref  = ref($seasonality_config) || '';
 
         my $bucket_preview = $bk_ref ? "$bucket_key" : (defined $bucket_key ? $bucket_key : '(undef)');
-        print STDERR "      ↳ [DEBUG] Phase 4 gate args: event=$event_name model=$model_type bucket_key=$bucket_preview"
+        print STDERR "      ↳ [DEBUG] _should_reprocess_bucket(): event=$event_name model=$model_type bucket_key=$bucket_preview"
             . " bucket_ref=" . ($bk_ref || '(scalar)')
             . " exec_ctx_ref=" . ($ec_ref || '(undef)')
             . " event_cfg_ref=" . ($ev_ref || '(undef)')
@@ -11556,14 +11707,16 @@ sub _should_reprocess_bucket {
             . "\n";
 
         if ($bk_ref) {
-            print STDERR "      ↳ [DEBUG] Phase 4 gate WARN: bucket_key is a reference; prior fingerprint lookup will never match months like '2025-04'\n";
-            if (($verbose // 0) >= 2) {
-                require Data::Dumper;
-                local $Data::Dumper::Terse  = 1;
-                local $Data::Dumper::Indent = 0;
-                print STDERR "      ↳ [DEBUG] Phase 4 gate bucket_key dump: " . Data::Dumper::Dumper($bucket_key) . "\n";
-            }
+            print STDERR "      ↳ [DEBUG] _should_reprocess_bucket(): WARN: bucket_key is a reference; prior fingerprint lookup will never match months like '2025-04'\n";
+            require Data::Dumper;
+            local $Data::Dumper::Terse  = 1;
+            local $Data::Dumper::Indent = 0;
+            print STDERR "      ↳ [DEBUG] _should_reprocess_bucket(): bucket_key dump: " . Data::Dumper::Dumper($bucket_key) . "\n";
         }
+    }
+
+    if ($verbose) {
+        print STDERR "      ↳  Dependency: " . substr(($dependency_fp // ''), 0, 12) . "\n";
     }
 
     # Compute current fingerprint (always, to ensure provenance is persisted even under --force)
@@ -11904,7 +12057,7 @@ sub _execute_automatic_seasonal_discovery {
     # Purpose: quickly confirm whether Phase 4 subs exist/are compiled and
     # whether the orchestrator is invoking them.
     # ----------------------------------------------------------------------
-    if (($verbose // 0) >= 1) {
+    if ($debug) {
         my @need = qw(
             _should_reprocess_bucket
             _compute_bucket_fingerprint
@@ -12031,7 +12184,7 @@ sub _execute_automatic_seasonal_discovery {
                 my $event_label  = $event_name // 'event';
 
                 # Default: always show the anchoring milestone
-                print STDERR "    Φ Anchoring $event_label analysis to reference date $anchor_ymd for history month $bucket_month\n";
+                print STDERR "    Φ History month $bucket_month: anchored to reference date $anchor_ymd\n";
 
                 # -v: user-friendly context about what data is being used
                 if (($verbose // 0) >= 1) {
@@ -12039,15 +12192,16 @@ sub _execute_automatic_seasonal_discovery {
                     if ($anchor_info->{bucket_occurrences} && ref($anchor_info->{bucket_occurrences}) eq 'ARRAY') {
                         $occ_n = scalar @{$anchor_info->{bucket_occurrences}};
                     }
+
                     # Translate anchor_source to plain English
                     my $src = $anchor_info->{anchor_source} // 'unknown';
-                    my $src_desc = $src eq 'bucket_latest_end'   ? 'latest completed occurrence'
-                                 : $src eq 'bucket_first_end'    ? 'earliest occurrence'
-                                 : $src eq 'bucket_aggregated'   ? 'aggregated occurrences'
+                    my $src_desc = $src eq 'bucket_latest_end'   ? 'latest completed event occurrence'
+                                 : $src eq 'bucket_first_end'    ? 'earliest completed event occurrence'
+                                 : $src eq 'bucket_aggregated'   ? 'aggregated event occurrences'
                                  : $src;
 
                     my $occ_label = $occ_n == 1 ? '1 occurrence' : "$occ_n occurrences";
-                    print STDERR "      ↳  Analysis basis: $src_desc ($occ_label in bucket)\n";
+                    print STDERR "      ↳  Analysis basis: $src_desc ($occ_label)\n";
 
                     # Show occurrence end dates if multiple
                     if ($occ_n > 1 && $anchor_info->{bucket_occurrences}) {
@@ -12067,8 +12221,14 @@ sub _execute_automatic_seasonal_discovery {
                 next;
             }
 
+            if (($verbose // 0) >= 1 && $anchor_info->{occurrence_start} && $anchor_info->{occurrence_end}) {
+                print STDERR "      ↳  Occurrence Window: " . $anchor_info->{occurrence_start}->ymd . " ↔ " . $anchor_info->{occurrence_end}->ymd . "\n";
+            }
+
             # Build the execution context with anchor information
             my $exec_ctx = _build_anchor_execution_context($anchor_info, $args_href, $event_cfg);
+            $exec_ctx->{debug}   = $debug ? 1 : 0;
+            $exec_ctx->{verbose} = $verbose // 0;   # if not already present everywhere
 
             # --- PHASE 4: IDEMPOTENCY GATE ---
 
@@ -12103,12 +12263,12 @@ sub _execute_automatic_seasonal_discovery {
                 # Default: show skip with user-friendly reason
                 # Skip this bucket - fingerprints match
                 my $skip_reason = _translate_skip_reason($reprocess_decision->{reason_category});
-                print STDERR "    ↳  [SKIP] Bucket $effective_bucket_key: $skip_reason\n";
+                print STDERR "      ↳  $effective_bucket_key: $skip_reason\n";
 
                 # -vv only: show fingerprint details
                 if (($verbose // 0) >= 2) {
                     my $fp_short = substr($reprocess_decision->{stored_fp}{combined} // '', 0, 12);
-                    print STDERR "      ↳  [DEBUG] Fingerprint: $fp_short...\n";
+                    print STDERR "        ↳  Fingerprint: $fp_short...\n";
                 }
 
                 # Update chain-of-custody with stored fingerprint for next bucket
@@ -12121,16 +12281,17 @@ sub _execute_automatic_seasonal_discovery {
             # Log reprocess reason
             my $reason_cat = $reprocess_decision->{reason_category} // 'unknown';
             if ($reason_cat eq 'missing_prior') {
-                print STDERR "    ↳  [NEW] First analysis for $effective_bucket_key\n";
+                print STDERR "    ↳  First analysis for $effective_bucket_key\n";
             } elsif ($reason_cat eq 'force') {
-                print STDERR "    ↳  [FORCE] Reprocessing $effective_bucket_key ($reprocess_decision->{reason})\n";
+                print STDERR "    ↳  Forced re-processing for $effective_bucket_key\n";
+                print STDERR "      ↳  Reason: $reprocess_decision->{reason}\n" if (($verbose // 0) >= 1);
             } else {
                 my $change_desc = _translate_change_reason($reason_cat, $reprocess_decision->{reason});
-                print STDERR "    ↳  [UPDATE] Change detected: $effective_bucket_key: $change_desc\n";
+                print STDERR "    ↳  $effective_bucket_key: $change_desc\n";
             }
 
-            # -vv only: developer diagnostics
-            if (($verbose // 0) >= 2) {
+            # --debug only: developer diagnostics
+            if ($debug) {
                 print STDERR "      ↳  [DEBUG] Category: $reason_cat\n";
                 print STDERR "      ↳  [DEBUG] Detail: $reprocess_decision->{reason}\n";
                 if ($reprocess_decision->{current_fp}) {
@@ -13947,7 +14108,14 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
         return;
     }
 
-    print STDERR "    Φ Multiplicative: aggregating $occ_n $event_name event occurrence(s) in bucket " . ($bucket_exec_ctx->{anchor_bucket} // 'unknown') . " (method: $method)\n";
+    print STDERR "    Φ Multiplicative: aggregating $occ_n $event_name event occurrence(s) in " . ($bucket_exec_ctx->{anchor_bucket} // 'unknown') . " (method: $method)\n";
+
+    # IMPORTANT: per-occurrence runs must NOT inherit the bucket-anchored start window.
+    # Reset to cache bounds so _build_anchor_execution_context can clamp correctly per occurrence.
+    my %bucket_base_ctx = %$bucket_exec_ctx;
+    $bucket_base_ctx{effective_start_date} = $bucket_exec_ctx->{cache_start_date};
+    $bucket_base_ctx{effective_end_date}   = $bucket_exec_ctx->{cache_end_date};
+    my $bucket_base_ctx_ref = \%bucket_base_ctx;
 
     # Collect per-occurrence forecast values and multipliers
     # Phase 3.2: collect all component fields for complete history storage
@@ -13960,7 +14128,12 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
     my %amplification_samples;  # vm -> profile -> [amplification_factor, ...]
 
     # We run the model once per occurrence end-date, but do NOT write history.
+    # Performance: emit CSV only on the final occurrence to avoid redundant engine runs.
+    my $occ_total = scalar(@$bucket_occ_aref);
+    my $occ_idx = 0;
+
     foreach my $occ (@$bucket_occ_aref) {
+        $occ_idx++;
         next unless ($occ && ref($occ) eq 'HASH');
         next unless ($occ->{end} && ref($occ->{end}) eq 'Time::Piece');
 
@@ -13973,21 +14146,24 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
         my $occ_anchor_info = {
             anchor_date    => $occ_end,
             anchor_bucket  => $bucket_exec_ctx->{anchor_bucket},
-            anchor_source  => 'occurrence_end',
+            anchor_source  => ($occ_idx == $occ_total) ? 'bucket_aggregated_csv' : 'occurrence_end',
             occurrence_start => $occ_start,
             occurrence_end => $occ_end,
             is_complete    => 1,
         };
 
-        my $occ_exec_ctx = _build_anchor_execution_context($occ_anchor_info, $bucket_exec_ctx, $event_cfg);
+        my $occ_exec_ctx = _build_anchor_execution_context($occ_anchor_info, $bucket_base_ctx_ref, $event_cfg);
 
         # Ensure per-occurrence run is isolated from previous run state.
         _reset_seasonal_state();
         %seasonal_debug_info = ();  # important: prevent leakage across runs
 
+        # Final occurrence: enable CSV/rationale emission to avoid redundant engine run
+        my $is_final_occurrence = ($occ_idx == $occ_total);
+
         my $forecast_href = _execute_multiplicative_seasonal(
             $event_name, $event_cfg, $current_cache_path, $profiles_aref, $occ_exec_ctx, $seasonality_config,
-            { store_history => 0, emit_csv => 0, emit_rationale => 0 }  # Suppress all intermediate outputs
+            { store_history => 0, emit_csv => $is_final_occurrence, emit_rationale => $is_final_occurrence }
         );
 
         next unless ($forecast_href && ref($forecast_href) eq 'HASH' && scalar(keys %$forecast_href) > 0);
@@ -14195,45 +14371,10 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
         $bucket_exec_ctx->{_fingerprints}  # Phase 4: Idempotency fingerprints
     );
 
-    # Phase 3.2: Generate CSV output for aggregated bucket
-    # Re-run the final occurrence with CSV/rationale enabled
-    # Note: This generates a CSV with the last occurrence's data structure but the
-    # forecasts stored to history are the properly aggregated values.
-    if (%aggregated_forecast && @$bucket_occ_aref) {
-        my $last_occ = $bucket_occ_aref->[-1];
-        if ($last_occ && $last_occ->{end}) {
-            my $last_occ_end = scalar($last_occ->{end}->truncate(to => 'day'));
-            my $last_occ_start = ($last_occ->{start} && ref($last_occ->{start}) eq 'Time::Piece')
-                ? scalar($last_occ->{start}->truncate(to => 'day'))
-                : $last_occ_end;
-            my $bucket_month = $bucket_exec_ctx->{anchor_bucket} // 'unknown';
-
-            my $final_anchor_info = {
-                anchor_date      => $last_occ_end,
-                anchor_bucket    => $bucket_month,
-                anchor_source    => 'bucket_aggregated_csv',
-                occurrence_start => $last_occ_start,
-                occurrence_end   => $last_occ_end,
-                is_complete      => 1,
-            };
-
-            my $final_exec_ctx = _build_anchor_execution_context($final_anchor_info, $bucket_exec_ctx, $event_cfg);
-
-            _reset_seasonal_state();
-            %seasonal_debug_info = ();
-
-            # Run with CSV enabled, history disabled (already stored above)
-            _execute_multiplicative_seasonal(
-                $event_name,
-                $event_cfg,
-                $current_cache_path,
-                $profiles_aref,
-                $final_exec_ctx,
-                $seasonality_config,
-                { store_history => 0, emit_csv => 1, emit_rationale => 1 }
-            );
-        }
-    }
+    # Phase 3.2: CSV output for aggregated bucket
+    # Note: CSV emission is now handled during the final occurrence iteration above,
+    # eliminating the redundant engine run that previously occurred here.
+    # The forecasts stored to history are the properly aggregated values.
 
     return;
 }
