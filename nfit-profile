@@ -8,7 +8,7 @@
 
 use strict;
 use warnings;
-use Getopt::Long qw(GetOptions);
+use Getopt::Long qw(GetOptions :config bundling);
 use Cwd qw(abs_path);
 use File::Basename qw(dirname basename);
 use File::Spec qw(catfile);
@@ -37,6 +37,12 @@ my $PROFILE_SCRIPT_START_TIME_STR = localtime($PROFILE_SCRIPT_START_TIME_EPOCH)-
 
 # --- Version ---
 my $VERSION = '6.25.306.0';
+
+# --- Seasonal Engine Version (Phase 4: Idempotency) ---
+# Bump this constant whenever anchoring semantics, fingerprint logic, or
+# model computation behaviour changes. This ensures stale cached results
+# are correctly invalidated.
+my $SEASONAL_ENGINE_VERSION = '1.0.0';
 
 # --- Configuration ---
 my $DEFAULT_AVG_METHOD     = 'ema';
@@ -260,7 +266,7 @@ GetOptions(
     'update-history'             => \$update_history_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
-    'v|verbose+'                 => \$verbose,
+    "v|verbose+"                 => \$verbose,
     'force'                      => \$force_update,
 ) or die usage_wrapper();
 
@@ -7972,13 +7978,13 @@ sub _assemble_seasonal_snapshot {
 #
 # SCHEMA:
 #   SeasonalEventSnapshots.{event}.ModelForecasts.{model} = {
-#     _meta: { model_version, generated_on, analysis_window },
+#     _meta: { model_version, generated_on, analysis_window, fingerprints },
 #     VM01: { forecast: {P-99W1: val}, baseline: {P-99W1: val} },
 #     VM02: { ... }
 #   }
 # ==============================================================================
 sub _store_model_forecast_to_history {
-    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config, $horizon_meta, $analysis_context, $explicit_anchor_bucket) = @_;
+    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config, $horizon_meta, $analysis_context, $explicit_anchor_bucket, $fingerprints_href) = @_;
 
     return unless ($system_cache_dir && $event_name && $model_type && $forecast_results_href);
     return unless (scalar keys %$forecast_results_href > 0);
@@ -8117,6 +8123,17 @@ sub _store_model_forecast_to_history {
     if ($horizon_meta) {
         $meta_block->{forecast_target_date}  = $horizon_meta->{target_date};
         $meta_block->{forecast_horizon_days} = $horizon_meta->{days};
+    }
+
+    # Phase 4: Inject fingerprints for idempotency (if provided)
+    if ($fingerprints_href && ref($fingerprints_href) eq 'HASH') {
+        $meta_block->{fingerprints} = {
+            combined       => $fingerprints_href->{combined},
+            event_def      => $fingerprints_href->{event_def},
+            exec_ctx       => $fingerprints_href->{exec_ctx},
+            chain          => $fingerprints_href->{chain},
+            engine_version => $fingerprints_href->{engine_version},
+        };
     }
 
     $model_data{'_meta'} = $meta_block;
@@ -9092,7 +9109,7 @@ sub _validate_pre_update_conditions {
             foreach my $event_name (keys %$snapshots) {
                 if (exists $snapshots->{$event_name}{forecast}) {
                     if ($force_flag) {
-                        warn "⚠ WARNING: Month $month_key already enriched with forecasts. " .
+                        warn "⚠  Month $month_key already enriched with forecasts. " .
                              "This will be overwritten. Proceeding due to --force flag.\n";
                     } else {
                         die "FATAL: Month $month_key already contains forecast enrichment.\n" .
@@ -11236,6 +11253,474 @@ sub _compute_exclusion_fingerprint {
 }
 
 # ==============================================================================
+# SUBROUTINE: _compute_event_definition_fingerprint (Phase 4: Idempotency)
+# PURPOSE:    Computes a deterministic fingerprint for a normalised event
+#             definition. Changes to any configuration element that affects
+#             forecast computation will produce a different fingerprint.
+# ARGUMENTS:
+#   $event_cfg (hashref) - The resolved event configuration
+# RETURNS:
+#   String - MD5 hex digest of the canonical event representation
+# ==============================================================================
+sub _compute_event_definition_fingerprint {
+    my ($event_cfg) = @_;
+    return 'NONE' unless (defined $event_cfg && ref($event_cfg) eq 'HASH');
+
+    require Digest::MD5;
+
+    # Canonical keys that affect computation (alphabetically sorted for stability)
+    # Includes user-modifiable fields that should trigger reprocessing:
+    #   - dates, exclude_dates, vms, exclude_vms, last_modified
+    my @fingerprint_keys = qw(
+        aggregation_method
+        baseline_period_days
+        confidence_level
+        dates
+        day_of_period
+        description
+        duration_days
+        exclude_dates
+        exclude_vms
+        fallback_event
+        interaction_dampening_factor
+        interaction_policy
+        last_modified
+        min_history_days
+        min_historical_peaks
+        min_historical_years
+        model
+        outlier_detection
+        peak_amplification_factor
+        period
+        priority
+        regime_detection
+        residual_peak_profile
+        seasonal_confidence_level
+        seasonal_lookback_days
+        source_event
+        vms
+        volatility_adjustment
+    );
+
+    my @parts;
+    foreach my $key (sort @fingerprint_keys) {
+        my $val = $event_cfg->{$key};
+        if (defined $val) {
+            # Normalise whitespace and case for string values
+            if (!ref($val)) {
+                $val =~ s/^\s+|\s+$//g;  # Trim
+                $val =~ s/\s+/ /g;       # Collapse internal whitespace
+            }
+            push @parts, "$key=$val";
+        }
+    }
+
+    # Include VM scope filter fingerprint if present
+    if (exists $event_cfg->{_vm_scope_filter} && ref($event_cfg->{_vm_scope_filter}) eq 'HASH') {
+        my $scope = $event_cfg->{_vm_scope_filter};
+        if ($scope->{include} && ref($scope->{include}) eq 'HASH') {
+            push @parts, "vms_include=" . join(",", sort keys %{$scope->{include}});
+        }
+        if ($scope->{exclude} && ref($scope->{exclude}) eq 'HASH') {
+            push @parts, "vms_exclude=" . join(",", sort keys %{$scope->{exclude}});
+        }
+    }
+
+    my $canonical = join("|", @parts);
+    return Digest::MD5::md5_hex($canonical);
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_execution_context_fingerprint (Phase 4: Idempotency)
+# PURPOSE:    Computes a deterministic fingerprint for the execution context
+#             of a bucket run. This captures runtime parameters that affect
+#             the result.
+# ARGUMENTS:
+#   $exec_ctx (hashref) - The bucket execution context
+#   $model_type (string) - Model identifier
+# RETURNS:
+#   String - MD5 hex digest of the canonical execution context
+# ==============================================================================
+sub _compute_execution_context_fingerprint {
+    my ($exec_ctx, $model_type) = @_;
+    return 'NONE' unless (defined $exec_ctx && ref($exec_ctx) eq 'HASH');
+
+    require Digest::MD5;
+
+    my @parts;
+
+    # Core temporal boundaries
+    if ($exec_ctx->{effective_start_date} && ref($exec_ctx->{effective_start_date}) eq 'Time::Piece') {
+        push @parts, "start=" . $exec_ctx->{effective_start_date}->ymd;
+    }
+    if ($exec_ctx->{effective_end_date} && ref($exec_ctx->{effective_end_date}) eq 'Time::Piece') {
+        push @parts, "end=" . $exec_ctx->{effective_end_date}->ymd;
+    }
+
+    # Anchor information
+    push @parts, "anchor_bucket=" . ($exec_ctx->{anchor_bucket} // 'unknown');
+    push @parts, "model=" . ($model_type // 'unknown');
+
+    # Cache bounds (ground truth)
+    if ($exec_ctx->{cache_start_date} && ref($exec_ctx->{cache_start_date}) eq 'Time::Piece') {
+        push @parts, "cache_start=" . $exec_ctx->{cache_start_date}->ymd;
+    }
+    if ($exec_ctx->{cache_end_date} && ref($exec_ctx->{cache_end_date}) eq 'Time::Piece') {
+        push @parts, "cache_end=" . $exec_ctx->{cache_end_date}->ymd;
+    }
+
+    # Engine version (ensures stale results are invalidated on logic changes)
+    push @parts, "engine_version=$SEASONAL_ENGINE_VERSION";
+
+    my $canonical = join("|", sort @parts);
+    return Digest::MD5::md5_hex($canonical);
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_bucket_fingerprint (Phase 4: Idempotency)
+# PURPOSE:    Computes the combined fingerprint for a bucket. This is the
+#             primary fingerprint used for skip/redo decisions.
+# ARGUMENTS:
+#   $event_cfg (hashref)  - The resolved event configuration
+#   $exec_ctx (hashref)   - The bucket execution context
+#   $model_type (string)  - Model identifier
+#   $prev_bucket_fp (string|undef) - Fingerprint of the prior bucket (chain-of-custody)
+# RETURNS:
+#   Hashref containing:
+#     combined     - The combined bucket fingerprint
+#     event_def    - Event definition fingerprint
+#     exec_ctx     - Execution context fingerprint
+#     chain        - Chain-of-custody fingerprint (may be 'NONE' for first bucket)
+#     engine_version - Current engine version
+# ==============================================================================
+sub _compute_bucket_fingerprint {
+    # Added $dependency_fp to the end of the signature
+    my ($event_cfg, $exec_ctx, $model_type, $prev_bucket_fp, $dependency_fp) = @_;
+
+    require Digest::MD5;
+
+    my $event_def_fp = _compute_event_definition_fingerprint($event_cfg);
+    my $exec_ctx_fp  = _compute_execution_context_fingerprint($exec_ctx, $model_type);
+
+    # Chain-of-custody: hash of previous bucket's combined fingerprint
+    my $chain_fp = 'NONE';
+    if (defined $prev_bucket_fp && $prev_bucket_fp ne '' && $prev_bucket_fp ne 'NONE') {
+        $chain_fp = Digest::MD5::md5_hex("chain:$prev_bucket_fp");
+    }
+
+    # Upstream Dependencies (Phase 4 addition)
+    # Defaults to 'NONE' to ensure the hash is stable even if dependencies are empty
+    my $dep_fp_str = (defined $dependency_fp && $dependency_fp ne '') ? $dependency_fp : 'NONE';
+
+    # Canonical Assembly
+    # We use a hash structure and JSON encoding to ensure deterministic key sorting
+    # and clean extensibility without manually managing pipe delimiters.
+    my $fingerprint_components = {
+        event_def      => $event_def_fp,
+        exec_ctx       => $exec_ctx_fp,
+        chain          => $chain_fp,
+        dependencies   => $dep_fp_str,
+        # Ensure engine version is captured if available in scope, else default
+        engine_version => $SEASONAL_ENGINE_VERSION // '1.0',
+    };
+
+    # Encode with options to ensure stability:
+    # canonical (sort keys), utf8, allow_nonref
+    my $json_struct = JSON->new->utf8->canonical->allow_nonref->encode($fingerprint_components);
+
+    # Combined fingerprint
+    my $combined = Digest::MD5::md5_hex($json_struct);
+
+    return {
+        combined       => $combined,
+        event_def      => $event_def_fp,
+        exec_ctx       => $exec_ctx_fp,
+        chain          => $chain_fp,
+        dependencies   => $dep_fp_str,
+        engine_version => $fingerprint_components->{engine_version},
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _load_stored_bucket_fingerprint (Phase 4: Idempotency)
+# PURPOSE:    Loads the stored fingerprint metadata for a bucket from history.
+#             Uses memoisation to avoid repeated disk reads within the same
+#             nfit-profile invocation.
+# ARGUMENTS:
+#   $system_cache_dir (string) - Path to system cache directory
+#   $event_name (string)       - Event name
+#   $model_type (string)       - Model identifier
+#   $bucket_key (string)       - Bucket key (YYYY-MM)
+# RETURNS:
+#   Hashref with fingerprint metadata, or undef if not found
+# ==============================================================================
+{
+    # Memoisation cache - scoped to avoid polluting global namespace
+    my %_fingerprint_history_cache;
+
+    sub _load_stored_bucket_fingerprint {
+        my ($system_cache_dir, $event_name, $model_type, $bucket_key) = @_;
+
+
+        # ------------------------------------------------------------------
+        # Phase 4 DEBUG: lookup probe (only when -v / -vv)
+        # Shows exactly what month key we search, and what we find (or don't).
+        # ------------------------------------------------------------------
+        if (($verbose // 0) >= 1) {
+            my $bk_ref = ref($bucket_key) || '';
+            my $bucket_preview = $bk_ref ? "$bucket_key" : (defined $bucket_key ? $bucket_key : '(undef)');
+            print STDERR "      ↳ [DEBUG] Phase 4 load-stored: event=$event_name model=$model_type bucket_key=$bucket_preview"
+                . " bucket_ref=" . ($bk_ref || '(scalar)')
+                . "\n";
+        }
+
+        # Memoise: load history once per system_cache_dir per invocation
+        my $cache_key = $system_cache_dir;
+        unless (exists $_fingerprint_history_cache{$cache_key}) {
+            $_fingerprint_history_cache{$cache_key} = read_unified_history($system_cache_dir);
+        }
+        if (($verbose // 0) >= 2) {
+            my @months = sort keys %{$_fingerprint_history_cache{$cache_key} // {}};
+            print STDERR "      ↳ [DEBUG] Phase 4 load-stored: unified history months=" . scalar(@months)
+                . " first=" . ($months[0] // '(none)') . " last=" . ($months[-1] // '(none)') . "\n";
+        }
+
+        my $history_data = $_fingerprint_history_cache{$cache_key};
+        return undef unless (defined $history_data && ref($history_data) eq 'HASH');
+
+        # Navigate to the stored _meta block
+        my $meta = $history_data->{$bucket_key}
+                              ->{SeasonalEventSnapshots}
+                              ->{$event_name}
+                              ->{ModelForecasts}
+                              ->{$model_type}
+                              ->{'_meta'};
+
+        return undef unless (defined $meta && ref($meta) eq 'HASH');
+
+        # Return fingerprint block if present
+        return $meta->{fingerprints} if (exists $meta->{fingerprints});
+
+        return undef;
+    }
+
+    # Helper to clear memoisation cache (useful if history is modified mid-run)
+    sub _clear_fingerprint_history_cache {
+        %_fingerprint_history_cache = ();
+    }
+}
+
+# ==============================================================================
+# SUBROUTINE: _should_reprocess_bucket (Phase 4: Idempotency)
+# PURPOSE:    Determines whether a bucket should be reprocessed or skipped.
+#             Implements the deterministic skip/redo gate.
+# ARGUMENTS:
+#   $system_cache_dir (string)  - Path to system cache directory
+#   $event_name (string)        - Event name
+#   $event_cfg (hashref)        - Event configuration
+#   $model_type (string)        - Model identifier
+#   $bucket_key (string)        - Bucket key (YYYY-MM)
+#   $exec_ctx (hashref)         - Bucket execution context
+#   $prev_bucket_fp (string|undef) - Previous bucket's combined fingerprint
+#   $force_flag (boolean)       - Whether --force was specified
+# RETURNS:
+#   Hashref with:
+#     reprocess        - Boolean: true if bucket should be reprocessed
+#     reason           - String: explanation of decision
+#     reason_category  - String: 'skip'|'config_changed'|'rules_changed'|
+#                                'chain_changed'|'missing_prior'|'force'
+#     current_fp       - Current computed fingerprint hashref
+#     stored_fp        - Stored fingerprint hashref (or undef)
+# ==============================================================================
+sub _should_reprocess_bucket {
+    my ($system_cache_dir, $event_name, $event_cfg, $model_type, $bucket_key, $exec_ctx, $prev_bucket_fp, $dependency_fp, $force_flag) = @_;
+
+
+    # ------------------------------------------------------------------
+    # Phase 4 DEBUG: argument sanity probe (only when -v / -vv)
+    # This is designed to catch the exact issue you're seeing:
+    # bucket_key accidentally arriving as a HASH ref -> "HASH(0x...)"
+    # ------------------------------------------------------------------
+    if (($verbose // 0) >= 1) {
+        my $bk_ref  = ref($bucket_key) || '';
+        my $ec_ref  = ref($exec_ctx)   || '';
+        my $ev_ref  = ref($event_cfg)  || '';
+        my $sc_ref  = ref($seasonality_config) || '';
+
+        my $bucket_preview = $bk_ref ? "$bucket_key" : (defined $bucket_key ? $bucket_key : '(undef)');
+        print STDERR "      ↳ [DEBUG] Phase 4 gate args: event=$event_name model=$model_type bucket_key=$bucket_preview"
+            . " bucket_ref=" . ($bk_ref || '(scalar)')
+            . " exec_ctx_ref=" . ($ec_ref || '(undef)')
+            . " event_cfg_ref=" . ($ev_ref || '(undef)')
+            . " seasonality_cfg_ref=" . ($sc_ref || '(undef)')
+            . "\n";
+
+        if ($bk_ref) {
+            print STDERR "      ↳ [DEBUG] Phase 4 gate WARN: bucket_key is a reference; prior fingerprint lookup will never match months like '2025-04'\n";
+            if (($verbose // 0) >= 2) {
+                require Data::Dumper;
+                local $Data::Dumper::Terse  = 1;
+                local $Data::Dumper::Indent = 0;
+                print STDERR "      ↳ [DEBUG] Phase 4 gate bucket_key dump: " . Data::Dumper::Dumper($bucket_key) . "\n";
+            }
+        }
+    }
+
+    # Compute current fingerprint (always, to ensure provenance is persisted even under --force)
+    my $current_fp = _compute_bucket_fingerprint($event_cfg, $exec_ctx, $model_type, $prev_bucket_fp, $dependency_fp);
+
+    # Always reprocess if forced (but still return fingerprint for storage)
+    if ($force_flag) {
+        return {
+            reprocess        => 1,
+            reason           => 'User requested --force',
+            reason_category  => 'force',
+            current_fp       => $current_fp,
+            stored_fp        => undef,
+        };
+    }
+
+    # Load stored fingerprint
+    my $stored_fp = _load_stored_bucket_fingerprint($system_cache_dir, $event_name, $model_type, $bucket_key);
+
+    # No prior fingerprint - must process (bootstrap)
+    unless (defined $stored_fp) {
+        return {
+            reprocess        => 1,
+            reason           => "No prior fingerprint (bootstrap or first run for bucket $bucket_key)",
+            reason_category  => 'missing_prior',
+            current_fp       => $current_fp,
+            stored_fp        => undef,
+        };
+    }
+
+    # Compare fingerprints
+    my @diff_reasons;
+
+    # Check engine version first (trumps other checks)
+    if (($stored_fp->{engine_version} // '') ne ($current_fp->{engine_version} // '')) {
+        push @diff_reasons, sprintf("engine version changed (%s -> %s)",
+            $stored_fp->{engine_version} // 'unknown',
+            $current_fp->{engine_version} // 'unknown');
+    }
+
+    # Check Upstream Dependencies
+    if (($stored_fp->{dependencies} // 'NONE') ne ($current_fp->{dependencies} // 'NONE')) {
+        push @diff_reasons, "upstream history inputs changed (backfill or regeneration)";
+    }
+
+    # Check event definition fingerprint (config changes)
+    if (($stored_fp->{event_def} // '') ne ($current_fp->{event_def} // '')) {
+        push @diff_reasons, "event configuration changed (dates, vms, exclude_dates, etc.)";
+    }
+
+    # Check execution context fingerprint (window/anchor changes)
+    if (($stored_fp->{exec_ctx} // '') ne ($current_fp->{exec_ctx} // '')) {
+        push @diff_reasons, "execution context changed (analysis window or cache bounds)";
+    }
+
+    # Check chain-of-custody fingerprint (upstream dependency changed)
+    if (($stored_fp->{chain} // '') ne ($current_fp->{chain} // '')) {
+        push @diff_reasons, "upstream dependency changed (prior bucket was reprocessed)";
+    }
+
+    # If any differences found, reprocess
+    if (@diff_reasons) {
+        my $reason_category = 'config_changed';
+        if (grep { /engine version/ } @diff_reasons) {
+            $reason_category = 'rules_changed';
+        } elsif (grep { /upstream dependency/ } @diff_reasons) {
+            $reason_category = 'chain_changed';
+        }
+
+        return {
+            reprocess        => 1,
+            reason           => join("; ", @diff_reasons),
+            reason_category  => $reason_category,
+            current_fp       => $current_fp,
+            stored_fp        => $stored_fp,
+        };
+    }
+
+    # All fingerprints match - skip
+    return {
+        reprocess        => 0,
+        reason           => "Fingerprints match (combined: " . substr($current_fp->{combined}, 0, 12) . "...)",
+        reason_category  => 'skip',
+        current_fp       => $current_fp,
+        stored_fp        => $stored_fp,
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _resolve_upstream_dependency_fingerprint
+# PURPOSE:    Resolves the fingerprints of the historical inputs required for this anchor date.
+# Performs lightweight JSON reads of the history files to avoid loading full datasets.
+sub _resolve_upstream_dependency_fingerprint {
+    my ($cache_path, $event_cfg, $anchor_date_obj) = @_;
+
+    return 'NONE' unless ($cache_path && -d $cache_path);
+    require Digest::MD5;
+
+    my @dependency_parts;
+    my $target_month_idx = $anchor_date_obj->mon;
+    my $model_type = $event_cfg->{model} // 'multiplicative_seasonal';
+    my $lookback_days = $event_cfg->{seasonal_lookback_days} // 730;
+
+    # 1. Identify which past months are dependencies
+    #    For multiplicative models, we only care about the same calendar month in prior years.
+    my $is_month_matched = ($model_type eq 'multiplicative_seasonal');
+
+    # Scan back 5 years (or lookback limit) to find relevant history files
+    my $start_year = $anchor_date_obj->year - 5;
+    my $end_year   = $anchor_date_obj->year;
+
+    for my $y ($start_year .. $end_year) {
+        for my $m (1..12) {
+            # Skip future/current
+            my $candidate_str = sprintf("%04d-%02d", $y, $m);
+            my $candidate_date = Time::Piece->strptime($candidate_str, "%Y-%m");
+            next if $candidate_date >= $anchor_date_obj->truncate(to => 'month');
+
+            # Apply Model Logic (Same Month)
+            if ($is_month_matched) {
+                next unless $m == $target_month_idx;
+            }
+
+            # 2. Check if file exists and read its meta fingerprint
+            #    Assumes standard file naming: "$cache_path/$candidate_str.json"
+            #    (Adjust filename pattern if your system uses a prefix)
+            my $file = File::Spec->catfile($cache_path, "$candidate_str.json");
+
+            if (-f $file) {
+                my $fp = 'missing_meta';
+                # Lightweight Read: We only need the top-level structure or specific event key
+                eval {
+                    local $/;
+                    open(my $fh, '<', $file) or die $!;
+                    my $json_text = <$fh>;
+                    close $fh;
+                    my $data = decode_json($json_text);
+                    my $evt = $event_cfg->{_eventName};
+
+                    # Grab the stored fingerprint if it exists
+                    # Navigate to: SeasonalEventSnapshots -> {event} -> ModelForecasts -> {model} -> _meta -> fingerprints
+                    my $model_meta = $data->{SeasonalEventSnapshots}{$evt}{ModelForecasts}{$model_type}{'_meta'};
+                    if ($model_meta && ref($model_meta) eq 'HASH' && $model_meta->{fingerprints}) {
+                        # Use the combined fingerprint as the dependency marker
+                        $fp = $model_meta->{fingerprints}{combined} // 'missing_combined';
+                    }
+                };
+                push @dependency_parts, "$candidate_str=$fp";
+            }
+        }
+    }
+
+    return 'NONE' unless @dependency_parts;
+    return Digest::MD5::md5_hex(join("|", @dependency_parts));
+}
+
+# ==============================================================================
 # SUBROUTINE: _inject_exclusions_into_manifest
 # PURPOSE:    Adds the _exclusions and _exclusion_fingerprint blocks to a
 #             manifest for transmission to the nfit engine.
@@ -11298,6 +11783,32 @@ sub _group_events_by_fingerprint {
     }
 
     return %groups;
+}
+
+# ==============================================================================
+# SUBROUTINE: _translate_skip_reason
+# PURPOSE:    Converts internal reason categories to user-friendly messages
+# ==============================================================================
+sub _translate_skip_reason {
+    my ($category) = @_;
+    return 'unchanged since last analysis'      if $category eq 'skip';
+    return 'no changes detected'                if !$category;
+    return $category;  # fallback
+}
+
+# ==============================================================================
+# SUBROUTINE: _translate_change_reason
+# PURPOSE:    Converts internal change reasons to user-friendly messages
+# ==============================================================================
+sub _translate_change_reason {
+    my ($category, $detail) = @_;
+
+    return 'configuration changed'              if $category eq 'config_changed' && $detail =~ /event configuration/;
+    return 'analysis window changed'            if $category eq 'config_changed' && $detail =~ /execution context/;
+    return 'upstream history updated'           if $category eq 'config_changed' && $detail =~ /upstream history/;
+    return 'engine version updated'             if $category eq 'rules_changed';
+    return 'prior bucket was reprocessed'       if $category eq 'chain_changed';
+    return 'changes detected';  # fallback
 }
 
 # ==============================================================================
@@ -11387,6 +11898,32 @@ sub _execute_automatic_seasonal_discovery {
 
     print STDERR "  [INFO] Detected " . scalar(@active_events) . " active seasonal event(s): " . join(", ", map { $_->{_eventName} } @active_events) . "\n";
 
+
+    # ----------------------------------------------------------------------
+    # Phase 4 Idempotency Gate: DEBUG PROBE (no behavioural change)
+    # Purpose: quickly confirm whether Phase 4 subs exist/are compiled and
+    # whether the orchestrator is invoking them.
+    # ----------------------------------------------------------------------
+    if (($verbose // 0) >= 1) {
+        my @need = qw(
+            _should_reprocess_bucket
+            _compute_bucket_fingerprint
+            _load_stored_bucket_fingerprint
+        );
+        my @present = grep { defined &{$_} } @need;
+        my @missing = grep { !defined &{$_} } @need;
+
+        print STDERR "  [DEBUG] Phase 4 probe: idempotency subs present: "
+            . (@present ? join(', ', @present) : '(none)')
+            . "\n";
+        if (@missing) {
+            print STDERR "  [DEBUG] Phase 4 probe: idempotency subs missing: "
+                . join(', ', @missing)
+                . "\n";
+            print STDERR "  [DEBUG] Phase 4 probe: gate cannot execute; run will always behave as pre-Phase-4\n";
+        }
+    }
+
     # 2. Iterate and execute with CENTRALISED ANCHOR RESOLUTION
     foreach my $event_cfg (@active_events) {
         my $event_name = $event_cfg->{_eventName};
@@ -11428,6 +11965,10 @@ sub _execute_automatic_seasonal_discovery {
             # Fallback to Phase 2 single-anchor resolution (also covers free-running events)
             @bucket_keys_to_run = ('__single__');
         }
+
+        # Phase 4: Chain-of-custody tracking for idempotency
+        # Track the previous bucket's combined fingerprint to establish dependency chain
+        my $prev_bucket_combined_fp = undef;
 
         foreach my $bucket_key (@bucket_keys_to_run) {
             # Reset global state to ensure clean execution per bucket
@@ -11489,28 +12030,29 @@ sub _execute_automatic_seasonal_discovery {
                 my $bucket_month = $anchor_info->{anchor_bucket} // 'unknown';
                 my $event_label  = $event_name // 'event';
 
-                # Default: one clear line
+                # Default: always show the anchoring milestone
                 print STDERR "    Φ Anchoring $event_label analysis to reference date $anchor_ymd for history month $bucket_month\n";
 
-                # -v: include source + occurrence count
+                # -v: user-friendly context about what data is being used
                 if (($verbose // 0) >= 1) {
-                    my $src = $anchor_info->{anchor_source} // 'unknown';
                     my $occ_n = 0;
                     if ($anchor_info->{bucket_occurrences} && ref($anchor_info->{bucket_occurrences}) eq 'ARRAY') {
                         $occ_n = scalar @{$anchor_info->{bucket_occurrences}};
                     }
-                    print STDERR "      ↳ source: $src, occurrences: $occ_n\n";
-                }
+                    # Translate anchor_source to plain English
+                    my $src = $anchor_info->{anchor_source} // 'unknown';
+                    my $src_desc = $src eq 'bucket_latest_end'   ? 'latest completed occurrence'
+                                 : $src eq 'bucket_first_end'    ? 'earliest occurrence'
+                                 : $src eq 'bucket_aggregated'   ? 'aggregated occurrences'
+                                 : $src;
 
-                # -vv: include full provenance end dates
-                if (($verbose // 0) >= 2) {
-                    if ($anchor_info->{bucket_occurrences} && ref($anchor_info->{bucket_occurrences}) eq 'ARRAY') {
-                        my @ends = map {
-                            ($_->{end} && ref($_->{end}) eq 'Time::Piece') ? $_->{end}->ymd : ()
-                        } @{$anchor_info->{bucket_occurrences}};
-                        if (@ends) {
-                            print STDERR "      ↳ occurrence end dates: " . join(', ', @ends) . "\n";
-                        }
+                    my $occ_label = $occ_n == 1 ? '1 occurrence' : "$occ_n occurrences";
+                    print STDERR "      ↳  Analysis basis: $src_desc ($occ_label in bucket)\n";
+
+                    # Show occurrence end dates if multiple
+                    if ($occ_n > 1 && $anchor_info->{bucket_occurrences}) {
+                        my @end_dates = map { $_->{end} ? $_->{end}->ymd : () } @{$anchor_info->{bucket_occurrences}};
+                        print STDERR "      ↳  Occurrence end dates: " . join(', ', @end_dates) . "\n";
                     }
                 }
 
@@ -11528,9 +12070,81 @@ sub _execute_automatic_seasonal_discovery {
             # Build the execution context with anchor information
             my $exec_ctx = _build_anchor_execution_context($anchor_info, $args_href, $event_cfg);
 
-            # --- DISPATCH TO MODEL EXECUTOR ---
-            my $model_type = $event_cfg->{model} // '';
+            # --- PHASE 4: IDEMPOTENCY GATE ---
 
+            # Resolve Upstream Dependencies
+            # We explicitly calculate the state of the history required by this bucket.
+            # If a history month was backfilled/regenerated, its fingerprint will have changed.
+            my $dependency_fp = _resolve_upstream_dependency_fingerprint(
+                $current_cache_path,
+                $event_cfg,
+                $anchor_info->{anchor_date}
+            );
+
+            # Check if this bucket needs reprocessing or can be skipped
+            my $model_type = $event_cfg->{model} // '';
+            my $effective_bucket_key = ($bucket_key eq '__single__')
+                ? ($anchor_info->{anchor_bucket} // 'unknown')
+                : $bucket_key;
+
+            my $reprocess_decision = _should_reprocess_bucket(
+                $current_cache_path,
+                $event_name,
+                $event_cfg,
+                $model_type,
+                $effective_bucket_key,
+                $exec_ctx,
+                $prev_bucket_combined_fp,
+                $dependency_fp,
+                $force_update  # Use the global --force flag
+            );
+
+            if (!$reprocess_decision->{reprocess}) {
+                # Default: show skip with user-friendly reason
+                # Skip this bucket - fingerprints match
+                my $skip_reason = _translate_skip_reason($reprocess_decision->{reason_category});
+                print STDERR "    ↳  [SKIP] Bucket $effective_bucket_key: $skip_reason\n";
+
+                # -vv only: show fingerprint details
+                if (($verbose // 0) >= 2) {
+                    my $fp_short = substr($reprocess_decision->{stored_fp}{combined} // '', 0, 12);
+                    print STDERR "      ↳  [DEBUG] Fingerprint: $fp_short...\n";
+                }
+
+                # Update chain-of-custody with stored fingerprint for next bucket
+                if ($reprocess_decision->{stored_fp} && $reprocess_decision->{stored_fp}{combined}) {
+                    $prev_bucket_combined_fp = $reprocess_decision->{stored_fp}{combined};
+                }
+                next;
+            }
+
+            # Log reprocess reason
+            my $reason_cat = $reprocess_decision->{reason_category} // 'unknown';
+            if ($reason_cat eq 'missing_prior') {
+                print STDERR "    ↳  [NEW] First analysis for $effective_bucket_key\n";
+            } elsif ($reason_cat eq 'force') {
+                print STDERR "    ↳  [FORCE] Reprocessing $effective_bucket_key ($reprocess_decision->{reason})\n";
+            } else {
+                my $change_desc = _translate_change_reason($reason_cat, $reprocess_decision->{reason});
+                print STDERR "    ↳  [UPDATE] Change detected: $effective_bucket_key: $change_desc\n";
+            }
+
+            # -vv only: developer diagnostics
+            if (($verbose // 0) >= 2) {
+                print STDERR "      ↳  [DEBUG] Category: $reason_cat\n";
+                print STDERR "      ↳  [DEBUG] Detail: $reprocess_decision->{reason}\n";
+                if ($reprocess_decision->{current_fp}) {
+                    require Data::Dumper;
+                    local $Data::Dumper::Terse = 1;
+                    local $Data::Dumper::Indent = 0;
+                    print STDERR "      ↳  [DEBUG] Current fingerprint: " . Data::Dumper::Dumper($reprocess_decision->{current_fp}) . "\n";
+                }
+            }
+
+            # Attach fingerprints to execution context for downstream storage
+            $exec_ctx->{_fingerprints} = $reprocess_decision->{current_fp};
+
+            # --- DISPATCH TO MODEL EXECUTOR ---
             if ($model_type eq 'multiplicative_seasonal') {
                 # Phase 3.2: if Phase 3.1 bucket provenance exists and we have multiple occurrences,
                 # aggregate multiplicative forecasts within the bucket.
@@ -11553,6 +12167,11 @@ sub _execute_automatic_seasonal_discovery {
             }
             else {
                 warn "  WARNING: Unknown or unsupported model type '$model_type' for event '$event_name'. Skipping.\n";
+            }
+
+            # Phase 4: Update chain-of-custody for next bucket
+            if ($exec_ctx->{_fingerprints} && $exec_ctx->{_fingerprints}{combined}) {
+                $prev_bucket_combined_fp = $exec_ctx->{_fingerprints}{combined};
             }
         }
 
@@ -12259,15 +12878,17 @@ sub _execute_multiplicative_seasonal {
         }
     }
 
-# DEBUG: Trace PeakValue source
-    my $sample_vm = (keys %$assimilation_map)[0];
-    if ($sample_vm && ($opts_href->{emit_csv} // 1)) {
-        my $peak_val = $assimilation_map->{$sample_vm}{CoreResults}{PeakValue};
-        print STDERR "  [DEBUG] CSV-emitting run for bucket: " . ($exec_ctx->{anchor_bucket} // 'N/A') . "\n";
-        print STDERR "  [DEBUG] effective_start_date: " . ($exec_ctx->{effective_start_date} ? $exec_ctx->{effective_start_date}->ymd : 'undef') . "\n";
-        print STDERR "  [DEBUG] effective_end_date: " . ($exec_ctx->{effective_end_date} ? $exec_ctx->{effective_end_date}->ymd : 'undef') . "\n";
-        print STDERR "  [DEBUG] occurrence_start: " . ($exec_ctx->{occurrence_start} ? $exec_ctx->{occurrence_start}->ymd : 'undef') . "\n";
-        print STDERR "  [DEBUG] Sample VM '$sample_vm' PeakValue: " . ($peak_val // 'undef') . "\n";
+    # DEBUG: Trace PeakValue source
+    if (($verbose // 0) > 1) {
+        my $sample_vm = (keys %$assimilation_map)[0];
+        if ($sample_vm && ($opts_href->{emit_csv} // 1)) {
+            my $peak_val = $assimilation_map->{$sample_vm}{CoreResults}{PeakValue};
+            print STDERR "  [DEBUG] CSV-emitting run for bucket: " . ($exec_ctx->{anchor_bucket} // 'N/A') . "\n";
+            print STDERR "  [DEBUG] effective_start_date: " . ($exec_ctx->{effective_start_date} ? $exec_ctx->{effective_start_date}->ymd : 'undef') . "\n";
+            print STDERR "  [DEBUG] effective_end_date: " . ($exec_ctx->{effective_end_date} ? $exec_ctx->{effective_end_date}->ymd : 'undef') . "\n";
+            print STDERR "  [DEBUG] occurrence_start: " . ($exec_ctx->{occurrence_start} ? $exec_ctx->{occurrence_start}->ymd : 'undef') . "\n";
+            print STDERR "  [DEBUG] Sample VM '$sample_vm' PeakValue: " . ($peak_val // 'undef') . "\n";
+        }
     }
 
     # --- ENRICHMENT LOOP ---
@@ -12445,7 +13066,8 @@ sub _execute_multiplicative_seasonal {
             $effective_config,
             $horizon_meta,
             $analysis_context,
-            $exec_ctx->{anchor_bucket}
+            $exec_ctx->{anchor_bucket},
+            $exec_ctx->{_fingerprints}  # Phase 4: Idempotency fingerprints
         );
     }
     # For aggregated mode, return the raw forecast hashref to caller
@@ -12765,7 +13387,8 @@ sub _execute_recency_decay {
         $event_config,
         $horizon_meta,
         $analysis_context,
-        $args_href->{anchor_bucket}
+        $args_href->{anchor_bucket},
+        $args_href->{_fingerprints}  # Phase 4: Idempotency fingerprints
     );
 
     # Phase 3.2: allow orchestration to aggregate results
@@ -13011,7 +13634,8 @@ sub _execute_predictive_peak {
         $effective_config,
         $horizon_meta,
         $analysis_context,
-        $args_href->{anchor_bucket}
+        $args_href->{anchor_bucket},
+        $args_href->{_fingerprints}  # Phase 4: Idempotency fingerprints
     );
 }
 
@@ -13567,7 +14191,8 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
         $event_cfg,
         $horizon_meta,
         $analysis_context,
-        $bucket_exec_ctx->{anchor_bucket}
+        $bucket_exec_ctx->{anchor_bucket},
+        $bucket_exec_ctx->{_fingerprints}  # Phase 4: Idempotency fingerprints
     );
 
     # Phase 3.2: Generate CSV output for aggregated bucket
