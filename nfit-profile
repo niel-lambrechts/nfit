@@ -219,6 +219,7 @@ my $mgsys_filter;
 my $verbose = 0;
 my $debug = 0;
 my $force_update = 0;
+my $use_l1_baseline = 0;  # Phase 6: Emergency escape hatch — forces legacy L1 cache baseline
 
 # Seasonality related variables
 my $apply_seasonality_event;
@@ -270,6 +271,7 @@ GetOptions(
     "v|verbose+"                 => \$verbose,
     "d|debug"                    => \$debug,
     'force'                      => \$force_update,
+    'use-l1-baseline'            => \$use_l1_baseline,
 ) or die usage_wrapper();
 
 print STDERR "nfit-profile version $VERSION\n" if (!defined $show_version);
@@ -5014,7 +5016,7 @@ sub _build_vm_scope_filter_from_strings {
 #   - A hash reference containing historical data for verbose reporting.
 # ==============================================================================
 sub calculate_multiplicative_forecast {
-    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href, $exclusions_href, $asof_start_obj, $asof_end_obj) = @_;
+    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href, $exclusions_href, $asof_start_obj, $asof_end_obj, $precomputed_baselines_href) = @_;
 
     # This subroutine implements a robust, multi-stage forecast for multiplicative seasonal events.
     # It intelligently determines the most appropriate recent baseline and applies a recency-weighted
@@ -5100,6 +5102,14 @@ sub calculate_multiplicative_forecast {
     my $baseline_source_log = "N/A";
     my @event_history_final = @event_history_initial; # Start with all available history.
 
+    # Phase 6: Use pre-computed history-based baseline if provided by orchestrator.
+    # When present, this replaces the legacy L1-based Path A/B/C below.
+    if ($precomputed_baselines_href && ref($precomputed_baselines_href) eq 'HASH' && %$precomputed_baselines_href) {
+        %current_baseline_results = %$precomputed_baselines_href;
+        $baseline_source_log = "History-based (canonical window)";
+        print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline]: history-based (pre-computed)\n";
+    } else {
+
     # --- Path A (Ideal): Attempt to calculate a "Post-Peak" baseline ---
     # The ideal baseline is the N days of data ending on the last day of the cache.
     my $post_peak_baseline_start_obj = $analysis_end_obj->truncate(to => 'day') - (($baseline_days_config - 1) * 86400);
@@ -5179,6 +5189,8 @@ sub calculate_multiplicative_forecast {
         # If we re-use this baseline, we must exclude its corresponding peak from the multiplier calculation.
         shift @event_history_final;
     }
+
+    } # end Phase 6: else (L1 legacy path)
 
     # --- Path C (Cold Start Recovery): Calculate baseline from pre-event window ---
     # This path activates when:
@@ -6968,7 +6980,7 @@ sub _build_nfit_baseline_command {
 # This version is enhanced to use the new two-part residual forecasting method.
 # ==============================================================================
 sub calculate_predictive_peak_forecast {
-    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $adaptive_runq_saturation_thresh, $exclusions_href, $asof_start_obj, $asof_end_obj) = @_;
+    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $adaptive_runq_saturation_thresh, $exclusions_href, $asof_start_obj, $asof_end_obj, $precomputed_baselines_href) = @_;
 
     print STDERR "\n  ⧉ Executing Predictive Peak Forecast for event $event_name on system $system_identifier\n";
 
@@ -6983,10 +6995,15 @@ sub calculate_predictive_peak_forecast {
         _calculate_peak_prediction($historical_data_href, $event_config);
 
     # --- Step 3: Calculate the Non-Peak Baseline (excluding all historical peaks) ---
-    # This logic remains unchanged.
-    # --- Step 3: Calculate the Non-Peak Baseline (excluding all historical peaks) ---
-    # This logic remains unchanged.
-    my $true_baseline_results_href = _get_true_baseline_results($system_cache_dir, $event_name, $event_config, $full_seasonality_config, $exclusions_href, $asof_start_obj, $asof_end_obj);
+    # Phase 6: Use pre-computed history-based baseline if provided by orchestrator.
+    my $true_baseline_results_href;
+    if ($precomputed_baselines_href && ref($precomputed_baselines_href) eq 'HASH' && %$precomputed_baselines_href) {
+        $true_baseline_results_href = $precomputed_baselines_href;
+        print STDERR "  Φ Predictive Peak [Baseline]: history-based (pre-computed)\n";
+    } else {
+        # Legacy L1-based path (--use-l1-baseline or pre-Phase 6 compatibility)
+        $true_baseline_results_href = _get_true_baseline_results($system_cache_dir, $event_name, $event_config, $full_seasonality_config, $exclusions_href, $asof_start_obj, $asof_end_obj);
+    }
 
     # --- Generate Active Events String ---
     # Even though predictive usually targets one event, we check for concurrent overlap for consistency.
@@ -8104,7 +8121,7 @@ sub _assemble_seasonal_snapshot {
 #   }
 # ==============================================================================
 sub _store_model_forecast_to_history {
-    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config, $horizon_meta, $analysis_context, $explicit_anchor_bucket, $fingerprints_href) = @_;
+    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config, $horizon_meta, $analysis_context, $explicit_anchor_bucket, $fingerprints_href, $baseline_meta_href) = @_;
 
     return unless ($system_cache_dir && $event_name && $model_type && $forecast_results_href);
     return unless (scalar keys %$forecast_results_href > 0);
@@ -8254,6 +8271,21 @@ sub _store_model_forecast_to_history {
             chain          => $fingerprints_href->{chain},
             engine_version => $fingerprints_href->{engine_version},
         };
+    }
+
+    # Phase 5: Inject baseline metadata for staleness detection (if provided)
+    # These fields sit at the _meta level alongside 'fingerprints', enabling
+    # _should_reprocess_bucket to detect baseline changes independently of
+    # the bucket fingerprint chain.
+    if ($baseline_meta_href && ref($baseline_meta_href) eq 'HASH') {
+        $meta_block->{baseline_fingerprint}  = $baseline_meta_href->{fingerprint};
+        $meta_block->{baseline_source}       = $baseline_meta_href->{baseline_source} // 'history';
+        $meta_block->{baseline_span}         = ($baseline_meta_href->{span_start} && $baseline_meta_href->{span_end})
+                                             ? "$baseline_meta_href->{span_start}:$baseline_meta_href->{span_end}"
+                                             : undef;
+        $meta_block->{baseline_months_read}  = $baseline_meta_href->{months_read};
+        $meta_block->{baseline_coverage_pct} = _calculate_aggregate_coverage(
+                                                   $baseline_meta_href->{coverage_by_vm});
     }
 
     $model_data{'_meta'} = $meta_block;
@@ -8408,6 +8440,97 @@ sub _store_model_forecast_to_history {
     else {
         print STDERR "  [WARN] No valid forecast data to store for $model_type in history\n";
     }
+}
+
+# ==============================================================================
+# SUBROUTINE: _mark_scores_invalid_for_snapshot
+# PURPOSE:    Phase 7 — Cross-zone score invalidation.
+#             When a snapshot is reprocessed due to baseline changes, Zone 3
+#             (nfit-forecast.py) tournament scores become stale because they
+#             were calculated against the previous forecast values.
+#
+#             This function sets a staleness marker at the event snapshot level
+#             that Zone 3 detects via its S6 scoring gate. Zone 2 NEVER deletes
+#             or modifies Zone 3 artefacts (scores, candidates); it only sets
+#             the cross-zone signal. Zone 3 is responsible for rescoring.
+#
+# ARGUMENTS:
+#   $system_cache_dir  - Path to the system's cache directory
+#   $event_name        - Name of the seasonal event
+#   $month_key         - Target month key (YYYY-MM)
+#   $reason            - Human-readable reason string for audit trail
+#
+# ZONE BOUNDARY:  Zone 2 writes → Zone 3 reads (one-way signal)
+# ==============================================================================
+sub _mark_scores_invalid_for_snapshot {
+    my ($system_cache_dir, $event_name, $month_key, $reason) = @_;
+
+    return unless ($system_cache_dir && $event_name && $month_key);
+
+    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $filepath = File::Spec->catfile($partition_dir, "nfit.hist.${month_key}.json");
+
+    return unless (-f $filepath && -s $filepath);
+
+    # Read the single partition
+    my $partition_data;
+    eval {
+        open my $fh, '<:encoding(utf8)', $filepath
+            or die "Cannot open $filepath: $!";
+        local $/;
+        $partition_data = JSON->new->allow_nonref->decode(<$fh>);
+        close $fh;
+    };
+    if ($@ || !$partition_data || ref($partition_data) ne 'HASH') {
+        warn "  [WARN] Phase 7: Could not read partition $month_key for score invalidation: $@\n";
+        return;
+    }
+
+    # Navigate to the event snapshot
+    my $month_data = $partition_data->{$month_key};
+    return unless (ref($month_data) eq 'HASH');
+
+    my $event_snapshot = $month_data->{SeasonalEventSnapshots}{$event_name} // undef;
+    return unless (ref($event_snapshot) eq 'HASH');
+
+    # Guard: only set marker if Zone 3 has actually scored this snapshot.
+    # If AdaptiveForecast.scoring does not exist, there are no scores to invalidate.
+    my $adaptive = $event_snapshot->{AdaptiveForecast} // {};
+    unless (ref($adaptive) eq 'HASH' && exists $adaptive->{scoring}) {
+        if (($verbose // 0) >= 2) {
+            print STDERR "      ↳  Phase 7: No Zone 3 scoring block for $event_name / $month_key — no scores to invalidate\n";
+        }
+        return;
+    }
+
+    # Set the cross-zone staleness marker at event snapshot level.
+    # This is deliberately placed OUTSIDE AdaptiveForecast to maintain
+    # zone boundary clarity — Zone 2 owns the event snapshot root,
+    # Zone 3 owns AdaptiveForecast internals.
+    $event_snapshot->{scores_valid}        = 0;
+    $event_snapshot->{baseline_changed_at} = localtime()->datetime();
+    $event_snapshot->{score_invalidation_reason} = $reason // 'baseline inputs changed';
+
+    # Atomic write-back (single partition)
+    my $json_encoder = JSON->new->pretty->canonical;
+    my $tmp_path = "${filepath}.tmp.$$";
+
+    eval {
+        my $json_text = $json_encoder->encode($partition_data);
+        open my $fh, '>:encoding(utf8)', $tmp_path
+            or die "Open temp failed: $!";
+        print {$fh} $json_text or die "Write failed: $!";
+        close $fh or die "Close failed: $!";
+        rename $tmp_path, $filepath
+            or die "Rename failed ($tmp_path → $filepath): $!";
+    };
+    if ($@) {
+        warn "  [WARN] Phase 7: Score invalidation write failed for $month_key: $@\n";
+        unlink $tmp_path if (-f $tmp_path);
+        return;
+    }
+
+    print STDERR "    [!] Scores marked invalid for $event_name / $month_key ($reason)\n";
 }
 
 # ==============================================================================
@@ -8983,6 +9106,1467 @@ sub _write_full_history {
     }
 
     return 1;
+}
+
+# ==============================================================================
+# HISTORY BASED BASELINING — PHASE 1: Date-Set Merge Primitives
+# ==============================================================================
+# These foundational functions implement correct, date-set-based update
+# detection and first-write-wins merge semantics for DailyProfileSeries
+# data stored in partitioned history months.
+#
+# Design reference: nFit - History Based Baselining Implementation Plan v1.3
+# Constraint: No existing code is modified — these are pure additive helpers.
+# ==============================================================================
+
+# ==============================================================================
+# SUBROUTINE: _extract_date_set_from_series
+# PURPOSE:    Extracts the set of all unique dates present across every VM and
+#             profile in a DailyProfileSeries structure.  The returned hashref
+#             is keyed on 'YYYY-MM-DD' strings for O(1) membership testing.
+#
+# ARGUMENTS:
+#   1. $daily_series_href (hashref): DailyProfileSeries structure:
+#      { VM => { Profile => { 'YYYY-MM-DD' => value, ... }, ... }, ... }
+#
+# RETURNS:
+#   - Hashref: { 'YYYY-MM-DD' => 1, ... }
+#   - Empty hashref if input is undef, empty, or malformed.
+# ==============================================================================
+sub _extract_date_set_from_series {
+    my ($daily_series_href) = @_;
+
+    my %date_set;
+    return \%date_set unless ($daily_series_href && ref($daily_series_href) eq 'HASH');
+
+    foreach my $vm (keys %$daily_series_href) {
+        unless (ref($daily_series_href->{$vm}) eq 'HASH') {
+            warn "  [WARN] _extract_date_set_from_series: VM '$vm' value is not a hashref, skipping\n";
+            next;
+        }
+        foreach my $profile (keys %{$daily_series_href->{$vm}}) {
+            unless (ref($daily_series_href->{$vm}{$profile}) eq 'HASH') {
+                warn "  [WARN] _extract_date_set_from_series: $vm/$profile value is not a hashref, skipping\n";
+                next;
+            }
+            foreach my $date (keys %{$daily_series_href->{$vm}{$profile}}) {
+                # Lightweight format guard — accept only YYYY-MM-DD
+                unless ($date =~ /^\d{4}-\d{2}-\d{2}$/) {
+                    warn "  [WARN] _extract_date_set_from_series: malformed date '$date' in $vm/$profile, skipping\n";
+                    next;
+                }
+                $date_set{$date} = 1;
+            }
+        }
+    }
+
+    return \%date_set;
+}
+
+# ==============================================================================
+# SUBROUTINE: _needs_history_update
+# PURPOSE:    Determines whether a month's DailyProfileSeries in history needs
+#             updating based on the date set present in the current L1 cache.
+#
+#             This replaces the legacy count-based comparison
+#             ($days_in_period > $stored_days) which fails on partial extensions.
+#             Date-set comparison correctly detects:
+#               - Forward extension  (history has Jan 01-25, L1 adds 26-31)
+#               - Backward extension (history has Jan 10-31, L1 adds 01-09)
+#               - Internal gap fill  (history missing Jan 12-14, L1 fills them)
+#
+# ARGUMENTS:
+#   1. $existing_date_set_href (hashref | undef): Dates currently in history
+#      for this month.  Keys are 'YYYY-MM-DD'.  undef or {} = new month.
+#   2. $l1_date_set_href (hashref | undef): Dates present in L1 for this month.
+#
+# RETURNS:
+#   Hashref:
+#   {
+#       needs_update => 0 | 1,
+#       reason       => 'new_month' | 'has_new_dates' | 'no_change' | 'empty_l1',
+#       new_dates    => [ ... ],   # Dates in L1 absent from history (sorted)
+#   }
+# ==============================================================================
+sub _needs_history_update {
+    my ($existing_date_set_href, $l1_date_set_href) = @_;
+
+    # Guard: empty L1 means nothing to contribute
+    unless ($l1_date_set_href && ref($l1_date_set_href) eq 'HASH' && %$l1_date_set_href) {
+        return { needs_update => 0, reason => 'empty_l1', new_dates => [] };
+    }
+
+    # New month — no existing history for this month
+    if (!$existing_date_set_href || ref($existing_date_set_href) ne 'HASH' || !%$existing_date_set_href) {
+        return {
+            needs_update => 1,
+            reason       => 'new_month',
+            new_dates    => [ sort keys %$l1_date_set_href ],
+        };
+    }
+
+    # Core logic: find dates in L1 that are NOT yet in existing history
+    my @new_dates;
+    foreach my $date (keys %$l1_date_set_href) {
+        push @new_dates, $date unless exists $existing_date_set_href->{$date};
+    }
+
+    if (@new_dates) {
+        return {
+            needs_update => 1,
+            reason       => 'has_new_dates',
+            new_dates    => [ sort @new_dates ],
+        };
+    }
+
+    return { needs_update => 0, reason => 'no_change', new_dates => [] };
+}
+
+# ==============================================================================
+# SUBROUTINE: _merge_daily_profile_series
+# PURPOSE:    Merges a DailyProfileSeries from L1 into an existing history
+#             series using FIRST-WRITE-WINS semantics.  Existing date values
+#             are never overwritten — only genuinely new dates are added.
+#
+#             This provides a predictable, auditable merge contract:
+#               - Once a date is committed to history, its value is immutable.
+#               - Re-runs of --update-history are idempotent for existing dates.
+#
+# ARGUMENTS:
+#   1. $existing_series_href (hashref): Current DailyProfileSeries from history.
+#      May be undef or {} for a brand-new month.
+#   2. $l1_series_href (hashref): DailyProfileSeries from the current L1 run.
+#
+# RETURNS:
+#   Hashref:
+#   {
+#       merged_series => { VM => { Profile => { date => val, ... } } },
+#       dates_added   => [ ... ],   # New dates written (sorted)
+#       dates_skipped => [ ... ],   # Existing dates preserved (sorted)
+#       meta => {
+#           first_date    => 'YYYY-MM-DD',
+#           last_date     => 'YYYY-MM-DD',
+#           ProcessedDays => N,      # Unique date count across all VMs/profiles
+#       },
+#   }
+# ==============================================================================
+sub _merge_daily_profile_series {
+    my ($existing_series_href, $l1_series_href) = @_;
+
+    # Initialise tracking
+    my %dates_added_set;
+    my %dates_skipped_set;
+
+    # Build merged structure — copy-on-write per VM/profile for memory efficiency
+    my %merged;
+    if ($existing_series_href && ref($existing_series_href) eq 'HASH') {
+        foreach my $vm (keys %$existing_series_href) {
+            next unless ref($existing_series_href->{$vm}) eq 'HASH';
+            foreach my $profile (keys %{$existing_series_href->{$vm}}) {
+                next unless ref($existing_series_href->{$vm}{$profile}) eq 'HASH';
+                # Shallow copy at date-value level (values are scalars)
+                $merged{$vm}{$profile} = { %{$existing_series_href->{$vm}{$profile}} };
+            }
+        }
+    }
+
+    # Merge L1 data with first-write-wins
+    if ($l1_series_href && ref($l1_series_href) eq 'HASH') {
+        foreach my $vm (keys %$l1_series_href) {
+            next unless ref($l1_series_href->{$vm}) eq 'HASH';
+            foreach my $profile (keys %{$l1_series_href->{$vm}}) {
+                next unless ref($l1_series_href->{$vm}{$profile}) eq 'HASH';
+
+                # Ensure target profile exists in merged structure
+                $merged{$vm}{$profile} //= {};
+
+                foreach my $date (keys %{$l1_series_href->{$vm}{$profile}}) {
+                    # Lightweight format guard
+                    next unless $date =~ /^\d{4}-\d{2}-\d{2}$/;
+
+                    if (exists $merged{$vm}{$profile}{$date}) {
+                        # First-write-wins: existing value preserved
+                        $dates_skipped_set{$date} = 1;
+                    } else {
+                        # Genuinely new date — add it
+                        $merged{$vm}{$profile}{$date} = $l1_series_href->{$vm}{$profile}{$date};
+                        $dates_added_set{$date} = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    # Compute merged metadata from the complete date universe
+    my $merged_date_set = _extract_date_set_from_series(\%merged);
+    my @all_dates = sort keys %$merged_date_set;
+
+    my $first_date    = $all_dates[0]  // undef;
+    my $last_date     = $all_dates[-1] // undef;
+    my $processed_days = scalar @all_dates;
+
+    return {
+        merged_series => \%merged,
+        dates_added   => [ sort keys %dates_added_set  ],
+        dates_skipped => [ sort keys %dates_skipped_set ],
+        meta => {
+            first_date    => $first_date,
+            last_date     => $last_date,
+            ProcessedDays => $processed_days,
+        },
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _update_month_metadata
+# PURPOSE:    Builds or updates the _meta block for a history month after a
+#             merge operation.  The content_version is incremented ONLY when
+#             new dates were actually added, preventing spurious fingerprint
+#             invalidation in downstream staleness gates.
+#
+# ARGUMENTS:
+#   1. $existing_meta_href (hashref | undef): Current _meta block from history.
+#      undef indicates a brand-new month with no prior metadata.
+#   2. $merge_result_href (hashref): Output from _merge_daily_profile_series,
+#      containing 'dates_added' and 'meta' sub-keys.
+#
+# RETURNS:
+#   Hashref — the new _meta block:
+#   {
+#       ProcessedDays   => N,
+#       first_date      => 'YYYY-MM-DD',
+#       last_date       => 'YYYY-MM-DD',
+#       content_version => M,
+#       last_modified   => 'YYYY-MM-DDTHH:MM:SSZ',
+#   }
+# ==============================================================================
+sub _update_month_metadata {
+    my ($existing_meta_href, $merge_result_href) = @_;
+
+    # Determine content_version
+    my $content_version;
+    my $dates_added = $merge_result_href->{dates_added} // [];
+
+    if (!$existing_meta_href || ref($existing_meta_href) ne 'HASH') {
+        # Brand-new month — initial version
+        $content_version = 1;
+    } elsif (scalar @$dates_added > 0) {
+        # Existing month with new content — increment
+        $content_version = ($existing_meta_href->{content_version} // 0) + 1;
+    } else {
+        # No change — preserve existing version
+        $content_version = $existing_meta_href->{content_version} // 1;
+    }
+
+    # Extract merged metadata
+    my $merge_meta = $merge_result_href->{meta} // {};
+
+    return {
+        ProcessedDays   => $merge_meta->{ProcessedDays} // 0,
+        first_date      => $merge_meta->{first_date},
+        last_date       => $merge_meta->{last_date},
+        content_version => $content_version,
+        last_modified   => gmtime()->strftime('%Y-%m-%dT%H:%M:%SZ'),
+    };
+}
+
+# ==============================================================================
+# HISTORY BASED BASELINING — PHASE 2: Bounded Month Loader Primitives
+# ==============================================================================
+# These functions implement safe, bounded I/O for loading only the history
+# months that intersect the canonical baseline window.  They replace the
+# unbounded read_unified_history() call path for baseline computation.
+#
+# Design reference: nFit - History Based Baselining Implementation Plan v1.3
+# ==============================================================================
+
+# ==============================================================================
+# SUBROUTINE: _get_month_boundaries
+# PURPOSE:    Returns correct first and last calendar day of a month using
+#             proper calendar arithmetic.  This replaces the fragile string
+#             approximation pattern ("${month_key}-31") which silently produces
+#             invalid dates for months with fewer than 31 days.
+#
+# ARGUMENTS:
+#   1. $month_key (string): 'YYYY-MM' format month identifier.
+#
+# RETURNS:
+#   List of two Time::Piece objects: ($month_start, $month_end)
+#   - $month_start: first day of the month (e.g., 2026-02-01)
+#   - $month_end:   last day of the month  (e.g., 2026-02-28 or 2026-02-29)
+#
+#   Returns empty list if $month_key is malformed.
+# ==============================================================================
+sub _get_month_boundaries {
+    my ($month_key) = @_;
+
+    unless ($month_key && $month_key =~ /^\d{4}-\d{2}$/) {
+        warn "  [WARN] _get_month_boundaries: malformed month_key '$month_key'\n";
+        return ();
+    }
+
+    my $month_start = eval { Time::Piece->strptime("${month_key}-01", '%Y-%m-%d') };
+    if ($@ || !$month_start) {
+        warn "  [WARN] _get_month_boundaries: failed to parse '${month_key}-01': $@\n";
+        return ();
+    }
+
+    # Last day = first day of next month minus one day
+    my $month_end = $month_start->add_months(1) - ONE_DAY;
+
+    return ($month_start, $month_end);
+}
+
+# ==============================================================================
+# SUBROUTINE: _get_history_month_index
+# PURPOSE:    Lists available history month files without loading their content.
+#             Performs a lightweight directory scan of the partitioned history
+#             directory and returns month keys for O(1) lookup.
+#
+# ARGUMENTS:
+#   1. $system_cache_dir (string): Path to the system's staging directory.
+#
+# RETURNS:
+#   Hashref: { 'YYYY-MM' => 1, ... }
+#   Empty hashref if the history directory doesn't exist or is empty.
+# ==============================================================================
+sub _get_history_month_index {
+    my ($system_cache_dir) = @_;
+
+    my %index;
+    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+
+    return \%index unless (-d $partition_dir);
+
+    opendir(my $dh, $partition_dir) or do {
+        warn "  [WARN] _get_history_month_index: cannot open '$partition_dir': $!\n";
+        return \%index;
+    };
+
+    while (my $entry = readdir($dh)) {
+        if ($entry =~ /^nfit\.hist\.(\d{4}-\d{2})\.json$/) {
+            $index{$1} = 1;
+        }
+    }
+    closedir($dh);
+
+    return \%index;
+}
+
+# ==============================================================================
+# SUBROUTINE: _determine_required_months
+# PURPOSE:    Given a canonical window (end_date, lookback_days) and an index
+#             of available history months, determines which months intersect
+#             the window and therefore need to be loaded.
+#
+#             Uses correct calendar-based overlap testing:
+#               month overlaps window ⟺ month_end ≥ window_start
+#                                    AND month_start ≤ window_end
+#
+# ARGUMENTS:
+#   1. $end_date_obj (Time::Piece): Anchor date — right edge of window.
+#   2. $lookback_days (integer): Canonical window size in days (e.g. 90).
+#   3. $history_index_href (hashref): Month keys available in history
+#      (output of _get_history_month_index).
+#
+# RETURNS:
+#   Arrayref of month keys in chronological order, e.g.:
+#   ['2025-12', '2026-01', '2026-02', '2026-03']
+#
+#   Empty arrayref if no months overlap the window.
+# ==============================================================================
+sub _determine_required_months {
+    my ($end_date_obj, $lookback_days, $history_index_href) = @_;
+
+    return [] unless ($end_date_obj && $lookback_days && $lookback_days > 0
+                      && $history_index_href && ref($history_index_href) eq 'HASH'
+                      && %$history_index_href);
+
+    # Calculate window boundaries (inclusive)
+    # N days ending on end_date → start = end - (N - 1) days
+    my $window_start = $end_date_obj - (($lookback_days - 1) * ONE_DAY);
+    my $window_end   = $end_date_obj;
+
+    my @required;
+    foreach my $month_key (keys %$history_index_href) {
+        my ($m_start, $m_end) = _get_month_boundaries($month_key);
+        next unless ($m_start && $m_end);
+
+        # Standard interval overlap test
+        next if $m_end   < $window_start;
+        next if $m_start > $window_end;
+
+        push @required, $month_key;
+    }
+
+    return [ sort @required ];
+}
+
+# ==============================================================================
+# SUBROUTINE: _read_bounded_history_months
+# PURPOSE:    Reads only the specified month partition files from history,
+#             avoiding the unbounded read_unified_history() call path.
+#
+#             This is the I/O primitive for baseline computation.  It reads
+#             exactly the months requested (as determined by
+#             _determine_required_months), never the full history directory.
+#
+#             The JSON envelope convention is identical to read_unified_history:
+#             each partition file contains { "YYYY-MM": { ... } } and the
+#             inner payload is extracted and returned.
+#
+# ARGUMENTS:
+#   1. $system_cache_dir (string): Path to the system's staging directory.
+#   2. $month_keys_aref (arrayref): Month keys to load, e.g. ['2025-04','2025-05'].
+#
+# RETURNS:
+#   Hashref with four fields:
+#   {
+#       months  => { 'YYYY-MM' => { ... }, ... },   # Successfully decoded payloads
+#       loaded  => ['YYYY-MM', ...],                 # Month keys loaded (sorted)
+#       missing => ['YYYY-MM', ...],                 # Requested but file absent (sorted)
+#       errors  => { 'YYYY-MM' => 'reason', ... },   # File found but decode failed
+#   }
+# ==============================================================================
+sub _read_bounded_history_months {
+    my ($system_cache_dir, $month_keys_aref) = @_;
+
+    my %result = (
+        months  => {},
+        loaded  => [],
+        missing => [],
+        errors  => {},
+    );
+
+    return \%result unless ($system_cache_dir && $month_keys_aref
+                            && ref($month_keys_aref) eq 'ARRAY'
+                            && @$month_keys_aref);
+
+    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+
+    # If the partition directory doesn't exist at all, every month is missing
+    unless (-d $partition_dir) {
+        $result{missing} = [ sort @$month_keys_aref ];
+        return \%result;
+    }
+
+    # Use the same decoder settings as read_unified_history for consistency
+    my $json_decoder = JSON->new->allow_nonref;
+
+    foreach my $month_key (sort @$month_keys_aref) {
+        # Guard: validate month_key format before constructing file path
+        unless ($month_key =~ /^\d{4}-\d{2}$/) {
+            $result{errors}{$month_key} = "Invalid month key format: '$month_key'";
+            next;
+        }
+
+        my $file = "nfit.hist.${month_key}.json";
+        my $path = File::Spec->catfile($partition_dir, $file);
+
+        # Check existence
+        unless (-f $path) {
+            push @{$result{missing}}, $month_key;
+            next;
+        }
+
+        # Check non-empty (same guard as read_unified_history's 'next unless $json_text')
+        unless (-s $path) {
+            $result{errors}{$month_key} = "File exists but is empty: $file";
+            next;
+        }
+
+        # Read file — same encoding as read_unified_history
+        my $json_text = do {
+            open my $fh, '<:encoding(utf8)', $path or do {
+                $result{errors}{$month_key} = "Cannot open $file: $!";
+                next;
+            };
+            local $/;
+            <$fh>;
+        };
+
+        unless ($json_text && $json_text =~ /\S/) {
+            $result{errors}{$month_key} = "File is blank or whitespace-only: $file";
+            next;
+        }
+
+        # Decode JSON — envelope: { "YYYY-MM": { ... } }
+        my $chunk = eval { $json_decoder->decode($json_text) };
+        if ($@ || !$chunk || ref($chunk) ne 'HASH') {
+            my $err = $@ || 'Decoded value is not a hashref';
+            $result{errors}{$month_key} = "JSON decode failed for $file: $err";
+            next;
+        }
+
+        # Unwrap envelope — extract the month payload
+        # Defensive: use the envelope key that matches the requested month_key,
+        # falling back to the first key if different (with a warning).
+        my $payload;
+        if (exists $chunk->{$month_key}) {
+            $payload = $chunk->{$month_key};
+        }
+        else {
+            my ($found_key) = keys %$chunk;
+            if ($found_key) {
+                warn "  [WARN] _read_bounded_history_months: envelope key '$found_key' "
+                   . "doesn't match requested '$month_key' in $file — using found key\n";
+                $payload = $chunk->{$found_key};
+            }
+            else {
+                $result{errors}{$month_key} = "Envelope is empty hash in $file";
+                next;
+            }
+        }
+
+        $result{months}{$month_key} = $payload;
+        push @{$result{loaded}}, $month_key;
+    }
+
+    return \%result;
+}
+
+# ==============================================================================
+# HISTORY BASED BASELINING — PHASE 3: Daily Series Stitcher and Exclusions
+# ==============================================================================
+# These functions stitch DailyProfileSeries from multiple history months into
+# a unified view for baseline computation, and apply exclusion filters at read
+# time to preserve history purity.
+#
+# Design reference: nFit - History Based Baselining Implementation Plan v1.3
+# ==============================================================================
+
+# ==============================================================================
+# SUBROUTINE: _expand_peak_periods_to_dates
+# PURPOSE:    Expands peak period time ranges into a flat hash of date strings
+#             for O(1) exclusion lookup.  Uses the existing _expand_date_range
+#             helper for correctness and consistency (including the 366-day
+#             per-range safety limit).
+#
+# ARGUMENTS:
+#   1. $peak_periods_aref (arrayref): Output from find_all_historical_periods.
+#      Each element is [Time::Piece start, Time::Piece end].
+#
+# RETURNS:
+#   Hashref: { 'YYYY-MM-DD' => 1, ... }
+#   Empty hashref if input is undef/empty or all ranges invalid.
+# ==============================================================================
+sub _expand_peak_periods_to_dates {
+    my ($peak_periods_aref) = @_;
+
+    my %date_set;
+    return \%date_set unless ($peak_periods_aref && ref($peak_periods_aref) eq 'ARRAY'
+                              && @$peak_periods_aref);
+
+    foreach my $pair (@$peak_periods_aref) {
+        next unless (ref($pair) eq 'ARRAY' && scalar(@$pair) >= 2);
+
+        my ($start_obj, $end_obj) = @$pair;
+
+        # Accept both Time::Piece objects and plain 'YYYY-MM-DD' strings
+        my $start_str = ref($start_obj) ? $start_obj->strftime('%Y-%m-%d') : $start_obj;
+        my $end_str   = ref($end_obj)   ? $end_obj->strftime('%Y-%m-%d')   : $end_obj;
+
+        # Delegate to existing helper — it handles swap, safety limit, and error logging
+        my @expanded = _expand_date_range($start_str, $end_str);
+        $date_set{$_} = 1 for @expanded;
+    }
+
+    return \%date_set;
+}
+
+# ==============================================================================
+# SUBROUTINE: _stitch_daily_series_bounded
+# PURPOSE:    Stitches DailyProfileSeries from multiple partitioned history
+#             months within a bounded lookback window.  This is the read-side
+#             primitive for history-based baselining.
+#
+#             Orchestrates Phase 2 functions:
+#               _get_history_month_index  → discover available months
+#               _determine_required_months → select months in window
+#               _read_bounded_history_months → load only those months
+#
+#             Then extracts, filters, and merges DailyProfileSeries from each
+#             loaded month into a single unified structure.
+#
+# ARGUMENTS:
+#   1. $args_href (hashref):
+#      {
+#          system_cache_dir => '/path/to/staging',       # Required
+#          end_date_obj     => Time::Piece object,       # Required: right edge of window
+#          lookback_days    => 90,                        # Default 90, hard cap 120
+#          profiles_needed  => ['G3-95W15', ...],         # Optional: skip other profiles
+#          vms_needed       => ['VM01', ...],             # Optional: skip other VMs
+#      }
+#
+# RETURNS:
+#   Hashref:
+#   {
+#       series           => { $vm => { $profile => { 'YYYY-MM-DD' => $value } } },
+#       months_read      => ['YYYY-MM', ...],
+#       months_missing   => ['YYYY-MM', ...],
+#       span_start       => 'YYYY-MM-DD',       # Earliest actual date in series
+#       span_end         => 'YYYY-MM-DD',        # Latest actual date in series
+#       content_versions => { 'YYYY-MM' => N },  # For fingerprinting
+#   }
+# ==============================================================================
+sub _stitch_daily_series_bounded {
+    my ($args_href) = @_;
+
+    my %result = (
+        series           => {},
+        months_read      => [],
+        months_missing   => [],
+        span_start       => undef,
+        span_end         => undef,
+        content_versions => {},
+    );
+
+    return \%result unless ($args_href && ref($args_href) eq 'HASH');
+
+    my $system_cache_dir = $args_href->{system_cache_dir};
+    my $end_date_obj     = $args_href->{end_date_obj};
+
+    return \%result unless ($system_cache_dir && $end_date_obj);
+
+    # --- Hard cap enforcement ---
+    my $lookback_days = $args_href->{lookback_days} // 90;
+    my $HARD_CAP = 120;
+    if ($lookback_days > $HARD_CAP) {
+        print STDERR "  [WARN] _stitch_daily_series_bounded: lookback_days $lookback_days "
+                   . "exceeds hard cap $HARD_CAP — clamping\n";
+        $lookback_days = $HARD_CAP;
+    }
+    $lookback_days = 1 if $lookback_days < 1;
+
+    # --- Build optional filter lookup hashes ---
+    my %vm_filter;
+    if ($args_href->{vms_needed} && ref($args_href->{vms_needed}) eq 'ARRAY'
+        && @{$args_href->{vms_needed}}) {
+        %vm_filter = map { $_ => 1 } @{$args_href->{vms_needed}};
+    }
+
+    my %profile_filter;
+    if ($args_href->{profiles_needed} && ref($args_href->{profiles_needed}) eq 'ARRAY'
+        && @{$args_href->{profiles_needed}}) {
+        %profile_filter = map { $_ => 1 } @{$args_href->{profiles_needed}};
+    }
+
+    # --- Phase 2 orchestration: discover, select, load ---
+    my $index = _get_history_month_index($system_cache_dir);
+    my $required = _determine_required_months($end_date_obj, $lookback_days, $index);
+
+    if (!@$required) {
+        return \%result;
+    }
+
+    my $load_result = _read_bounded_history_months($system_cache_dir, $required);
+
+    $result{months_read}    = $load_result->{loaded};
+    $result{months_missing} = $load_result->{missing};
+
+    # --- Calculate window boundaries for date clipping ---
+    # Window is inclusive: N days ending on end_date
+    my $window_start_str = ($end_date_obj - (($lookback_days - 1) * ONE_DAY))->strftime('%Y-%m-%d');
+    my $window_end_str   = $end_date_obj->strftime('%Y-%m-%d');
+
+    # --- Stitch loaded months ---
+    my $global_min_date;
+    my $global_max_date;
+
+    foreach my $month_key (@{$load_result->{loaded}}) {
+        my $month_data = $load_result->{months}{$month_key};
+        next unless (ref($month_data) eq 'HASH');
+
+        # Record content_version (from Phase 1 _meta if available, else 0 for legacy)
+        $result{content_versions}{$month_key} =
+            (exists $month_data->{_meta} && ref($month_data->{_meta}) eq 'HASH')
+                ? ($month_data->{_meta}{content_version} // 0)
+                : 0;
+
+        # Navigate to MonthlyWorkloadAnalysis
+        my $mwa = $month_data->{MonthlyWorkloadAnalysis};
+        next unless (ref($mwa) eq 'HASH');
+
+        foreach my $vm (keys %$mwa) {
+            # VM filter: skip if filter is active and VM not in list
+            next if (%vm_filter && !$vm_filter{$vm});
+
+            my $dps = $mwa->{$vm}{DailyProfileSeries};
+            next unless (ref($dps) eq 'HASH');
+
+            foreach my $profile (keys %$dps) {
+                # Profile filter: skip if filter is active and profile not in list
+                next if (%profile_filter && !$profile_filter{$profile});
+
+                my $date_values = $dps->{$profile};
+                next unless (ref($date_values) eq 'HASH');
+
+                foreach my $date (keys %$date_values) {
+                    # Date format guard
+                    next unless ($date =~ /^\d{4}-\d{2}-\d{2}$/);
+
+                    # Window clipping (string comparison is correct for YYYY-MM-DD)
+                    next if ($date lt $window_start_str);
+                    next if ($date gt $window_end_str);
+
+                    # Add to stitched series
+                    $result{series}{$vm}{$profile}{$date} = $date_values->{$date};
+
+                    # Track actual data span
+                    if (!defined $global_min_date || $date lt $global_min_date) {
+                        $global_min_date = $date;
+                    }
+                    if (!defined $global_max_date || $date gt $global_max_date) {
+                        $global_max_date = $date;
+                    }
+                }
+            }
+        }
+    }
+
+    $result{span_start} = $global_min_date;
+    $result{span_end}   = $global_max_date;
+
+    return \%result;
+}
+
+# ==============================================================================
+# SUBROUTINE: _apply_exclusions_to_stitched_series
+# PURPOSE:    Applies all exclusion filters to a stitched DailyProfileSeries
+#             at READ time, preserving history purity.  The processing order
+#             is strictly defined for deterministic, auditable behaviour.
+#
+#             Processing order (mandatory):
+#               1. VM inclusions  — keep only listed VMs
+#               2. VM exclusions  — remove listed VMs
+#               3. Global date exclusions — remove dates from all VMs/profiles
+#               4. VM-specific date exclusions — remove dates per-VM
+#               5. Peak period exclusions — remove dates within peak ranges
+#
+#             Each date removal is attributed to exactly one category (the
+#             first matching rule wins) for unambiguous audit stats.
+#
+# ARGUMENTS:
+#   1. $args_href (hashref):
+#      {
+#          stitched_series => { VM => { Profile => { date => val } } },
+#          vm_scope_filter => {                    # From _parse_vm_scope_filter or undef
+#              include => { VM => 1, ... },        # or undef
+#              exclude => { VM => 1, ... },        # or undef
+#          },
+#          date_exclusions => {                    # From _parse_exclusion_dates or undef
+#              global      => ['YYYY-MM-DD', ...],
+#              vm_specific => { VM => ['YYYY-MM-DD', ...] },
+#          },
+#          peak_periods    => [                    # From find_all_historical_periods or undef
+#              [Time::Piece start, Time::Piece end],
+#              ...
+#          ],
+#      }
+#
+# RETURNS:
+#   Hashref:
+#   {
+#       filtered_series => { ... },   # Same ref as input (mutated in place)
+#       exclusion_stats => {
+#           vms_included      => N,   # VMs remaining after include filter (0 = no filter)
+#           vms_excluded      => M,   # VMs removed by include + exclude steps
+#           dates_excluded    => {
+#               global        => K,   # Date-point removals attributed to global rule
+#               vm_specific   => L,   # Date-point removals attributed to VM-specific rule
+#               peak_periods  => P,   # Date-point removals attributed to peak rule
+#           },
+#       },
+#   }
+#
+# NOTE: This function MUTATES the input stitched_series for memory efficiency
+#       (consistent with existing _apply_vm_scope_filter pattern).  The caller
+#       should not reference the input series after this call.
+# ==============================================================================
+sub _apply_exclusions_to_stitched_series {
+    my ($args_href) = @_;
+
+    my %stats = (
+        vms_included   => 0,
+        vms_excluded   => 0,
+        dates_excluded => {
+            global       => 0,
+            vm_specific  => 0,
+            peak_periods => 0,
+        },
+    );
+
+    my $series = ($args_href && ref($args_href) eq 'HASH')
+               ? $args_href->{stitched_series}
+               : undef;
+
+    # If no series or empty, return immediately
+    unless ($series && ref($series) eq 'HASH' && %$series) {
+        return { filtered_series => ($series // {}), exclusion_stats => \%stats };
+    }
+
+    my $vm_scope    = $args_href->{vm_scope_filter};
+    my $date_excl   = $args_href->{date_exclusions};
+    my $peak_aref   = $args_href->{peak_periods};
+
+    # ---------------------------------------------------------------
+    # STEP 1: VM Inclusions — keep only listed VMs
+    # ---------------------------------------------------------------
+    my $include_filter = ($vm_scope && ref($vm_scope) eq 'HASH')
+                       ? $vm_scope->{include} : undef;
+
+    if ($include_filter && ref($include_filter) eq 'HASH' && %$include_filter) {
+        my @to_remove;
+        foreach my $vm (keys %$series) {
+            unless ($include_filter->{$vm}) {
+                push @to_remove, $vm;
+            }
+        }
+        delete $series->{$_} for @to_remove;
+        $stats{vms_excluded} += scalar @to_remove;
+        $stats{vms_included} = scalar keys %$series;
+    }
+
+    # ---------------------------------------------------------------
+    # STEP 2: VM Exclusions — remove listed VMs
+    # ---------------------------------------------------------------
+    my $exclude_filter = ($vm_scope && ref($vm_scope) eq 'HASH')
+                       ? $vm_scope->{exclude} : undef;
+
+    if ($exclude_filter && ref($exclude_filter) eq 'HASH' && %$exclude_filter) {
+        my $removed = 0;
+        foreach my $vm (keys %$series) {
+            if ($exclude_filter->{$vm}) {
+                delete $series->{$vm};
+                $removed++;
+            }
+        }
+        $stats{vms_excluded} += $removed;
+    }
+
+    # Early exit if no VMs remain after VM filtering
+    unless (%$series) {
+        return { filtered_series => $series, exclusion_stats => \%stats };
+    }
+
+    # ---------------------------------------------------------------
+    # STEP 3-5 preparation: build lookup hashes for date exclusions
+    # ---------------------------------------------------------------
+
+    # Global date exclusions → hash for O(1) lookup
+    my %global_dates;
+    if ($date_excl && ref($date_excl) eq 'HASH'
+        && $date_excl->{global} && ref($date_excl->{global}) eq 'ARRAY') {
+        %global_dates = map { $_ => 1 } @{$date_excl->{global}};
+    }
+
+    # VM-specific date exclusions → hash of hashes
+    my %vm_specific_dates;
+    if ($date_excl && ref($date_excl) eq 'HASH'
+        && $date_excl->{vm_specific} && ref($date_excl->{vm_specific}) eq 'HASH') {
+        foreach my $vm (keys %{$date_excl->{vm_specific}}) {
+            my $dates_aref = $date_excl->{vm_specific}{$vm};
+            if (ref($dates_aref) eq 'ARRAY') {
+                $vm_specific_dates{$vm} = { map { $_ => 1 } @$dates_aref };
+            }
+        }
+    }
+
+    # Peak period dates → flat hash (delegates to _expand_peak_periods_to_dates)
+    my $peak_dates_href = _expand_peak_periods_to_dates($peak_aref);
+
+    # Short-circuit: if no date exclusions of any kind, return early
+    unless (%global_dates || %vm_specific_dates || %$peak_dates_href) {
+        return { filtered_series => $series, exclusion_stats => \%stats };
+    }
+
+    # ---------------------------------------------------------------
+    # STEPS 3-5: Apply date exclusions with elsif priority
+    #   global > vm_specific > peak_periods
+    # ---------------------------------------------------------------
+    foreach my $vm (keys %$series) {
+        my $vm_profiles = $series->{$vm};
+        next unless (ref($vm_profiles) eq 'HASH');
+
+        # Pre-fetch VM-specific lookup for this VM (may be undef)
+        my $this_vm_excl = $vm_specific_dates{$vm};
+
+        foreach my $profile (keys %$vm_profiles) {
+            my $date_values = $vm_profiles->{$profile};
+            next unless (ref($date_values) eq 'HASH');
+
+            my @dates_to_delete;
+
+            foreach my $date (keys %$date_values) {
+                # STEP 3: Global exclusion (highest priority)
+                if ($global_dates{$date}) {
+                    push @dates_to_delete, $date;
+                    $stats{dates_excluded}{global}++;
+                }
+                # STEP 4: VM-specific exclusion
+                elsif ($this_vm_excl && $this_vm_excl->{$date}) {
+                    push @dates_to_delete, $date;
+                    $stats{dates_excluded}{vm_specific}++;
+                }
+                # STEP 5: Peak period exclusion
+                elsif ($peak_dates_href->{$date}) {
+                    push @dates_to_delete, $date;
+                    $stats{dates_excluded}{peak_periods}++;
+                }
+            }
+
+            delete $date_values->{$_} for @dates_to_delete;
+        }
+    }
+
+    return { filtered_series => $series, exclusion_stats => \%stats };
+}
+
+# ==============================================================================
+# HISTORY BASED BASELINING — PHASE 4: Baseline Computation and Fingerprinting
+# ==============================================================================
+# These functions compute P95 baselines from stitched/filtered series, track
+# per-VM/profile coverage, and produce deterministic fingerprints for staleness
+# detection.
+#
+# Design reference: nFit - History Based Baselining Implementation Plan v1.3
+# ==============================================================================
+
+# ==============================================================================
+# SUBROUTINE: _compute_profile_set_hash
+# PURPOSE:    Deterministic hash of requested profile names for fingerprinting.
+# ARGUMENTS:  $profiles_aref (arrayref of profile name strings)
+# RETURNS:    MD5 hex digest string
+# ==============================================================================
+sub _compute_profile_set_hash {
+    my ($profiles_aref) = @_;
+    return '' unless ($profiles_aref && ref($profiles_aref) eq 'ARRAY' && @$profiles_aref);
+    require Digest::MD5;
+    return Digest::MD5::md5_hex(join('|', sort @$profiles_aref));
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_vm_set_hash
+# PURPOSE:    Deterministic hash of requested VM names for fingerprinting.
+#             Returns literal 'ALL' when no VM filter is active.
+# ARGUMENTS:  $vms_aref (arrayref of VM name strings, or undef for all)
+# RETURNS:    MD5 hex digest string, or 'ALL'
+# ==============================================================================
+sub _compute_vm_set_hash {
+    my ($vms_aref) = @_;
+    return 'ALL' unless ($vms_aref && ref($vms_aref) eq 'ARRAY' && @$vms_aref);
+    require Digest::MD5;
+    return Digest::MD5::md5_hex(join('|', sort @$vms_aref));
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_months_content_hash
+# PURPOSE:    Deterministic hash of month keys and their content versions.
+#             Changes when history is reprocessed (content_version increments).
+# ARGUMENTS:  $content_versions_href ({ 'YYYY-MM' => version_int, ... })
+# RETURNS:    MD5 hex digest string, or 'NONE' if empty
+# ==============================================================================
+sub _compute_months_content_hash {
+    my ($content_versions_href) = @_;
+    return 'NONE' unless ($content_versions_href && ref($content_versions_href) eq 'HASH'
+                          && %$content_versions_href);
+    my @parts;
+    foreach my $month (sort keys %$content_versions_href) {
+        push @parts, "$month:$content_versions_href->{$month}";
+    }
+    require Digest::MD5;
+    return Digest::MD5::md5_hex(join('|', @parts));
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_vm_scope_hash
+# PURPOSE:    Deterministic hash of VM scope filter (include/exclude lists).
+# ARGUMENTS:  $vm_scope_filter_href ({ include => { VM => 1 }, exclude => { VM => 1 } })
+# RETURNS:    MD5 hex digest string, or 'NONE' if no filter active
+# ==============================================================================
+sub _compute_vm_scope_hash {
+    my ($vm_scope_filter_href) = @_;
+    return 'NONE' unless ($vm_scope_filter_href && ref($vm_scope_filter_href) eq 'HASH');
+
+    my @parts;
+    my $include = $vm_scope_filter_href->{include};
+    if ($include && ref($include) eq 'HASH' && %$include) {
+        push @parts, 'I:' . join(',', sort keys %$include);
+    }
+    my $exclude = $vm_scope_filter_href->{exclude};
+    if ($exclude && ref($exclude) eq 'HASH' && %$exclude) {
+        push @parts, 'E:' . join(',', sort keys %$exclude);
+    }
+
+    return 'NONE' unless @parts;
+    require Digest::MD5;
+    return Digest::MD5::md5_hex(join('|', @parts));
+}
+
+# ==============================================================================
+# SUBROUTINE: _calculate_percentile_from_sorted
+# PURPOSE:    Computes a percentile value from a pre-sorted array using linear
+#             interpolation.  Identical algorithm to calculate_percentile in
+#             nfit.pl — reproduced here for nfit-profile.pl self-containment.
+#
+# ARGUMENTS:
+#   1. $sorted_aref (arrayref): Numerically sorted values (ascending)
+#   2. $p (number): Percentile to compute (0-100)
+#
+# RETURNS:    Numeric value, or undef if input is empty
+# ==============================================================================
+sub _calculate_percentile_from_sorted {
+    my ($sorted_aref, $p) = @_;
+
+    return undef unless ($sorted_aref && ref($sorted_aref) eq 'ARRAY');
+    my $n = scalar @$sorted_aref;
+    return undef if $n == 0;
+    return $sorted_aref->[0] if $n == 1;
+
+    return $sorted_aref->[0]      if $p == 0;
+    return $sorted_aref->[$n - 1] if $p == 100;
+
+    my $rank = ($p / 100) * ($n - 1);
+    my $k    = int($rank);
+    my $d    = $rank - $k;
+
+    if ($k >= $n - 1) {
+        return $sorted_aref->[$n - 1];
+    }
+
+    return $sorted_aref->[$k] + $d * ($sorted_aref->[$k + 1] - $sorted_aref->[$k]);
+}
+
+# ==============================================================================
+# SUBROUTINE: _calculate_baseline_from_stitched
+# PURPOSE:    Calculates P95 baselines from a filtered stitched series with
+#             per-VM/profile coverage assessment.  Coverage is computed against
+#             canonical_days (the requested window), not actual available days.
+#
+# ARGUMENTS:
+#   1. $args_href (hashref):
+#      {
+#          filtered_series    => { VM => { Profile => { date => val } } },
+#          canonical_days     => 90,
+#          coverage_threshold => 0.7,
+#      }
+#
+# RETURNS:
+#   Hashref:
+#   {
+#       baselines => {
+#           $vm => { $profile => P95_value | undef },
+#       },
+#       coverage => {
+#           $vm => {
+#               $profile => {
+#                   days_available  => N,
+#                   pct_coverage    => 0.XX,
+#                   status          => 'sufficient' | 'degraded' | 'no_data',
+#               },
+#           },
+#       },
+#   }
+# ==============================================================================
+sub _calculate_baseline_from_stitched {
+    my ($args_href) = @_;
+
+    my %baselines;
+    my %coverage;
+
+    return { baselines => \%baselines, coverage => \%coverage }
+        unless ($args_href && ref($args_href) eq 'HASH');
+
+    my $series             = $args_href->{filtered_series} // {};
+    my $canonical_days     = $args_href->{canonical_days}     // 90;
+    my $coverage_threshold = $args_href->{coverage_threshold} // 0.7;
+
+    # Guard: canonical_days must be positive
+    $canonical_days = 1 if $canonical_days < 1;
+
+    foreach my $vm (keys %$series) {
+        my $vm_profiles = $series->{$vm};
+        next unless (ref($vm_profiles) eq 'HASH');
+
+        foreach my $profile (keys %$vm_profiles) {
+            my $date_values = $vm_profiles->{$profile};
+
+            # Collect numeric values — skip undef/non-numeric
+            my @values;
+            if (ref($date_values) eq 'HASH') {
+                foreach my $val (values %$date_values) {
+                    push @values, $val if (defined $val && looks_like_number($val));
+                }
+            }
+
+            my $days_available = scalar @values;
+            my $pct_coverage   = $days_available / $canonical_days;
+
+            if ($days_available == 0) {
+                $baselines{$vm}{$profile} = undef;
+                $coverage{$vm}{$profile}  = {
+                    days_available => 0,
+                    pct_coverage   => 0,
+                    status         => 'no_data',
+                };
+                next;
+            }
+
+            # Sort once, compute P95
+            my @sorted = sort { $a <=> $b } @values;
+            my $p95    = sum0(@values) / scalar(@values);
+
+            my $status = ($pct_coverage >= $coverage_threshold)
+                       ? 'sufficient'
+                       : 'degraded';
+
+            $baselines{$vm}{$profile} = $p95;
+            $coverage{$vm}{$profile}  = {
+                days_available => $days_available,
+                pct_coverage   => $pct_coverage,
+                status         => $status,
+            };
+        }
+    }
+
+    return { baselines => \%baselines, coverage => \%coverage };
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_baseline_fingerprint
+# PURPOSE:    Computes a deterministic MD5 fingerprint from the meta block of a
+#             history-based baseline result.  Any change to inputs that could
+#             affect the baseline will produce a different fingerprint.
+#
+# ARGUMENTS:  $meta_href (hashref): The assembled meta block
+# RETURNS:    MD5 hex digest string
+#
+# FINGERPRINT INPUTS (order-sensitive, pipe-delimited):
+#   baseline_source | canonical_days | lookback_cap_days | required_days |
+#   coverage_threshold | span_start | span_end | excluded_dates_hash |
+#   vm_scope_hash | months_content_hash | profile_set_hash | vm_set_hash
+#
+# NOTE: actual_data_span and coverage_by_vm are NOT in the fingerprint —
+#       they are audit/reporting fields that vary with data availability.
+# ==============================================================================
+sub _compute_baseline_fingerprint {
+    my ($meta_href) = @_;
+    return 'NONE' unless ($meta_href && ref($meta_href) eq 'HASH');
+
+    require Digest::MD5;
+
+    my @components = (
+        $meta_href->{baseline_source},
+        $meta_href->{canonical_days},
+        $meta_href->{lookback_cap_days},
+        $meta_href->{required_days},
+        $meta_href->{coverage_threshold},
+        $meta_href->{span_start},
+        $meta_href->{span_end},
+        $meta_href->{excluded_dates_hash},
+        $meta_href->{vm_scope_hash},
+        $meta_href->{months_content_hash},
+        $meta_href->{profile_set_hash} // '',
+        $meta_href->{vm_set_hash}      // '',
+    );
+
+    return Digest::MD5::md5_hex(join('|', map { $_ // '' } @components));
+}
+
+# ==============================================================================
+# SUBROUTINE: _compute_exclusion_hash
+# PURPOSE:    Computes a deterministic MD5 hash of the exclusion configuration
+#             for use in baseline fingerprinting.  Unlike _compute_exclusion_
+#             fingerprint (which returns 'NONE' for empty input), this always
+#             returns a 32-char MD5 hex digest for consistent fingerprint
+#             composition in _compute_baseline_fingerprint.
+# ARGUMENTS:  $date_exclusions - hashref { global => [...], vm_specific => { VM => [...] } }
+# RETURNS:    String - 32-character lowercase MD5 hex digest.
+# PHASE:      History Based Baselining - Phase 4
+# ==============================================================================
+sub _compute_exclusion_hash {
+    my ($date_exclusions) = @_;
+
+    # Empty/undef exclusions still produce a deterministic hash
+    return Digest::MD5::md5_hex('') unless ($date_exclusions
+                                            && ref($date_exclusions) eq 'HASH');
+
+    # Canonical representation: sorted for determinism
+    my @parts;
+    push @parts, "G:" . join(",", sort @{$date_exclusions->{global} // []});
+
+    foreach my $vm (sort keys %{$date_exclusions->{vm_specific} // {}}) {
+        push @parts, "$vm:" . join(",", sort @{$date_exclusions->{vm_specific}{$vm}});
+    }
+
+    return Digest::MD5::md5_hex(join("|", @parts));
+}
+
+# ==============================================================================
+# SUBROUTINE: _get_baseline_from_history
+# PURPOSE:    Primary entry point for history-based baseline calculation.
+#             Orchestrates the full pipeline: stitch → exclusions → baseline
+#             computation → canonical span → fingerprint assembly.
+# ARGUMENTS:  $args_href - hashref:
+#               system_cache_dir   => '/path/to/staging'
+#               end_date_obj       => Time::Piece object
+#               canonical_days     => 90          (default)
+#               coverage_threshold => 0.7         (default)
+#               vm_scope_filter    => { ... } | undef
+#               date_exclusions    => { ... } | undef
+#               peak_periods       => [ ... ] | undef
+#               profiles           => ['G3-95W15', ...]
+#               vms                => ['VM01', ...] | undef  (undef = all VMs)
+# RETURNS:    Hashref { baselines => { ... }, meta => { ... } }
+# THROWS:     die "No history exists..." if no history files found
+# PHASE:      History Based Baselining - Phase 4
+# ==============================================================================
+sub _get_baseline_from_history {
+    my ($args_href) = @_;
+
+    my $system_cache_dir   = $args_href->{system_cache_dir};
+    my $end_date_obj       = $args_href->{end_date_obj};
+    my $canonical_days     = $args_href->{canonical_days}     // 90;
+    my $coverage_threshold = $args_href->{coverage_threshold} // 0.7;
+    my $required_days      = int($canonical_days * $coverage_threshold);
+
+    # ------------------------------------------------------------------
+    # Step 1: Stitch bounded history
+    # ------------------------------------------------------------------
+    my $stitch_result = _stitch_daily_series_bounded({
+        system_cache_dir => $system_cache_dir,
+        end_date_obj     => $end_date_obj,
+        lookback_days    => $canonical_days,
+        profiles_needed  => $args_href->{profiles},
+        vms_needed       => $args_href->{vms},
+    });
+
+    # ------------------------------------------------------------------
+    # Step 2: No history check
+    # ------------------------------------------------------------------
+    if (!$stitch_result->{months_read} || !@{$stitch_result->{months_read}}) {
+        die "No history exists. Run `nfit-profile --update-history` first.\n";
+    }
+
+    # ------------------------------------------------------------------
+    # Step 3: Apply exclusions
+    # ------------------------------------------------------------------
+    my $excl_result = _apply_exclusions_to_stitched_series({
+        stitched_series => $stitch_result->{series},
+        vm_scope_filter => $args_href->{vm_scope_filter},
+        date_exclusions => $args_href->{date_exclusions},
+        peak_periods    => $args_href->{peak_periods},
+    });
+
+    # ------------------------------------------------------------------
+    # Step 4: Compute baselines with coverage assessment
+    # ------------------------------------------------------------------
+    my $baseline_result = _calculate_baseline_from_stitched({
+        filtered_series    => $excl_result->{filtered_series},
+        canonical_days     => $canonical_days,
+        coverage_threshold => $coverage_threshold,
+    });
+
+    # ------------------------------------------------------------------
+    # Step 5: Canonical span (deterministic from inputs, NOT actual data)
+    #
+    # INCLUSIVE window calculation (matches existing L1 convention):
+    #   span_start = end_date - (N - 1) days
+    #   span_end   = end_date
+    # Example: 90 days ending Jan 31 → span_start = Nov 03
+    #
+    # Rationale: The fingerprint must be deterministic from inputs alone.
+    # Using actual data range would cause divergence between
+    # _calculate_expected_baseline_fingerprint (Phase 5, lightweight path)
+    # and the real baseline path.  The actual data range is captured in
+    # actual_data_span and coverage_by_vm for reporting/audit purposes.
+    # ------------------------------------------------------------------
+    my $canonical_span_start = ($end_date_obj - (($canonical_days - 1) * ONE_DAY))->strftime('%Y-%m-%d');
+    my $canonical_span_end   = $end_date_obj->strftime('%Y-%m-%d');
+
+    # ------------------------------------------------------------------
+    # Step 6: Assemble meta with fingerprint components
+    # ------------------------------------------------------------------
+    my $meta = {
+        baseline_source     => 'history',
+        canonical_days      => $canonical_days,
+        lookback_cap_days   => 120,
+        required_days       => $required_days,
+        coverage_threshold  => $coverage_threshold,
+        span_start          => $canonical_span_start,
+        span_end            => $canonical_span_end,
+        actual_data_span    => {
+            first_date => $stitch_result->{span_start},
+            last_date  => $stitch_result->{span_end},
+        },
+        excluded_dates_hash  => _compute_exclusion_hash($args_href->{date_exclusions}),
+        vm_scope_hash        => _compute_vm_scope_hash($args_href->{vm_scope_filter}),
+        months_read          => $stitch_result->{months_read},
+        months_content_hash  => _compute_months_content_hash($stitch_result->{content_versions}),
+        profile_set_hash     => _compute_profile_set_hash($args_href->{profiles} // []),
+        vm_set_hash          => _compute_vm_set_hash($args_href->{vms}),
+        coverage_by_vm       => $baseline_result->{coverage},
+        exclusion_stats      => $excl_result->{exclusion_stats},
+    };
+
+    # ------------------------------------------------------------------
+    # Step 7: Compute combined fingerprint
+    # ------------------------------------------------------------------
+    $meta->{fingerprint} = _compute_baseline_fingerprint($meta);
+
+    return {
+        baselines => $baseline_result->{baselines},
+        meta      => $meta,
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _read_month_metadata_only
+# PURPOSE:    Lightweight reader that extracts ONLY the _meta block from a
+#             month partition JSON file, without loading the full series data.
+#             Used by _calculate_expected_baseline_fingerprint for efficient
+#             staleness detection.
+# ARGUMENTS:
+#   $system_cache_dir - Path to system cache directory
+#   $month_key        - Month key (YYYY-MM)
+# RETURNS:    Hashref of _meta block, or undef if not found/corrupt.
+# PHASE:      History Based Baselining - Phase 5
+# ==============================================================================
+sub _read_month_metadata_only {
+    my ($system_cache_dir, $month_key) = @_;
+    return undef unless ($system_cache_dir && $month_key && $month_key =~ /^\d{4}-\d{2}$/);
+
+    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $path = File::Spec->catfile($partition_dir, "nfit.hist.${month_key}.json");
+    return undef unless (-f $path && -s $path);
+
+    my $meta;
+    eval {
+        open my $fh, '<:encoding(utf8)', $path or die "Cannot open: $!";
+        local $/;
+        my $json_text = <$fh>;
+        close $fh;
+
+        my $data = JSON->new->allow_nonref->decode($json_text);
+        return unless (ref($data) eq 'HASH');
+
+        # Navigate to the month payload (keyed by month_key or first key)
+        my $payload = exists $data->{$month_key}
+                    ? $data->{$month_key}
+                    : $data->{(keys %$data)[0]};
+
+        if (ref($payload) eq 'HASH' && exists $payload->{_meta}
+            && ref($payload->{_meta}) eq 'HASH') {
+            $meta = $payload->{_meta};
+        }
+    };
+    if ($@) {
+        warn "  [WARN] _read_month_metadata_only: failed for $month_key: $@\n";
+    }
+    return $meta;
+}
+
+# ==============================================================================
+# SUBROUTINE: _calculate_expected_baseline_fingerprint
+# PURPOSE:    Computes what the baseline fingerprint WOULD be for given inputs,
+#             without actually computing the full baseline.  Uses the same
+#             shared hash helpers and fingerprint builder as the real baseline
+#             path (_get_baseline_from_history) to guarantee non-divergence.
+#
+#             This enables efficient staleness detection: if the expected
+#             fingerprint differs from the stored one, the baseline must be
+#             recomputed.
+# ARGUMENTS:  $args_href - hashref:
+#               system_cache_dir   => '/path/to/staging'
+#               end_date_obj       => Time::Piece object
+#               canonical_days     => 90          (default)
+#               coverage_threshold => 0.7         (default)
+#               vm_scope_filter    => { ... } | undef
+#               date_exclusions    => { ... } | undef
+#               profiles           => ['G3-95W15', ...]
+#               vms                => ['VM01', ...] | undef
+# RETURNS:    String - MD5 hex fingerprint (or undef if no history exists)
+# PHASE:      History Based Baselining - Phase 5
+# ==============================================================================
+sub _calculate_expected_baseline_fingerprint {
+    my ($args_href) = @_;
+
+    my $canonical_days     = $args_href->{canonical_days}     // 90;
+    my $coverage_threshold = $args_href->{coverage_threshold} // 0.7;
+    my $required_days      = int($canonical_days * $coverage_threshold);
+
+    # 1. Determine required months (same logic as stitcher)
+    my $history_index = _get_history_month_index($args_href->{system_cache_dir});
+    my $required_months = _determine_required_months(
+        $args_href->{end_date_obj},
+        $canonical_days,
+        $history_index
+    );
+
+    return undef unless ($required_months && @$required_months);
+
+    # 2. Load ONLY metadata from those months (not full series data)
+    my %content_versions;
+    foreach my $month_key (@$required_months) {
+        my $meta = _read_month_metadata_only($args_href->{system_cache_dir}, $month_key);
+        $content_versions{$month_key} = ($meta ? ($meta->{content_version} // 0) : 0);
+    }
+
+    # 3. Calculate span (canonical window bounds — deterministic, matches Phase 4)
+    #    INCLUSIVE: N days ending on end_date → start = end - (N - 1)
+    my $span_start = ($args_href->{end_date_obj} - (($canonical_days - 1) * ONE_DAY))->strftime('%Y-%m-%d');
+    my $span_end   = $args_href->{end_date_obj}->strftime('%Y-%m-%d');
+
+    # 4. Assemble meta block using SHARED helpers (non-divergence guarantee)
+    my $meta = {
+        baseline_source      => 'history',
+        canonical_days       => $canonical_days,
+        lookback_cap_days    => 120,
+        required_days        => $required_days,
+        coverage_threshold   => $coverage_threshold,
+        span_start           => $span_start,
+        span_end             => $span_end,
+        excluded_dates_hash  => _compute_exclusion_hash($args_href->{date_exclusions}),
+        vm_scope_hash        => _compute_vm_scope_hash($args_href->{vm_scope_filter}),
+        months_content_hash  => _compute_months_content_hash(\%content_versions),
+        profile_set_hash     => _compute_profile_set_hash($args_href->{profiles} // []),
+        vm_set_hash          => _compute_vm_set_hash($args_href->{vms}),
+    };
+
+    # 5. Use SHARED fingerprint builder
+    return _compute_baseline_fingerprint($meta);
+}
+
+# ==============================================================================
+# SUBROUTINE: _calculate_aggregate_coverage
+# PURPOSE:    Computes a single aggregate coverage percentage from per-VM
+#             coverage data returned by _calculate_baseline_from_stitched.
+#             Uses the minimum coverage across all VM/profile pairs to
+#             represent the worst-case data quality.
+# ARGUMENTS:  $coverage_by_vm - hashref { VM => { profile => { pct_coverage => N } } }
+# RETURNS:    Number (0.0–1.0), or 0 if no coverage data.
+# PHASE:      History Based Baselining - Phase 5
+# ==============================================================================
+sub _calculate_aggregate_coverage {
+    my ($coverage_by_vm) = @_;
+    return 0 unless ($coverage_by_vm && ref($coverage_by_vm) eq 'HASH' && %$coverage_by_vm);
+
+    my $min_coverage = 1.0;
+    my $has_data = 0;
+
+    foreach my $vm (keys %$coverage_by_vm) {
+        my $profiles = $coverage_by_vm->{$vm};
+        next unless (ref($profiles) eq 'HASH');
+        foreach my $profile (keys %$profiles) {
+            my $info = $profiles->{$profile};
+            next unless (ref($info) eq 'HASH' && exists $info->{pct_coverage});
+            $has_data = 1;
+            $min_coverage = $info->{pct_coverage}
+                if ($info->{pct_coverage} < $min_coverage);
+        }
+    }
+
+    return $has_data ? $min_coverage : 0;
 }
 
 # ==============================================================================
@@ -11547,8 +13131,7 @@ sub _compute_execution_context_fingerprint {
 #     engine_version - Current engine version
 # ==============================================================================
 sub _compute_bucket_fingerprint {
-    # Added $dependency_fp to the end of the signature
-    my ($event_cfg, $exec_ctx, $model_type, $prev_bucket_fp, $dependency_fp) = @_;
+    my ($event_cfg, $exec_ctx, $model_type, $prev_bucket_fp, $dependency_fp, $baseline_fp) = @_;
 
     require Digest::MD5;
 
@@ -11565,10 +13148,16 @@ sub _compute_bucket_fingerprint {
     # Defaults to 'NONE' to ensure the hash is stable even if dependencies are empty
     my $dep_fp_str = (defined $dependency_fp && $dependency_fp ne '') ? $dependency_fp : 'NONE';
 
+    # Phase 5: Baseline fingerprint (History Based Baselining)
+    # When provided, a change in baseline data triggers staleness detection.
+    # Defaults to 'NONE' for backward compatibility with pre-baselining snapshots.
+    my $baseline_fp_str = (defined $baseline_fp && $baseline_fp ne '') ? $baseline_fp : 'NONE';
+
     # Canonical Assembly
     # We use a hash structure and JSON encoding to ensure deterministic key sorting
     # and clean extensibility without manually managing pipe delimiters.
     my $fingerprint_components = {
+        baseline       => $baseline_fp_str,
         event_def      => $event_def_fp,
         exec_ctx       => $exec_ctx_fp,
         chain          => $chain_fp,
@@ -11586,6 +13175,7 @@ sub _compute_bucket_fingerprint {
 
     return {
         combined       => $combined,
+        baseline       => $baseline_fp_str,
         event_def      => $event_def_fp,
         exec_ctx       => $exec_ctx_fp,
         chain          => $chain_fp,
@@ -11650,8 +13240,21 @@ sub _compute_bucket_fingerprint {
 
         return undef unless (defined $meta && ref($meta) eq 'HASH');
 
-        # Return fingerprint block if present
-        return $meta->{fingerprints} if (exists $meta->{fingerprints});
+        # Return fingerprint block if present, enriched with baseline metadata
+        # (Phase 5: History Based Baselining staleness detection)
+        if (exists $meta->{fingerprints}) {
+            # Shallow copy to avoid mutating the memoised cache
+            my %result = %{$meta->{fingerprints}};
+
+            # Carry baseline fields from _meta into the returned structure
+            # so _should_reprocess_bucket can perform baseline-specific checks
+            $result{baseline_fingerprint} = $meta->{baseline_fingerprint}
+                if exists $meta->{baseline_fingerprint};
+            $result{baseline_source} = $meta->{baseline_source}
+                if exists $meta->{baseline_source};
+
+            return \%result;
+        }
 
         return undef;
     }
@@ -11685,7 +13288,7 @@ sub _compute_bucket_fingerprint {
 #     stored_fp        - Stored fingerprint hashref (or undef)
 # ==============================================================================
 sub _should_reprocess_bucket {
-    my ($system_cache_dir, $event_name, $event_cfg, $model_type, $bucket_key, $exec_ctx, $prev_bucket_fp, $dependency_fp, $force_flag) = @_;
+    my ($system_cache_dir, $event_name, $event_cfg, $model_type, $bucket_key, $exec_ctx, $prev_bucket_fp, $dependency_fp, $force_flag, $baseline_fp_href) = @_;
 
     # ------------------------------------------------------------------
     # Idempotency & Dependency Awareness: DEBUG: argument sanity probe (only when --debug)
@@ -11719,8 +13322,12 @@ sub _should_reprocess_bucket {
         print STDERR "      ↳  Dependency: " . substr(($dependency_fp // ''), 0, 12) . "\n";
     }
 
+    # Phase 5: Extract baseline fingerprint for bucket fingerprint composition
+    my $baseline_fp_str = ($baseline_fp_href && ref($baseline_fp_href) eq 'HASH')
+                        ? $baseline_fp_href->{fingerprint} : undef;
+
     # Compute current fingerprint (always, to ensure provenance is persisted even under --force)
-    my $current_fp = _compute_bucket_fingerprint($event_cfg, $exec_ctx, $model_type, $prev_bucket_fp, $dependency_fp);
+    my $current_fp = _compute_bucket_fingerprint($event_cfg, $exec_ctx, $model_type, $prev_bucket_fp, $dependency_fp, $baseline_fp_str);
 
     # Always reprocess if forced (but still return fingerprint for storage)
     if ($force_flag) {
@@ -11762,6 +13369,23 @@ sub _should_reprocess_bucket {
         push @diff_reasons, "upstream history inputs changed (backfill or regeneration)";
     }
 
+    # Phase 5: Check baseline source mode change (L1 <-> history)
+    if ($baseline_fp_href && ref($baseline_fp_href) eq 'HASH') {
+        my $stored_bl_source  = $stored_fp->{baseline_source}      // 'unknown';
+        my $current_bl_source = $baseline_fp_href->{source}        // 'history';
+        if ($stored_bl_source ne 'unknown' && $stored_bl_source ne $current_bl_source) {
+            push @diff_reasons, sprintf("baseline mode changed (%s -> %s)",
+                $stored_bl_source, $current_bl_source);
+        }
+
+        # Check baseline fingerprint (within same mode)
+        my $stored_bl_fp  = $stored_fp->{baseline_fingerprint} // 'none';
+        my $current_bl_fp = $baseline_fp_href->{fingerprint}   // 'none';
+        if ($stored_bl_fp ne 'none' && $stored_bl_fp ne $current_bl_fp) {
+            push @diff_reasons, "baseline inputs changed (history content or exclusion configuration)";
+        }
+    }
+
     # Check event definition fingerprint (config changes)
     if (($stored_fp->{event_def} // '') ne ($current_fp->{event_def} // '')) {
         push @diff_reasons, "event configuration changed (dates, vms, exclude_dates, etc.)";
@@ -11782,6 +13406,8 @@ sub _should_reprocess_bucket {
         my $reason_category = 'config_changed';
         if (grep { /engine version/ } @diff_reasons) {
             $reason_category = 'rules_changed';
+        } elsif (grep { /baseline/ } @diff_reasons) {
+            $reason_category = 'baseline_changed';
         } elsif (grep { /upstream dependency/ } @diff_reasons) {
             $reason_category = 'chain_changed';
         }
@@ -11960,6 +13586,7 @@ sub _translate_change_reason {
     return 'analysis window changed'            if $category eq 'config_changed' && $detail =~ /execution context/;
     return 'upstream history updated'           if $category eq 'config_changed' && $detail =~ /upstream history/;
     return 'engine version updated'             if $category eq 'rules_changed';
+    return 'baseline data changed'              if $category eq 'baseline_changed';
     return 'prior bucket was reprocessed'       if $category eq 'chain_changed';
     return 'changes detected';  # fallback
 }
@@ -12241,8 +13868,69 @@ sub _execute_automatic_seasonal_discovery {
                 $anchor_info->{anchor_date}
             );
 
-            # Check if this bucket needs reprocessing or can be skipped
+            # --- PHASE 6: HISTORY-BASED BASELINE FINGERPRINT FOR STALENESS ---
+            # Compute the expected baseline fingerprint BEFORE the idempotency gate.
+            # This is lightweight (metadata-only) and allows staleness detection
+            # when baseline inputs change (content_version, exclusions, mode switch).
+            my $baseline_fp_href;
+
+            if (!$use_l1_baseline) {
+                # History-based path (default)
+                my $bl_exclusions;
+                if (defined $event_cfg->{exclude_dates}) {
+                    my $known_vms = _get_known_vms_from_cache($current_cache_path);
+                    $bl_exclusions = _parse_exclusion_dates($event_cfg->{exclude_dates}, $known_vms);
+                }
+                my $bl_vm_scope = _parse_vm_scope_filter($event_cfg);
+                my $bl_canonical_days = $event_cfg->{baseline_canonical_days} // 90;
+
+                my $expected_bl_fp = _calculate_expected_baseline_fingerprint({
+                    system_cache_dir   => $current_cache_path,
+                    end_date_obj       => $exec_ctx->{effective_end_date},
+                    canonical_days     => $bl_canonical_days,
+                    coverage_threshold => $event_cfg->{baseline_coverage_threshold} // 0.7,
+                    date_exclusions    => $bl_exclusions,
+                    vm_scope_filter    => $bl_vm_scope,
+                    profiles           => [map { $_->{name} } @$profiles_aref],
+                });
+
+                if (defined $expected_bl_fp) {
+                    $baseline_fp_href = {
+                        fingerprint => $expected_bl_fp,
+                        source      => 'history',
+                    };
+                }
+            } else {
+                # L1 escape hatch: deterministic fingerprint based on canonical span
+                require Digest::MD5;
+                my $bl_canonical_days = $event_cfg->{baseline_canonical_days} // 90;
+                my $span_start = ($exec_ctx->{effective_end_date} - (($bl_canonical_days - 1) * ONE_DAY))->strftime('%Y-%m-%d');
+                my $span_end   = $exec_ctx->{effective_end_date}->strftime('%Y-%m-%d');
+                $baseline_fp_href = {
+                    fingerprint => Digest::MD5::md5_hex("l1_cache:$bl_canonical_days:$span_start:$span_end"),
+                    source      => 'l1_cache',
+                };
+            }
+
+            # Override: predictive_peak always uses L1 baseline, so its staleness
+            # fingerprint must reflect L1 provenance rather than history content.
+            # Without this, history content changes (e.g. new month committed)
+            # would trigger unnecessary reprocessing for predictive_peak buckets
+            # whose baseline is unaffected by history.
             my $model_type = $event_cfg->{model} // '';
+            if ($model_type eq 'predictive_peak' && !$use_l1_baseline
+                && $baseline_fp_href && $baseline_fp_href->{source} eq 'history') {
+                require Digest::MD5;
+                my $bl_canonical_days = $event_cfg->{baseline_canonical_days} // 90;
+                my $span_start = ($exec_ctx->{effective_end_date} - (($bl_canonical_days - 1) * ONE_DAY))->strftime('%Y-%m-%d');
+                my $span_end   = $exec_ctx->{effective_end_date}->strftime('%Y-%m-%d');
+                $baseline_fp_href = {
+                    fingerprint => Digest::MD5::md5_hex("l1_cache:$bl_canonical_days:$span_start:$span_end"),
+                    source      => 'l1_cache',
+                };
+            }
+
+            # Check if this bucket needs reprocessing or can be skipped
             my $effective_bucket_key = ($bucket_key eq '__single__')
                 ? ($anchor_info->{anchor_bucket} // 'unknown')
                 : $bucket_key;
@@ -12256,7 +13944,8 @@ sub _execute_automatic_seasonal_discovery {
                 $exec_ctx,
                 $prev_bucket_combined_fp,
                 $dependency_fp,
-                $force_update  # Use the global --force flag
+                $force_update,       # Use the global --force flag
+                $baseline_fp_href    # Phase 6: baseline staleness input
             );
 
             if (!$reprocess_decision->{reprocess}) {
@@ -12305,7 +13994,85 @@ sub _execute_automatic_seasonal_discovery {
             # Attach fingerprints to execution context for downstream storage
             $exec_ctx->{_fingerprints} = $reprocess_decision->{current_fp};
 
+            # --- PHASE 6: FULL BASELINE COMPUTATION (only on reprocess) ---
+            # Compute the complete baseline from history for consumer use.
+            # Skipped when --use-l1-baseline is active (consumers fall back to L1 path).
+            if (!$use_l1_baseline) {
+                my $bl_exclusions;
+                if (defined $event_cfg->{exclude_dates}) {
+                    my $known_vms = _get_known_vms_from_cache($current_cache_path);
+                    $bl_exclusions = _parse_exclusion_dates($event_cfg->{exclude_dates}, $known_vms);
+                }
+                my $bl_vm_scope = _parse_vm_scope_filter($event_cfg);
+                my $bl_canonical_days = $event_cfg->{baseline_canonical_days} // 90;
+
+                my @all_peak_periods = find_all_historical_periods(
+                    $seasonality_config,
+                    $args_href->{effective_start_date},
+                    $exec_ctx->{effective_end_date}
+                );
+
+                eval {
+                    my $baseline_result = _get_baseline_from_history({
+                        system_cache_dir   => $current_cache_path,
+                        end_date_obj       => $exec_ctx->{effective_end_date},
+                        canonical_days     => $bl_canonical_days,
+                        coverage_threshold => $event_cfg->{baseline_coverage_threshold} // 0.7,
+                        vm_scope_filter    => $bl_vm_scope,
+                        date_exclusions    => $bl_exclusions,
+                        peak_periods       => \@all_peak_periods,
+                        profiles           => [map { $_->{name} } @$profiles_aref],
+                    });
+
+                    $exec_ctx->{_baseline_result} = $baseline_result;
+                    $exec_ctx->{_baseline_meta}   = $baseline_result->{meta};
+
+                    if (($verbose // 0) >= 1) {
+                        my $bl_status = ($baseline_result->{meta}{coverage_by_vm})
+                            ? 'computed' : 'no coverage data';
+                        print STDERR "      ↳  Baseline from history: $bl_status\n";
+                    }
+                };
+                if ($@) {
+                    # History-based baseline failed — this is non-fatal.
+                    # Consumers will detect the absence and use legacy L1 path.
+                    my $err_msg = $@;
+                    chomp $err_msg;
+                    warn "  [WARN] History-based baseline unavailable: $err_msg\n";
+                    warn "  [WARN] Consumers will use legacy L1 path for this bucket.\n"
+                        if (($verbose // 0) >= 1);
+                }
+            }
+
             # --- DISPATCH TO MODEL EXECUTOR ---
+
+            # Gate: suppress history-based baseline for predictive_peak.
+            # The predictive_peak model uses baseline in a max() gate where
+            # small differences can flip the governing branch. Mean-of-daily-
+            # aggregates cannot reproduce the pooled-percentile precision that
+            # the legacy L1 single-pass engine provides. Multiplicative models
+            # are unaffected because baseline enters as a ratio multiplicand
+            # where day-weighting bias cancels between numerator and denominator.
+            #
+            # Replace history baseline with an L1 metadata stub so that:
+            #  - The consumer falls through to _get_true_baseline_results (L1)
+            #  - The storage function records baseline_source = 'l1_cache'
+            #  - Snapshot auditability is preserved
+            if ($model_type eq 'predictive_peak' && !$use_l1_baseline) {
+                delete $exec_ctx->{_baseline_result};
+                $exec_ctx->{_baseline_meta} = {
+                    baseline_source => 'l1_cache',
+                    fingerprint     => $baseline_fp_href->{fingerprint},
+                    span_start      => undef,
+                    span_end        => undef,
+                    months_read     => undef,
+                    coverage_by_vm  => undef,
+                };
+                if (($verbose // 0) >= 1) {
+                    print STDERR "      ↳  Baseline: using staged data cache as data source (predictive_peak precision requirement)\n";
+                }
+            }
+
             if ($model_type eq 'multiplicative_seasonal') {
                 # Phase 3.2: if Phase 3.1 bucket provenance exists and we have multiple occurrences,
                 # aggregate multiplicative forecasts within the bucket.
@@ -12328,6 +14095,19 @@ sub _execute_automatic_seasonal_discovery {
             }
             else {
                 warn "  WARNING: Unknown or unsupported model type '$model_type' for event '$event_name'. Skipping.\n";
+            }
+
+            # Phase 7: Cross-zone score invalidation for baseline changes
+            # When the reprocess reason includes baseline changes, any existing
+            # Zone 3 tournament scores are stale (they referenced old forecasts).
+            # Set the staleness marker so Zone 3 detects and rescores.
+            if ($reason_cat eq 'baseline_changed') {
+                _mark_scores_invalid_for_snapshot(
+                    $current_cache_path,
+                    $event_name,
+                    $effective_bucket_key,
+                    $reprocess_decision->{reason}
+                );
             }
 
             # Phase 4: Update chain-of-custody for next bucket
@@ -12976,6 +14756,10 @@ sub _execute_multiplicative_seasonal {
         }
     }
 
+    # Phase 6: Extract pre-computed history baseline (undef if --use-l1-baseline)
+    my $precomputed_baselines = ($exec_ctx->{_baseline_result})
+        ? $exec_ctx->{_baseline_result}{baselines} : undef;
+
     # 6. Calculate Forecast
     my ($forecast_results, $historic_data) = calculate_multiplicative_forecast(
         $current_cache_path,
@@ -12986,7 +14770,8 @@ sub _execute_multiplicative_seasonal {
         $assimilation_map,
         $exclusions,
         $exec_ctx->{effective_start_date},
-        $exec_ctx->{effective_end_date}
+        $exec_ctx->{effective_end_date},
+        $precomputed_baselines     # Phase 6: history-based baseline (undef → L1 fallback)
     );
 
     # Merge Forecast Results (preserving event-period measurement values)
@@ -13228,7 +15013,8 @@ sub _execute_multiplicative_seasonal {
             $horizon_meta,
             $analysis_context,
             $exec_ctx->{anchor_bucket},
-            $exec_ctx->{_fingerprints}  # Phase 4: Idempotency fingerprints
+            $exec_ctx->{_fingerprints}, # Phase 4: Idempotency fingerprints
+            $exec_ctx->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
         );
     }
     # For aggregated mode, return the raw forecast hashref to caller
@@ -13549,7 +15335,8 @@ sub _execute_recency_decay {
         $horizon_meta,
         $analysis_context,
         $args_href->{anchor_bucket},
-        $args_href->{_fingerprints}  # Phase 4: Idempotency fingerprints
+        $args_href->{_fingerprints},  # Phase 4: Idempotency fingerprints
+        $args_href->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
     );
 
     # Phase 3.2: allow orchestration to aggregate results
@@ -13625,6 +15412,10 @@ sub _execute_predictive_peak {
         return;
     }
 
+    # Phase 6: Extract pre-computed history baseline (undef if --use-l1-baseline)
+    my $precomputed_baselines = ($args_href->{_baseline_result})
+        ? $args_href->{_baseline_result}{baselines} : undef;
+
     # 5. Calculate Forecast
     my $forecast_results = calculate_predictive_peak_forecast(
         $current_cache_path,
@@ -13635,7 +15426,8 @@ sub _execute_predictive_peak {
         $args_href->{adaptive_saturation_thresh},
         $exclusions,
         $args_href->{effective_start_date},
-        $args_href->{effective_end_date}
+        $args_href->{effective_end_date},
+        $precomputed_baselines     # Phase 6: history-based baseline (undef → L1 fallback)
     );
 
     # Merge Forecast
@@ -13796,7 +15588,8 @@ sub _execute_predictive_peak {
         $horizon_meta,
         $analysis_context,
         $args_href->{anchor_bucket},
-        $args_href->{_fingerprints}  # Phase 4: Idempotency fingerprints
+        $args_href->{_fingerprints},  # Phase 4: Idempotency fingerprints
+        $args_href->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
     );
 }
 
@@ -14368,7 +16161,8 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
         $horizon_meta,
         $analysis_context,
         $bucket_exec_ctx->{anchor_bucket},
-        $bucket_exec_ctx->{_fingerprints}  # Phase 4: Idempotency fingerprints
+        $bucket_exec_ctx->{_fingerprints},  # Phase 4: Idempotency fingerprints
+        $bucket_exec_ctx->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
     );
 
     # Phase 3.2: CSV output for aggregated bucket
