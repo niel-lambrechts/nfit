@@ -77,6 +77,42 @@ my $LIMIT_THRESHOLD_PERC = 0.98;       # P99W1 vs MaxCPU for pressure detection
 my $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD = 2.0; # NormRunQ P90 above this may indicate workload pressure (NOT adaptive)
 my $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD = 1.5;       # AbsRunQ P90 / (MaxCPU * SMT) above this indicates RunQ pressure (ADAPTIVE)
 my $RUNQ_ADDITIVE_TOLERANCE_FACTOR = 1.8;               # Tolerate AbsRunQ up to this Factor x Base_Profile_PhysC's LCPU capacity (NOT adaptive)
+my $RUNQ_TARGET_HEADROOM_FACTOR = 0.80;                 # Target headroom below the tolerance ceiling (aim below the red line)
+
+# VCPU sizing policy (stress-driven, slot-aware, rENT-bounded)
+# Note: rVCPU is emitted per profile. The envelope is computed from the profile's rENT (growth-aware).
+my $VCPU_RATIO_MIN = 1.20;                              # IBM guidance (typical): keep VCPU >= ~1.20x entitlement
+my $VCPU_RATIO_MAX = 2.00;                              # IBM guidance (typical): keep VCPU <= ~2.00x entitlement
+my $VCPU_MIN_ABS = 1;                                   # Never recommend below 1 VP
+my $VCPU_MIN_FOR_ENT_GE_0_5_LT_1 = 2;                    # For 0.5 <= rENT < 1.0, prefer at least 2 VPs
+my $VCPU_ROUND_UP_TO_EVEN = 1;                           # If true: round rVCPU up to nearest even (within envelope)
+my $VCPU_PEAK_HEADROOM_FACTOR = 1.20;   # rVCPU floor based on P-99W1 (smoothed peak cores); 1.00 => at least ceil(P-99W1)
+# Optional dynamic scaling of peak headroom based on stress/volatility diagnostics.
+# Multiplier is clamped to keep behaviour bounded.
+my $VCPU_PEAK_HEADROOM_DYNAMIC = 1;
+my $VCPU_PEAK_HEADROOM_MULT_MIN = 0.90;
+my $VCPU_PEAK_HEADROOM_MULT_MAX = 1.20;
+
+# RunQ credibility adjustment for P99W1 peak floor.
+# When RunQ-derived core demand is well below PhysC peak, the gap likely reflects
+# VP dispatch overhead (idle spin, cache warming, folding) rather than true workload.
+# The adjustment discounts PhysC peak proportionally, bounded by a minimum credibility.
+my $VCPU_PEAK_CRED_BIAS    = 0.15;   # Benefit-of-doubt for PhysC (I/O, interrupts, cache affinity)
+my $VCPU_PEAK_CRED_MIN     = 0.65;   # Never discount PhysC peak by more than 35%
+
+
+# Tier-aware rVCPU headroom factors (aligns with tier_upsizing_factors philosophy).
+# Higher tiers (lower latency tolerance) receive more conservative (wider) VP allocation.
+# Applied to both the RunQ operating-point and the P99W1 peak floor.
+# Split into separate maps if independent tuning is required later.
+my %VCPU_TIER_HEADROOM_FACTORS = (
+    1 => 1.30,  # Tier 1: +30% more width (low latency tolerance)
+    2 => 1.15,  # Tier 2: +15% more width
+    3 => 1.00,  # Tier 3: Baseline (no adjustment)
+    4 => 0.95,  # Tier 4: Slightly moderated width
+);
+
+
 my $ENTITLEMENT_BURST_ALLOWANCE_FACTOR = 0.25;          # Allow uncapped VMs to burst 25% over their entitlement before pressure is assessed
 my $BURST_ALLOWANCE_MIN_FACTOR = 0.0;
 my $BURST_ALLOWANCE_MAX_FACTOR = 0.5;                   # Clamp at 50%
@@ -128,6 +164,30 @@ my $STD_PHYSC_STABILITY_THRESH = 0.15; # PhysC P90/P50 ratio must be less than 1
 my $STD_LCPU_TIER1_MAX = 8;     # For small VMs (less dampening)
 my $STD_LCPU_TIER2_MAX = 32;    # For medium VMs (base dampening)
                                 # VMs > TIER2_MAX are large (more dampening)
+
+# --- Downsizing Guardrail Banding (AAE / PAE / IQRC) ---
+# Replaces the legacy "Base PhysC > Entitlement" veto for tactical downsizing.
+#
+# AAE: Average Above Entitlement (daily diagnostic; entitlement-relative)
+#   - negative means typical utilisation is below entitlement
+#   - slightly positive means typical utilisation is above entitlement
+#
+# PAE: Peak Above Entitlement (daily diagnostic; entitlement-relative)
+#   - negative means peak is below entitlement
+#   - positive means tail frequently exceeds entitlement
+#
+# IQRC: Normalised RunQ volatility (NormRunQ IQRC)
+#
+# Bands:
+#   GREEN: allow analytical downsizing to proceed normally
+#   AMBER: allow downsizing, but dampen analytical reduction
+#   RED:   block tactical downsizing (retain conservative behaviour)
+my $DOWNSIZE_GUARD_GREEN_MAX_PAE   = 0.25;  # up to +25% tail exceedance allowed
+my $DOWNSIZE_GUARD_AMBER_MAX_PAE   = 0.50;  # up to +50% tail exceedance allowed (limited)
+my $DOWNSIZE_GUARD_GREEN_MAX_IQRC  = 0.60;  # moderate variability OK
+my $DOWNSIZE_GUARD_AMBER_MAX_IQRC  = 1.00;  # higher variability acceptable with dampening
+my $DOWNSIZE_GUARD_AMBER_MAX_AAE   = 0.05;  # allow slight typical exceedance (+5%) in AMBER
+my $DOWNSIZE_GUARD_AMBER_CAP_SCALE = 0.50;  # halve the analytical reduction in AMBER band
 
 # --- Dispatch-Bound Workload (DBW) Anomaly Heuristics ---
 # Detects workloads with very low CPU usage but extremely high dispatch contention.
@@ -630,13 +690,20 @@ my %vm_tier_overrides = %{parse_vm_tier_overrides("$script_dir/etc/nfit.vms.cfg"
     "RunQ_Tactical", "RunQ_Strategic", "RunQ_Potential", "RunQ_Source", $PEAK_PROFILE_NAME
 );
 
-# Add profile names as column headers (these will contain the RunQ-modified PhysC values)
-push @output_header_cols_csv, map { $_->{name} } @csv_visible_profiles;
+# Add interleaved profile + rVCPU columns (rVCPU is emitted for all visible profiles
+# EXCEPT the mandatory peak helper profile (P99W1), which is not a workload profile).
+foreach my $p (@csv_visible_profiles) {
+    push @output_header_cols_csv, $p->{name};
+    if (defined $p->{name} && $p->{name} ne $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+        push @output_header_cols_csv, $p->{name} . "_rVCPU";
+    }
+}
 
-# Add "Current - ENT" which is always shown.
-push @output_header_cols_csv, ("Current - ENT");
+# Add current entitlement + current VCPU + constraint flags
+push @output_header_cols_csv, ("Current - ENT", "Current - VCPU", "NFIT - ENT", "VCPU_Constraints");
+
 if ($add_excel_formulas) {
-    push @output_header_cols_csv, ("NFIT - ENT", "NETT", "NETT%");
+    push @output_header_cols_csv, ("NETT", "NETT%");
 }
 
 # --- Ensure the Mandatory P-99W1 Profile is Defined ---
@@ -1172,6 +1239,71 @@ foreach my $system_serial (@target_systems_to_process)
         print {$LOG_FH} "  - RunQ Avg Method            : $nfit_runq_avg_method_str\n";
         print {$LOG_FH} "  - Default SMT for Profile    : $default_smt_arg\n";
         print {$LOG_FH} "======================================================================\n\n";
+
+        print {$LOG_FH} "Key Terminology Reference (Sections C, E, F)\n";
+        print {$LOG_FH} "----------------------------------------------------------------------\n";
+        print {$LOG_FH} "  PhysC              Physical CPU consumed, as reported by the hypervisor. Includes\n";
+        print {$LOG_FH} "                     active thread execution, idle VP spin, and cache warming overhead.\n";
+        print {$LOG_FH} "                     Higher VP counts can inflate PhysC without increased workload.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Entitlement vs     Entitlement is the guaranteed CPU capacity (cores). rVCPU is the\n";
+        print {$LOG_FH} "  rVCPU              number of virtual processors needed to schedule peak thread demand.\n";
+        print {$LOG_FH} "                     They answer different questions: entitlement sizes steady-state\n";
+        print {$LOG_FH} "                     allocation; rVCPU sizes dispatch width for peak bursts.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Tier / Tier Factor Policy classification (1-4) reflecting latency sensitivity.\n";
+        print {$LOG_FH} "                     Tier 1 (most conservative) adds headroom for latency-intolerant\n";
+        print {$LOG_FH} "                     workloads; Tier 4 (most efficient) favours cost reduction.\n";
+        print {$LOG_FH} "                     The tier factor scales RunQ headroom and peak floor padding.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  P-99W1             The 99th percentile of weekly-windowed (5-min) PhysC averages.\n";
+        print {$LOG_FH} "                     Represents the credible sustained peak: the highest demand this\n";
+        print {$LOG_FH} "                     LPAR sustains for a meaningful duration, filtering out sub-second\n";
+        print {$LOG_FH} "                     spikes. Used as the baseline for rVCPU peak floor calculations.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  PAE                Proportion of Above-Entitlement days. The fraction of measured\n";
+        print {$LOG_FH} "                     days where daily PhysC exceeded the LPAR's entitled capacity.\n";
+        print {$LOG_FH} "                     High PAE (e.g. >30%) indicates chronic reliance on burst CPU.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  AAE                Aggregate Above-Entitlement excess. The total CPU consumption\n";
+        print {$LOG_FH} "                     above entitlement as a fraction of total consumption. High AAE\n";
+        print {$LOG_FH} "                     (e.g. >10%) indicates significant burst magnitude, not just\n";
+        print {$LOG_FH} "                     frequency. PAE measures how often; AAE measures how much.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  NormRunQ_IQRC      Normalised Run Queue Inter-Quartile Range Coefficient. Measures\n";
+        print {$LOG_FH} "                     the volatility of the run queue: (P75-P25)/P50. Low values\n";
+        print {$LOG_FH} "                     (<0.30) indicate steady, predictable demand; high values signal\n";
+        print {$LOG_FH} "                     bursty, unpredictable workload patterns.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  AAE/PAE/IQRC       A guardrail that prevents CPU downsizing when the workload\n";
+        print {$LOG_FH} "  Banding Veto       exhibits above-entitlement operation and does not match a\n";
+        print {$LOG_FH} "                     recognised safe pattern (e.g. single-threaded dominant). The\n";
+        print {$LOG_FH} "                     veto uses PAE, AAE, and IQRC to classify workload stress bands.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Envelope Minimum   The lower bound of the vendor-safe rVCPU range, calculated as\n";
+        print {$LOG_FH} "                     ceil(rENT_P x VCPU_RATIO_MIN). IBM guidance recommends VCPUs\n";
+        print {$LOG_FH} "                     should not fall below approximately 1.2x entitlement to ensure\n";
+        print {$LOG_FH} "                     adequate scheduling width for the entitled capacity.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Peak Floor         The minimum rVCPU count needed to physically service the LPAR's\n";
+        print {$LOG_FH} "                     observed credible peak (P-99W1). Ensures the hypervisor has\n";
+        print {$LOG_FH} "                     enough virtual processors to run all peak threads without\n";
+        print {$LOG_FH} "                     excessive queueing. Headroom is scaled by PAE/AAE evidence\n";
+        print {$LOG_FH} "                     and tier policy.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Credible Peak      The P-99W1 PhysC peak after RunQ credibility adjustment. When\n";
+        print {$LOG_FH} "                     the run queue evidence (AbsRunQ_P99) suggests significantly\n";
+        print {$LOG_FH} "                     fewer active threads than PhysC implies, the gap likely reflects\n";
+        print {$LOG_FH} "                     VP dispatch overhead rather than true workload demand. The\n";
+        print {$LOG_FH} "                     credible peak discounts PhysC proportionally (bounded by a\n";
+        print {$LOG_FH} "                     minimum credibility of $VCPU_PEAK_CRED_MIN).\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  RunQ Dispatch      The rVCPU count derived purely from observed run queue depth.\n";
+        print {$LOG_FH} "  Width              Converts the AbsRunQ tail percentile (threads) to cores via\n";
+        print {$LOG_FH} "                     SMT, applies a target headroom factor, and scales by tier.\n";
+        print {$LOG_FH} "                     Answers: how many VPs does the scheduler need to avoid\n";
+        print {$LOG_FH} "                     dispatch latency at the observed queue depth?\n";
+        print {$LOG_FH} "======================================================================\n\n";
     }
 
     # --- Adaptive Threshold Initialisation for this system ---
@@ -1446,6 +1578,58 @@ foreach my $system_serial (@target_systems_to_process)
                     if (looks_like_number($adjusted_physc)) {
                         $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
                     }
+
+                    # Step 3: Per-profile rVCPU (stress-driven, slot-aware, rENT-bounded, growth-aware)
+                    # - RunQ_hi_threads: AbsRunQ value actually used for this profile’s logic (already selected)
+                    # - rENT_P: final entitlement recommendation for this profile (growth-adjusted, plus any narrow RunQ additive)
+                    # - rVCPU envelope: clamp to vendor-safe band relative to rENT_P
+                    my $rvcpu_final;
+                    my $rvcpu_raw;
+                    my $rvcpu_min;
+                    my $rvcpu_max;
+
+                    my $runq_hi_threads = undef;
+                    if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                        my $v = $debug_info_ref->{'AbsRunQValueUsedForCalc'};
+                        $runq_hi_threads = (defined $v && looks_like_number($v)) ? ($v + 0) : undef;
+                    }
+
+                    my $rENT_P = (defined $adjusted_physc && looks_like_number($adjusted_physc)) ? ($adjusted_physc + 0) : undef;
+                    my $smt_for_vcpu = (defined $vm_map_ref->{Configuration}{smt} && looks_like_number($vm_map_ref->{Configuration}{smt}))
+                                     ? ($vm_map_ref->{Configuration}{smt} + 0)
+                                     : undef;
+
+                    # Tier-aware headroom for rVCPU
+                    my $ml_tier_str = $p_name;
+                    $ml_tier_str =~ s/-.*//;
+                    my $rvcpu_tier_num = 3;
+                    if ($ml_tier_str =~ /(\d)$/) {
+                        $rvcpu_tier_num = $1;
+                    } elsif ($ml_tier_str eq 'P') {
+                        $rvcpu_tier_num = 1;
+                    }
+                    my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
+
+                    if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0 && defined $rENT_P && $rENT_P > 0) {
+                        # Workload-driven width requirement (threads -> cores -> vCPUs), tier-adjusted
+                        my $required_threads = ($runq_hi_threads / $RUNQ_TARGET_HEADROOM_FACTOR) * $rvcpu_tier_factor;
+                        my $required_cores   = $required_threads / $smt_for_vcpu;
+                        $rvcpu_raw = int($required_cores);
+                        $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil for positive values
+
+                        # Envelope from rENT_P (growth-aware)
+                        my $min_v = $rENT_P * $VCPU_RATIO_MIN;
+                        my $max_v = $rENT_P * $VCPU_RATIO_MAX;
+                        $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
+                        $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
+
+                        # Clamp
+                        $rvcpu_final = $rvcpu_raw;
+                        $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
+                        $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
+                    }
+
+                    $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : '';
 
                     # If this is the source profile, save the modifiers for the CSV columns
                     if ($p_name eq $runq_source_profile_name) {
@@ -2602,18 +2786,18 @@ sub log_profile_rationale
         $net_change_str = sprintf("%s%.4f cores%s", ($delta >=0 ? "+" : ""), abs($delta), $perc_change_str);
     }
 
-#    print {$fh} "\n======================================================================\n";
-#    printf {$fh} "VM Name                                      : %s\n", $vm_name;
-#    printf {$fh} "Profile Processed                            : %s\n", $profile_description_log;
-#    print {$fh} "----------------------------------------------------------------------\n";
+    print {$fh} "\n======================================================================\n";
+    printf {$fh} "VM Name                                      : %s\n", $vm_name;
+    printf {$fh} "Profile Processed                            : %s\n", $profile_description_log;
+    print {$fh} "----------------------------------------------------------------------\n";
     if ($model_type eq 'recency_decay') {
 		# --- PATH B: Log the Recency Decay Rationale (Standardised) ---
 		my $profile_desc = parse_profile_name_for_log($profile_being_adjusted);
 
-		print {$fh} "======================================================================\n";
-		printf {$fh} "VM Name                             : %s\n", $vm_name;
-		printf {$fh} "Profile Processed                   : %s\n", $profile_desc;
-		print {$fh} "----------------------------------------------------------------------\n";
+#		print {$fh} "======================================================================\n";
+#		printf {$fh} "VM Name                             : %s\n", $vm_name;
+#		printf {$fh} "Profile Processed                   : %s\n", $profile_desc;
+#		print {$fh} "----------------------------------------------------------------------\n";
 		print {$fh} "  CPU Forecasting Model: Recency-Anchored Decay (Seasonal: '$apply_seasonality_event')\n\n";
 
 		# EXEMPTION: Special Handling for P-99W1
@@ -2834,7 +3018,9 @@ sub log_profile_rationale
             # Display MK variant and routing information
                 if (my $mk_variant = $gd->{mk_variant}) {
                     if ($mk_variant eq 'standard_mk_trend_dominant') {
-                        print {$fh} "    - Test Variant       : Standard MK (strong trend detected, |τ| ≥ 0.4)\n";
+                        my $tau = "\x{03C4}";
+                        my $ge  = "\x{2265}";
+                        print {$fh} "    - Test Variant       : Standard MK (strong trend detected, |$tau| $ge 0.4)\n";
                         if (my $reason = $gd->{hamed_rao_skip_reason}) {
                             print {$fh} "    - Note               : $reason\n";
                         }
@@ -2887,7 +3073,7 @@ sub log_profile_rationale
 
     print {$fh} "Section B: Key Inputs & Configuration for Modifier Logic\n";
     printf {$fh} "  1. Key RunQ Metrics (source: %s, state: %s)\n", $runq_metrics_source_profile_name_for_this_calc, "Most Recent";
-    printf {$fh} "     - AbsRunQ for Upsizing (%s)    : %s threads\n", $abs_runq_key_reported_in_log, ($abs_runq_value_used_for_calc // $na);
+    printf {$fh} "     - AbsRunQ for Upsizing (%s)    : %s threads\n", ($abs_runq_key_reported_in_log // $na), (defined $abs_runq_value_used_for_calc && looks_like_number($abs_runq_value_used_for_calc) ? sprintf("%.2f", $abs_runq_value_used_for_calc) : ($abs_runq_value_used_for_calc // $na));
     printf {$fh} "     - NormRunQ P25                          : %s\n", (looks_like_number($calc_debug_info_ref->{'NormRunQ_P25_Val'}) ? sprintf("%.4f", $calc_debug_info_ref->{'NormRunQ_P25_Val'}) : $na);
     printf {$fh} "     - NormRunQ P50                          : %.4f\n", ($normP50_for_this_calc // ($calc_debug_info_ref->{'NormRunQ_P50_Val'} // $na) );
     printf {$fh} "     - NormRunQ P75                          : %.4f\n", ($calc_debug_info_ref->{'NormRunQ_P75_Val'} // $na);
@@ -2907,6 +3093,27 @@ sub log_profile_rationale
     } else {
         print {$fh} "\n";
     }
+
+
+    # ------------------------------------------------------------------
+    # Additional diagnostics (DailySeries-based PhysC diagnostics + headroom)
+    # ------------------------------------------------------------------
+    my $physc_iqrc_log = looks_like_number($calc_debug_info_ref->{'PhysC_Daily_IQRC'}) ? sprintf("%.4f", $calc_debug_info_ref->{'PhysC_Daily_IQRC'}) : $na;
+    my $physc_pae_log  = looks_like_number($calc_debug_info_ref->{'PhysC_Daily_PAE'})  ? sprintf("%.4f", $calc_debug_info_ref->{'PhysC_Daily_PAE'})  : $na;
+    my $physc_aae_log  = looks_like_number($calc_debug_info_ref->{'PhysC_Daily_AAE'})  ? sprintf("%.4f", $calc_debug_info_ref->{'PhysC_Daily_AAE'})  : $na;
+    printf {$fh} "     - PhysC Daily IQRC (Diagnostic)         : %s\n", $physc_iqrc_log;
+    printf {$fh} "     - PhysC Daily PAE  (Diag: %%days > Ent)  : %s\n", $physc_pae_log;
+    printf {$fh} "     - PhysC Daily AAE  (Diag: excess/total) : %s\n", $physc_aae_log;
+
+    my $hg_t = looks_like_number($calc_debug_info_ref->{'Headroom_Guaranteed_Threads'}) ? sprintf("%.2f", $calc_debug_info_ref->{'Headroom_Guaranteed_Threads'}) : $na;
+    my $hg_c = looks_like_number($calc_debug_info_ref->{'Headroom_Guaranteed_Cores'})   ? sprintf("%.4f", $calc_debug_info_ref->{'Headroom_Guaranteed_Cores'})   : $na;
+    my $hr_t = looks_like_number($calc_debug_info_ref->{'Headroom_Reachable_Threads'})  ? sprintf("%.2f", $calc_debug_info_ref->{'Headroom_Reachable_Threads'})  : $na;
+    my $hr_c = looks_like_number($calc_debug_info_ref->{'Headroom_Reachable_Cores'})    ? sprintf("%.4f", $calc_debug_info_ref->{'Headroom_Reachable_Cores'})    : $na;
+    my $hqk  = $calc_debug_info_ref->{'Headroom_AbsRunQKey'} // $na;
+    my $hqt  = looks_like_number($calc_debug_info_ref->{'Headroom_AbsRunQ_Threads'}) ? sprintf("%.2f", $calc_debug_info_ref->{'Headroom_AbsRunQ_Threads'}) : $na;
+    my $hrc  = looks_like_number($calc_debug_info_ref->{'Headroom_EffectiveReachableCores'}) ? sprintf("%.2f", $calc_debug_info_ref->{'Headroom_EffectiveReachableCores'}) : $na;
+    printf {$fh} "     - Headroom vs %s (AbsRunQ=%s thr)       : Guaranteed %s thr (%s cores), Reachable[%s cores] %s thr (%s cores)\n",
+        $hqk, $hqt, $hg_t, $hg_c, $hrc, $hr_t, $hr_c;
 
     my $is_runq_pressure_C_log_sec = ($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True";
     my $is_workload_pressure_C_log_sec = ($calc_debug_info_ref->{'IsWorkloadPressure'} // "False") eq "True";
@@ -2931,7 +3138,7 @@ sub log_profile_rationale
         $lpar_pressure_reason = sprintf("Ratio %.2f <= %.2f (No pressure detected)", ($calc_debug_info_ref->{'RunQPressure_P90_Val'} // 0), $adaptive_runq_saturation_thresh);
     }
     printf {$fh} "     - Overall LPAR RunQ Pressure            : %s (Source: %s)\n", (($calc_debug_info_ref->{'IsRunQPressure'} // "False") eq "True" ? "True" : "False"), $abs_runq_source_str;
-    printf {$fh} "         Basis for Pressure Calc             : %s\n", $pressure_basis_str;
+    printf {$fh} "         Basis for Pressure Calc             : %s\n", $pressure_basis_str // 'N/A';
     printf {$fh} "         Reason for Pressure Flag            : %s\n", $lpar_pressure_reason;
 
     # Enhanced line for Normalised Workload Pressure
@@ -2970,9 +3177,14 @@ sub log_profile_rationale
 
         } elsif ($downsizing_reason_B_log =~ /workload does not match STD pattern/) {
             # --- Path 2: Bursting, but STD Pattern was NOT detected ---
-            printf {$fh} "  - Overall Status                           : Tactical Downsizing Skipped (Entitlement Floor Guard)\n";
+            my $band = $calc_debug_info_ref->{'DownsizeGuardBand'} // 'RED';
+            printf {$fh} "  - Overall Status                           : Tactical Downsizing Skipped (%s band guardrail)\n", $band;
             printf {$fh} "  - Guardrail Rationale                      : Base PhysC (%.4f) > Entitlement (%.2f)\n", ($eff_p_base_numeric // 0), ($curr_ent_numeric // 0);
-            printf {$fh} "  - Heuristic Assessment                     : Workload does NOT match STD pattern. No override applied.\n";
+            printf {$fh} "  - Guardrail Decision                       : AAE/PAE/IQRC banding veto (workload does not match STD pattern).\n";
+            printf {$fh} "      - Inputs                               : AAE=%s, PAE=%s, NormRunQ_IQRC=%s\n",
+                ($calc_debug_info_ref->{'PhysC_Daily_AAE'} // 'N/A'),
+                ($calc_debug_info_ref->{'PhysC_Daily_PAE'} // 'N/A'),
+                (defined $calc_debug_info_ref->{'NormRunQ_IQRC_Val'} ? $calc_debug_info_ref->{'NormRunQ_IQRC_Val'} : 'N/A');
             printf {$fh} "      - Confidence Checks                    : %s\n", ($calc_debug_info_ref->{'STDConfidenceChecks'} // 'N/A');
 
         } else {
@@ -2981,6 +3193,91 @@ sub log_profile_rationale
         }
 
         printf {$fh} "  - Final Downsizing Factor                  : %s\n", $downsizing_factor_B_log;
+
+        # rVCPU is stored per profile name in CoreResults
+        my $rv = $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_being_adjusted};
+        my $re = $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$profile_being_adjusted} // {};
+
+        # Determine binding constraint for plain-language verdict
+        my $rv_n   = (defined $rv && looks_like_number($rv)) ? ($rv + 0) : undef;
+        my $re_raw = (defined $re->{Raw} && looks_like_number($re->{Raw})) ? ($re->{Raw} + 0) : undef;
+        my $re_min = (defined $re->{Min} && looks_like_number($re->{Min})) ? ($re->{Min} + 0) : undef;
+        my $re_flr = (defined $re->{P99W1Floor} && looks_like_number($re->{P99W1Floor})) ? ($re->{P99W1Floor} + 0) : undef;
+        # Account for even-rounding: final may be 1 above the true binding value
+        my $rv_pre_even = (defined $rv_n && $VCPU_ROUND_UP_TO_EVEN && ($rv_n % 2) == 0) ? ($rv_n - 1) : $rv_n;
+
+        my $governed_by = 'N/A';
+        my @secondary = ();
+        if (defined $rv_n) {
+            # Identify which constraint(s) equal the final (or final-1 for even-rounding)
+            my $env_binds  = (defined $re_min && ($rv_n == $re_min || (defined $rv_pre_even && $rv_pre_even == $re_min)));
+            my $flr_binds  = (defined $re_flr && ($rv_n == $re_flr || (defined $rv_pre_even && $rv_pre_even == $re_flr)));
+            my $raw_binds  = (defined $re_raw && ($rv_n == $re_raw || (defined $rv_pre_even && $rv_pre_even == $re_raw)));
+
+            if ($env_binds && $flr_binds) {
+                $governed_by = sprintf("Envelope minimum (%s) tied with peak floor (%s)", $re_min // $na, $re_flr // $na);
+            } elsif ($env_binds) {
+                $governed_by = sprintf("Envelope minimum (%s)", $re_min // $na);
+            } elsif ($flr_binds) {
+                $governed_by = sprintf("Peak floor (%s)", $re_flr // $na);
+            } elsif ($raw_binds) {
+                $governed_by = sprintf("RunQ dispatch width (%s)", $re_raw // $na);
+            } else {
+                $governed_by = sprintf("Envelope minimum (%s)", $re_min // $na);  # Safe default
+            }
+
+            # Collect the non-binding constraints for context
+            push @secondary, sprintf("peak floor (%s)", $re_flr // $na)
+                if (defined $re_flr && !$flr_binds);
+            push @secondary, sprintf("envelope minimum (%s)", $re_min // $na)
+                if (defined $re_min && !$env_binds);
+            push @secondary, sprintf("RunQ dispatch width (%s)", $re_raw // $na)
+                if (defined $re_raw && !$raw_binds);
+        }
+        my $secondary_txt = @secondary
+            ? join(', ', @secondary) . (@secondary == 1 ? ' was lower.' : ' were lower.')
+            : '';
+
+        printf {$fh} "  - rVCPU (per-profile)                      : %s virtual processors\n",
+            (defined $rv ? $rv : 'N/A');
+        printf {$fh} "    Governed by: %s.%s\n",
+            $governed_by,
+            ($secondary_txt ? " $secondary_txt" : '');
+
+        # Credibility-adjusted peak line (only when adjustment was applied)
+        my $re_cred = (defined $re->{P99W1CredRatio} && looks_like_number($re->{P99W1CredRatio})) ? ($re->{P99W1CredRatio} + 0) : 1.00;
+        if ($re_cred < 1.00 && defined $re->{P99W1RawPeak} && defined $re->{P99W1AdjPeak}) {
+            printf {$fh} "    Credible peak: %s cores (PhysC %s adjusted by RunQ corroboration %.3f) x headroom %s.\n",
+                $re->{P99W1AdjPeak},
+                $re->{P99W1RawPeak},
+                $re_cred,
+                ($re->{P99W1FactorEff} // 'N/A');
+
+            # Diagnostic hint when credibility discount is material (>25% of peak unexplained by RunQ)
+            if ($re_cred < 0.75 && looks_like_number($re->{P99W1RawPeak}) && looks_like_number($re->{P99W1AdjPeak})) {
+                my $discount_cores = sprintf("%.2f", $re->{P99W1RawPeak} - $re->{P99W1AdjPeak});
+                my $discount_pct   = sprintf("%.0f", (1.0 - ($re->{P99W1AdjPeak} / $re->{P99W1RawPeak})) * 100);
+                printf {$fh} "    NOTE: Low RunQ corroboration — approximately %s cores (%s%%) of the P99W1 peak\n", $discount_cores, $discount_pct;
+                printf {$fh} "          is not backed by run queue evidence and may reflect VP dispatch overhead.\n";
+                printf {$fh} "          CAPACITY PLANNER HINT: Review the LPAR's current VP count (%s) relative to workload concurrency.\n",
+                    (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus})) ? sprintf("%d VPs", $cfg->{virtual_cpus}) : 'unknown';
+            }
+        }
+
+        printf {$fh} "    Detail: raw=%s; env=%s..%s; tier=%s/f=%s; P99W1_floor=%s @ factor=%s (headroom=%s; peak=%s adj=%s cred=%s); RunQ=%s=%s\n",
+            ($re->{Raw} // 'N/A'),
+            ($re->{Min} // 'N/A'),
+            ($re->{Max} // 'N/A'),
+            ($re->{TierNum} // 'N/A'),
+            ($re->{TierFactor} // 'N/A'),
+            ($re->{P99W1Floor} // 'N/A'),
+            ($re->{P99W1FactorEff} // 'N/A'),
+            ($re->{P99W1Mult} // 'N/A'),
+            ($re->{P99W1RawPeak} // 'N/A'),
+            ($re->{P99W1AdjPeak} // 'N/A'),
+            ($re->{P99W1CredRatio} // 'N/A'),
+            ($re->{RunQKeyUsed} // 'N/A'),
+            ($re->{RunQHiThreads} // 'N/A');
 
         ## --- END: Enhanced Section C Rationale Logging ---
 
@@ -2994,7 +3291,7 @@ sub log_profile_rationale
             printf {$fh} "     a. Initial Condition Checks for Downsizing Path:\n";
             my $eff_cond_norm_p50_met_str_B = $calc_debug_info_ref->{'EffCondNormP50Met'} ? "YES (Low P50)" : "NO (P50 not low enough)";
             printf {$fh} "        - NormRunQ P50                       : %-5s (Condition: < %.2f for consideration? %s)\n",
-            ($normP50_for_this_calc // $na),
+            ((defined $normP50_for_this_calc) ? sprintf("%.2f", $normP50_for_this_calc) : $na),
             $NORM_P50_THRESHOLD_FOR_EFFICIENCY_CONSIDERATION,
             $eff_cond_norm_p50_met_str_B;
 
@@ -3162,6 +3459,102 @@ sub log_profile_rationale
         printf {$fh} "  - Limited by MaxCPU Sanity Check?          : %s\n", ($calc_debug_info_ref->{'CappedByMaxCPU'} // $na);
         printf {$fh} "  => Recommendation after Max Sanity Check   : %s cores\n\n", ($final_recommendation_unrounded_str // $na);
     } # End else for ReasonForNoModification (main calculation block)
+
+    # --- Section F: VCPU Recommendation (Profile Width) ---
+    print {$fh} "Section F: VCPU Recommendation (Profile Width)\n";
+
+    my $curr_vcpu_log = (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus})) ? sprintf("%d", $cfg->{virtual_cpus}) : $na;
+    my $maxcpu_log    = (defined $cfg->{max_cpu} && looks_like_number($cfg->{max_cpu})) ? sprintf("%.2f", $cfg->{max_cpu}) : $na;
+
+    my $rvcpu_final_log = (defined $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_being_adjusted} && $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_being_adjusted} ne "")
+        ? $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_being_adjusted}
+        : ($calc_debug_info_ref->{'rVCPU_Final'} // $na);
+
+    printf {$fh} "  - Current VCPUs / MaxCPU                   : %s / %s\n", $curr_vcpu_log, $maxcpu_log;
+
+# Determine binding constraint for plain-language verdict
+    my $sf_rv_n  = looks_like_number($rvcpu_final_log) ? ($rvcpu_final_log + 0) : undef;
+    my $sf_raw   = (defined $calc_debug_info_ref->{'rVCPU_Raw'} && looks_like_number($calc_debug_info_ref->{'rVCPU_Raw'}))
+                 ? ($calc_debug_info_ref->{'rVCPU_Raw'} + 0) : undef;
+    my $sf_min   = (defined $calc_debug_info_ref->{'rVCPU_Min'} && looks_like_number($calc_debug_info_ref->{'rVCPU_Min'}))
+                 ? ($calc_debug_info_ref->{'rVCPU_Min'} + 0) : undef;
+    my $sf_flr   = (defined $calc_debug_info_ref->{'rVCPU_P99W1Floor'} && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1Floor'}))
+                 ? ($calc_debug_info_ref->{'rVCPU_P99W1Floor'} + 0) : undef;
+    my $sf_pre_even = (defined $sf_rv_n && $VCPU_ROUND_UP_TO_EVEN && ($sf_rv_n % 2) == 0) ? ($sf_rv_n - 1) : $sf_rv_n;
+
+    my $sf_governed = 'N/A';
+    my @sf_secondary = ();
+    if (defined $sf_rv_n) {
+        my $sf_env_binds = (defined $sf_min && ($sf_rv_n == $sf_min || (defined $sf_pre_even && $sf_pre_even == $sf_min)));
+        my $sf_flr_binds = (defined $sf_flr && ($sf_rv_n == $sf_flr || (defined $sf_pre_even && $sf_pre_even == $sf_flr)));
+        my $sf_raw_binds = (defined $sf_raw && ($sf_rv_n == $sf_raw || (defined $sf_pre_even && $sf_pre_even == $sf_raw)));
+
+        if ($sf_env_binds && $sf_flr_binds) {
+            $sf_governed = sprintf("Envelope minimum (%s) tied with peak floor (%s)", $sf_min // $na, $sf_flr // $na);
+        } elsif ($sf_env_binds) {
+            $sf_governed = sprintf("Envelope minimum (%s)", $sf_min // $na);
+        } elsif ($sf_flr_binds) {
+            $sf_governed = sprintf("Peak floor (%s)", $sf_flr // $na);
+        } elsif ($sf_raw_binds) {
+            $sf_governed = sprintf("RunQ dispatch width (%s)", $sf_raw // $na);
+        } else {
+            $sf_governed = sprintf("Envelope minimum (%s)", $sf_min // $na);
+        }
+
+        push @sf_secondary, sprintf("peak floor (%s)", $sf_flr // $na)
+            if (defined $sf_flr && !$sf_flr_binds);
+        push @sf_secondary, sprintf("envelope minimum (%s)", $sf_min // $na)
+            if (defined $sf_min && !$sf_env_binds);
+        push @sf_secondary, sprintf("RunQ dispatch width (%s)", $sf_raw // $na)
+            if (defined $sf_raw && !$sf_raw_binds);
+    }
+    my $sf_secondary_txt = @sf_secondary
+        ? join(', ', @sf_secondary) . (@sf_secondary == 1 ? ' was lower.' : ' were lower.')
+        : '';
+
+    printf {$fh} "  - Recommended VCPUs (rVCPU)                : %s virtual processors\n",
+        ($rvcpu_final_log // $na);
+    printf {$fh} "    Governed by: %s.%s\n",
+        $sf_governed,
+        ($sf_secondary_txt ? " $sf_secondary_txt" : '');
+
+    # Credibility-adjusted peak line (only when adjustment was applied)
+    my $sf_cred = (defined $calc_debug_info_ref->{'rVCPU_P99W1CredRatio'} && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1CredRatio'}))
+                ? ($calc_debug_info_ref->{'rVCPU_P99W1CredRatio'} + 0) : 1.00;
+    if ($sf_cred < 1.00 && defined $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} && defined $calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'}) {
+        printf {$fh} "    Credible peak: %s cores (PhysC %s adjusted by RunQ corroboration %.3f) x headroom %s.\n",
+            $calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'},
+            $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'},
+            $sf_cred,
+            ($calc_debug_info_ref->{'rVCPU_P99W1FactorEff'} // $na);
+
+        # Diagnostic hint when credibility discount is material (>25% of peak unexplained by RunQ)
+        if ($sf_cred < 0.75
+            && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1RawPeak'})
+            && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'})) {
+            my $sf_disc_cores = sprintf("%.2f", $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} - $calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'});
+            my $sf_disc_pct   = sprintf("%.0f", (1.0 - ($calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'} / $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'})) * 100);
+            printf {$fh} "    NOTE: Low RunQ corroboration — approximately %s cores (%s%%) of the P99W1 peak\n", $sf_disc_cores, $sf_disc_pct;
+            printf {$fh} "          is not backed by run queue evidence and may reflect VP dispatch overhead.\n";
+            printf {$fh} "          CAPACITY PLANNER HINT: Review the LPAR's current VP count (%s) relative to workload concurrency.\n",
+                (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus})) ? sprintf("%d VPs", $cfg->{virtual_cpus}) : 'unknown';
+        }
+    }
+
+    printf {$fh} "    Detail: raw=%s; env=%s..%s; tier=%s/f=%s; P99W1_floor=%s @ factor=%s (headroom=%s; peak=%s adj=%s cred=%s); RunQ=%s=%s\n\n",
+        ($calc_debug_info_ref->{'rVCPU_Raw'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_Min'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_Max'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_TierNum'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_TierFactor'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_P99W1Floor'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_P99W1FactorEff'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_P99W1Mult'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_P99W1CredRatio'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_RunQKeyUsed'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_RunQHiThreads'} // $na);
 
     # --- Footer Block (Bottom Summary) ---
     print {$fh} "----------------------------------------------------------------------\n";
@@ -3590,6 +3983,20 @@ sub calculate_runq_modified_physc
     $debug_info{'EffCalculatedFactor'} = "1.0000";
     $debug_info{'EffFinalFactorApplied'} = "1.00";
 
+    # Diagnostics (daily-series based; diagnostic approximation)
+    $debug_info{'PhysC_Daily_PAE'}  = $na_str;
+    $debug_info{'PhysC_Daily_AAE'}  = $na_str;
+    $debug_info{'PhysC_Daily_IQRC'} = $na_str;
+
+    # Headroom diagnostics (threads + cores)
+    $debug_info{'Headroom_Guaranteed_Threads'} = $na_str;
+    $debug_info{'Headroom_Guaranteed_Cores'}   = $na_str;
+    $debug_info{'Headroom_Reachable_Threads'}  = $na_str;
+    $debug_info{'Headroom_Reachable_Cores'}    = $na_str;
+    $debug_info{'Headroom_AbsRunQKey'}         = $abs_runq_key_for_debug // $na_str;
+    $debug_info{'Headroom_AbsRunQ_Threads'}    = $na_str;
+    $debug_info{'Headroom_EffectiveReachableCores'} = $na_str;
+
     # General fields
     $debug_info{'DownsizedPhysC'} = defined($base_physc) ? sprintf("%.4f", $base_physc) : $na_str;
     $debug_info{'RunQ_Strategic'} = "0.0000";
@@ -3613,13 +4020,45 @@ sub calculate_runq_modified_physc
     $debug_info{'ReasonForNoModification'} = "";
 
     my $curr_ent_numeric = $debug_info{'EntitlementForForecast'};
-    my $eff_p_base_numeric = defined($base_physc) ? $base_physc : undef;
+    my $eff_p_base_numeric = undef;          # Pre-growth base for efficiency/downsizing logic
+    my $growth_adj_numeric = 0.0;            # GrowthAdj associated with this profile
+    my $pre_growth_base_physc_numeric = undef;
 
-    # NOTE: Growth adjustment is now pre-applied in ProfileValues (stored as FinalValue).
-    # The base_physc value retrieved from ProfileValues already includes GrowthAdj.
-    # This ensures all subsequent calculations (downsizing, upsizing, capping) work with
-    # the growth-adjusted baseline, maintaining proper audit trail transparency.
-    # The manual addition that was previously here has been removed to prevent double-counting.
+    # ------------------------------------------------------------------
+    # Growth vs Downsizing ordering fix (production fix)
+    # ------------------------------------------------------------------
+    # We must avoid disqualifying downsizing because GrowthAdj inflated BasePhysC.
+    # Therefore:
+    #   1) Compute downsizing on PRE-GROWTH base (BaseValue)
+    #   2) Apply GrowthAdj AFTER downsizing, then continue with additive logic
+    #
+    # NOTE: CoreResults.ProfileValues already holds the growth-inclusive FinalValue.
+    #       We retrieve BaseValue & GrowthAdj from vm_map->{Growth}{...} to restore order.
+    my $pre_base_from_map = _safe_dig($vm_map_ref, 'Growth', 'base_values', $profile_name);
+    my $growth_adj_from_map = _safe_dig($vm_map_ref, 'Growth', 'adjustments', $profile_name);
+
+    if (defined $growth_adj_from_map && looks_like_number($growth_adj_from_map)) {
+        $growth_adj_numeric = $growth_adj_from_map + 0;
+    }
+
+    if (defined $pre_base_from_map && looks_like_number($pre_base_from_map)) {
+        $pre_growth_base_physc_numeric = $pre_base_from_map + 0;
+    } elsif (defined $base_physc) {
+        # Fallback: if BaseValue missing, infer pre-growth base from growth-inclusive base_physc
+        $pre_growth_base_physc_numeric = ($base_physc + 0) - $growth_adj_numeric;
+    }
+
+    # Final guard: if still undefined, fall back to growth-inclusive base
+    $pre_growth_base_physc_numeric = $base_physc
+        if (!defined $pre_growth_base_physc_numeric && defined $base_physc);
+
+    $eff_p_base_numeric = defined($pre_growth_base_physc_numeric) ? ($pre_growth_base_physc_numeric + 0) : undef;
+
+    $debug_info{'PreGrowthBasePhysC'}  = defined($pre_growth_base_physc_numeric) ? sprintf("%.4f", $pre_growth_base_physc_numeric) : $na_str;
+    $debug_info{'GrowthAdjUsed'}       = defined($growth_adj_numeric) ? sprintf("%+.4f", $growth_adj_numeric) : $na_str;
+    $debug_info{'PostGrowthBasePhysC'} = defined($base_physc) ? sprintf("%.4f", $base_physc) : $na_str;
+
+    # EffPBase should reflect the PRE-GROWTH base for the downsizing/efficiency logic.
     $debug_info{'EffPBase'} = defined($eff_p_base_numeric) ? sprintf("%.4f", $eff_p_base_numeric) : $na_str;
 
     unless (defined $base_physc)
@@ -3633,6 +4072,58 @@ sub calculate_runq_modified_physc
     my $norm_p90_numeric = ($norm_runq_p90_str ne $na_str && $norm_runq_p90_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p90_str + 0) : undef;
     my $abs_runq_p_numeric  = ($abs_runq_p_value_str ne $na_str && $abs_runq_p_value_str  =~ /^-?[0-9.]+$/) ? ($abs_runq_p_value_str + 0)  : undef;
     $debug_info{'NormRunQ_P90_Val'} = (defined $norm_p90_numeric) ? sprintf("%.2f", $norm_p90_numeric) : $na_str;
+    # ------------------------------------------------------------------
+    # Harvest per-profile PhysC diagnostics (DailySeries-based approximation)
+    # ------------------------------------------------------------------
+    my $physc_diag = _safe_dig($vm_map_ref, 'Diagnostics', 'PhysC', $profile_name);
+    if (ref($physc_diag) eq 'HASH') {
+        if (defined $physc_diag->{PAE} && looks_like_number($physc_diag->{PAE})) {
+            $debug_info{'PhysC_Daily_PAE'} = sprintf("%.4f", $physc_diag->{PAE} + 0);
+        }
+        if (defined $physc_diag->{AAE} && looks_like_number($physc_diag->{AAE})) {
+            $debug_info{'PhysC_Daily_AAE'} = sprintf("%.4f", $physc_diag->{AAE} + 0);
+        }
+        if (defined $physc_diag->{IQRC} && looks_like_number($physc_diag->{IQRC})) {
+            $debug_info{'PhysC_Daily_IQRC'} = sprintf("%.4f", $physc_diag->{IQRC} + 0);
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Headroom diagnostics (threads & cores)
+    # ------------------------------------------------------------------
+    if (defined $smt_used && $smt_used > 0 && defined $abs_runq_p_numeric) {
+        my $guaranteed_threads = (defined $curr_ent_numeric && looks_like_number($curr_ent_numeric) && $curr_ent_numeric > 0)
+                               ? ($smt_used * $curr_ent_numeric)
+                               : 0.0;
+
+        # "Reachable" cores is bounded by vCPU and pool CPU when uncapped.
+        my $reachable_cores = 0.0;
+        if (defined $cfg_ref->{is_capped} && $cfg_ref->{is_capped}) {
+            $reachable_cores = $curr_ent_numeric;
+        } else {
+            if (defined $pool_cpu_for_lpar_numeric && looks_like_number($pool_cpu_for_lpar_numeric) && $pool_cpu_for_lpar_numeric > 0
+                && defined $vcpu_for_lpar_numeric && looks_like_number($vcpu_for_lpar_numeric) && $vcpu_for_lpar_numeric > 0) {
+                $reachable_cores = ($vcpu_for_lpar_numeric < $pool_cpu_for_lpar_numeric) ? $vcpu_for_lpar_numeric : $pool_cpu_for_lpar_numeric;
+            } elsif (defined $vcpu_for_lpar_numeric && looks_like_number($vcpu_for_lpar_numeric) && $vcpu_for_lpar_numeric > 0) {
+                $reachable_cores = $vcpu_for_lpar_numeric;
+            } else {
+                $reachable_cores = $curr_ent_numeric;
+            }
+        }
+        $reachable_cores = 0.0 if (!defined $reachable_cores || $reachable_cores < 0);
+        my $reachable_threads = $smt_used * $reachable_cores;
+
+        my $headroom_g_threads = $guaranteed_threads - $abs_runq_p_numeric;
+        my $headroom_r_threads = $reachable_threads  - $abs_runq_p_numeric;
+
+        $debug_info{'Headroom_AbsRunQ_Threads'} = sprintf("%.2f", $abs_runq_p_numeric);
+        $debug_info{'Headroom_EffectiveReachableCores'} = sprintf("%.2f", $reachable_cores);
+        $debug_info{'Headroom_Guaranteed_Threads'} = sprintf("%.2f", $headroom_g_threads);
+        $debug_info{'Headroom_Guaranteed_Cores'}   = sprintf("%.4f", ($smt_used > 0 ? ($headroom_g_threads / $smt_used) : 0.0));
+        $debug_info{'Headroom_Reachable_Threads'}  = sprintf("%.2f", $headroom_r_threads);
+        $debug_info{'Headroom_Reachable_Cores'}    = sprintf("%.4f", ($smt_used > 0 ? ($headroom_r_threads / $smt_used) : 0.0));
+    }
+
 
     # Calculate Effective LCPUs for Pressure
     my ($effective_lcpus_for_pressure_calc, $pressure_basis_rationale);
@@ -3882,6 +4373,22 @@ sub calculate_runq_modified_physc
         my $is_std_pattern = (defined $norm_p90_numeric && $norm_p90_numeric < $STD_NORM_P90_THRESH) && (defined $normrunq_iqrc_val && $normrunq_iqrc_val < $STD_IQRC_THRESH) && $is_physc_stable;
         $debug_info{'STDConfidenceChecks'} = sprintf("NormP90<%.1f(%.2f), IQRC<%.1f(%.3f), PhysC_Stable(P95/P50)<%.2f(%.2f)", $STD_NORM_P90_THRESH, ($norm_p90_numeric // 0), $STD_IQRC_THRESH, ($normrunq_iqrc_val // 0), (1.0 + $STD_PHYSC_STABILITY_THRESH), $physc_stability_ratio);
 
+        # ------------------------------------------------------------------
+        # Downsizing guardrail banding (AAE / PAE / IQRC)
+        # ------------------------------------------------------------------
+        my $aae = (defined $debug_info{'PhysC_Daily_AAE'} && looks_like_number($debug_info{'PhysC_Daily_AAE'})) ? ($debug_info{'PhysC_Daily_AAE'} + 0) : 999;
+        my $pae = (defined $debug_info{'PhysC_Daily_PAE'} && looks_like_number($debug_info{'PhysC_Daily_PAE'})) ? ($debug_info{'PhysC_Daily_PAE'} + 0) : 999;
+        my $iqrc = (defined $normrunq_iqrc_val && looks_like_number($normrunq_iqrc_val)) ? ($normrunq_iqrc_val + 0) : 999;
+
+        my $downsize_guard_band = "RED";
+        if ($aae <= 0.0 && $pae <= $DOWNSIZE_GUARD_GREEN_MAX_PAE && $iqrc <= $DOWNSIZE_GUARD_GREEN_MAX_IQRC) {
+            $downsize_guard_band = "GREEN";
+        }
+        elsif ($aae <= $DOWNSIZE_GUARD_AMBER_MAX_AAE && $pae <= $DOWNSIZE_GUARD_AMBER_MAX_PAE && $iqrc <= $DOWNSIZE_GUARD_AMBER_MAX_IQRC) {
+            $downsize_guard_band = "AMBER";
+        }
+        $debug_info{'DownsizeGuardBand'} = $downsize_guard_band;
+
         # If pattern matched: This is a high-confidence inefficient workload.
         if ($is_std_pattern) {
             my $actual_reduction_num = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'})) ? ($debug_info{'EffActualReductionCores'} + 0) : 0;
@@ -3909,9 +4416,48 @@ sub calculate_runq_modified_physc
             $debug_info{'STDDampeningTier'} = sprintf("%s, L_eff=%.1f", $tier_rationale, $effective_lcpus_for_pressure_calc);
             $debug_info{'STDFinalDampeningFactor'} = $graduated_dampening_factor;
         } else {
-            # PATTERN NOT MATCHED: This is a genuine burst. Block all downsizing.
-            $skip_downsizing_reason = sprintf("Base PhysC (%.4f) > Entitlement (%.2f) and workload does not match STD pattern.", $eff_p_base_numeric, $curr_ent_numeric);
-            $debug_info{'RunQ_Strategic'} = "0.0000";
+            # PATTERN NOT MATCHED: Use AAE/PAE/IQRC banding to decide whether tactical downsizing may proceed.
+            my $band = $debug_info{'DownsizeGuardBand'} // "RED";
+
+            if ($band eq 'RED') {
+                # Conservative fallback: block tactical downsizing.
+                my $pre_growth_str  = $debug_info{'PreGrowthBasePhysC'}  // 'N/A';
+                my $post_growth_str = $debug_info{'PostGrowthBasePhysC'} // (defined $eff_p_base_numeric ? sprintf("%.4f",$eff_p_base_numeric) : 'N/A');
+                $skip_downsizing_reason = sprintf(
+                    "Downsizing blocked (RED band): Base PhysC (post-growth %.4f; pre-growth %s) > Entitlement (%.2f); AAE=%s, PAE=%s, IQRC=%s; workload does not match STD pattern.",
+                    $post_growth_str, $pre_growth_str, $curr_ent_numeric,
+                    ($debug_info{'PhysC_Daily_AAE'} // 'N/A'),
+                    ($debug_info{'PhysC_Daily_PAE'} // 'N/A'),
+                    (defined $normrunq_iqrc_val && looks_like_number($normrunq_iqrc_val) ? sprintf("%.3f", $normrunq_iqrc_val) : 'N/A')
+                );
+                $debug_info{'RunQ_Strategic'} = "0.0000";
+            }
+            elsif ($band eq 'AMBER') {
+                # Allow downsizing, but dampen the analytical reduction for safety.
+                my $actual_reduction_num = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'}))
+                    ? ($debug_info{'EffActualReductionCores'} + 0) : 0.0;
+
+                if ($actual_reduction_num > 1e-6 && defined $eff_p_base_numeric && $eff_p_base_numeric > 1e-6) {
+                    my $scaled_reduction = $actual_reduction_num * $DOWNSIZE_GUARD_AMBER_CAP_SCALE;
+                    $scaled_reduction = max(0, $scaled_reduction);
+                    $scaled_reduction = min($scaled_reduction, $actual_reduction_num);
+
+                    $debug_info{'EffActualReductionCores'} = sprintf("%.4f", $scaled_reduction);
+                    my $new_physc_after_reduction = $eff_p_base_numeric - $scaled_reduction;
+                    $efficiency_factor_numeric = $new_physc_after_reduction / $eff_p_base_numeric;
+
+                    $efficiency_factor_numeric = 1.00 if $efficiency_factor_numeric > 1.00;
+                    $efficiency_factor_numeric = max(0, $efficiency_factor_numeric);
+
+                    $debug_info{'RunQ_Potential'} = sprintf("%.4f", -$scaled_reduction);
+                }
+
+                # Do NOT set skip_downsizing_reason -> downsizing proceeds (with dampened factor if applicable).
+            }
+            else {
+                # GREEN band: allow tactical downsizing to proceed normally.
+                # Do NOT set skip_downsizing_reason.
+            }
         }
     }
     if (defined $skip_downsizing_reason) {
@@ -3924,6 +4470,16 @@ sub calculate_runq_modified_physc
             $debug_info{'DownsizingReason'} = "Analytical CPU Downsizing applied.";
         }
     }
+
+    # Apply GrowthAdj AFTER downsizing (ordering fix).
+    # This prevents GrowthAdj from disqualifying downsizing gates whilst preserving
+    # growth-inclusive values for subsequent additive logic and final recommendation.
+    my $downsized_pre_growth = $base_adjusted_physc;
+    if (defined $growth_adj_numeric && looks_like_number($growth_adj_numeric)) {
+        $base_adjusted_physc = $downsized_pre_growth + $growth_adj_numeric;
+    }
+    $debug_info{'DownsizedPhysC_PreGrowth'} = sprintf("%.4f", $downsized_pre_growth);
+
 
     # Now, definitively set the final factor that was actually used.
     $debug_info{'DownsizingFactor'} = sprintf("%.2f", $efficiency_factor_numeric);
@@ -4035,11 +4591,28 @@ sub calculate_runq_modified_physc
 
         my $capacity_threshold_for_excess = $tolerance_factor * $effective_lcpus_for_pressure_calc;
 
-        $excess_threads = (defined $abs_runq_p_numeric ? $abs_runq_p_numeric : 0) - $capacity_threshold_for_excess;
-        if ($excess_threads > 0)
+        # Trigger remains tied to the tolerance ceiling (pressure boundary), but the additive magnitude
+        # should aim for a safer target below that ceiling.
+        #
+        # - Tolerance ceiling: the maximum "acceptable" queue before action is required.
+        # - Target ceiling:    the desired operating point (headroom), below the tolerance ceiling.
+        my $capacity_threshold_target = $capacity_threshold_for_excess * $RUNQ_TARGET_HEADROOM_FACTOR;
+
+        $excess_threads = (defined $abs_runq_p_numeric ? $abs_runq_p_numeric : 0) - $capacity_threshold_target;
+        if ((defined $abs_runq_p_numeric ? $abs_runq_p_numeric : 0) > $capacity_threshold_for_excess && $excess_threads > 0)
         {
             # Convert the excess threads into a raw CPU core requirement. This is the unconstrained demand.
-            $debug_info{'ExcessThreads'} = sprintf( "\n         1. Observed Run Queue (%s) : %.2f threads\n". "         2. Tolerated Capacity               : %.1f LCPUs * %.2f (Tolerance Factor) = %.2f threads\n". "         => Excess Threads to Service        : %.2f - %.2f = %.2f", $debug_info{AbsRunQKeyUsed}, ($abs_runq_p_numeric // 0.0), $effective_lcpus_for_pressure_calc, $tolerance_factor, $capacity_threshold_for_excess, ($abs_runq_p_numeric // 0.0), $capacity_threshold_for_excess, $excess_threads);
+            $debug_info{'ExcessThreads'} = sprintf(
+                "\n         1. Observed Run Queue (%s)          : %.2f threads\n".
+                "         2. Tolerance Ceiling               : %.1f LCPUs * %.2f (Tolerance Factor) = %.2f threads\n".
+                "         3. Target Ceiling (Headroom)        : %.2f * %.2f (Target Factor) = %.2f threads\n".
+                "         => Excess Threads to Service (to target): %.2f - %.2f = %.2f",
+                $debug_info{AbsRunQKeyUsed},
+                ($abs_runq_p_numeric // 0.0),
+                $effective_lcpus_for_pressure_calc, $tolerance_factor, $capacity_threshold_for_excess,
+                $capacity_threshold_for_excess, $RUNQ_TARGET_HEADROOM_FACTOR, $capacity_threshold_target,
+                ($abs_runq_p_numeric // 0.0), $capacity_threshold_target, $excess_threads
+            );
             $raw_additive_cpu = $excess_threads / $smt_used if $smt_used > 0;
 
             # Determine the business policy scaling factor based on the VM's final tier.
@@ -4177,7 +4750,13 @@ sub calculate_runq_modified_physc
             }
 
       } else {
-            $debug_info{'ExcessThreads'} = sprintf("0.0000 (No excess above tolerated capacity of %.2f from %s; AbsRunQ %s was %.2f)", $capacity_threshold_for_excess, ($pressure_basis_rationale =~ /Burst-Tolerant/ ? "Entitlement+Burst" : "MaxCPU"), $debug_info{AbsRunQKeyUsed}, ($abs_runq_p_numeric // $na_str));
+            my $capacity_threshold_target = $capacity_threshold_for_excess * $RUNQ_TARGET_HEADROOM_FACTOR;
+            $debug_info{'ExcessThreads'} = sprintf(
+                "0.0000 (AbsRunQ %s was %.2f; target ceiling %.2f = tolerance %.2f * target %.2f; basis=%s)",
+                $debug_info{AbsRunQKeyUsed}, ($abs_runq_p_numeric // $na_str),
+                $capacity_threshold_target, $capacity_threshold_for_excess, $RUNQ_TARGET_HEADROOM_FACTOR,
+                ($pressure_basis_rationale =~ /Burst-Tolerant/ ? "Entitlement+Burst" : "MaxCPU")
+            );
             $raw_additive_cpu = 0.0;
             $capped_raw_additive_val = 0.0;
             $additive_cpu = 0.0;
@@ -4305,6 +4884,162 @@ sub calculate_runq_modified_physc
     }
     if ($runq_modified_rec < 0) { $runq_modified_rec = 0; }
     $debug_info{'FinalAdjustedPhysC'} = sprintf("%.4f", $runq_modified_rec);
+    # ------------------------------------------------------------------
+    # rVCPU computation (stress-driven, slot-aware, rENT-bounded, peak-aware)
+    #
+    # IMPORTANT: This must be computed here (where per-profile AbsRunQ_Pxx is
+    # already available as $abs_runq_p_numeric) so rationale logging can be
+    # deterministic and consistent with other debug_info fields.
+    # ------------------------------------------------------------------
+    do {
+        my $rvcpu_raw;
+        my $rvcpu_min;
+        my $rvcpu_max;
+        my $rvcpu_final;
+        my $p99w1_floor_vcpu;
+        my $p99w1_factor_eff;
+        my $p99w1_mult;
+        my $cred_ratio = 1.00;
+        my $p99w1_adjusted;
+
+        my $rENT_P = (defined $runq_modified_rec && looks_like_number($runq_modified_rec)) ? ($runq_modified_rec + 0) : undef;
+        my $smt_for_vcpu = (defined $vm_map_ref->{Configuration}{smt} && looks_like_number($vm_map_ref->{Configuration}{smt}))
+                         ? ($vm_map_ref->{Configuration}{smt} + 0)
+                         : undef;
+
+        # Use the per-profile AbsRunQ percentile already computed in this function.
+        my $runq_hi_threads = (defined $abs_runq_p_numeric && looks_like_number($abs_runq_p_numeric)) ? ($abs_runq_p_numeric + 0) : undef;
+
+        # Tier-aware headroom: extract tier number from $final_tier (already in scope).
+        my $rvcpu_tier_num = 3;  # Default baseline
+        if (defined $final_tier && $final_tier =~ /(\d)$/) {
+            $rvcpu_tier_num = $1;
+        } elsif (defined $final_tier && $final_tier eq 'P') {
+            $rvcpu_tier_num = 1;
+        }
+        my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
+
+        if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0 && defined $rENT_P && $rENT_P > 0) {
+            # Workload-driven width requirement (threads -> cores -> vCPUs), tier-adjusted.
+            # Higher tiers demand more spare runnable capacity (lower acceptable queue utilisation).
+            my $required_threads = ($runq_hi_threads / $RUNQ_TARGET_HEADROOM_FACTOR) * $rvcpu_tier_factor;
+            my $required_cores   = $required_threads / $smt_for_vcpu;
+            $rvcpu_raw = int($required_cores);
+            $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil
+
+            # Vendor envelope from rENT_P (growth-aware, because rENT_P is post-growth in this path)
+            my $min_v = $rENT_P * $VCPU_RATIO_MIN;
+            my $max_v = $rENT_P * $VCPU_RATIO_MAX;
+            $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
+            $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
+
+            # Clamp
+            $rvcpu_final = $rvcpu_raw;
+            $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
+            $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
+
+            # Low-entitlement sanity rules
+            $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
+            if (defined $rENT_P && $rENT_P >= 0.5 && $rENT_P < 1.0) {
+                $rvcpu_final = $VCPU_MIN_FOR_ENT_GE_0_5_LT_1 if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_FOR_ENT_GE_0_5_LT_1);
+            }
+
+            # Peak-aware floor from P-99W1 (mandatory helper profile)
+            if (defined $pure_p99w1_physc && looks_like_number($pure_p99w1_physc) && $pure_p99w1_physc > 0) {
+                # RunQ credibility adjustment: verify PhysC peak against RunQ evidence.
+                # When RunQ-derived core demand is significantly below PhysC, the gap
+                # likely reflects VP dispatch overhead rather than true workload demand.
+                $p99w1_adjusted = $pure_p99w1_physc;
+
+                # Credibility uses AbsRunQ_P99 unconditionally — both sides of the
+                # comparison must be tail metrics for the ratio to be physically meaningful.
+                # The per-profile RunQ percentile (P90/P95/P98/P99) is correct for Gate 1
+                # (dispatch width), but the credibility check asks whether the P99W1 PhysC
+                # peak is corroborated, which requires a matching tail RunQ percentile.
+                my $runq_p99_for_cred = undef;
+                if (defined $runq_metrics_ref && ref($runq_metrics_ref) eq 'HASH'
+                    && defined $runq_metrics_ref->{'AbsRunQ_P99'}
+                    && looks_like_number($runq_metrics_ref->{'AbsRunQ_P99'})) {
+                    $runq_p99_for_cred = $runq_metrics_ref->{'AbsRunQ_P99'} + 0;
+                }
+                if (defined $runq_p99_for_cred && $runq_p99_for_cred > 0 && defined $smt_for_vcpu && $smt_for_vcpu > 0) {
+                    my $runq_peak_cores = $runq_p99_for_cred / $smt_for_vcpu;
+                    $cred_ratio = $runq_peak_cores / $pure_p99w1_physc;
+                    my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
+                    $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
+                    $credibility = 1.00 if ($credibility > 1.00);
+                    $p99w1_adjusted = $pure_p99w1_physc * $credibility;
+                }
+
+                # Peak floor: PAE/AAE-driven headroom, tier-scaled.
+                # Base is 1.00 (VCPUs must at minimum cover peak cores).
+                # Headroom above that is proportional to empirical above-entitlement evidence,
+                # amplified by tier policy. This avoids the multiplicative compounding of
+                # base × dynamic_mult × tier that inflated recommendations for stressed tier-1 LPARs.
+                my $pae_raw = (defined $debug_info{'PhysC_Daily_PAE'} && looks_like_number($debug_info{'PhysC_Daily_PAE'})) ? ($debug_info{'PhysC_Daily_PAE'} + 0) : 0.0;
+                my $aae_raw = (defined $debug_info{'PhysC_Daily_AAE'} && looks_like_number($debug_info{'PhysC_Daily_AAE'})) ? ($debug_info{'PhysC_Daily_AAE'} + 0) : 0.0;
+
+                # Each component contributes up to +15% of peak when its threshold is reached.
+                # PAE: proportion of days above entitlement (chronic burst indicator)
+                # AAE: aggregate excess above entitlement (burst magnitude indicator)
+                my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
+                my $aae_component = ($aae_raw > 0) ? (($aae_raw < 0.10 ? $aae_raw : 0.10) / 0.10) * 0.15 : 0.0;
+
+                my $headroom = ($pae_component + $aae_component) * $rvcpu_tier_factor;
+                $p99w1_factor_eff = 1.00 + $headroom;
+                $p99w1_mult = $headroom;  # For rationale: the headroom portion above 1.00
+
+                my $floor_v = ($p99w1_adjusted + 0) * $p99w1_factor_eff;
+
+                $p99w1_floor_vcpu = int($floor_v); $p99w1_floor_vcpu++ if ($floor_v > $p99w1_floor_vcpu);
+
+                if (defined $p99w1_floor_vcpu && defined $rvcpu_final && $p99w1_floor_vcpu > $rvcpu_final) {
+                    $rvcpu_final = $p99w1_floor_vcpu;
+                    $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && defined $rvcpu_final && $rvcpu_final > $rvcpu_max);
+                }
+            }
+
+            # Optional even-rounding
+            if ($VCPU_ROUND_UP_TO_EVEN && defined $rvcpu_final && $rvcpu_final >= 2 && ($rvcpu_final % 2) == 1) {
+                my $even_up = $rvcpu_final + 1;
+                $rvcpu_final = $even_up if (!defined $rvcpu_max || $even_up <= $rvcpu_max);
+            }
+        }
+
+        # Persist for CSV and rationale consumers
+        $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_name} = defined($rvcpu_final) ? $rvcpu_final : '';
+        $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$profile_name} = {
+            Raw            => $rvcpu_raw,
+            Min            => $rvcpu_min,
+            Max            => $rvcpu_max,
+            TierNum        => $rvcpu_tier_num,
+            TierFactor     => sprintf("%.2f", $rvcpu_tier_factor),
+            RunQKeyUsed    => $abs_runq_key_for_debug,  # Must match the key actually selected for this profile's AbsRunQ
+            RunQHiThreads  => (defined $runq_hi_threads ? sprintf("%.2f", $runq_hi_threads) : undef),
+            P99W1Floor     => $p99w1_floor_vcpu,
+            P99W1FactorEff => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
+            P99W1Mult      => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
+            P99W1CredRatio => sprintf("%.3f", $cred_ratio),
+            P99W1AdjPeak   => sprintf("%.2f", $p99w1_adjusted),
+            P99W1RawPeak   => sprintf("%.2f", $pure_p99w1_physc),
+        };
+
+        # Mirror into debug_info (so rationale can print in the same style as other diagnostics)
+        $debug_info{'rVCPU_RunQKeyUsed'}    = $abs_runq_key_for_debug // 'N/A';
+        $debug_info{'rVCPU_TierNum'}        = $rvcpu_tier_num;
+        $debug_info{'rVCPU_TierFactor'}     = sprintf("%.2f", $rvcpu_tier_factor);
+        $debug_info{'rVCPU_Raw'}            = defined($rvcpu_raw) ? $rvcpu_raw : 'N/A';
+        $debug_info{'rVCPU_Min'}            = defined($rvcpu_min) ? $rvcpu_min : 'N/A';
+        $debug_info{'rVCPU_Max'}            = defined($rvcpu_max) ? $rvcpu_max : 'N/A';
+        $debug_info{'rVCPU_P99W1Floor'}     = defined($p99w1_floor_vcpu) ? $p99w1_floor_vcpu : 'N/A';
+        $debug_info{'rVCPU_P99W1FactorEff'} = defined($p99w1_factor_eff) ? sprintf("%.3f",$p99w1_factor_eff) : 'N/A';
+        $debug_info{'rVCPU_P99W1Mult'}      = defined($p99w1_mult) ? sprintf("%.3f",$p99w1_mult) : 'N/A';
+        $debug_info{'rVCPU_P99W1CredRatio'} = sprintf("%.3f", $cred_ratio);
+        $debug_info{'rVCPU_P99W1AdjPeak'}   = sprintf("%.2f", $p99w1_adjusted);
+        $debug_info{'rVCPU_P99W1RawPeak'}   = sprintf("%.2f", $pure_p99w1_physc);
+        $debug_info{'rVCPU_RunQHiThreads'}  = defined($runq_hi_threads) ? sprintf("%.2f",$runq_hi_threads) : 'N/A';
+        $debug_info{'rVCPU_Final'}          = defined($rvcpu_final) ? $rvcpu_final : 'N/A';
+    };
 
     return ($runq_modified_rec, \%debug_info);
 }
@@ -6320,11 +7055,210 @@ sub _write_standard_csv_report {
         my $peak_val = $core->{PeakValue};
         push @data_row_csv, (defined $peak_val && looks_like_number($peak_val)) ? sprintf("%.3f", $peak_val) : ($peak_val // "");
 
-        # Push all profile values with enforced 3-digit precision
+        # Push interleaved profile value + rVCPU (except for mandatory peak helper profile)
+        my $smt_used = (defined $cfg->{smt} && looks_like_number($cfg->{smt})) ? ($cfg->{smt} + 0) : $DEFAULT_SMT;
+        my $max_rvcpu_seen = undef;
+
         foreach my $profile (@csv_visible_profiles) {
-            my $val = $core->{ProfileValues}{$profile->{name}};
+            my $pname = $profile->{name};
+
+            # Profile value (rENT_P; already growth-aware)
+            my $val = $core->{ProfileValues}{$pname};
             my $formatted_val = (defined $val && looks_like_number($val)) ? sprintf("%.3f", $val) : ($val // "");
             push @data_row_csv, $formatted_val;
+
+            # rVCPU column for all visible profiles except mandatory peak helper profile (P99W1)
+            if (defined $pname && $pname ne $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                my $rvcpu_out = "";
+
+                my $rENT_P = (defined $val && looks_like_number($val)) ? ($val + 0) : undef;
+
+                # Derive percentile from profile name (e.g. G3-95W15 => 95; G1-99W5 => 99)
+                my $perc = undef;
+                if ($pname =~ /^[A-Z]\d-([0-9]{2,3})W/i) {
+                    $perc = $1 + 0;
+                } elsif ($pname =~ /^[A-Z]\d-([0-9]{2,3})/i) {
+                    $perc = $1 + 0;
+                }
+                $perc = 90 if (!defined $perc);
+
+                # RunQ_hi_threads selection for rVCPU:
+                # Prefer the SAME AbsRunQ key/value that the modifier logic selected for upsizing
+                # (especially important for --runq-perc-behavior match). Fall back to profile-derived
+                # AbsRunQ_P{perc} only if the selected values are not available.
+                my $runq_key = sprintf("AbsRunQ_P%d", $perc);
+                my $runq_hi_threads = undef;
+
+                my $pdbg = undef;
+                if (defined $vm_map_ref->{CoreResults}
+                    && defined $vm_map_ref->{CoreResults}{ProfileDebugInfo}
+                    && ref($vm_map_ref->{CoreResults}{ProfileDebugInfo}) eq 'HASH'
+                    && defined $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname}
+                    && ref($vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname}) eq 'HASH'
+                ) {
+                    $pdbg = $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname};
+                }
+
+                if (defined $pdbg
+                    && defined $pdbg->{AbsRunQKeyUsed}
+                    && defined $pdbg->{AbsRunQValueUsedForCalc}
+                    && looks_like_number($pdbg->{AbsRunQValueUsedForCalc})
+                ) {
+                    $runq_key = $pdbg->{AbsRunQKeyUsed};
+                    $runq_hi_threads = $pdbg->{AbsRunQValueUsedForCalc} + 0;
+                } elsif (defined $vm_map_ref->{RunQMetrics} && ref($vm_map_ref->{RunQMetrics}) eq 'HASH') {
+                    my $rm = $vm_map_ref->{RunQMetrics};
+                    if (defined $rm->{$runq_key} && looks_like_number($rm->{$runq_key})) {
+                        $runq_hi_threads = $rm->{$runq_key} + 0;
+                    } elsif (defined $rm->{'AbsRunQ_P90'} && looks_like_number($rm->{'AbsRunQ_P90'})) {
+                        $runq_key = 'AbsRunQ_P90';
+                        $runq_hi_threads = $rm->{'AbsRunQ_P90'} + 0;
+                    }
+                }
+
+                # Tier-aware headroom: extract tier from profile name (e.g., "G3-50W15" -> "G3" -> tier 3).
+                my $csv_tier_str = $pname;
+                $csv_tier_str =~ s/-.*//;
+                my $rvcpu_tier_num = 3;  # Default baseline
+                if ($csv_tier_str =~ /(\d)$/) {
+                    $rvcpu_tier_num = $1;
+                } elsif ($csv_tier_str eq 'P') {
+                    $rvcpu_tier_num = 1;
+                }
+                my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
+
+                if (defined $runq_hi_threads && defined $rENT_P && $rENT_P > 0 && defined $smt_used && $smt_used > 0) {
+                    # rVCPU explain vars must be in this scope (used later for CSV + rationale persistence)
+                    my $p99w1_floor_vcpu = undef;
+                    my $p99w1_factor_eff = undef;
+                    my $p99w1_mult = undef;
+                    my $cred_ratio = 1.00;
+                    my $p99w1_adjusted;
+
+                    # Workload-driven width requirement (threads -> cores -> vCPUs), tier-adjusted.
+                    my $required_threads = ($runq_hi_threads / $RUNQ_TARGET_HEADROOM_FACTOR) * $rvcpu_tier_factor;
+                    my $required_cores   = $required_threads / $smt_used;
+                    my $rvcpu_raw = int($required_cores);
+                    $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil
+
+                    # Vendor-safe envelope from rENT_P (growth-aware)
+                    my $min_v = $rENT_P * $VCPU_RATIO_MIN;
+                    my $max_v = $rENT_P * $VCPU_RATIO_MAX;
+                    my $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
+                    my $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
+
+                    my $rvcpu_final = $rvcpu_raw;
+                    $rvcpu_final = $rvcpu_min if ($rvcpu_final < $rvcpu_min);
+                    $rvcpu_final = $rvcpu_max if ($rvcpu_final > $rvcpu_max);
+
+                    # Low-entitlement sanity / practical minimums
+                    $rvcpu_final = $VCPU_MIN_ABS if ($rvcpu_final < $VCPU_MIN_ABS);
+                    if ($rENT_P >= 0.5 && $rENT_P < 1.0 && $rvcpu_final < $VCPU_MIN_FOR_ENT_GE_0_5_LT_1) {
+                        $rvcpu_final = $VCPU_MIN_FOR_ENT_GE_0_5_LT_1;
+                    }
+
+                    # Peak floor: PAE/AAE-driven headroom, tier-scaled.
+                    # Base is 1.00 (VCPUs must at minimum cover peak cores).
+                    # Headroom proportional to empirical above-entitlement evidence,
+                    # amplified by tier policy. Avoids multiplicative compounding.
+                    my $p99w1_cores = $core->{ProfileValues}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
+                    if (defined $p99w1_cores && looks_like_number($p99w1_cores) && $p99w1_cores > 0) {
+
+                        # RunQ credibility adjustment
+                        $p99w1_adjusted = $p99w1_cores;
+                        $cred_ratio = 1.00;
+                        # Credibility uses AbsRunQ_P99 unconditionally (tail-to-tail comparison).
+                        my $runq_p99_for_cred = undef;
+                        if (defined $vm_map_ref->{RunQMetrics} && ref($vm_map_ref->{RunQMetrics}) eq 'HASH'
+                            && defined $vm_map_ref->{RunQMetrics}{'AbsRunQ_P99'}
+                            && looks_like_number($vm_map_ref->{RunQMetrics}{'AbsRunQ_P99'})) {
+                            $runq_p99_for_cred = $vm_map_ref->{RunQMetrics}{'AbsRunQ_P99'} + 0;
+                        }
+                        if (defined $runq_p99_for_cred && $runq_p99_for_cred > 0 && defined $smt_used && $smt_used > 0) {
+                            my $runq_peak_cores = $runq_p99_for_cred / $smt_used;
+                            $cred_ratio = $runq_peak_cores / $p99w1_cores;
+                            my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
+                            $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
+                            $credibility = 1.00 if ($credibility > 1.00);
+                            $p99w1_adjusted = $p99w1_cores * $credibility;
+                        }
+
+                        my $pae_raw = 0.0;
+                        my $aae_raw = 0.0;
+                        my $calc_debug_info_ref = $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname} // {};
+                        $pae_raw = (defined $calc_debug_info_ref->{'PhysC_Daily_PAE'} && looks_like_number($calc_debug_info_ref->{'PhysC_Daily_PAE'}))
+                                 ? ($calc_debug_info_ref->{'PhysC_Daily_PAE'} + 0) : 0.0;
+                        $aae_raw = (defined $calc_debug_info_ref->{'PhysC_Daily_AAE'} && looks_like_number($calc_debug_info_ref->{'PhysC_Daily_AAE'}))
+                                 ? ($calc_debug_info_ref->{'PhysC_Daily_AAE'} + 0) : 0.0;
+
+                        my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
+                        my $aae_component = ($aae_raw > 0) ? (($aae_raw < 0.10 ? $aae_raw : 0.10) / 0.10) * 0.15 : 0.0;
+
+                        my $headroom = ($pae_component + $aae_component) * $rvcpu_tier_factor;
+                        $p99w1_factor_eff = 1.00 + $headroom;
+                        $p99w1_mult = $headroom;  # Rationale: the headroom portion above 1.00
+
+                        my $floor_v = ($p99w1_adjusted + 0) * $p99w1_factor_eff;
+
+                        $p99w1_floor_vcpu = int($floor_v); $p99w1_floor_vcpu++ if ($floor_v > $p99w1_floor_vcpu); # ceil
+                        if ($p99w1_floor_vcpu > $rvcpu_final) {
+                            $rvcpu_final = $p99w1_floor_vcpu;
+                            $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
+                        }
+                    }
+
+                    # Round up to nearest even number (but keep within envelope)
+                    if ($VCPU_ROUND_UP_TO_EVEN && $rvcpu_final >= 2 && ($rvcpu_final % 2) == 1) {
+                        my $even_up = $rvcpu_final + 1;
+                        if (!defined $rvcpu_max || $even_up <= $rvcpu_max) {
+                            $rvcpu_final = $even_up;
+                        }
+                    }
+
+                    $rvcpu_out = $rvcpu_final;
+                    $max_rvcpu_seen = $rvcpu_final if (!defined $max_rvcpu_seen || $rvcpu_final > $max_rvcpu_seen);
+
+                    # Persist rVCPU + explain so rationale can print an audit trail
+                    $vm_map_ref->{CoreResults}{Profile_rVCPU}{$pname} = $rvcpu_final;
+                    $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$pname} = {
+                        Raw               => $rvcpu_raw,
+                        Min               => $rvcpu_min,
+                        Max               => $rvcpu_max,
+                        TierNum           => $rvcpu_tier_num,
+                        TierFactor        => sprintf("%.2f", $rvcpu_tier_factor),
+                        RunQKeyUsed       => $runq_key,
+                        RunQHiThreads     => (defined $runq_hi_threads ? sprintf("%.2f", $runq_hi_threads) : undef),
+                        P99W1Floor        => $p99w1_floor_vcpu,
+                        P99W1FactorEff    => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
+                        P99W1Mult         => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
+                        P99W1CredRatio    => sprintf("%.3f", $cred_ratio),
+                        P99W1AdjPeak      => sprintf("%.2f", $p99w1_adjusted),
+                        P99W1RawPeak      => sprintf("%.2f", $p99w1_cores),
+                    };
+
+                    # ALSO persist into per-profile debug info used by rationale (prevents stale labels such as AbsRunQ_P95)
+                    if (!defined $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname} || ref($vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname}) ne 'HASH') {
+                        $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname} = {};
+                    }
+                    my $di = $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname};
+                    $di->{'rVCPU_RunQKeyUsed'}     = defined $runq_key ? $runq_key : "N/A";
+                    $di->{'rVCPU_TierNum'}          = $rvcpu_tier_num;
+                    $di->{'rVCPU_TierFactor'}       = sprintf("%.2f", $rvcpu_tier_factor);
+                    $di->{'rVCPU_RunQHiThreads'}   = defined $runq_hi_threads ? sprintf("%.2f", $runq_hi_threads) : "N/A";
+                    $di->{'rVCPU_Raw'}             = defined $rvcpu_raw ? $rvcpu_raw : "N/A";
+                    $di->{'rVCPU_Min'}             = defined $rvcpu_min ? $rvcpu_min : "N/A";
+                    $di->{'rVCPU_Max'}             = defined $rvcpu_max ? $rvcpu_max : "N/A";
+                    $di->{'rVCPU_P99W1Floor'}       = defined $p99w1_floor_vcpu ? $p99w1_floor_vcpu : "N/A";
+                    $di->{'rVCPU_P99W1FactorEff'}   = defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : "N/A";
+                    $di->{'rVCPU_P99W1Mult'}        = defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : "N/A";
+                    $di->{'rVCPU_P99W1CredRatio'}   = sprintf("%.3f", $cred_ratio);
+                    $di->{'rVCPU_P99W1AdjPeak'}     = sprintf("%.2f", $p99w1_adjusted);
+                    $di->{'rVCPU_P99W1RawPeak'}     = sprintf("%.2f", $p99w1_cores);
+                    $di->{'rVCPU_Final'}            = defined $rvcpu_final ? $rvcpu_final : "N/A";
+                }
+
+                push @data_row_csv, $rvcpu_out;
+            }
         }
 
         # Model-specific columns
@@ -6532,13 +7466,46 @@ sub _write_standard_csv_report {
         my $ent_out = $cfg->{entitlement};
         my $current_ent_display = (looks_like_number($ent_out)) ? sprintf("%.2f", $ent_out) : ($ent_out // "");
         push @data_row_csv, $current_ent_display; # Always add Current - ENT
+
+        # Current - VCPU (adjacent to Current - ENT)
+        my $vcpu_out = $cfg->{virtual_cpus};
+        my $current_vcpu_display = (defined $vcpu_out && looks_like_number($vcpu_out)) ? int($vcpu_out) : ($vcpu_out // "");
+        push @data_row_csv, $current_vcpu_display;
+
+        # NFIT - ENT (blank unless Excel formulas are enabled; see branch below)
+        push @data_row_csv, "";
+
+        # VCPU_Constraints (single compact status column; advisory only)
+        my $maxcpu_out = $cfg->{max_cpu};
+        my $maxcpu_num = (defined $maxcpu_out && looks_like_number($maxcpu_out)) ? ($maxcpu_out + 0) : undef;
+        my $vcpu_num   = (defined $vcpu_out   && looks_like_number($vcpu_out))   ? ($vcpu_out + 0)   : undef;
+
+        my $max_rvcpu = undef;
+        foreach my $profile (@csv_visible_profiles) {
+            my $rv = $core->{Profile_rVCPU}{$profile->{name}};
+            next unless (defined $rv && looks_like_number($rv));
+            $max_rvcpu = $rv if (!defined $max_rvcpu || $rv > $max_rvcpu);
+        }
+
+        my @vcpu_flags;
+        if (defined $max_rvcpu) {
+            push @vcpu_flags, "VCPU_LT_rVCPU"   if (defined $vcpu_num   && $vcpu_num   > 0 && $max_rvcpu > $vcpu_num);
+            push @vcpu_flags, "MaxCPU_LT_rVCPU" if (defined $maxcpu_num && $maxcpu_num > 0 && $max_rvcpu > $maxcpu_num);
+        }
+        my $vcpu_constraints_str = scalar(@vcpu_flags) ? join(";", @vcpu_flags) : "";
+        push @data_row_csv, $vcpu_constraints_str;
+
         if ($add_excel_formulas) {
             my $nfit_ent_formula_str = generate_nfit_ent_formula($excel_row_num_counter, scalar(@csv_visible_profiles), $formula_col_offset);
-            my $col_nfit_ent_letter = get_excel_col_name(scalar(@output_header_cols_csv) - 2 + $formula_col_offset);
-            my $col_curr_ent_letter = get_excel_col_name(scalar(@output_header_cols_csv) - 3 + $formula_col_offset);
+            # Column lookups by label (robust to inserted columns)
+            my ($idx_nfit_ent) = grep { $header_for_this_report[$_] eq 'NFIT - ENT' } 0..$#header_for_this_report;
+            my ($idx_curr_ent) = grep { $header_for_this_report[$_] eq 'Current - ENT' } 0..$#header_for_this_report;
+            my $col_nfit_ent_letter = defined($idx_nfit_ent) ? get_excel_col_name(($idx_nfit_ent + 1) + $formula_col_offset) : get_excel_col_name(scalar(@output_header_cols_csv) - 2 + $formula_col_offset);
+            my $col_curr_ent_letter = defined($idx_curr_ent) ? get_excel_col_name(($idx_curr_ent + 1) + $formula_col_offset) : get_excel_col_name(scalar(@output_header_cols_csv) - 3 + $formula_col_offset);
             my $nett_user_formula_str = sprintf("=(%s%d-%s%d)", $col_nfit_ent_letter, $excel_row_num_counter, $col_curr_ent_letter, $excel_row_num_counter);
             my $nett_perc_user_formula_str = sprintf("=IFERROR((%s%d-%s%d)/%s%d,\"\")", $col_nfit_ent_letter, $excel_row_num_counter, $col_curr_ent_letter, $excel_row_num_counter, $col_curr_ent_letter, $excel_row_num_counter);
-            push @data_row_csv, $nfit_ent_formula_str, $nett_user_formula_str, $nett_perc_user_formula_str;
+            $data_row_csv[$idx_nfit_ent] = $nfit_ent_formula_str if (defined $idx_nfit_ent);
+            push @data_row_csv, $nett_user_formula_str, $nett_perc_user_formula_str;
         }
 
          print {$out_fh} join(",", map { quote_csv($_) } @data_row_csv) . "\n";
@@ -12353,6 +13320,60 @@ sub build_assimilation_map {
                 if (ref($rationale) eq 'HASH' && scalar keys %$rationale) {
                     $vm_map->{GrowthRationaleByProfile}{$profile_name} = $rationale;
                 }
+
+                # ------------------------------------------------------------------
+                # Diagnostics (AIX-agnostic): PhysC daily-series diagnostics per profile
+                # ------------------------------------------------------------------
+                # NOTE: These diagnostics are computed from DailySeries (daily aggregated values),
+                #       not raw 1-minute samples. They are intended as *diagnostic signals*.
+                my $daily_series = _safe_dig($profile_data, 'DailySeries');
+                if (ref($daily_series) eq 'HASH' && scalar(keys %$daily_series) > 0) {
+                    my @physc_daily_vals = grep { defined($_) && looks_like_number($_) } values %$daily_series;
+                    my $n_daily = scalar @physc_daily_vals;
+
+                    if ($n_daily > 0) {
+                        @physc_daily_vals = sort { $a <=> $b } @physc_daily_vals;
+
+                        my $p25 = _calculate_percentile_from_sorted(\@physc_daily_vals, 25);
+                        my $p50 = _calculate_percentile_from_sorted(\@physc_daily_vals, 50);
+                        my $p75 = _calculate_percentile_from_sorted(\@physc_daily_vals, 75);
+
+                        my $physc_iqrc;
+                        if (defined $p50 && $p50 > $FLOAT_EPSILON && defined $p75 && defined $p25) {
+                            $physc_iqrc = ($p75 - $p25) / $p50;
+                        }
+
+                        # PAE (Peak Above Entitlement / PhysC Above Entitlement) and AAE (Area Above Entitlement),
+                        # derived from daily PhysC points (diagnostic approximation).
+                        my $ent_diag = (defined $vm_map->{Configuration}{entitlement} && looks_like_number($vm_map->{Configuration}{entitlement}))
+                                     ? ($vm_map->{Configuration}{entitlement} + 0)
+                                     : 0.0;
+
+                        my $pae_cnt = 0;
+                        my $sum_physc = 0.0;
+                        my $sum_excess = 0.0;
+                        foreach my $v (@physc_daily_vals) {
+                            $sum_physc += $v;
+                            if ($v > $ent_diag) {
+                                $pae_cnt++;
+                                $sum_excess += ($v - $ent_diag);
+                            }
+                        }
+
+                        my $pae = ($n_daily > 0) ? ($pae_cnt / $n_daily) : undef;
+                        my $aae = ($sum_physc > $FLOAT_EPSILON) ? ($sum_excess / $sum_physc) : undef;
+
+                        $vm_map->{Diagnostics}{PhysC}{$profile_name} = {
+                            DailyCount => $n_daily,
+                            P25        => (defined $p25 ? ($p25 + 0) : undef),
+                            P50        => (defined $p50 ? ($p50 + 0) : undef),
+                            P75        => (defined $p75 ? ($p75 + 0) : undef),
+                            IQRC       => (defined $physc_iqrc ? ($physc_iqrc + 0) : undef),
+                            PAE        => (defined $pae ? ($pae + 0) : undef),
+                            AAE        => (defined $aae ? ($aae + 0) : undef),
+                        };
+                    }
+                }
             }
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -14886,6 +15907,195 @@ sub _execute_multiplicative_seasonal {
 
             if (looks_like_number($adjusted_physc)) {
                 $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+            }
+
+            # Persist per-profile debug info for downstream consumers (CSV rVCPU scaling, later rationale refinements, etc.)
+            if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$p_name} = $debug_info_ref;
+            }
+
+            # --- rVCPU (per profile): stress-driven, slot-aware, rENT-bounded, peak-aware ---
+            # Store for CSV + rationale (do NOT recompute later in CSV scope).
+            my $rvcpu_final = undef;
+            my $rvcpu_raw = undef;
+            my $rvcpu_min = undef;
+            my $rvcpu_max = undef;
+            my $p99w1_floor_vcpu = undef;
+            my $p99w1_factor_eff = undef;
+            my $p99w1_mult = undef;
+            my $cred_ratio = 1.00;
+            my $p99w1_adjusted;
+            my $p99w1_cores;
+
+            my $rENT_P = (defined $adjusted_physc && looks_like_number($adjusted_physc)) ? ($adjusted_physc + 0) : undef;
+            my $smt_used = (defined $vm_map_ref->{Configuration}{smt} && looks_like_number($vm_map_ref->{Configuration}{smt}))
+                         ? ($vm_map_ref->{Configuration}{smt} + 0)
+                         : $DEFAULT_SMT;
+
+            # Use the SAME AbsRunQ key/value selected inside calculate_runq_modified_physc()
+            # to avoid divergence between rationale, modifier logic, and rVCPU.
+            #
+            # IMPORTANT: keep the key/value paired. If the value comes from AbsRunQValueUsedForCalc,
+            # then the key MUST come from AbsRunQKeyUsed (or a safe fallback), otherwise we risk
+            # misleading output such as "RunQ=AbsRunQ_P95=<value from P50>".
+            my $runq_key = undef;
+            my $runq_hi_threads = undef;
+
+            if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                if (defined $debug_info_ref->{AbsRunQKeyUsed} && $debug_info_ref->{AbsRunQKeyUsed} =~ /^AbsRunQ_P\d+$/) {
+                    $runq_key = $debug_info_ref->{AbsRunQKeyUsed};
+                }
+
+                if (defined $debug_info_ref->{AbsRunQValueUsedForCalc} && looks_like_number($debug_info_ref->{AbsRunQValueUsedForCalc})) {
+                    $runq_hi_threads = $debug_info_ref->{AbsRunQValueUsedForCalc} + 0;
+                    # If we got a value but the key is missing/invalid, fall back to the headroom key
+                    # (which is derived from the same selection chain) or to a conservative default.
+                    if (!defined $runq_key) {
+                        if (defined $debug_info_ref->{Headroom_AbsRunQKey} && $debug_info_ref->{Headroom_AbsRunQKey} =~ /^AbsRunQ_P\d+$/) {
+                            $runq_key = $debug_info_ref->{Headroom_AbsRunQKey};
+                        } else {
+                            $runq_key = 'AbsRunQ_P90';
+                        }
+                    }
+                }
+            }
+
+            # Fallback chain only if the selected value is not available.
+            if (!defined $runq_hi_threads) {
+                $runq_key = 'AbsRunQ_P90' if (!defined $runq_key);
+                if (defined $vm_map_ref->{RunQMetrics} && ref($vm_map_ref->{RunQMetrics}) eq 'HASH') {
+                    if (defined $vm_map_ref->{RunQMetrics}{$runq_key} && looks_like_number($vm_map_ref->{RunQMetrics}{$runq_key})) {
+                        $runq_hi_threads = $vm_map_ref->{RunQMetrics}{$runq_key} + 0;
+                    } elsif (defined $vm_map_ref->{RunQMetrics}{AbsRunQ_P90} && looks_like_number($vm_map_ref->{RunQMetrics}{AbsRunQ_P90})) {
+                        $runq_key = 'AbsRunQ_P90';
+                        $runq_hi_threads = $vm_map_ref->{RunQMetrics}{AbsRunQ_P90} + 0;
+                    }
+                }
+            }
+
+            # Tier-aware headroom: extract tier from profile name (e.g., "G3-50W15" -> "G3" -> tier 3).
+            my $ms_tier_str = $p_name;
+            $ms_tier_str =~ s/-.*//;
+            my $rvcpu_tier_num = 3;  # Default baseline
+            if ($ms_tier_str =~ /(\d)$/) {
+                $rvcpu_tier_num = $1;
+            } elsif ($ms_tier_str eq 'P') {
+                $rvcpu_tier_num = 1;
+            }
+            my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
+
+            if (defined $rENT_P && $rENT_P > 0 && defined $smt_used && $smt_used > 0 && defined $runq_hi_threads && $runq_hi_threads > 0) {
+                # Workload width to target headroom, tier-adjusted
+                my $required_threads = ($runq_hi_threads / $RUNQ_TARGET_HEADROOM_FACTOR) * $rvcpu_tier_factor;
+                my $required_cores = $required_threads / $smt_used;
+                $rvcpu_raw = int($required_cores); $rvcpu_raw++ if ($required_cores > $rvcpu_raw);
+
+                # Vendor envelope from rENT_P
+                my $min_v = $rENT_P * $VCPU_RATIO_MIN;
+                my $max_v = $rENT_P * $VCPU_RATIO_MAX;
+                $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
+                $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
+
+                $rvcpu_final = $rvcpu_raw;
+                $rvcpu_final = $rvcpu_min if ($rvcpu_final < $rvcpu_min);
+                $rvcpu_final = $rvcpu_max if ($rvcpu_final > $rvcpu_max);
+
+                # Low-entitlement minimums
+                $rvcpu_final = $VCPU_MIN_ABS if ($rvcpu_final < $VCPU_MIN_ABS);
+                if ($rENT_P >= 0.5 && $rENT_P < 1.0 && $rvcpu_final < $VCPU_MIN_FOR_ENT_GE_0_5_LT_1) {
+                    $rvcpu_final = $VCPU_MIN_FOR_ENT_GE_0_5_LT_1;
+                }
+
+                # Peak floor: PAE/AAE-driven headroom, tier-scaled.
+                # Base is 1.00 (VCPUs must at minimum cover peak cores).
+                # Headroom proportional to empirical above-entitlement evidence,
+                # amplified by tier policy. Avoids multiplicative compounding.
+                $p99w1_cores = $vm_map_ref->{CoreResults}{ProfileValues}{$MANDATORY_PEAK_PROFILE_FOR_HINT};
+                if (defined $p99w1_cores && looks_like_number($p99w1_cores) && $p99w1_cores > 0) {
+                    # RunQ credibility adjustment
+                    $p99w1_adjusted = $p99w1_cores;
+                    $cred_ratio = 1.00;
+
+                    # Credibility uses AbsRunQ_P99 unconditionally (tail-to-tail comparison).
+                    my $runq_p99_for_cred = undef;
+                    if (defined $vm_map_ref->{RunQMetrics} && ref($vm_map_ref->{RunQMetrics}) eq 'HASH'
+                        && defined $vm_map_ref->{RunQMetrics}{'AbsRunQ_P99'}
+                        && looks_like_number($vm_map_ref->{RunQMetrics}{'AbsRunQ_P99'})) {
+                        $runq_p99_for_cred = $vm_map_ref->{RunQMetrics}{'AbsRunQ_P99'} + 0;
+                    }
+                    if (defined $runq_p99_for_cred && $runq_p99_for_cred > 0 && defined $smt_used && $smt_used > 0) {
+                        my $runq_peak_cores = $runq_p99_for_cred / $smt_used;
+                        $cred_ratio = $runq_peak_cores / $p99w1_cores;
+                        my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
+                        $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
+                        $credibility = 1.00 if ($credibility > 1.00);
+                        $p99w1_adjusted = $p99w1_cores * $credibility;
+                    }
+
+                    my $pae_raw = 0.0;
+                    my $aae_raw = 0.0;
+                    if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                        $pae_raw = (defined $debug_info_ref->{'PhysC_Daily_PAE'} && looks_like_number($debug_info_ref->{'PhysC_Daily_PAE'}))
+                                 ? ($debug_info_ref->{'PhysC_Daily_PAE'} + 0) : 0.0;
+                        $aae_raw = (defined $debug_info_ref->{'PhysC_Daily_AAE'} && looks_like_number($debug_info_ref->{'PhysC_Daily_AAE'}))
+                                 ? ($debug_info_ref->{'PhysC_Daily_AAE'} + 0) : 0.0;
+                    }
+
+                    my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
+                    my $aae_component = ($aae_raw > 0) ? (($aae_raw < 0.10 ? $aae_raw : 0.10) / 0.10) * 0.15 : 0.0;
+
+                    my $headroom = ($pae_component + $aae_component) * $rvcpu_tier_factor;
+                    $p99w1_factor_eff = 1.00 + $headroom;
+                    $p99w1_mult = $headroom;  # Rationale: the headroom portion above 1.00
+
+                    my $floor_v = ($p99w1_adjusted + 0) * $p99w1_factor_eff;
+
+                    $p99w1_floor_vcpu = int($floor_v); $p99w1_floor_vcpu++ if ($floor_v > $p99w1_floor_vcpu);
+                    if ($p99w1_floor_vcpu > $rvcpu_final) {
+                        $rvcpu_final = $p99w1_floor_vcpu;
+                        $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
+                    }
+                }
+
+                # Optional even-rounding
+                if ($VCPU_ROUND_UP_TO_EVEN && $rvcpu_final >= 2 && ($rvcpu_final % 2) == 1) {
+                    my $even_up = $rvcpu_final + 1;
+                    if (!defined $rvcpu_max || $even_up <= $rvcpu_max) { $rvcpu_final = $even_up; }
+                }
+            }
+
+            $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : "";
+            $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$p_name} = {
+                Raw            => $rvcpu_raw,
+                Min            => $rvcpu_min,
+                Max            => $rvcpu_max,
+                TierNum        => $rvcpu_tier_num,
+                TierFactor     => sprintf("%.2f", $rvcpu_tier_factor),
+                RunQKeyUsed    => defined($runq_key) ? $runq_key : undef,
+                RunQHiThreads  => (defined $runq_hi_threads ? sprintf("%.2f", $runq_hi_threads) : undef),
+                P99W1Floor     => $p99w1_floor_vcpu,
+                P99W1FactorEff => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
+                P99W1Mult      => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
+                P99W1CredRatio => sprintf("%.3f", $cred_ratio),
+                P99W1AdjPeak   => sprintf("%.2f", $p99w1_adjusted),
+                P99W1RawPeak   => sprintf("%.2f", $p99w1_cores),
+            };
+            if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                # Persist the paired key/value used for rVCPU so rationale cannot drift.
+                $debug_info_ref->{'rVCPU_RunQKeyUsed'}   = defined($runq_key) ? $runq_key : "N/A";
+                $debug_info_ref->{'rVCPU_TierNum'}       = $rvcpu_tier_num;
+                $debug_info_ref->{'rVCPU_TierFactor'}    = sprintf("%.2f", $rvcpu_tier_factor);
+                $debug_info_ref->{'rVCPU_RunQHiThreads'} = defined($runq_hi_threads) ? sprintf("%.2f",$runq_hi_threads) : "N/A";
+                $debug_info_ref->{'rVCPU_Raw'} = defined($rvcpu_raw) ? $rvcpu_raw : "N/A";
+                $debug_info_ref->{'rVCPU_Min'} = defined($rvcpu_min) ? $rvcpu_min : "N/A";
+                $debug_info_ref->{'rVCPU_Max'} = defined($rvcpu_max) ? $rvcpu_max : "N/A";
+                $debug_info_ref->{'rVCPU_P99W1Floor'} = defined($p99w1_floor_vcpu) ? $p99w1_floor_vcpu : "N/A";
+                $debug_info_ref->{'rVCPU_P99W1FactorEff'} = defined($p99w1_factor_eff) ? sprintf("%.3f",$p99w1_factor_eff) : "N/A";
+                $debug_info_ref->{'rVCPU_P99W1Mult'} = defined($p99w1_mult) ? sprintf("%.3f",$p99w1_mult) : "N/A";
+                $debug_info_ref->{'rVCPU_P99W1CredRatio'} = sprintf("%.3f", $cred_ratio);
+                $debug_info_ref->{'rVCPU_P99W1AdjPeak'}   = sprintf("%.2f", $p99w1_adjusted);
+                $debug_info_ref->{'rVCPU_P99W1RawPeak'}   = sprintf("%.2f", $p99w1_cores);
+                $debug_info_ref->{'rVCPU_Final'} = defined($rvcpu_final) ? $rvcpu_final : "N/A";
             }
 
             if ($p_name eq $runq_source_profile_name) {
