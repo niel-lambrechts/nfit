@@ -66,7 +66,7 @@ my $MANDATORY_PEAK_PROFILE_FOR_HINT = "Peak_P-99W1";
 # configuration is incomplete. This profile is an evidence source (peak + RunQ)
 # and is intentionally hidden from the planner CSV by default when injected.
 my $DEFAULT_MANDATORY_PEAK_PROFILE_FLAGS = "-p 99.75 -w 1 --filter-above-perc 30 --decay high --runq-decay medium --runq-abs-perc 90 --runq-norm-perc \"50,90\" --enable-growth-prediction --max-growth-inflation-percent 15";
- 
+
 my $LEGACY_MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1"; # Back-compat alias
 my $MISSION_CRITICAL_PROFILE_NAME = "P-99W1";          # Actionable peak-coverage profile (runs full modifier chain)
 
@@ -1407,9 +1407,12 @@ foreach my $system_serial (@target_systems_to_process)
     # It detects the interval and gets the appropriate thresholds for this system's run.
     my $detected_interval_secs = detect_sampling_interval($data_cache_file);
 
-    # The set_adaptive_thresholds function returns the new values, which are stored
+    # The _build_adaptive_thresholds_hash function returns the new values, which are stored
     # in local variables. This avoids modifying the global defaults.
-    my ($adaptive_runq_saturation_thresh, $adaptive_target_norm_runq, $adaptive_max_efficiency_reduction) = set_adaptive_thresholds($detected_interval_secs, $log_fh_for_system);
+    my $adaptive_thresholds_href = _build_adaptive_thresholds_hash($detected_interval_secs, $log_fh_for_system);
+    my $adaptive_runq_saturation_thresh     = $adaptive_thresholds_href->{saturation};
+    my $adaptive_target_norm_runq           = $adaptive_thresholds_href->{target};
+    my $adaptive_max_efficiency_reduction   = $adaptive_thresholds_href->{max_reduction};
 
     # --- Seasonality Engine: Main Controller ---
     # This block determines if a seasonal model should be applied and orchestrates the analysis.
@@ -1441,6 +1444,7 @@ foreach my $system_serial (@target_systems_to_process)
             adaptive_saturation_thresh => $adaptive_runq_saturation_thresh,
             adaptive_target_norm_runq => $adaptive_target_norm_runq,
             adaptive_max_efficiency_reduction => $adaptive_max_efficiency_reduction,
+            adaptive_thresholds_href => $adaptive_thresholds_href,
             sampling_interval => $detected_interval_secs,
             cache_start_date  => $start_date,
             cache_end_date    => $end_date,
@@ -1472,6 +1476,7 @@ foreach my $system_serial (@target_systems_to_process)
                 adaptive_saturation_thresh => $adaptive_runq_saturation_thresh,
                 adaptive_target_norm_runq => $adaptive_target_norm_runq,
                 adaptive_max_efficiency_reduction => $adaptive_max_efficiency_reduction,
+                adaptive_thresholds_href => $adaptive_thresholds_href,
                 sampling_interval => $detected_interval_secs,
                 cache_start_date  => $start_date,
                 cache_end_date    => $end_date,
@@ -1662,7 +1667,7 @@ foreach my $system_serial (@target_systems_to_process)
                     next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
 
                     my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-                    my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+                    my %adaptive_thresholds = %$adaptive_thresholds_href;
 
                     # Calculate modified value (Forecast + RunQ)
                     my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
@@ -1704,11 +1709,31 @@ foreach my $system_serial (@target_systems_to_process)
                     } elsif ($ml_tier_str eq 'P') {
                         $rvcpu_tier_num = 1;
                     }
+
                     my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
+
+                    # Interval-adaptive divisor for Gate 1 (dispatch width).
+                    # This is a divisor (target utilisation), not a multiplier.
+                    my $runq_width_divisor = $RUNQ_TARGET_HEADROOM_FACTOR;
+                    $runq_width_divisor = 0.80 if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
+
+                    if (defined $adaptive_thresholds_href && ref($adaptive_thresholds_href) eq 'HASH'
+                        && defined $adaptive_thresholds_href->{runq_width_divisor}
+                        && looks_like_number($adaptive_thresholds_href->{runq_width_divisor})
+                        && $adaptive_thresholds_href->{runq_width_divisor} > 0) {
+                        $runq_width_divisor = $adaptive_thresholds_href->{runq_width_divisor} + 0;
+                    }
+
+                    # Hard safety clamps (never allow divide-by-zero or absurd divisors).
+                    my $MIN_RUNQ_WIDTH_DIVISOR = 0.50;
+                    my $MAX_RUNQ_WIDTH_DIVISOR = 1.00;
+                    $runq_width_divisor = 0.80 if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
+                    $runq_width_divisor = $MIN_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor < $MIN_RUNQ_WIDTH_DIVISOR);
+                    $runq_width_divisor = $MAX_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor > $MAX_RUNQ_WIDTH_DIVISOR);
 
                     if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0 && defined $rENT_P && $rENT_P > 0) {
                         # Workload-driven width requirement (threads -> cores -> vCPUs), tier-adjusted
-                        my $required_threads = ($runq_hi_threads / $RUNQ_TARGET_HEADROOM_FACTOR) * $rvcpu_tier_factor;
+                        my $required_threads = ($runq_hi_threads / $runq_width_divisor) * $rvcpu_tier_factor;
                         my $required_cores   = $required_threads / $smt_for_vcpu;
                         $rvcpu_raw = int($required_cores);
                         $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil for positive values
@@ -1834,7 +1859,7 @@ foreach my $system_serial (@target_systems_to_process)
 
             if ($runq_source_profile_obj) {
                 my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-                my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+                my %adaptive_thresholds = %$adaptive_thresholds_href;
 
                 my (undef, $debug_info_ref) = calculate_runq_modified_physc(
                     $vm_name, $assimilation_map_ref->{$vm_name}, $runq_source_profile_obj, \%pressure_flags, \%adaptive_thresholds
@@ -1854,7 +1879,7 @@ foreach my $system_serial (@target_systems_to_process)
                 next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
 
                 my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-                my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+                my %adaptive_thresholds = %$adaptive_thresholds_href;
 
                 my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
                     $vm_name, $assimilation_map_ref->{$vm_name}, $profile, \%pressure_flags, \%adaptive_thresholds
@@ -1954,11 +1979,7 @@ foreach my $system_serial (@target_systems_to_process)
                         abs_pressure  => $vm_map_ref->{Hinting}{P99W1_AbsRunQPressure}  // 0,
                         norm_pressure => $vm_map_ref->{Hinting}{P99W1_NormRunQPressure} // 0
                     );
-                    my %adaptive_thresholds_rd = (
-                        saturation    => $adaptive_runq_saturation_thresh,
-                        target        => $adaptive_target_norm_runq,
-                        max_reduction => $adaptive_max_efficiency_reduction
-                    );
+                    my %adaptive_thresholds_rd = %$adaptive_thresholds_href;
 
                     my (undef, $debug_info_ref_rd) = calculate_runq_modified_physc(
                         $vm_name, $vm_map_ref, $growth_source_profile_obj,
@@ -2049,7 +2070,7 @@ foreach my $system_serial (@target_systems_to_process)
             # (recency_decay already populated these values correctly)
             if ($runq_source_profile_obj && !$skip_phase2_modifiers) {
                 my %pressure_flags = ( abs_pressure => $p99w1_has_abs_pressure, norm_pressure => $p99w1_has_norm_pressure );
-                my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+                my %adaptive_thresholds = %$adaptive_thresholds_href;
 
                 # Calculate modifiers ONLY for the source profile
                 my (undef, $debug_info_ref) = calculate_runq_modified_physc(
@@ -2090,7 +2111,7 @@ foreach my $system_serial (@target_systems_to_process)
                 } else {
                     # Recalculate for logging, but do NOT store these values for the CSV
                     my %pressure_flags = ( abs_pressure => $p99w1_has_abs_pressure, norm_pressure => $p99w1_has_norm_pressure );
-                    my %adaptive_thresholds = ( saturation => $adaptive_runq_saturation_thresh, target => $adaptive_target_norm_runq, max_reduction => $adaptive_max_efficiency_reduction );
+                    my %adaptive_thresholds = %$adaptive_thresholds_href;
 
                     my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
                         $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
@@ -2167,7 +2188,7 @@ foreach my $system_serial (@target_systems_to_process)
    if ($is_multiplicative_forecast_run) {
         # This is the new path for the multiplicative model, which now uses the standard reporter.
         if (@vm_order) {
-            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 1, 0, 0, $adaptive_runq_saturation_thresh);
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 1, 0, 0, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef);
 
             # If verbose mode is on, generate the extra audit trail files.
             if ($verbose) {
@@ -2198,7 +2219,7 @@ foreach my $system_serial (@target_systems_to_process)
                 # For predictive_peak, pass a false flag to generate a standard report.
                 my $is_recency_flag = ($model_type eq 'recency_decay') ? 1 : 0;
                 my $is_predictive_flag = ($model_type eq 'predictive_peak') ? 1 : 0;
-                _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $unique_date_suffix, 0, $is_recency_flag, $is_predictive_flag, $adaptive_runq_saturation_thresh);
+                _write_standard_csv_report($assimilation_map_ref, $apply_seasonality_event, $system_identifier, $unique_date_suffix, 0, $is_recency_flag, $is_predictive_flag, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef);
 
                 # Store recency_decay forecast results to unified history
                 if ($model_type eq 'recency_decay')  {
@@ -2256,7 +2277,7 @@ foreach my $system_serial (@target_systems_to_process)
         # This is the standard, non-seasonal run path. It now generates one report
         # per system before proceeding to the next.
         if (@vm_order) {
-            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh);
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef);
         }
     }
 
@@ -3347,11 +3368,13 @@ sub log_profile_rationale
             my $re_cred_eff = $re_cred + $VCPU_PEAK_CRED_BIAS;
             $re_cred_eff = $VCPU_PEAK_CRED_MIN if ($re_cred_eff < $VCPU_PEAK_CRED_MIN);
             $re_cred_eff = 1.00 if ($re_cred_eff > 1.00);
-            printf {$fh} "    Credible peak: %s cores (PhysC %s x %.3f effective credibility; corroboration ratio %.3f).\n",            
+            my $re_cred_suffix = (defined $re->{P99W1CredRatioSuffix}) ? $re->{P99W1CredRatioSuffix} : '';
+            printf {$fh} "    Credible peak: %s cores (PhysC %s x %.3f effective credibility; corroboration ratio %.3f%s).\n",
                 $re->{P99W1AdjPeak},
                 $re->{P99W1RawPeak},
                 $re_cred_eff,
-                $re_cred;
+                $re_cred,
+                $re_cred_suffix;
 
             # Diagnostic hint when credibility discount is material (>30% of peak unexplained by RunQ)
             if ($re_cred < 0.70 && looks_like_number($re->{P99W1RawPeak}) && looks_like_number($re->{P99W1AdjPeak})) {
@@ -5106,10 +5129,74 @@ sub calculate_runq_modified_physc
         }
         my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
 
+        # Interval-adaptive divisor for Gate 1 (dispatch width).
+        # This is a divisor (target utilisation), not a multiplier.
+        my $runq_width_divisor = $RUNQ_TARGET_HEADROOM_FACTOR;
+        $runq_width_divisor = 0.80 if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
+
+        my $runq_width_divisor_base = $runq_width_divisor;
+        my $runq_interval_minutes_snapped;
+
+        if (defined $adaptive_thresholds_href && ref($adaptive_thresholds_href) eq 'HASH') {
+            if (defined $adaptive_thresholds_href->{runq_width_divisor_base}
+                && looks_like_number($adaptive_thresholds_href->{runq_width_divisor_base})
+                && $adaptive_thresholds_href->{runq_width_divisor_base} > 0) {
+                $runq_width_divisor_base = $adaptive_thresholds_href->{runq_width_divisor_base} + 0;
+            }
+            if (defined $adaptive_thresholds_href->{runq_width_divisor}
+                && looks_like_number($adaptive_thresholds_href->{runq_width_divisor})
+                && $adaptive_thresholds_href->{runq_width_divisor} > 0) {
+                $runq_width_divisor = $adaptive_thresholds_href->{runq_width_divisor} + 0;
+            }
+            if (defined $adaptive_thresholds_href->{snapped_minutes}
+                && looks_like_number($adaptive_thresholds_href->{snapped_minutes})
+                && $adaptive_thresholds_href->{snapped_minutes} > 0) {
+                $runq_interval_minutes_snapped = int($adaptive_thresholds_href->{snapped_minutes} + 0);
+            }
+        }
+
+        # Hard safety clamps (never allow divide-by-zero or absurd divisors).
+        my $MIN_RUNQ_WIDTH_DIVISOR = 0.50;
+        my $MAX_RUNQ_WIDTH_DIVISOR = 1.00;
+        $runq_width_divisor_base = 0.80 if (!defined $runq_width_divisor_base || !looks_like_number($runq_width_divisor_base) || $runq_width_divisor_base <= 0);
+        $runq_width_divisor_base = $MIN_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor_base < $MIN_RUNQ_WIDTH_DIVISOR);
+        $runq_width_divisor_base = $MAX_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor_base > $MAX_RUNQ_WIDTH_DIVISOR);
+
+        $runq_width_divisor = $runq_width_divisor_base if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
+        $runq_width_divisor = $MIN_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor < $MIN_RUNQ_WIDTH_DIVISOR);
+        $runq_width_divisor = $MAX_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor > $MAX_RUNQ_WIDTH_DIVISOR);
+
+        # Interval credibility correction (for corroboration ratio only):
+        # Coarser sampling dampens RunQ tails, which can falsely reduce RunQ↔PhysC corroboration.
+        # Apply a *relative* correction ONLY to the RunQ-derived cores used in the credibility ratio:
+        #   corr = base_divisor / adaptive_divisor
+        # This is an identity at 60s (corr=1.00), never deflates RunQ credibility (corr>=1.00),
+        # and is hard-clamped to avoid over-trusting RunQ tails.
+        my $runq_cred_corr = 1.00;
+        my $runq_cred_corr_suffix = '';
+        do {
+            my $corr = 1.00;
+            if (defined $runq_width_divisor_base && defined $runq_width_divisor && $runq_width_divisor > 0) {
+                $corr = $runq_width_divisor_base / $runq_width_divisor;
+            }
+            $corr = 1.00 if (!defined $corr || !looks_like_number($corr) || $corr <= 0);
+            $corr = 1.00 if ($corr < 1.00);
+            $corr = 1.50 if ($corr > 1.50);
+            $runq_cred_corr = $corr;
+
+            if ($runq_cred_corr > 1.0005) {
+                $runq_cred_corr_suffix = sprintf(" [Interval Correction: x%.2f%s]",
+                    $runq_cred_corr,
+                    (defined $runq_interval_minutes_snapped ? sprintf(", %dm", $runq_interval_minutes_snapped) : "")
+                );
+            }
+        };
+
         if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0 && defined $rENT_P && $rENT_P > 0) {
             # Workload-driven width requirement (threads -> cores -> vCPUs), tier-adjusted.
             # Higher tiers demand more spare runnable capacity (lower acceptable queue utilisation).
-            my $required_threads = ($runq_hi_threads / $RUNQ_TARGET_HEADROOM_FACTOR) * $rvcpu_tier_factor;
+            # NOTE: The divisor below is a target utilisation divisor (e.g., 0.80), not a multiplier.
+            my $required_threads = ($runq_hi_threads / $runq_width_divisor) * $rvcpu_tier_factor;
             my $required_cores   = $required_threads / $smt_for_vcpu;
             $rvcpu_raw = int($required_cores);
             $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil
@@ -5160,8 +5247,10 @@ sub calculate_runq_modified_physc
                 my $runq_p99w1_for_cred =
                     $vm_map_ref->{RunQMetrics}{AbsRunQ_P99W1} //
                     $vm_map_ref->{RunQMetrics}{AbsRunQ_P99};
+
                 if (defined $runq_p99w1_for_cred && $runq_p99w1_for_cred > 0 && defined $smt_for_vcpu && $smt_for_vcpu > 0) {
-                    my $runq_peak_cores = $runq_p99w1_for_cred / $smt_for_vcpu;
+                    my $runq_peak_cores_raw = $runq_p99w1_for_cred / $smt_for_vcpu;
+                    my $runq_peak_cores = $runq_peak_cores_raw * $runq_cred_corr;
                     $cred_ratio = $runq_peak_cores / $pure_p99w1_physc;
                     my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
                     $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
@@ -5229,10 +5318,15 @@ sub calculate_runq_modified_physc
             TierFactor     => sprintf("%.2f", $rvcpu_tier_factor),
             RunQKeyUsed    => $abs_runq_key_for_debug,  # Must match the key actually selected for this profile's AbsRunQ
             RunQHiThreads  => (defined $runq_hi_threads ? sprintf("%.2f", $runq_hi_threads) : undef),
+            RunQWidthDivisor      => sprintf("%.2f", $runq_width_divisor),
+            RunQWidthDivisorBase  => sprintf("%.2f", $runq_width_divisor_base),
+            RunQIntervalMinutes   => (defined $runq_interval_minutes_snapped ? $runq_interval_minutes_snapped : undef),
             P99W1Floor     => $p99w1_floor_vcpu,
             P99W1FactorEff => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
             P99W1Mult      => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
             P99W1CredRatio => sprintf("%.3f", $cred_ratio),
+            P99W1CredCorr  => sprintf("%.2f", $runq_cred_corr),
+            P99W1CredRatioSuffix => $runq_cred_corr_suffix,
             P99W1AdjPeak   => sprintf("%.2f", $p99w1_adjusted),
             P99W1RawPeak   => sprintf("%.2f", $pure_p99w1_physc),
         };
@@ -5251,6 +5345,11 @@ sub calculate_runq_modified_physc
         $debug_info{'rVCPU_P99W1AdjPeak'}   = sprintf("%.2f", $p99w1_adjusted);
         $debug_info{'rVCPU_P99W1RawPeak'}   = sprintf("%.2f", $pure_p99w1_physc);
         $debug_info{'rVCPU_RunQHiThreads'}  = defined($runq_hi_threads) ? sprintf("%.2f",$runq_hi_threads) : 'N/A';
+        $debug_info{'rVCPU_RunQWidthDivisor'}     = sprintf("%.2f", $runq_width_divisor);
+        $debug_info{'rVCPU_RunQWidthDivisorBase'} = sprintf("%.2f", $runq_width_divisor_base);
+        $debug_info{'rVCPU_RunQIntervalMinutes'}  = defined($runq_interval_minutes_snapped) ? $runq_interval_minutes_snapped : 'N/A';
+        $debug_info{'rVCPU_P99W1CredCorr'}        = sprintf("%.2f", $runq_cred_corr);
+        $debug_info{'rVCPU_P99W1CredRatioSuffix'} = $runq_cred_corr_suffix;
         $debug_info{'rVCPU_Final'}          = defined($rvcpu_final) ? $rvcpu_final : 'N/A';
     };
 
@@ -7166,7 +7265,7 @@ sub _round_up_to_even
 #             its data from the final, fully populated assimilation map.
 # ==============================================================================
 sub _write_standard_csv_report {
-    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag, $adaptive_runq_saturation_thresh) = @_;
+    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, $anchor_bucket) = @_;
 
     # Ensure we have data to process before creating a file.
     # The @vm_order array is still used to control the iteration order.
@@ -7362,6 +7461,7 @@ sub _write_standard_csv_report {
                 } elsif ($csv_tier_str eq 'P') {
                     $rvcpu_tier_num = 1;
                 }
+
                 my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
 
                 if (defined $runq_hi_threads && defined $rENT_P && $rENT_P > 0 && defined $smt_used && $smt_used > 0) {
@@ -7371,9 +7471,57 @@ sub _write_standard_csv_report {
                     my $p99w1_mult = undef;
                     my $cred_ratio = 1.00;
                     my $p99w1_adjusted;
+                    my $runq_cred_corr = 1.00;
+                    my $runq_cred_corr_suffix = '';
+
+                    # Interval-adaptive divisor (dispatch width) for this fallback recomputation.
+                    my $runq_width_divisor = $RUNQ_TARGET_HEADROOM_FACTOR;
+                    $runq_width_divisor = 0.80 if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
+                    my $runq_width_divisor_base = $runq_width_divisor;
+                    my $snapped_minutes;
+
+                    if (defined $adaptive_thresholds_href && ref($adaptive_thresholds_href) eq 'HASH') {
+                        if (defined $adaptive_thresholds_href->{runq_width_divisor_base}
+                            && looks_like_number($adaptive_thresholds_href->{runq_width_divisor_base})
+                            && $adaptive_thresholds_href->{runq_width_divisor_base} > 0) {
+                            $runq_width_divisor_base = $adaptive_thresholds_href->{runq_width_divisor_base} + 0;
+                        }
+                        if (defined $adaptive_thresholds_href->{runq_width_divisor}
+                            && looks_like_number($adaptive_thresholds_href->{runq_width_divisor})
+                            && $adaptive_thresholds_href->{runq_width_divisor} > 0) {
+                            $runq_width_divisor = $adaptive_thresholds_href->{runq_width_divisor} + 0;
+                        }
+                        if (defined $adaptive_thresholds_href->{snapped_minutes}
+                            && looks_like_number($adaptive_thresholds_href->{snapped_minutes})
+                            && $adaptive_thresholds_href->{snapped_minutes} > 0) {
+                            $snapped_minutes = int($adaptive_thresholds_href->{snapped_minutes} + 0);
+                        }
+                    }
+
+                    # Hard clamps (same safety intent as main path).
+                    my $MIN_DIV = 0.50;
+                    my $MAX_DIV = 1.00;
+                    $runq_width_divisor_base = 0.80 if (!defined $runq_width_divisor_base || !looks_like_number($runq_width_divisor_base) || $runq_width_divisor_base <= 0);
+                    $runq_width_divisor_base = $MIN_DIV if ($runq_width_divisor_base < $MIN_DIV);
+                    $runq_width_divisor_base = $MAX_DIV if ($runq_width_divisor_base > $MAX_DIV);
+                    $runq_width_divisor = $runq_width_divisor_base if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
+                    $runq_width_divisor = $MIN_DIV if ($runq_width_divisor < $MIN_DIV);
+                    $runq_width_divisor = $MAX_DIV if ($runq_width_divisor > $MAX_DIV);
+
+                    # Relative interval correction for credibility ratio only (identity at 60s).
+                    my $corr = $runq_width_divisor_base / $runq_width_divisor;
+                    $corr = 1.00 if (!defined $corr || !looks_like_number($corr) || $corr <= 0);
+                    $corr = 1.00 if ($corr < 1.00);
+                    $corr = 1.50 if ($corr > 1.50);
+                    $runq_cred_corr = $corr;
+                    if ($runq_cred_corr > 1.0005) {
+                        $runq_cred_corr_suffix = sprintf(" [Interval Correction: x%.2f%s]", $runq_cred_corr,
+                            (defined $snapped_minutes ? sprintf(", %dm", $snapped_minutes) : "")
+                        );
+                    }
 
                     # Workload-driven width requirement (threads -> cores -> vCPUs), tier-adjusted.
-                    my $required_threads = ($runq_hi_threads / $RUNQ_TARGET_HEADROOM_FACTOR) * $rvcpu_tier_factor;
+                    my $required_threads = ($runq_hi_threads / $runq_width_divisor) * $rvcpu_tier_factor;
                     my $required_cores   = $required_threads / $smt_used;
                     my $rvcpu_raw = int($required_cores);
                     $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil
@@ -7424,7 +7572,8 @@ sub _write_standard_csv_report {
                             $vm_map_ref->{RunQMetrics}{AbsRunQ_P99};
 
                         if (defined $runq_p99w1_for_cred && $runq_p99w1_for_cred > 0 && defined $smt_used && $smt_used > 0) {
-                            my $runq_peak_cores = $runq_p99w1_for_cred / $smt_used;
+                            my $runq_peak_cores_raw = $runq_p99w1_for_cred / $smt_used;
+                            my $runq_peak_cores = $runq_peak_cores_raw * $runq_cred_corr;
                             $cred_ratio = $runq_peak_cores / $p99w1_cores;
                             my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
                             $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
@@ -7490,6 +7639,8 @@ sub _write_standard_csv_report {
                         P99W1FactorEff    => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
                         P99W1Mult         => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
                         P99W1CredRatio    => sprintf("%.3f", $cred_ratio),
+                        P99W1CredCorr   => sprintf("%.2f", $runq_cred_corr),
+                        P99W1CredRatioSuffix => $runq_cred_corr_suffix,
                         P99W1AdjPeak      => sprintf("%.2f", $p99w1_adjusted),
                         P99W1RawPeak      => sprintf("%.2f", $p99w1_cores),
                     };
@@ -12873,7 +13024,7 @@ sub detect_sampling_interval {
 }
 
 # ==============================================================================
-# --- set_adaptive_thresholds ---
+# --- _build_adaptive_thresholds_hash ---
 # Takes a detected sampling interval, snaps it to a standard value (e.g., 1, 5, 10 min),
 # calculates the adaptive thresholds for saturation and efficiency, and logs the rationale.
 # This function does NOT modify global state; it returns the calculated values.
@@ -12883,7 +13034,7 @@ sub detect_sampling_interval {
 #     1. The new saturation threshold (float).
 #     2. The new target for efficiency calculation (float).
 #     3. The new max downsizing percentage (as a factor, e.g., 0.05 for 5%).
-sub set_adaptive_thresholds {
+sub _build_adaptive_thresholds_hash {
     my ($raw_interval_seconds, $log_fh) = @_;
 
     # --- Baseline (1-min) thresholds ---
@@ -12948,7 +13099,54 @@ sub set_adaptive_thresholds {
         print {$log_fh} "----------------------------------------------------------------------\n";
     }
 
-    return ($sat_thresh, $target_norm_runq, $max_downsize_perc_factor);
+    # --- Additional derived policy knobs (plumbing only) ---
+    # Baseline divisor (60s) remains the global constant; coarser intervals may map to a more conservative divisor.
+    my $runq_width_divisor_base = $RUNQ_TARGET_HEADROOM_FACTOR;
+    $runq_width_divisor_base = 0.80 if (!defined $runq_width_divisor_base || $runq_width_divisor_base <= 0);
+
+    # NOTE: These values are not yet consumed in calculations (Patch 1 plumbing only).
+    my %width_divisor_lookup = (
+        5  => 0.70,
+        10 => 0.65,
+        15 => 0.60,
+    );
+
+    my $runq_width_divisor = $runq_width_divisor_base;
+    if ($snapped_minutes > 1) {
+        $runq_width_divisor = $width_divisor_lookup{$snapped_minutes} // $runq_width_divisor_base;
+    }
+    $runq_width_divisor = $runq_width_divisor_base if (!defined $runq_width_divisor || $runq_width_divisor <= 0);
+
+    my $snapped_interval_secs = int(($snapped_minutes * 60) + 0.5);
+
+    return {
+        # Interval context
+        interval_secs_raw     => $raw_interval_seconds,
+        interval_secs_snapped => $snapped_interval_secs,
+        snapped_minutes       => $snapped_minutes + 0,
+
+        # Adaptive thresholds currently used by RunQ logic
+        saturation    => $sat_thresh + 0,
+        target        => $target_norm_runq + 0,
+        max_reduction => $max_downsize_perc_factor + 0,
+
+        # Future (plumbing only for now)
+        runq_width_divisor_base => $runq_width_divisor_base + 0,
+        runq_width_divisor      => $runq_width_divisor + 0,
+
+        # Diagnostics (not consumed by calculations)
+        detection_method => $detection_method_log,
+        status           => $log_message,
+    };
+}
+
+# --- set_adaptive_thresholds ---
+# Backwards-compatible wrapper: returns the three threshold scalars used by existing logic.
+# Prefer calling _build_adaptive_thresholds_hash() for full context (interval + policy knobs).
+sub set_adaptive_thresholds {
+    my ($raw_interval_seconds, $log_fh) = @_;
+    my $href = _build_adaptive_thresholds_hash($raw_interval_seconds, $log_fh);
+    return ($href->{saturation}, $href->{target}, $href->{max_reduction});
 }
 
 # --- parse_vm_tier_overrides ---
@@ -16159,7 +16357,10 @@ sub _execute_multiplicative_seasonal {
             next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
 
             my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-            my %adaptive_thresholds = ( saturation => $exec_ctx->{adaptive_saturation_thresh}, target => $exec_ctx->{adaptive_target_norm_runq}, max_reduction => $exec_ctx->{adaptive_max_efficiency_reduction} );
+            my %adaptive_thresholds = %{ $exec_ctx->{adaptive_thresholds_href} // {} };
+            $adaptive_thresholds{saturation}    //= $exec_ctx->{adaptive_saturation_thresh};
+            $adaptive_thresholds{target}        //= $exec_ctx->{adaptive_target_norm_runq};
+            $adaptive_thresholds{max_reduction} //= $exec_ctx->{adaptive_max_efficiency_reduction};
 
             my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
                 $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
@@ -16424,8 +16625,10 @@ sub _execute_multiplicative_seasonal {
             $exec_ctx->{system_identifier},
             $unique_suffix,
             1, # is_multiplicative
-            0, 0,
+            0,
+            0,
             $exec_ctx->{adaptive_saturation_thresh},
+            $exec_ctx->{adaptive_thresholds_href},
             $anchor_bucket  # Pass anchor_bucket for potential column inclusion
         );
 
@@ -16661,11 +16864,10 @@ sub _execute_recency_decay {
 
         if ($runq_source_profile_obj) {
             my %pressure_flags_src = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-            my %adaptive_thresholds_src = (
-                saturation    => $args_href->{adaptive_saturation_thresh},
-                target        => $args_href->{adaptive_target_norm_runq},
-                max_reduction => $args_href->{adaptive_max_efficiency_reduction}
-            );
+            my %adaptive_thresholds_src = %{ $args_href->{adaptive_thresholds_href} // {} };
+            $adaptive_thresholds_src{saturation}    //= $args_href->{adaptive_saturation_thresh};
+            $adaptive_thresholds_src{target}        //= $args_href->{adaptive_target_norm_runq};
+            $adaptive_thresholds_src{max_reduction} //= $args_href->{adaptive_max_efficiency_reduction};
 
             my (undef, $debug_info_ref_src) = calculate_runq_modified_physc(
                 $vm_name, $vm_map_ref, $runq_source_profile_obj,
@@ -16716,11 +16918,10 @@ sub _execute_recency_decay {
             # Inline Rationale Logging (still call calculate_runq_modified_physc for debug_info)
             if ($log_fh) {
                 my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-                my %adaptive_thresholds = (
-                    saturation    => $args_href->{adaptive_saturation_thresh},
-                    target        => $args_href->{adaptive_target_norm_runq},
-                    max_reduction => $args_href->{adaptive_max_efficiency_reduction}
-                );
+                my %adaptive_thresholds = %{ $args_href->{adaptive_thresholds_href} // {} };
+                $adaptive_thresholds{saturation}    //= $args_href->{adaptive_saturation_thresh};
+                $adaptive_thresholds{target}        //= $args_href->{adaptive_target_norm_runq};
+                $adaptive_thresholds{max_reduction} //= $args_href->{adaptive_max_efficiency_reduction};
 
                 my (undef, $debug_info_ref) = calculate_runq_modified_physc(
                     $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
@@ -16776,6 +16977,7 @@ sub _execute_recency_decay {
         1, # is_recency_decay
         0,
         $args_href->{adaptive_saturation_thresh},
+        $args_href->{adaptive_thresholds_href},
         $anchor_bucket  # Pass anchor_bucket for potential column inclusion
     );
 
@@ -16961,7 +17163,10 @@ sub _execute_predictive_peak {
             next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
 
             my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-            my %adaptive_thresholds = ( saturation => $args_href->{adaptive_saturation_thresh}, target => $args_href->{adaptive_target_norm_runq}, max_reduction => $args_href->{adaptive_max_efficiency_reduction} );
+            my %adaptive_thresholds = %{ $args_href->{adaptive_thresholds_href} // {} };
+            $adaptive_thresholds{saturation}    //= $args_href->{adaptive_saturation_thresh};
+            $adaptive_thresholds{target}        //= $args_href->{adaptive_target_norm_runq};
+            $adaptive_thresholds{max_reduction} //= $args_href->{adaptive_max_efficiency_reduction};
 
             my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
                 $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
@@ -17034,6 +17239,7 @@ sub _execute_predictive_peak {
         0,
         1, # is_predictive_peak
         $args_href->{adaptive_saturation_thresh},
+        $args_href->{adaptive_thresholds_href},
         $anchor_bucket  # Pass anchor_bucket for potential column inclusion
     );
 
