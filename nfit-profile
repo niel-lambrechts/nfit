@@ -108,8 +108,15 @@ my $VCPU_PEAK_HEADROOM_MULT_MAX = 1.20;
 my $VCPU_PEAK_CRED_BIAS    = 0.15;   # Benefit-of-doubt for PhysC (I/O, interrupts, cache affinity)
 my $VCPU_PEAK_CRED_MIN     = 0.65;   # Never discount PhysC peak by more than 35%
 
+# Micro-partition RunQ envelope override.
+# When a tiny partition (rENT < threshold) has strong RunQ evidence (cred_ratio > threshold)
+# that exceeds the PhysC-derived envelope, allow VP envelope to expand to meet RunQ demand.
+# This addresses scheduling disadvantage in micro-partitions where PhysC under-reports true demand.
+my $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH  = 0.50;  # rENT_P must be below this
+my $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH = 1.50;  # cred_ratio must exceed this
+my $MICRO_PARTITION_RUNQ_MAX_VP_CAP           = 6;     # Absolute VP ceiling for override
 
-# Tier-aware rVCPU headroom factors (aligns with tier_upsizing_factors philosophy).
+# Tier-aware rVCPU headroom factors
 # Higher tiers (lower latency tolerance) receive more conservative (wider) VP allocation.
 # Applied to both the RunQ operating-point and the P99W1 peak floor.
 # Split into separate maps if independent tuning is required later.
@@ -3938,6 +3945,34 @@ sub log_profile_rationale
         }
     }
 
+    # Micro-partition RunQ envelope override PLANNER NOTE
+    my $runq_override_flag = $calc_debug_info_ref->{'rVCPU_RunQEnvelopeOverride'} // "No";
+    if ($runq_override_flag eq "Yes") {
+        my $runq_basis  = $calc_debug_info_ref->{'rVCPU_RunQEnvelopeBasis'} // 'N/A';
+        my $orig_min    = $calc_debug_info_ref->{'rVCPU_OrigMin'} // 'N/A';
+        my $orig_max    = $calc_debug_info_ref->{'rVCPU_OrigMax'} // 'N/A';
+        my $final_max   = $calc_debug_info_ref->{'rVCPU_Max'} // 'N/A';
+        my $ent_cores   = $calc_debug_info_ref->{'rVCPU_EntCores'};
+        my $final_rv    = $calc_debug_info_ref->{'rVCPU_Final'} // 'N/A';
+
+        print  {$fh} "    PLANNER NOTE: Micro-partition RunQ override active.\n";
+        printf {$fh} "      RunQ tail (%.2f cores) exceeds P-99W1 PhysC (%.2f cores) by %.1fx.\n",
+            ($runq_basis ne 'N/A' && looks_like_number($runq_basis) ? $runq_basis : 0),
+            (defined $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1RawPeak'})
+                ? $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} : 0),
+            ($sf_cred > 0 ? $sf_cred : 1.0);
+        printf {$fh} "      VP envelope (from rENT_P=%.2f cores): min %s, max %s\n",
+            (defined $ent_cores && looks_like_number($ent_cores) ? $ent_cores : 0),
+            $orig_min, $orig_max;
+        printf {$fh} "      RunQ override applied: extended env_max to %s (RunQ dispatch sizing requires %s VPs)\n",
+            $final_max, ($calc_debug_info_ref->{'rVCPU_Raw'} // 'N/A');
+        if (defined $ent_cores && looks_like_number($ent_cores) && $ent_cores > 0
+            && defined $final_rv && looks_like_number($final_rv) && $final_rv > 0) {
+            printf {$fh} "      Resulting VP:ENT ratio (%.1fx) exceeds normal 2.0x maximum - justified by dispatch pressure evidence.\n",
+                ($final_rv / $ent_cores);
+        }
+    }
+
     printf {$fh} "    Detail: raw=%s; env=%s..%s; tier=%s/f=%s; P99W1_floor=%s @ factor=%s (headroom=%s; peak=%s adj=%s cred=%s); RunQ=%s=%s%s\n\n",
         ($calc_debug_info_ref->{'rVCPU_Raw'} // $na),
         ($calc_debug_info_ref->{'rVCPU_Min'} // $na),
@@ -5440,6 +5475,11 @@ sub calculate_runq_modified_physc
         my $dispatch_reserve_reason = '';
         my $dispatch_reserve_pre_final;  # Store the pre-reserve rVCPU for rationale
 
+        # Micro-partition RunQ envelope override tracking
+        my $runq_envelope_override = 0;
+        my $runq_envelope_basis = undef;
+        my ($orig_rvcpu_min, $orig_rvcpu_max) = (undef, undef);
+
         # rENT_P (operational): the post-MaxCPU-sanity value used for the final entitlement output.
         my $rENT_P = (defined $runq_modified_rec && looks_like_number($runq_modified_rec)) ? ($runq_modified_rec + 0) : undef;
 
@@ -5548,17 +5588,17 @@ sub calculate_runq_modified_physc
             $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
             $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
 
-            # Policy: rVCPU must always be even. Enforce this at the envelope level so
-            # that envelope bounds cannot block evenisation (e.g., avoid env=2..3).
+            # Enforce minimum VP floor (evenisation removed - odd VP counts now permitted)
             if (defined $rvcpu_min) {
-                $rvcpu_min = 2 if ($rvcpu_min < 2);
-                $rvcpu_min++ if (($rvcpu_min % 2) == 1);
+                $rvcpu_min = 1 if ($rvcpu_min < 1);
             }
             if (defined $rvcpu_max) {
-                $rvcpu_max = 2 if ($rvcpu_max < 2);
-                $rvcpu_max++ if (($rvcpu_max % 2) == 1);
+                $rvcpu_max = 1 if ($rvcpu_max < 1);
                 $rvcpu_max = $rvcpu_min if (defined $rvcpu_min && $rvcpu_max < $rvcpu_min);
             }
+
+            # Track original envelope for rationale (before any override)
+            ($orig_rvcpu_min, $orig_rvcpu_max) = ($rvcpu_min, $rvcpu_max);
 
             # Clamp
             $rvcpu_final = $rvcpu_raw;
@@ -5621,11 +5661,9 @@ sub calculate_runq_modified_physc
 
                 $p99w1_floor_vcpu = int($floor_v); $p99w1_floor_vcpu++ if ($floor_v > $p99w1_floor_vcpu);
 
-                # Policy: the peak-floor width must also be even. This keeps the constraint
-                # breakdown honest ("evenised") and avoids odd floors surfacing in logs.
+                # Enforce minimum floor (evenisation removed)
                 if (defined $p99w1_floor_vcpu) {
-                    $p99w1_floor_vcpu = 2 if ($p99w1_floor_vcpu < 2);
-                    $p99w1_floor_vcpu++ if (($p99w1_floor_vcpu % 2) == 1);
+                    $p99w1_floor_vcpu = 1 if ($p99w1_floor_vcpu < 1);
                 }
 
                 if (defined $p99w1_floor_vcpu && defined $rvcpu_final && $p99w1_floor_vcpu > $rvcpu_final) {
@@ -5634,17 +5672,52 @@ sub calculate_runq_modified_physc
                 }
             }
 
-            # Enforce even output (always). Envelope max is evenised above so this cannot
-            # produce odd results or exceed the vendor envelope by more than the envelope
-            # already allows.
-            if (defined $rvcpu_final) {
-                $rvcpu_final = 2 if ($rvcpu_final < 2);
-                if (($rvcpu_final % 2) == 1) {
-                    my $even_up = $rvcpu_final + 1;
-                    $rvcpu_final = $even_up;
-                }
-                $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
+            # Enforce minimum (evenisation removed)
+            $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
+
+            # ================================================================
+            # LAYER 5a: Micro-partition RunQ Envelope Override
+            # ================================================================
+            # When rENT_P < threshold and RunQ strongly exceeds PhysC (cred_ratio > threshold),
+            # and the RunQ-derived VP requirement exceeds the envelope max,
+            # expand the envelope to accommodate the RunQ evidence.
+            # This addresses scheduling disadvantage in tiny partitions.
+            # ================================================================
+            my $runq_peak_cores_for_override = undef;
+
+            # Calculate RunQ-derived core requirement for comparison
+            if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0) {
+                $runq_peak_cores_for_override = $runq_hi_threads / $smt_for_vcpu;
+            }
+
+            # Check DBW/XRQ anomaly state (do not apply override if pathological)
+            my $is_dbw_anomaly = (defined $debug_info{'RunQ_Potential'} && $debug_info{'RunQ_Potential'} =~ /ANOMALY.*DBW/i);
+            my $is_xrq_anomaly = (defined $debug_info{'RunQ_Potential'} && $debug_info{'RunQ_Potential'} =~ /ANOMALY.*XRQ/i);
+
+            # Check pressure flags - use per-profile detection (not overall flags which can miss cases)
+            my $has_pressure_for_override =
+                (defined $debug_info{'IsRunQPressure'} && $debug_info{'IsRunQPressure'} eq "True") ||
+                (defined $debug_info{'IsWorkloadPressure'} && $debug_info{'IsWorkloadPressure'} eq "True");
+
+            if (   defined $rENT_P && $rENT_P > 0 && $rENT_P < $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH
+                && defined $cred_ratio && $cred_ratio > $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH
+                && defined $rvcpu_raw && defined $rvcpu_max && $rvcpu_raw > $rvcpu_max
+                && !$is_dbw_anomaly && !$is_xrq_anomaly
+                && $has_pressure_for_override
+                && defined $runq_peak_cores_for_override) {
+
+                $runq_envelope_override = 1;
+                $runq_envelope_basis = $runq_peak_cores_for_override;
+
+                # Extend env_max to permit the RunQ-derived VP requirement
+                my $extended_max = $rvcpu_raw;
+                $extended_max = $MICRO_PARTITION_RUNQ_MAX_VP_CAP if ($extended_max > $MICRO_PARTITION_RUNQ_MAX_VP_CAP);
+                $rvcpu_max = $extended_max;
+
+                # Re-apply clamp with new envelope
+                $rvcpu_final = $rvcpu_raw;
                 $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
+                $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
             }
 
             # ================================================================
@@ -5781,9 +5854,13 @@ sub calculate_runq_modified_physc
             P99W1CredRatioSuffix => $runq_cred_corr_suffix,
             P99W1AdjPeak   => sprintf("%.2f", $p99w1_adjusted),
             P99W1RawPeak   => sprintf("%.2f", $pure_p99w1_physc),
+            RunQEnvelopeOverride => $runq_envelope_override ? "Yes" : "No",
+            RunQEnvelopeBasis    => defined $runq_envelope_basis ? sprintf("%.3f", $runq_envelope_basis) : undef,
+            OrigMin              => $orig_rvcpu_min,
+            OrigMax              => $orig_rvcpu_max,
         };
 
-        # Mirror into debug_info (so rationale can print in the same style as other diagnostics)
+        # Mirror into debug_info
         $debug_info{'rVCPU_RunQKeyUsed'}    = $abs_runq_key_for_debug // 'N/A';
         $debug_info{'rVCPU_TierNum'}        = $rvcpu_tier_num;
         $debug_info{'rVCPU_TierFactor'}     = sprintf("%.2f", $rvcpu_tier_factor);
@@ -5809,6 +5886,10 @@ sub calculate_runq_modified_physc
         $debug_info{'rVCPU_P99W1CredCorr'}        = sprintf("%.2f", $runq_cred_corr);
         $debug_info{'rVCPU_P99W1CredRatioSuffix'} = $runq_cred_corr_suffix;
         $debug_info{'rVCPU_Final'}          = defined($rvcpu_final) ? $rvcpu_final : 'N/A';
+        $debug_info{'rVCPU_RunQEnvelopeOverride'} = $runq_envelope_override ? "Yes" : "No";
+        $debug_info{'rVCPU_RunQEnvelopeBasis'}    = defined $runq_envelope_basis ? sprintf("%.3f", $runq_envelope_basis) : 'N/A';
+        $debug_info{'rVCPU_OrigMin'}              = defined $orig_rvcpu_min ? $orig_rvcpu_min : 'N/A';
+        $debug_info{'rVCPU_OrigMax'}              = defined $orig_rvcpu_max ? $orig_rvcpu_max : 'N/A';
     };
 
     return ($runq_modified_rec, \%debug_info);
@@ -8091,16 +8172,8 @@ sub _write_standard_csv_report {
                         }
                     }
 
-                    # Enforce even output (always). Envelope max is evenised above.
-                    if (defined $rvcpu_final) {
-                        $rvcpu_final = 2 if ($rvcpu_final < 2);
-                        if (($rvcpu_final % 2) == 1) {
-                            my $even_up = $rvcpu_final + 1;
-                            $rvcpu_final = $even_up;
-                        }
-                        $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
-                        $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
-                    }
+                    # Enforce minimum (evenisation removed)
+                    $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
 
                     $rvcpu_out = $rvcpu_final;
                     $max_rvcpu_seen = $rvcpu_final if (!defined $max_rvcpu_seen || $rvcpu_final > $max_rvcpu_seen);
@@ -8131,6 +8204,11 @@ sub _write_standard_csv_report {
                         P99W1CredRatioSuffix => $runq_cred_corr_suffix,
                         P99W1AdjPeak      => sprintf("%.2f", $p99w1_adjusted),
                         P99W1RawPeak      => sprintf("%.2f", $p99w1_cores),
+                        # Micro-partition override: not computed in CSV fallback path
+                        RunQEnvelopeOverride => "No",
+                        RunQEnvelopeBasis    => undef,
+                        OrigMin              => undef,
+                        OrigMax              => undef,
                     };
 
                     # ALSO persist into per-profile debug info used by rationale (prevents stale labels such as AbsRunQ_P95)
@@ -8427,6 +8505,17 @@ sub _write_standard_csv_report {
                 $vcpu_constraints_str = "GovernedByVPMax";
             } elsif (defined $env_min && defined $raw_vp && $raw_vp < $env_min && $rv == $env_min) {
                 $vcpu_constraints_str = "GovernedByVPMin";
+            }
+
+            # Add RunQ envelope override indicator if active
+            my $runq_override = $explain_ref->{RunQEnvelopeOverride} // "No";
+            if ($runq_override eq "Yes") {
+                my $override_tag = "MicroPartitionRunQOverride";
+                if ($vcpu_constraints_str ne "") {
+                    $vcpu_constraints_str .= "; $override_tag";
+                } else {
+                    $vcpu_constraints_str = $override_tag;
+                }
             }
         }
         # Annotate with the planning profile used (Tier-mapped, else G3 fallback)
@@ -16989,15 +17078,12 @@ sub _execute_multiplicative_seasonal {
                 $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
                 $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
 
-                # Policy: rVCPU must always be even. Enforce this at the envelope level so
-                # that envelope bounds cannot block evenisation (e.g., avoid env=2..3).
+                # Enforce minimum VP floor (evenisation removed)
                 if (defined $rvcpu_min) {
-                    $rvcpu_min = 2 if ($rvcpu_min < 2);
-                    $rvcpu_min++ if (($rvcpu_min % 2) == 1);
+                    $rvcpu_min = 1 if ($rvcpu_min < 1);
                 }
                 if (defined $rvcpu_max) {
-                    $rvcpu_max = 2 if ($rvcpu_max < 2);
-                    $rvcpu_max++ if (($rvcpu_max % 2) == 1);
+                    $rvcpu_max = 1 if ($rvcpu_max < 1);
                     $rvcpu_max = $rvcpu_min if (defined $rvcpu_min && $rvcpu_max < $rvcpu_min);
                 }
 
@@ -17056,10 +17142,9 @@ sub _execute_multiplicative_seasonal {
                     my $floor_v = ($p99w1_adjusted + 0) * $p99w1_factor_eff;
 
                     $p99w1_floor_vcpu = int($floor_v); $p99w1_floor_vcpu++ if ($floor_v > $p99w1_floor_vcpu);
-                    # Policy: peak-floor width must be even as well (matches AIX VP folding guidance).
+                    # Enforce minimum floor (evenisation removed)
                     if (defined $p99w1_floor_vcpu) {
-                        $p99w1_floor_vcpu = 2 if ($p99w1_floor_vcpu < 2);
-                        $p99w1_floor_vcpu++ if (($p99w1_floor_vcpu % 2) == 1);
+                        $p99w1_floor_vcpu = 1 if ($p99w1_floor_vcpu < 1);
                     }
 
                     if ($p99w1_floor_vcpu > $rvcpu_final) {
@@ -17068,16 +17153,8 @@ sub _execute_multiplicative_seasonal {
                     }
                 }
 
-                # Enforce even output (always). Envelope max is evenised above.
-                if (defined $rvcpu_final) {
-                    $rvcpu_final = 2 if ($rvcpu_final < 2);
-                    if (($rvcpu_final % 2) == 1) {
-                        my $even_up = $rvcpu_final + 1;
-                        $rvcpu_final = $even_up;
-                    }
-                    $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
-                    $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
-                }
+                # Enforce minimum (evenisation removed)
+                $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
             }
 
             $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : "";
@@ -17103,6 +17180,11 @@ sub _execute_multiplicative_seasonal {
                 P99W1CredRatio => sprintf("%.3f", $cred_ratio),
                 P99W1AdjPeak   => sprintf("%.2f", $p99w1_adjusted),
                 P99W1RawPeak   => sprintf("%.2f", $p99w1_cores),
+                # Micro-partition override: not computed in seasonal path
+                RunQEnvelopeOverride => "No",
+                RunQEnvelopeBasis    => undef,
+                OrigMin              => undef,
+                OrigMax              => undef,
             };
             if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
                 # Persist the paired key/value used for rVCPU so rationale cannot drift.
