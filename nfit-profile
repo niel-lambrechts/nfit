@@ -204,6 +204,24 @@ my $DOWNSIZE_GUARD_AMBER_MAX_IQRC  = 1.00;  # higher variability acceptable with
 my $DOWNSIZE_GUARD_AMBER_MAX_AAE   = 0.05;  # allow slight typical exceedance (+5%) in AMBER
 my $DOWNSIZE_GUARD_AMBER_CAP_SCALE = 0.50;  # halve the analytical reduction in AMBER band
 
+# --- New: 2D boundary helpers (AAE x PAE) ---
+#
+# "Frequent but shallow" lane:
+#   - PAE can exceed AMBER_MAX_PAE, but ONLY if AAE remains shallow.
+#   - We intentionally align this with AMBER_MAX_AAE so you don't create a new
+#     interpretation of "shallow typical exceedance".
+my $DOWNSIZE_GUARD_AMBER_SHALLOW_AAE = $DOWNSIZE_GUARD_AMBER_MAX_AAE;  # 0.05
+
+# Hard RED magnitude veto:
+#   - If typical above-entitlement magnitude is meaningfully high, don't downsize,
+#     regardless of frequency. This matches your earlier "AAE > 0.10 => RED" idea.
+my $DOWNSIZE_GUARD_RED_HARD_AAE = 0.10;
+
+# Frequent exceedance threshold:
+#   - This is the line beyond which "frequency" is considered high. You already use
+#     0.50 as the AMBER ceiling, so re-using it keeps behaviour intuitive.
+my $DOWNSIZE_GUARD_RED_FREQUENT_PAE = $DOWNSIZE_GUARD_AMBER_MAX_PAE;   # 0.50
+
 # --- Dispatch-Bound Workload (DBW) Anomaly Heuristics ---
 # Detects workloads with very low CPU usage but extremely high dispatch contention.
 my $DBW_LOW_UTIL_FACTOR = 0.5; # BasePhysC must be less than 50% of Entitlement.
@@ -3515,6 +3533,8 @@ sub log_profile_rationale
             ($re->{RunQKeyUsed} // 'N/A'),
             ($re->{RunQHiThreads} // 'N/A');
 
+        printf {$fh} "    Downsize Guard Summary: %s\n", ($calc_debug_info_ref->{DownsizeGuardSummary} // 'N/A');
+
         ## --- END: Enhanced Section C Rationale Logging ---
 
         # Conditionally print detailed analytical breakdown for downsizing
@@ -4911,13 +4931,83 @@ sub calculate_runq_modified_physc
         my $iqrc = (defined $normrunq_iqrc_val && looks_like_number($normrunq_iqrc_val)) ? ($normrunq_iqrc_val + 0) : 999;
 
         my $downsize_guard_band = "RED";
-        if ($aae <= 0.0 && $pae <= $DOWNSIZE_GUARD_GREEN_MAX_PAE && $iqrc <= $DOWNSIZE_GUARD_GREEN_MAX_IQRC) {
-            $downsize_guard_band = "GREEN";
+
+        # Treat missing metrics as "unknown" => conservative.
+        my $has_metrics = ($aae != 999 && $pae != 999 && $iqrc != 999);
+
+        if ($has_metrics) {
+            # 0) Volatility veto (IQRC too high => RED regardless)
+            if ($iqrc > $DOWNSIZE_GUARD_AMBER_MAX_IQRC) {
+                $downsize_guard_band = "RED";
+            }
+            else {
+                # 1) GREEN: essentially no above-entitlement behaviour and stable
+                if ($aae <= 0.0
+                    && $pae <= $DOWNSIZE_GUARD_GREEN_MAX_PAE
+                    && $iqrc <= $DOWNSIZE_GUARD_GREEN_MAX_IQRC) {
+                    $downsize_guard_band = "GREEN";
+                }
+                else {
+                    # 2) 2D boundary (AAE x PAE) with IQRC already bounded to <= AMBER max
+
+                    # Hard RED: magnitude too large (independent of frequency)
+                    if ($aae > $DOWNSIZE_GUARD_RED_HARD_AAE) {
+                        $downsize_guard_band = "RED";
+                    }
+                    else {
+                        # Frequent-but-shallow AMBER: high PAE allowed if AAE is shallow
+                        if ($pae > $DOWNSIZE_GUARD_RED_FREQUENT_PAE) {
+                            if ($aae <= $DOWNSIZE_GUARD_AMBER_SHALLOW_AAE) {
+                                $downsize_guard_band = "AMBER";
+                            } else {
+                                $downsize_guard_band = "RED";
+                            }
+                        }
+                        else {
+                            # Otherwise, fall back to your existing AMBER envelope
+                            if ($aae <= $DOWNSIZE_GUARD_AMBER_MAX_AAE
+                                && $pae <= $DOWNSIZE_GUARD_AMBER_MAX_PAE
+                                && $iqrc <= $DOWNSIZE_GUARD_AMBER_MAX_IQRC) {
+                                $downsize_guard_band = "AMBER";
+                            } else {
+                                $downsize_guard_band = "RED";
+                            }
+                        }
+                    }
+                }
+            }
         }
-        elsif ($aae <= $DOWNSIZE_GUARD_AMBER_MAX_AAE && $pae <= $DOWNSIZE_GUARD_AMBER_MAX_PAE && $iqrc <= $DOWNSIZE_GUARD_AMBER_MAX_IQRC) {
-            $downsize_guard_band = "AMBER";
-        }
+
         $debug_info{'DownsizeGuardBand'} = $downsize_guard_band;
+
+        # Build a concise, grep-friendly guardrail summary for rationale consumers.
+        # Note: This describes whether tactical downsizing is eligible, independent of tier policy.
+        my $ds_aae_disp  = (defined $debug_info{'PhysC_Daily_AAE'} && looks_like_number($debug_info{'PhysC_Daily_AAE'})) ? sprintf("%.3f", $aae) : 'N/A';
+        my $ds_pae_disp  = (defined $debug_info{'PhysC_Daily_PAE'} && looks_like_number($debug_info{'PhysC_Daily_PAE'})) ? sprintf("%.3f", $pae) : 'N/A';
+        my $ds_iqrc_disp = (defined $normrunq_iqrc_val && looks_like_number($normrunq_iqrc_val)) ? sprintf("%.3f", $iqrc) : 'N/A';
+
+        my @ds_reasons;
+        if ($downsize_guard_band eq 'GREEN') {
+            push @ds_reasons, sprintf("AAE<=0, PAE<=%.2f, IQRC<=%.2f",
+                $DOWNSIZE_GUARD_GREEN_MAX_PAE, $DOWNSIZE_GUARD_GREEN_MAX_IQRC);
+        } elsif ($downsize_guard_band eq 'AMBER') {
+            push @ds_reasons, sprintf("AAE<=%.2f, PAE<=%.2f, IQRC<=%.2f, cap_scale=%.2f",
+                $DOWNSIZE_GUARD_AMBER_MAX_AAE, $DOWNSIZE_GUARD_AMBER_MAX_PAE,
+                $DOWNSIZE_GUARD_AMBER_MAX_IQRC, $DOWNSIZE_GUARD_AMBER_CAP_SCALE);
+        } else {
+            push @ds_reasons, sprintf("AAE=%s (max %.2f)",  $ds_aae_disp,  $DOWNSIZE_GUARD_AMBER_MAX_AAE)  if ($ds_aae_disp ne 'N/A'  && $aae  > $DOWNSIZE_GUARD_AMBER_MAX_AAE);
+            push @ds_reasons, sprintf("PAE=%s (max %.2f)",  $ds_pae_disp,  $DOWNSIZE_GUARD_AMBER_MAX_PAE)  if ($ds_pae_disp ne 'N/A'  && $pae  > $DOWNSIZE_GUARD_AMBER_MAX_PAE);
+            push @ds_reasons, sprintf("IQRC=%s (max %.2f)", $ds_iqrc_disp, $DOWNSIZE_GUARD_AMBER_MAX_IQRC) if ($ds_iqrc_disp ne 'N/A' && $iqrc > $DOWNSIZE_GUARD_AMBER_MAX_IQRC);
+        }
+
+        $debug_info{'DownsizeGuardSummary'} = sprintf(
+            "Band=%s; AAE=%s; PAE=%s; IQRC=%s; STD=%s%s%s",
+            $downsize_guard_band,
+            $ds_aae_disp, $ds_pae_disp, $ds_iqrc_disp,
+            ($is_std_pattern ? 'True' : 'False'),
+            (@ds_reasons ? "; " : ""),
+            (@ds_reasons ? join("; ", @ds_reasons) : "")
+        );
 
         # If pattern matched: This is a high-confidence inefficient workload.
         if ($is_std_pattern) {
