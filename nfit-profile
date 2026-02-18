@@ -264,6 +264,15 @@ my $HOT_THREAD_WL_MAX_DYNAMIC_DAMPENING = 0.75; # Ceiling for the final dynamic 
 my $ADDITIVE_CPU_SAFETY_CAP_FACTOR_OF_BASE = 2.0; # Max additive CPU as a multiple of BasePhysC
 my $ADDITIVE_CPU_SAFETY_CAP_ABSOLUTE = 0.5;       # Absolute maximum additive CPU in cores
 
+# CPU flat-lining detection thresholds.
+# Detects VMs where CPU is "pinned" at MaxCPU ceiling, appearing stable due to
+# constraint-driven behaviour. Flags this as a potential pathological state.
+my $CPU_FLATLINING_PCT_OF_MAXCPU  = 0.95;   # BasePhysC >= this fraction of MaxCPU
+my $CPU_FLATLINING_IQRC_THRESHOLD = 0.05;   # PhysC_Daily_IQRC <= this (very low variability)
+my $CPU_FLATLINING_PAE_THRESHOLD  = 0.90;   # PAE >= this (exceeds entitlement most days)
+my $CPU_FLATLINING_AAE_THRESHOLD  = 0.25;   # AAE >= this (material average excess)
+my $CPU_FLATLINING_MAX_TAGS       = 5;      # Maximum tags in VM_Comments column
+
 my $POOL_CONSTRAINT_CONFIDENCE_FACTOR = 0.80; # Reduction factor for additive CPU if VM is in a non-default pool
 
 # --- Built-in default Target NormRunQ values for the adaptive heuristic ---
@@ -825,7 +834,7 @@ foreach my $p (@csv_visible_profiles) {
 }
 
 # Add recommendation and constraint flags (after profile results)
-push @output_header_cols_csv, ("NFIT - ENT", "VCPU_Constraints");
+push @output_header_cols_csv, ("NFIT - ENT", "VCPU_Constraints", "VM_Comments");
 
 if ($add_excel_formulas) {
     push @output_header_cols_csv, ("NETT", "NETT%");
@@ -1478,6 +1487,12 @@ foreach my $system_serial (@target_systems_to_process)
         print {$LOG_FH} "                       - BlockedByMaxCPU: recommendation exceeds MaxCPU (feasibility)\n";
         print {$LOG_FH} "                     Note: BlockedByMaxCPU does not change rVCPU; it highlights that MaxCPU\n";
         print {$LOG_FH} "                     must be raised to apply the recommendation.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  VM_Comments        Diagnostic flags aggregated across all profiles for a VM.\n";
+        print {$LOG_FH} "                     Flags indicate pathological states requiring investigation:\n";
+        print {$LOG_FH} "                       - CPU_FLATLINING[<profile>]: CPU usage pinned at MaxCPU ceiling\n";
+        print {$LOG_FH} "                         with very low variability; appears stable but is constrained.\n";
+        print {$LOG_FH} "                     Multiple flags may be emitted, semicolon-separated.\n";
         print {$LOG_FH} "======================================================================\n\n";
     }
 
@@ -1759,7 +1774,12 @@ foreach my $system_serial (@target_systems_to_process)
                         $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
                     }
 
-                    # Step 3: Per-profile rVCPU (stress-driven, slot-aware, rENT-bounded, growth-aware)
+                    # Persist per-profile debug info for downstream consumers (CSV VM_Comments, rationale, etc.)
+                    if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                        $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$p_name} = $debug_info_ref;
+                    }
+
+                    # Step 3: Per-profile rVCPU
                     # - RunQ_hi_threads: AbsRunQ value actually used for this profile’s logic (already selected)
                     # - rENT_P: final entitlement recommendation for this profile (growth-adjusted, plus any narrow RunQ additive)
                     # - rVCPU envelope: clamp to vendor-safe band relative to rENT_P
@@ -1970,6 +1990,11 @@ foreach my $system_serial (@target_systems_to_process)
 
                 if (looks_like_number($adjusted_physc)) {
                     $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+                }
+
+                # Persist per-profile debug info for downstream consumers (CSV VM_Comments, rationale, etc.)
+                if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                    $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileDebugInfo}{$p_name} = $debug_info_ref;
                 }
             }
 
@@ -2199,6 +2224,11 @@ foreach my $system_serial (@target_systems_to_process)
                     my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
                         $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
                     );
+
+                    # Persist per-profile debug info for downstream consumers (CSV VM_Comments, etc.)
+                    if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                        $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$profile_name} = $debug_info_ref;
+                    }
 
                     # CRITICAL: For recency_decay models, ProfileValues was ALREADY correctly calculated
                     # in the dedicated block above (base + growth + runq_potential). We must NOT
@@ -3345,6 +3375,14 @@ sub log_profile_rationale
     }
     print {$fh} "     Workload Stability:\n";
     printf {$fh} "       - PhysC Daily IQRC                              : %s (%s)\n", $physc_iqrc_log, $physc_stability_str;
+
+    # CPU flat-lining detection note
+    if (defined $calc_debug_info_ref->{'CPUFlatlining'} && $calc_debug_info_ref->{'CPUFlatlining'} eq "Yes") {
+        print {$fh} "       PLANNER NOTE [CPU Ceiling Plateau]: This profile appears 'stable' because CPU\n";
+        print {$fh} "         usage is flat-lining near a ceiling, not due to genuine workload steadiness.\n";
+        printf {$fh} "         %s.\n", ($calc_debug_info_ref->{'CPUFlatliningDetail'} // "");
+        print {$fh} "         Treat sizing outputs cautiously; investigate caps, shape, or constraints.\n";
+    }
 
     # --- Dispatch Headroom ---
     my $hg_t = looks_like_number($calc_debug_info_ref->{'Headroom_Guaranteed_Threads'}) ? sprintf("%.2f", $calc_debug_info_ref->{'Headroom_Guaranteed_Threads'}) : $na;
@@ -4759,6 +4797,56 @@ sub calculate_runq_modified_physc
         $debug_info{'Headroom_Reachable_Cores'}    = sprintf("%.4f", ($smt_used > 0 ? ($headroom_r_threads / $smt_used) : 0.0));
     }
 
+    # ------------------------------------------------------------------
+    # CPU Flat-lining Detection (MaxCPU ceiling plateau)
+    # ------------------------------------------------------------------
+    # Detect VMs where low variability is due to being pinned at MaxCPU,
+    # not genuine workload stability. This is a pathological state that
+    # should be visible to capacity planners.
+    # ------------------------------------------------------------------
+    $debug_info{'CPUFlatlining'} = "No";
+    $debug_info{'CPUFlatliningDetail'} = "";
+
+    my $fl_max_cpu = (defined $max_cpu_config_str && looks_like_number($max_cpu_config_str)) ? ($max_cpu_config_str + 0) : 0;
+    my $fl_base_physc = (defined $base_physc && looks_like_number($base_physc)) ? ($base_physc + 0) : 0;
+    my $fl_iqrc = (defined $debug_info{'PhysC_Daily_IQRC'} && looks_like_number($debug_info{'PhysC_Daily_IQRC'}))
+                ? ($debug_info{'PhysC_Daily_IQRC'} + 0) : 999;
+    my $fl_pae = (defined $debug_info{'PhysC_Daily_PAE'} && looks_like_number($debug_info{'PhysC_Daily_PAE'}))
+               ? ($debug_info{'PhysC_Daily_PAE'} + 0) : 0;
+    my $fl_aae = (defined $debug_info{'PhysC_Daily_AAE'} && looks_like_number($debug_info{'PhysC_Daily_AAE'}))
+               ? ($debug_info{'PhysC_Daily_AAE'} + 0) : 0;
+    my $fl_is_capped = (defined $cfg_ref->{is_capped} && $cfg_ref->{is_capped}) ? 1 : 0;
+
+    if ($fl_max_cpu > 0 && $fl_base_physc > 0) {
+        my $fl_pct_of_maxcpu = $fl_base_physc / $fl_max_cpu;
+
+        # Condition 1: Near MaxCPU (>= 95% of ceiling)
+        my $cond_near_maxcpu = ($fl_pct_of_maxcpu >= $CPU_FLATLINING_PCT_OF_MAXCPU);
+
+        # Condition 2: Very low day-to-day variability
+        my $cond_low_iqrc = ($fl_iqrc <= $CPU_FLATLINING_IQRC_THRESHOLD);
+
+        # Condition 3: Chronic under-entitlement (OR-ed conditions)
+        # For capped VMs, skip this requirement entirely
+        my $cond_under_ent = $fl_is_capped
+                           || ($fl_pae >= $CPU_FLATLINING_PAE_THRESHOLD)
+                           || ($fl_aae >= $CPU_FLATLINING_AAE_THRESHOLD);
+
+        if ($cond_near_maxcpu && $cond_low_iqrc && $cond_under_ent) {
+            $debug_info{'CPUFlatlining'} = "Yes";
+            my $fl_detail = sprintf(
+                "BasePhysC %.2f is %.0f%% of MaxCPU %.2f with very low daily variability (IQRC %.4f)",
+                $fl_base_physc, $fl_pct_of_maxcpu * 100, $fl_max_cpu, $fl_iqrc
+            );
+            if ($fl_is_capped) {
+                $fl_detail .= "; capped mode";
+            } else {
+                $fl_detail .= sprintf("; exceeds entitlement frequently (PAE %.2f, AAE %.2f)", $fl_pae, $fl_aae);
+            }
+            $debug_info{'CPUFlatliningDetail'} = $fl_detail;
+            $debug_info{'CPUFlatliningPctOfMaxCPU'} = sprintf("%.0f", $fl_pct_of_maxcpu * 100);
+        }
+    }
 
     # Calculate Effective LCPUs for Pressure
     my ($effective_lcpus_for_pressure_calc, $pressure_basis_rationale);
@@ -8877,6 +8965,25 @@ sub _write_standard_csv_report {
             $vcpu_constraints_str .= sprintf(" [%s]", $planning_profile_name);
         }
         push @data_row_csv, $vcpu_constraints_str;
+
+        # VM_Comments: aggregate diagnostic tags across all profiles
+        my @vm_comment_tags;
+        foreach my $profile (@csv_visible_profiles) {
+            my $pname = $profile->{name};
+            next unless defined $pname && $pname ne "";
+            my $pdbg = $core->{ProfileDebugInfo}{$pname} // {};
+            if (defined $pdbg->{'CPUFlatlining'} && $pdbg->{'CPUFlatlining'} eq "Yes") {
+                push @vm_comment_tags, "CPU_FLATLINING[$pname]";
+            }
+        }
+        # De-duplicate and cap at maximum tags
+        my %seen_tags;
+        @vm_comment_tags = grep { !$seen_tags{$_}++ } @vm_comment_tags;
+        if (scalar(@vm_comment_tags) > $CPU_FLATLINING_MAX_TAGS) {
+            @vm_comment_tags = @vm_comment_tags[0 .. ($CPU_FLATLINING_MAX_TAGS - 1)];
+        }
+        my $vm_comments_str = join("; ", @vm_comment_tags);
+        push @data_row_csv, $vm_comments_str;
 
         if ($add_excel_formulas) {
             my $nfit_ent_formula_str = generate_nfit_ent_formula($excel_row_num_counter, scalar(@csv_visible_profiles), $formula_col_offset);
@@ -18146,8 +18253,14 @@ sub _execute_predictive_peak {
             my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
                 $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
             );
+
             if (looks_like_number($adjusted_physc)) {
                 $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+            }
+
+            # Persist per-profile debug info for downstream consumers (CSV VM_Comments, etc.)
+            if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$p_name} = $debug_info_ref;
             }
 
             if ($p_name eq $runq_source_profile_name) {
