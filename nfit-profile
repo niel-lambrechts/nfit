@@ -6026,10 +6026,18 @@ sub calculate_runq_modified_physc
                 my $basis_cores = $rENT_P_for_envelope // $rENT_P // 0;
                 my $raw_reserve = $basis_cores * $target_pct;
 
-                # 4. Tiered Floor (always even to maintain VP parity policy)
-                #    Tier 1/2: Critical workloads need minimum +4 VPs headroom
-                #    Tier 3+:  Non-critical workloads need minimum +2 VPs
-                my $floor_vps = ($rvcpu_tier_num <= 2) ? 4 : 2;
+                # 4. Tiered Floor (scaled to VP_Min to avoid blunt fixed step changes)
+                #    NOTE: rVCPU evenisation is intentionally disabled (commit 95f3364c...),
+                #          so do NOT force this floor to be even.
+                #    Tier 1/2: floor = max(2, ceil(VP_Min × 0.25))
+                #    Tier 3+:  floor = max(2, ceil(VP_Min × 0.15))
+                my $vp_min_for_floor = (defined $rvcpu_min && looks_like_number($rvcpu_min)) ? ($rvcpu_min + 0) : 0;
+                my $floor_ratio = ($rvcpu_tier_num <= 2) ? 0.25 : 0.15;
+                my $floor_raw = $vp_min_for_floor * $floor_ratio;
+
+                # ceil
+                my $floor_vps = int($floor_raw + 0.999);
+                $floor_vps = 2 if ($floor_vps < 2);
 
                 # 5. Integer Rounding (Ceiling)
                 my $calc_reserve = int($raw_reserve + 0.999);  # ceil
@@ -6037,11 +6045,34 @@ sub calculate_runq_modified_physc
                 # Apply floor
                 $calc_reserve = $floor_vps if ($calc_reserve < $floor_vps);
 
-                # 6. Evenisation (round UP to next even if odd)
-                #$calc_reserve++ if ($calc_reserve % 2 == 1);
+                # 6. Headroom-aware cap: avoid consuming most of the remaining VP envelope when reserve is
+                #    triggered by uncertainty (e.g., LowCorroboration) rather than demonstrated dispatch demand.
+                #
+                #    Cap reserve to a fraction of available headroom above the *pre-reserve* rVCPU:
+                #      Tier 1/2: up to 50% of headroom
+                #      Tier 3+:  up to 40% of headroom
+                #
+                #    NOTE: rVCPU evenisation is intentionally disabled (commit 95f3364c...),
+                #          so do NOT force reserve or caps to be even.
+                my $available_headroom = $rvcpu_max - $rvcpu_final;
+                $available_headroom = 0 if (!defined $available_headroom || $available_headroom < 0);
+
+                my $headroom_frac = ($rvcpu_tier_num <= 2) ? 0.50 : 0.40;
+                my $headroom_cap_vps = 0;
+                if ($available_headroom > 0) {
+                    my $cap_raw = $available_headroom * $headroom_frac;
+                    $headroom_cap_vps = int($cap_raw + 0.999);  # ceil
+                    $headroom_cap_vps = 0 if ($headroom_cap_vps < 0);
+                }
+
+                my $was_headroom_capped = 0;
+                my $pre_headroom_cap_reserve = $calc_reserve;
+                if ($headroom_cap_vps >= 0 && $calc_reserve > $headroom_cap_vps) {
+                    $calc_reserve = $headroom_cap_vps;
+                    $was_headroom_capped = 1;
+                }
 
                 # 7. Safe Clamping (respect env_max)
-                my $available_headroom = $rvcpu_max - $rvcpu_final;
                 my $was_clamped = 0;
                 my $pre_clamp_reserve = $calc_reserve;
 
@@ -6054,10 +6085,6 @@ sub calculate_runq_modified_physc
                     # Ensure non-negative
                     $dispatch_reserve_vp = 0 if ($dispatch_reserve_vp < 0);
 
-                    # Re-evenise after clamp (round DOWN to stay within env_max)
-                    #if ($dispatch_reserve_vp > 0 && ($dispatch_reserve_vp % 2 == 1)) {
-                    #    $dispatch_reserve_vp--;
-                    #}
                 }
 
                 # Build trigger list for rationale
@@ -6071,8 +6098,14 @@ sub calculate_runq_modified_physc
                 # Build reason for rationale (including suppression cases)
                 if ($dispatch_reserve_vp > 0) {
                     my $clamp_note = "";
+                    if ($was_headroom_capped) {
+                        my $cap_pct = int($headroom_frac * 100 + 0.5);
+                        $clamp_note .= sprintf(" [headroom-cap %d%% (%d/%d) from %d]",
+                            $cap_pct, $headroom_cap_vps, $available_headroom, $pre_headroom_cap_reserve
+                        );
+                    }
                     if ($was_clamped) {
-                        $clamp_note = sprintf(" [clamped from %d; headroom %d]", $pre_clamp_reserve, $available_headroom);
+                        $clamp_note .= sprintf(" [clamped from %d; headroom %d]", $pre_clamp_reserve, $available_headroom);
                     }
                     $dispatch_reserve_reason = sprintf(
                         "Dispatch reserve +%d VPs (Mode: %s; Scale: %.1f%% of %.2f cores; Floor: %d; Triggers: %s)%s",
