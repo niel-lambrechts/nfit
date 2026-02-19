@@ -65,7 +65,7 @@ my $MANDATORY_PEAK_PROFILE_FOR_HINT = "Peak_P-99W1";
 # Default flags for the mandatory peak helper profile, used when the profiles
 # configuration is incomplete. This profile is an evidence source (peak + RunQ)
 # and is intentionally hidden from the planner CSV by default when injected.
-my $DEFAULT_MANDATORY_PEAK_PROFILE_FLAGS = "-p 99.75 -w 1 --filter-above-perc 30 --decay high --runq-decay medium --runq-abs-perc 90 --runq-norm-perc \"50,90\" --enable-growth-prediction --max-growth-inflation-percent 15";
+my $DEFAULT_MANDATORY_PEAK_PROFILE_FLAGS = "-p 99.75 -w 1 --filter-above-perc 30 --decay high --runq-decay medium --runq-abs-perc \"90,99.75\" --runq-norm-perc \"50,90\" --enable-growth-prediction --max-growth-inflation-percent 15";
 
 my $LEGACY_MANDATORY_PEAK_PROFILE_FOR_HINT = "P-99W1"; # Back-compat alias
 my $MISSION_CRITICAL_PROFILE_NAME = "P-99W1";          # Actionable peak-coverage profile (runs full modifier chain)
@@ -264,14 +264,16 @@ my $HOT_THREAD_WL_MAX_DYNAMIC_DAMPENING = 0.75; # Ceiling for the final dynamic 
 my $ADDITIVE_CPU_SAFETY_CAP_FACTOR_OF_BASE = 2.0; # Max additive CPU as a multiple of BasePhysC
 my $ADDITIVE_CPU_SAFETY_CAP_ABSOLUTE = 0.5;       # Absolute maximum additive CPU in cores
 
-# CPU flat-lining detection thresholds.
-# Detects VMs where CPU is "pinned" at MaxCPU ceiling, appearing stable due to
-# constraint-driven behaviour. Flags this as a potential pathological state.
-my $CPU_FLATLINING_PCT_OF_MAXCPU  = 0.95;   # BasePhysC >= this fraction of MaxCPU
-my $CPU_FLATLINING_IQRC_THRESHOLD = 0.05;   # PhysC_Daily_IQRC <= this (very low variability)
-my $CPU_FLATLINING_PAE_THRESHOLD  = 0.90;   # PAE >= this (exceeds entitlement most days)
-my $CPU_FLATLINING_AAE_THRESHOLD  = 0.25;   # AAE >= this (material average excess)
-my $CPU_FLATLINING_MAX_TAGS       = 5;      # Maximum tags in VM_Comments column
+# CPU ceiling detection thresholds (two-tier system).
+# Tier 1 (CAP_LIMITED): Informational - VM is running near MaxCPU consistently.
+# Tier 2 (CPU_FLATLINING): Warning - Suspicious plateau not explained by genuine demand.
+my $CPU_CEILING_PCT_OF_MAXCPU         = 0.97;   # BasePhysC >= this fraction of MaxCPU
+my $CPU_CAPLIMITED_IQRC_THRESHOLD     = 0.05;   # PhysC_Daily_IQRC <= this (low variability)
+my $CPU_FLATLINING_IQRC_THRESHOLD     = 0.03;   # PhysC_Daily_IQRC <= this (very low variability)
+my $CPU_FLATLINING_PAE_THRESHOLD      = 0.95;   # PAE >= this (exceeds entitlement most days)
+my $CPU_FLATLINING_AAE_THRESHOLD      = 0.40;   # AAE >= this (material average excess) - AND with PAE
+my $CPU_FLATLINING_OVERLOAD_RATIO     = 1.10;   # RunQ/Reachable > this = genuine overload (not suspicious)
+my $CPU_FLATLINING_MAX_TAGS           = 5;      # Maximum tags in VM_Comments column
 
 my $POOL_CONSTRAINT_CONFIDENCE_FACTOR = 0.80; # Reduction factor for additive CPU if VM is in a non-default pool
 
@@ -1489,9 +1491,12 @@ foreach my $system_serial (@target_systems_to_process)
         print {$LOG_FH} "                     must be raised to apply the recommendation.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  VM_Comments        Diagnostic flags aggregated across all profiles for a VM.\n";
-        print {$LOG_FH} "                     Flags indicate pathological states requiring investigation:\n";
-        print {$LOG_FH} "                       - CPU_FLATLINING[<profile>]: CPU usage pinned at MaxCPU ceiling\n";
-        print {$LOG_FH} "                         with very low variability; appears stable but is constrained.\n";
+        print {$LOG_FH} "                     Two-tier ceiling detection system:\n";
+        print {$LOG_FH} "                       - CAP_LIMITED[<profile>]: Sustained high load near MaxCPU.\n";
+        print {$LOG_FH} "                         Informational; VM may benefit from increased MaxCPU.\n";
+        print {$LOG_FH} "                       - CPU_FLATLINING[<profile>]: Suspicious plateau behaviour.\n";
+        print {$LOG_FH} "                         CPU pinned at ceiling with very low variability, not explained\n";
+        print {$LOG_FH} "                         by genuine RunQ demand. Investigate caps/shape/constraints.\n";
         print {$LOG_FH} "                     Multiple flags may be emitted, semicolon-separated.\n";
         print {$LOG_FH} "======================================================================\n\n";
     }
@@ -3376,12 +3381,18 @@ sub log_profile_rationale
     print {$fh} "     Workload Stability:\n";
     printf {$fh} "       - PhysC Daily IQRC                              : %s (%s)\n", $physc_iqrc_log, $physc_stability_str;
 
-    # CPU flat-lining detection note
+    # CPU ceiling detection notes (two-tier system)
     if (defined $calc_debug_info_ref->{'CPUFlatlining'} && $calc_debug_info_ref->{'CPUFlatlining'} eq "Yes") {
+        # Tier 2: Suspicious plateau (warning)
         print {$fh} "       PLANNER NOTE [CPU Ceiling Plateau]: This profile appears 'stable' because CPU\n";
         print {$fh} "         usage is flat-lining near a ceiling, not due to genuine workload steadiness.\n";
         printf {$fh} "         %s.\n", ($calc_debug_info_ref->{'CPUFlatliningDetail'} // "");
         print {$fh} "         Treat sizing outputs cautiously; investigate caps, shape, or constraints.\n";
+    } elsif (defined $calc_debug_info_ref->{'CPUCapLimited'} && $calc_debug_info_ref->{'CPUCapLimited'} eq "Yes") {
+        # Tier 1: Cap-limited (informational)
+        print {$fh} "       PLANNER NOTE [Cap-Limited]: Sustained high load near MaxCPU ceiling.\n";
+        printf {$fh} "         %s.\n", ($calc_debug_info_ref->{'CPUCapLimitedDetail'} // "");
+        print {$fh} "         This VM may benefit from increased MaxCPU allocation.\n";
     }
 
     # --- Dispatch Headroom ---
@@ -4798,12 +4809,13 @@ sub calculate_runq_modified_physc
     }
 
     # ------------------------------------------------------------------
-    # CPU Flat-lining Detection (MaxCPU ceiling plateau)
+    # CPU Ceiling Detection (Two-Tier System)
     # ------------------------------------------------------------------
-    # Detect VMs where low variability is due to being pinned at MaxCPU,
-    # not genuine workload stability. This is a pathological state that
-    # should be visible to capacity planners.
+    # Tier 1 (CAP_LIMITED): VM is consistently near MaxCPU - informational.
+    # Tier 2 (CPU_FLATLINING): Suspicious plateau not explained by demand.
     # ------------------------------------------------------------------
+    $debug_info{'CPUCapLimited'} = "No";
+    $debug_info{'CPUCapLimitedDetail'} = "";
     $debug_info{'CPUFlatlining'} = "No";
     $debug_info{'CPUFlatliningDetail'} = "";
 
@@ -4817,34 +4829,90 @@ sub calculate_runq_modified_physc
                ? ($debug_info{'PhysC_Daily_AAE'} + 0) : 0;
     my $fl_is_capped = (defined $cfg_ref->{is_capped} && $cfg_ref->{is_capped}) ? 1 : 0;
 
+    # Corroboration gate: compute RunQ demand vs reachable capacity
+    # CRITICAL: Use FIXED PEAK RunQ for corroboration, NOT the profile-matched
+    # percentile. The question "is the VM genuinely overloaded at its ceiling?"
+    # is a VM-level question that should be answered consistently across all
+    # profiles. Use tail-to-tail comparison: P99.75 PhysC vs P99.75 AbsRunQ.
+    my $fl_reachable_threads = ($fl_max_cpu > 0 && defined $smt_used && $smt_used > 0)
+        ? ($fl_max_cpu * $smt_used) : 0;
+
+    # Prefer peak-aligned P99.75 (tail-to-tail with Peak_P-99W1's PhysC), then P99, then P90
+    my $fl_runq_key_used = 'AbsRunQ_P99.75';
+    my $fl_runq_demand_peak = $runq_metrics_ref->{'AbsRunQ_P99.75'};
+
+    if (!defined $fl_runq_demand_peak || !looks_like_number($fl_runq_demand_peak)) {
+        $fl_runq_key_used = 'AbsRunQ_P99';
+        $fl_runq_demand_peak = $runq_metrics_ref->{'AbsRunQ_P99'};
+    }
+    if (!defined $fl_runq_demand_peak || !looks_like_number($fl_runq_demand_peak)) {
+        $fl_runq_key_used = 'AbsRunQ_P90';
+        $fl_runq_demand_peak = $runq_metrics_ref->{'AbsRunQ_P90'};
+    }
+    if (!defined $fl_runq_demand_peak || !looks_like_number($fl_runq_demand_peak)) {
+        $fl_runq_key_used = $abs_runq_key_to_use // 'profile-matched';
+        $fl_runq_demand_peak = $abs_runq_p_numeric;
+    }
+
+    my $fl_runq_demand = (defined $fl_runq_demand_peak && looks_like_number($fl_runq_demand_peak))
+        ? ($fl_runq_demand_peak + 0) : 0;
+    my $fl_runq_ratio = ($fl_reachable_threads > 0) ? ($fl_runq_demand / $fl_reachable_threads) : 0;
+
+    # Store corroboration key for rationale transparency
+    $debug_info{'CPUCeilingRunQKeyUsed'} = $fl_runq_key_used;
+
     if ($fl_max_cpu > 0 && $fl_base_physc > 0) {
         my $fl_pct_of_maxcpu = $fl_base_physc / $fl_max_cpu;
 
-        # Condition 1: Near MaxCPU (>= 95% of ceiling)
-        my $cond_near_maxcpu = ($fl_pct_of_maxcpu >= $CPU_FLATLINING_PCT_OF_MAXCPU);
+        # Condition 1: Near MaxCPU (>= 97% of ceiling)
+        my $cond_near_maxcpu = ($fl_pct_of_maxcpu >= $CPU_CEILING_PCT_OF_MAXCPU);
 
-        # Condition 2: Very low day-to-day variability
-        my $cond_low_iqrc = ($fl_iqrc <= $CPU_FLATLINING_IQRC_THRESHOLD);
+        # Condition 2a: Low day-to-day variability (for cap-limited)
+        my $cond_low_iqrc = ($fl_iqrc <= $CPU_CAPLIMITED_IQRC_THRESHOLD);
 
-        # Condition 3: Chronic under-entitlement (OR-ed conditions)
-        # For capped VMs, skip this requirement entirely
+        # Condition 2b: Very low day-to-day variability (for suspicious flatlining)
+        my $cond_very_low_iqrc = ($fl_iqrc <= $CPU_FLATLINING_IQRC_THRESHOLD);
+
+        # Condition 3: Chronic under-entitlement (AND logic, not OR)
+        # For capped VMs, skip this requirement entirely (ceiling = entitlement)
         my $cond_under_ent = $fl_is_capped
-                           || ($fl_pae >= $CPU_FLATLINING_PAE_THRESHOLD)
-                           || ($fl_aae >= $CPU_FLATLINING_AAE_THRESHOLD);
+                           || (($fl_pae >= $CPU_FLATLINING_PAE_THRESHOLD)
+                               && ($fl_aae >= $CPU_FLATLINING_AAE_THRESHOLD));
 
-        if ($cond_near_maxcpu && $cond_low_iqrc && $cond_under_ent) {
+        # Condition 4: NOT genuine overload
+        # If RunQ demand strongly exceeds reachable capacity, the plateau is explained
+        # by genuine demand, not a suspicious artefact. Do NOT flag as CPU_FLATLINING.
+        my $cond_not_genuine_overload = ($fl_runq_ratio <= $CPU_FLATLINING_OVERLOAD_RATIO);
+
+        # --- Tier 1: Cap-Limited (informational) ---
+        # Triggers when near MaxCPU with low variability, regardless of cause.
+        if ($cond_near_maxcpu && $cond_low_iqrc) {
+            $debug_info{'CPUCapLimited'} = "Yes";
+            $debug_info{'CPUCapLimitedDetail'} = sprintf(
+                "BasePhysC %.2f is %.0f%% of MaxCPU %.2f with low variability (IQRC %.4f)",
+                $fl_base_physc, $fl_pct_of_maxcpu * 100, $fl_max_cpu, $fl_iqrc
+            );
+            $debug_info{'CPUCapLimitedPctOfMaxCPU'} = sprintf("%.0f", $fl_pct_of_maxcpu * 100);
+        }
+
+        # --- Tier 2: CPU Flatlining (suspicious/warning) ---
+        # Triggers only when the plateau is NOT explained by genuine overload.
+        if ($cond_near_maxcpu && $cond_very_low_iqrc && $cond_under_ent && $cond_not_genuine_overload) {
             $debug_info{'CPUFlatlining'} = "Yes";
             my $fl_detail = sprintf(
-                "BasePhysC %.2f is %.0f%% of MaxCPU %.2f with very low daily variability (IQRC %.4f)",
+                "BasePhysC %.2f is %.0f%% of MaxCPU %.2f with very low variability (IQRC %.4f)",
                 $fl_base_physc, $fl_pct_of_maxcpu * 100, $fl_max_cpu, $fl_iqrc
             );
             if ($fl_is_capped) {
                 $fl_detail .= "; capped mode";
             } else {
-                $fl_detail .= sprintf("; exceeds entitlement frequently (PAE %.2f, AAE %.2f)", $fl_pae, $fl_aae);
+                $fl_detail .= sprintf("; chronic over-entitlement (PAE %.2f, AAE %.2f)", $fl_pae, $fl_aae);
             }
+            $fl_detail .= sprintf("; RunQ ratio %.2f (%s) does not indicate genuine overload", $fl_runq_ratio, $fl_runq_key_used);
+
             $debug_info{'CPUFlatliningDetail'} = $fl_detail;
             $debug_info{'CPUFlatliningPctOfMaxCPU'} = sprintf("%.0f", $fl_pct_of_maxcpu * 100);
+            $debug_info{'CPUFlatliningRunQRatio'} = sprintf("%.2f", $fl_runq_ratio);
         }
     }
 
@@ -8966,14 +9034,20 @@ sub _write_standard_csv_report {
         }
         push @data_row_csv, $vcpu_constraints_str;
 
-        # VM_Comments: aggregate diagnostic tags across all profiles
+        # VM_Comments: aggregate diagnostic tags across all profiles (two-tier)
+        # CPU_FLATLINING = suspicious plateau (warning)
+        # CAP_LIMITED = near ceiling with low variability (informational)
         my @vm_comment_tags;
         foreach my $profile (@csv_visible_profiles) {
             my $pname = $profile->{name};
             next unless defined $pname && $pname ne "";
             my $pdbg = $core->{ProfileDebugInfo}{$pname} // {};
+
+            # Tier 2 takes precedence over Tier 1 for the same profile
             if (defined $pdbg->{'CPUFlatlining'} && $pdbg->{'CPUFlatlining'} eq "Yes") {
                 push @vm_comment_tags, "CPU_FLATLINING[$pname]";
+            } elsif (defined $pdbg->{'CPUCapLimited'} && $pdbg->{'CPUCapLimited'} eq "Yes") {
+                push @vm_comment_tags, "CAP_LIMITED[$pname]";
             }
         }
         # De-duplicate and cap at maximum tags
