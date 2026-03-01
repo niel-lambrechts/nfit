@@ -7979,16 +7979,28 @@ sub write_seasonal_csv_output {
         # --- Build header ---
         my @header;
         if ($type eq 'historic_snapshot') {
-            # Specialised header for the detailed historic report.
+            # Two rows per VM: HistoricPeak and HistoricBaseline.
             @header = ("VM", "MetricType");
+        } elsif ($type eq 'current_baseline') {
+            # Simple audit file: one row per VM showing the pre-event baseline values
+            # used in the multiplier calculation.  No context columns — the data hash
+            # only contains {vm}{profile} = value, not _report_data.
+            @header = ("VM");
         } else {
-            # Standard header for 'current_baseline' and 'final_forecast'
+            # Standard header for the final forecast report.
             @header = (
                 "VM", "TIER", "Hint", "Pattern", "Pressure", "PressureDetail", "SMT",
                 "Serial", "SystemType", "Pool Name", "Pool ID", $PEAK_PROFILE_NAME
             );
         }
         push @header, map { $_->{name} } @csv_visible_profiles;
+
+        # historic_snapshot and current_baseline have self-contained rows; print
+        # their headers now, before any data rows are written.  The standard forecast
+        # path defers its header print until after the extra columns are appended.
+        if ($type eq 'historic_snapshot' || $type eq 'current_baseline') {
+            print $fh join(",", map { quote_csv($_) } @header) . "\n";
+        }
 
         # --- Write data rows ---
         foreach my $vm_name (sort keys %$data_href) {
@@ -8009,15 +8021,17 @@ sub write_seasonal_csv_output {
                     push @base_row, (looks_like_number($value) ? sprintf("%.4f", $value) : $value);
                 }
                 print $fh join(",", map { quote_csv($_) } @base_row) . "\n";
-            } else {
-                # --- Standard handling for 'current_baseline' file ---
+            } elsif ($type eq 'current_baseline') {
+                # --- Audit baseline file: VM name + one profile value per column ---
                 my @row = ($vm_name);
                 my $vm_data = $data_href->{$vm_name};
                 foreach my $profile (@csv_visible_profiles) {
                     my $value = $vm_data->{$profile->{name}} // '';
                     push @row, (looks_like_number($value) ? sprintf("%.4f", $value) : $value);
                 }
+                print $fh join(",", map { quote_csv($_) } @row) . "\n";
             }
+            # Note: the standard forecast path writes its rows in the second loop below.
         }
 
         # Add the new SeasonalMultiplier column before the entitlement columns.
@@ -8025,7 +8039,11 @@ sub write_seasonal_csv_output {
         if ($add_excel_formulas) {
             push @header, ("NFIT - ENT", "NETT", "NETT%");
         }
-        print $fh join(",", map { quote_csv($_) } @header) . "\n";
+        # historic_snapshot and current_baseline wrote their headers and all rows above;
+        # skip both the deferred header and the second data loop for those types.
+        unless ($type eq 'historic_snapshot' || $type eq 'current_baseline') {
+            print $fh join(",", map { quote_csv($_) } @header) . "\n";
+        }
 
         my $excel_row_num_counter = 1;
         foreach my $vm_name (sort keys %$data_href) {
@@ -8237,6 +8255,56 @@ sub detect_active_events {
                     $is_active = 1;
                 }
             }
+        }
+
+        elsif (defined $event_config->{period} && lc($event_config->{period}) eq 'weekly') {
+            # A weekly event recurs indefinitely on a fixed weekday unless bounded by
+            # event_start_date / event_end_date config fields.
+            # Active if any occurrence of the target weekday falls within the horizon
+            # window [analysis_date - lookback, analysis_date + lookahead].
+            # Because weekdays recur every 7 days, a horizon >= 7 days will always
+            # contain at least one occurrence for an unbounded event.
+ 
+            my $dow = _parse_day_of_week($event_config->{day_of_week});
+            if (defined $dow) {
+                my $horizon_start = $analysis_date_utc - ($lookback_days  * ONE_DAY);
+                my $horizon_end   = $analysis_date_utc + ($lookahead_days * ONE_DAY);
+
+                # Respect optional bounding dates in the event config
+                if (defined $event_config->{event_start_date}) {
+                    my $bound = _parse_anchor_date_string($event_config->{event_start_date});
+                    $horizon_start = $bound if ($bound && $bound->epoch > $horizon_start->epoch);
+                }
+                if (defined $event_config->{event_end_date}) {
+                    my $bound = _parse_anchor_date_string($event_config->{event_end_date});
+                    $horizon_end = $bound if ($bound && $bound->epoch < $horizon_end->epoch);
+                }
+
+                # Find the first matching weekday on/after horizon_start
+                my $days_ahead = ($dow - $horizon_start->day_of_week + 7) % 7;
+                my $first_occ  = $horizon_start + ($days_ahead * ONE_DAY);
+
+                $is_active = 1 if ($first_occ->epoch <= $horizon_end->epoch);
+            }
+        }
+        elsif (defined $event_config->{period} && lc($event_config->{period}) eq 'daily') {
+            # A daily event has an occurrence every calendar day; it is always active
+            # within any non-empty horizon window unless bounded by event_start_date /
+            # event_end_date config fields.
+
+            my $horizon_start = $analysis_date_utc - ($lookback_days  * ONE_DAY);
+            my $horizon_end   = $analysis_date_utc + ($lookahead_days * ONE_DAY);
+
+            if (defined $event_config->{event_start_date}) {
+                my $bound = _parse_anchor_date_string($event_config->{event_start_date});
+                $horizon_start = $bound if ($bound && $bound->epoch > $horizon_start->epoch);
+            }
+            if (defined $event_config->{event_end_date}) {
+                my $bound = _parse_anchor_date_string($event_config->{event_end_date});
+                $horizon_end = $bound if ($bound && $bound->epoch < $horizon_end->epoch);
+            }
+
+            $is_active = 1 if ($horizon_start->epoch <= $horizon_end->epoch);
         }
 
         if ($is_active) {
@@ -9607,27 +9675,57 @@ sub determine_seasonal_analysis_path {
     my $model_to_run = $event_config->{model} // '';
     return $event_name unless ($model_to_run eq 'multiplicative_seasonal' || $model_to_run eq 'predictive_peak');
 
-    # Use // to allow explicit 0 for cold-start bootstrap runs
-    my $min_history_required = $event_config->{min_historical_years} // 1;
+    # min_historical_periods is the canonical key.
+    # What counts as "one period" is intentionally aligned with the event's own period:
+    #
+    #   period = weekly or daily  → one period = one individual occurrence (the
+    #                               bucket_occurrence_count stored in each monthly
+    #                               partition's _meta.AnalysisContext is summed).
+    #
+    #   period = monthly, dates=, or unspecified (annual) → one period = one monthly
+    #                               history partition (the original behaviour).
+    #
+    # min_historical_years is retained as a backward-compatible alias.
+    my $min_history_required = $event_config->{min_historical_periods}
+                            // $event_config->{min_historical_years}
+                            // 1;
+
+    my $event_period = lc($event_config->{period} // '');
+    my $count_occurrences = ($event_period eq 'weekly' || $event_period eq 'daily');
 
     # Read the unified history to count available snapshots for this event.
     my $unified_history = read_unified_history($system_cache_dir);
-    my $total_history_months = scalar(keys %$unified_history);
 
     my $history_count = 0;
     foreach my $month_data (values %$unified_history) {
-        if (exists $month_data->{SeasonalEventSnapshots}{$event_name}) {
+        next unless exists $month_data->{SeasonalEventSnapshots}{$event_name};
+
+        if ($count_occurrences) {
+            # Sum the individual occurrences recorded per monthly bucket.
+            # bucket_occurrence_count is written by _store_model_forecast_to_history
+            # into _meta.AnalysisContext; fall back to 1 if absent (legacy history).
+            my $occ = $month_data->{SeasonalEventSnapshots}{$event_name}
+                                   {ModelForecasts}
+                                   {$model_to_run}
+                                   {_meta}
+                                   {AnalysisContext}
+                                   {bucket_occurrence_count}
+                    // 1;
+            $history_count += $occ;
+        } else {
             $history_count++;
         }
     }
 
+    my $period_label = $count_occurrences ? 'occurrence(s)' : 'monthly partition(s)';
+
     if ($history_count >= $min_history_required) {
-        print STDERR "  [INFO] Historical snapshots for event '$event_name': $history_count (>= min. $min_history_required)\n";
+        print STDERR "  [INFO] Historical snapshots for event '$event_name': $history_count $period_label (>= min. $min_history_required)\n";
         return $event_name;
     } else {
         my $fallback_event_name = $event_config->{fallback_event} // '';
 
-        print STDERR "  [WARN] Insufficient history for event '$event_name' (found $history_count, min. $min_history_required)\n";
+        print STDERR "  [WARN] Insufficient history for event '$event_name' (found $history_count $period_label, min. $min_history_required)\n";
 
         if ($fallback_event_name ne '' && exists $seasonality_config->{$fallback_event_name}) {
             print STDERR "  Φ Seasonal Analysis [Event selection]: fallback event '$fallback_event_name' selected\n";
@@ -11685,56 +11783,75 @@ sub _validate_history_structure {
             die "FATAL: History structure validation failed for $month_key - month data is not a hash\n";
         }
 
-        # Check for required top-level blocks
-        unless (exists $month_data->{MonthlyWorkloadAnalysis}) {
-            die "FATAL: History structure validation failed for $month_key - missing MonthlyWorkloadAnalysis block\n";
+        # Determine partition type.
+        #
+        # Two valid partition types exist:
+        #
+        #   Full analysis partition:   MonthlyWorkloadAnalysis + Metadata.ProcessedDays
+        #                              Created by forensic / trending runs.
+        #
+        #   Seasonal-only partition:   SeasonalEventSnapshots (no MonthlyWorkloadAnalysis)
+        #                              Created when --apply-seasonality runs against a month
+        #                              that has not yet received a forensic baseline run.
+        #
+        # Both are legitimate. Requiring MonthlyWorkloadAnalysis unconditionally rejects
+        # the second type and contradicts the intentional design of _store_model_forecast_to_history.
+
+        my $has_mwa      = exists $month_data->{MonthlyWorkloadAnalysis};
+        my $has_seasonal = (exists $month_data->{SeasonalEventSnapshots}
+                            && ref($month_data->{SeasonalEventSnapshots}) eq 'HASH'
+                            && scalar keys %{$month_data->{SeasonalEventSnapshots}});
+
+        unless ($has_mwa || $has_seasonal) {
+            die "FATAL: History structure validation failed for $month_key - "
+              . "partition contains neither MonthlyWorkloadAnalysis nor SeasonalEventSnapshots\n";
         }
 
-        unless (exists $month_data->{Metadata}) {
-            die "FATAL: History structure validation failed for $month_key - missing Metadata block\n";
-        }
+        # --- Full analysis partition: validate MonthlyWorkloadAnalysis contents ---
+        if ($has_mwa) {
+            my $workload_analysis = $month_data->{MonthlyWorkloadAnalysis};
 
-        # Validate MonthlyWorkloadAnalysis is not empty
-        my $workload_analysis = $month_data->{MonthlyWorkloadAnalysis};
-        unless (ref($workload_analysis) eq 'HASH') {
-            die "FATAL: History structure validation failed for $month_key - MonthlyWorkloadAnalysis is not a hash\n";
-        }
-
-        unless (scalar keys %$workload_analysis) {
-            die "FATAL: History structure validation failed for $month_key - MonthlyWorkloadAnalysis is empty\n";
-        }
-
-        # Validate that each VM in MonthlyWorkloadAnalysis has required fields
-        foreach my $vm_name (keys %$workload_analysis) {
-            my $vm_data = $workload_analysis->{$vm_name};
-
-            unless (ref($vm_data) eq 'HASH') {
-                die "FATAL: History structure validation failed for $month_key VM $vm_name - VM data is not a hash\n";
+            unless (ref($workload_analysis) eq 'HASH') {
+                die "FATAL: History structure validation failed for $month_key - MonthlyWorkloadAnalysis is not a hash\n";
             }
 
-            # Check for required fields
-            my @required_fields = qw(ProfileValues Hint Pattern Pressure);
-            foreach my $field (@required_fields) {
-                unless (exists $vm_data->{$field}) {
-                    die "FATAL: History structure validation failed for $month_key VM $vm_name - missing required field: $field\n";
+            unless (scalar keys %$workload_analysis) {
+                die "FATAL: History structure validation failed for $month_key - MonthlyWorkloadAnalysis is empty\n";
+            }
+
+            # Validate that each VM in MonthlyWorkloadAnalysis has required fields
+            foreach my $vm_name (keys %$workload_analysis) {
+                my $vm_data = $workload_analysis->{$vm_name};
+
+                unless (ref($vm_data) eq 'HASH') {
+                    die "FATAL: History structure validation failed for $month_key VM $vm_name - VM data is not a hash\n";
+                }
+
+                my @required_fields = qw(ProfileValues Hint Pattern Pressure);
+                foreach my $field (@required_fields) {
+                    unless (exists $vm_data->{$field}) {
+                        die "FATAL: History structure validation failed for $month_key VM $vm_name - missing required field: $field\n";
+                    }
+                }
+                unless (ref($vm_data->{ProfileValues}) eq 'HASH' && scalar keys %{$vm_data->{ProfileValues}}) {
+                    die "FATAL: History structure validation failed for $month_key VM $vm_name - ProfileValues is empty or invalid\n";
                 }
             }
+        }
 
-            # Validate ProfileValues is a non-empty hash
-            unless (ref($vm_data->{ProfileValues}) eq 'HASH' && scalar keys %{$vm_data->{ProfileValues}}) {
-                die "FATAL: History structure validation failed for $month_key VM $vm_name - ProfileValues is empty or invalid\n";
+        # --- Metadata: ProcessedDays is only meaningful for full analysis partitions ---
+        if (exists $month_data->{Metadata}) {
+            my $metadata = $month_data->{Metadata};
+
+            unless (ref($metadata) eq 'HASH') {
+                die "FATAL: History structure validation failed for $month_key - Metadata is not a hash\n";
             }
-        }
 
-        # Validate Metadata structure
-        my $metadata = $month_data->{Metadata};
-        unless (ref($metadata) eq 'HASH') {
-            die "FATAL: History structure validation failed for $month_key - Metadata is not a hash\n";
-        }
-
-        # Check for essential metadata fields
-        unless (exists $metadata->{ProcessedDays}) {
-            die "FATAL: History structure validation failed for $month_key - Metadata missing ProcessedDays\n";
+            # ProcessedDays is written by forensic runs; seasonal-only partitions set
+            # LastUpdated instead. Only enforce ProcessedDays when MWA is present.
+            if ($has_mwa && !exists $metadata->{ProcessedDays}) {
+                die "FATAL: History structure validation failed for $month_key - Metadata missing ProcessedDays\n";
+            }
         }
 
         # Optional: Validate SeasonalEventSnapshots structure if present
@@ -11757,7 +11874,6 @@ sub _validate_history_structure {
                     die "FATAL: History structure validation failed for $month_key event $event_name - missing both 'results' (Snapshot) and 'ModelForecasts' (Forecast) blocks\n";
                 }
             }
-
         }
     }
 
@@ -15905,6 +16021,7 @@ sub _compute_event_definition_fingerprint {
         interaction_policy
         last_modified
         min_history_days
+        min_historical_periods
         min_historical_peaks
         min_historical_years
         model
@@ -17067,7 +17184,14 @@ sub _reset_seasonal_state {
 #
 # RETURNS:
 #   Arrayref of occurrence hashrefs:
-#     { start => Time::Piece, end => Time::Piece, kind => 'monthly'|'dates' }
+#     { start => Time::Piece, end => Time::Piece, kind => 'monthly'|'dates'|'weekly'|'daily' }
+#
+# DISPATCH ORDER (highest to lowest priority):
+#   1. Explicit dates list / range  (period ignored when dates= is present)
+#   2. Monthly month-end            (period=monthly, day_of_period=-1)
+#   3. Weekly day-of-week           (period=weekly,  day_of_week=mon..sun)
+#   4. Daily                        (period=daily)
+#   5. Free-running                 (returns [])
 #
 # ==============================================================================
 sub _enumerate_event_occurrences {
@@ -17077,18 +17201,35 @@ sub _enumerate_event_occurrences {
 
     my $period        = $event_config->{period} // '';
     my $day_of_period = $event_config->{day_of_period} // 0;
+    my $duration_days = $event_config->{duration_days} // 1;
+    $duration_days    = 1 unless ($duration_days > 0);
 
-    # Month-end events: monthly with day_of_period == -1
-    if ($period eq 'monthly' && $day_of_period == -1) {
-        return _enumerate_monthly_occurrences($analysis_start, $analysis_end);
-    }
-
-    # Explicit date events: dates = ...
+    # --- Priority 1: Explicit date events (dates= overrides period) ---
     if (defined $event_config->{dates} && length($event_config->{dates})) {
         return _enumerate_explicit_date_occurrences($event_config->{dates}, $analysis_start, $analysis_end);
     }
 
-    # No enumerable occurrences for free-running events
+    # --- Priority 2: Month-end monthly events ---
+    if ($period eq 'monthly' && $day_of_period == -1) {
+        return _enumerate_monthly_occurrences($analysis_start, $analysis_end);
+    }
+
+    # --- Priority 3: Weekly day-of-week events ---
+    if ($period eq 'weekly') {
+        my $dow = _parse_day_of_week($event_config->{day_of_week});
+        unless (defined $dow) {
+            print STDERR "  [WARN] Seasonal: event has period=weekly but no valid day_of_week; skipping enumeration\n";
+            return [];
+        }
+        return _enumerate_weekly_occurrences($analysis_start, $analysis_end, $duration_days, $dow);
+    }
+
+    # --- Priority 4: Daily events ---
+    if ($period eq 'daily') {
+        return _enumerate_daily_occurrences($analysis_start, $analysis_end, $duration_days);
+    }
+
+    # --- Fallthrough: free-running / unknown period ---
     return [];
 }
 
@@ -17142,6 +17283,160 @@ sub _enumerate_monthly_occurrences {
 
     return \@occ;
 }
+
+# ==============================================================================
+# SUBROUTINE: _parse_day_of_week
+#
+# PURPOSE:
+#   Parses a day_of_week config value into a Time::Piece-compatible wday index.
+#   Time::Piece->day_of_week uses POSIX convention: 0=Sunday, 1=Monday … 6=Saturday.
+#
+# ACCEPTS:
+#   - Three-letter abbreviations (case-insensitive): mon tue wed thu fri sat sun
+#   - Numeric ISO weekday:  1=Mon … 7=Sun
+#
+# RETURNS:
+#   Integer 0..6 (POSIX wday), or undef on invalid input.
+#
+# ==============================================================================
+sub _parse_day_of_week {
+    my ($dow_value) = @_;
+
+    return undef unless (defined $dow_value && length $dow_value);
+
+    my %abbr_to_wday = (
+        sun => 0, mon => 1, tue => 2, wed => 3,
+        thu => 4, fri => 5, sat => 6,
+    );
+
+    my $lc = lc($dow_value);
+    $lc =~ s/^\s+|\s+$//g;
+
+    # Three-letter abbreviation
+    return $abbr_to_wday{$lc} if exists $abbr_to_wday{$lc};
+
+    # ISO numeric (1=Mon..7=Sun) → POSIX (0=Sun..6=Sat)
+    if ($lc =~ /^\d+$/) {
+        my $iso = int($lc);
+        return undef unless ($iso >= 1 && $iso <= 7);
+        # ISO 7 (Sunday) maps to POSIX 0; ISO 1-6 map to POSIX 1-6
+        return ($iso == 7) ? 0 : $iso;
+    }
+
+    return undef;
+}
+
+# ==============================================================================
+# SUBROUTINE: _enumerate_weekly_occurrences
+#
+# PURPOSE:
+#   Produces weekly occurrences anchored to a specific weekday within the
+#   supplied analysis window.  Each occurrence's start is the matching weekday;
+#   end is start + (duration_days - 1) days (inclusive), matching the convention
+#   used by _enumerate_explicit_date_occurrences for single-day entries.
+#
+# ARGUMENTS:
+#   $analysis_start (Time::Piece) - Inclusive window start
+#   $analysis_end   (Time::Piece) - Inclusive window end
+#   $duration_days  (integer)     - Event duration in days (>= 1)
+#   $dow_target     (integer)     - POSIX weekday index (0=Sun..6=Sat)
+#
+# RETURNS:
+#   Arrayref of { start => Time::Piece, end => Time::Piece, kind => 'weekly' }
+#
+# ==============================================================================
+sub _enumerate_weekly_occurrences {
+    my ($analysis_start, $analysis_end, $duration_days, $dow_target) = @_;
+
+    return [] unless ($analysis_start && $analysis_end);
+    return [] unless (defined $dow_target);
+
+    $duration_days //= 1;
+    $duration_days   = 1 unless $duration_days > 0;
+
+    my $win_start = $analysis_start->truncate(to => 'day');
+    my $win_end   = $analysis_end->truncate(to => 'day');
+
+    return [] if ($win_start->epoch > $win_end->epoch);
+
+    # Advance cursor to the first occurrence of the target weekday on/after win_start
+    my $cursor = $win_start;
+    my $days_ahead = ($dow_target - $cursor->day_of_week + 7) % 7;
+    $cursor = $cursor + ($days_ahead * ONE_DAY) if $days_ahead;
+
+    my @occ;
+    while ($cursor->epoch <= $win_end->epoch) {
+        my $occ_start = $cursor;
+        my $occ_end   = $cursor + (($duration_days - 1) * ONE_DAY);
+
+        push @occ, { start => $occ_start, end => $occ_end, kind => 'weekly' };
+
+        $cursor = $cursor + (7 * ONE_DAY);
+    }
+
+    my $day_names = [qw(Sun Mon Tue Wed Thu Fri Sat)];
+    printf STDERR "  [Seasonal] Enumerated %d weekly occurrence(s) (%s) for %s..%s\n",
+        scalar(@occ),
+        $day_names->[$dow_target],
+        $win_start->ymd,
+        $win_end->ymd;
+
+    return \@occ;
+}
+
+# ==============================================================================
+# SUBROUTINE: _enumerate_daily_occurrences
+#
+# PURPOSE:
+#   Produces one occurrence per calendar day within the analysis window.
+#   Each occurrence's end is start + (duration_days - 1) days (inclusive).
+#
+# ARGUMENTS:
+#   $analysis_start (Time::Piece) - Inclusive window start
+#   $analysis_end   (Time::Piece) - Inclusive window end
+#   $duration_days  (integer)     - Event duration in days (>= 1)
+#
+# RETURNS:
+#   Arrayref of { start => Time::Piece, end => Time::Piece, kind => 'daily' }
+#
+# ==============================================================================
+sub _enumerate_daily_occurrences {
+    my ($analysis_start, $analysis_end, $duration_days) = @_;
+
+    return [] unless ($analysis_start && $analysis_end);
+
+    $duration_days //= 1;
+    $duration_days   = 1 unless $duration_days > 0;
+
+    my $win_start = $analysis_start->truncate(to => 'day');
+    my $win_end   = $analysis_end->truncate(to => 'day');
+
+    return [] if ($win_start->epoch > $win_end->epoch);
+
+    my @occ;
+    my $cursor = $win_start;
+    while ($cursor->epoch <= $win_end->epoch) {
+        my $occ_end = $cursor + (($duration_days - 1) * ONE_DAY);
+        push @occ, { start => $cursor, end => $occ_end, kind => 'daily' };
+        $cursor = $cursor + ONE_DAY;
+    }
+
+    printf STDERR "  [Seasonal] Enumerated %d daily occurrence(s) for %s..%s\n",
+        scalar(@occ),
+        $win_start->ymd,
+        $win_end->ymd;
+
+    return \@occ;
+}
+
+
+#
+# PURPOSE:
+#   Selects the most recent completed occurrence (by end date) as-of the supplied
+#   reference date.
+#
+# RETURNS:
+#   Occurrence hashref, or undef if none completed.
 
 ################################################################################
 # Phase 3 helpers: bucketisation for high-frequency / multi-occurrence events
