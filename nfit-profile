@@ -11054,6 +11054,27 @@ sub _store_model_forecast_to_history {
     print STDERR "  • Loading unified partitioned history\n";
     my $history_data = read_unified_history($system_cache_dir);
 
+    # --- Backstop completeness guard ---
+    # _should_reprocess_bucket enforces this upstream for --seasonal-scope runs.
+    # This guard protects direct call paths (e.g. --apply-seasonality without the
+    # bucket orchestrator) from overwriting a richer stored result with one derived
+    # from a shorter analysis window.  Bypass with --force ($force_update).
+    unless ($force_update) {
+        my $stored_ctx = ($history_data->{$target_month_key}
+                                         {SeasonalEventSnapshots}
+                                         {$event_name}
+                                         {ModelForecasts}
+                                         {$model_type}
+                                         {'_meta'} // {});
+        my $stored_window_days = $stored_ctx->{AnalysisContext}{analysis_window_days} // 0;
+        if ($stored_window_days > $analysis_days && $analysis_days > 0) {
+            print STDERR "    [SKIP] $target_month_key/$event_name/$model_type: "
+                . "stored window ($stored_window_days days) > current window ($analysis_days days); "
+                . "preserving richer result (use --force to override)\n";
+            return;
+        }
+    }
+
     # --- PHASE 1: Relaxed partition existence check ---
     # We no longer require MonthlyWorkloadAnalysis to exist for the target month.
     # The seasonal snapshot can be stored even if the monthly analysis hasn't run yet.
@@ -16252,6 +16273,12 @@ sub _compute_bucket_fingerprint {
             $result{baseline_source} = $meta->{baseline_source}
                 if exists $meta->{baseline_source};
 
+            # Completeness guard: carry analysis_window_days so _should_reprocess_bucket
+            # can detect when the stored result used a larger window than the current run.
+            $result{analysis_window_days} = $meta->{AnalysisContext}{analysis_window_days}
+                if (exists $meta->{AnalysisContext}
+                    && exists $meta->{AnalysisContext}{analysis_window_days});
+
             return \%result;
         }
 
@@ -16350,6 +16377,43 @@ sub _should_reprocess_bucket {
             reason_category  => 'missing_prior',
             current_fp       => $current_fp,
             stored_fp        => undef,
+        };
+    }
+
+    # --- Completeness guard ---
+    # If the stored result was produced from a larger analysis window than the
+    # current run would produce, preserve the richer stored result — unless the
+    # event definition or baseline inputs have changed, which would invalidate
+    # it regardless of window size.  This prevents a batch with a shorter cache
+    # window (e.g. a partially overlapping staging range) from downgrading a
+    # fully-windowed result written by an earlier, longer-range batch.
+    my $stored_window_days  = $stored_fp->{analysis_window_days} // 0;
+    my $current_window_days = do {
+        my ($s, $e) = ($exec_ctx->{effective_start_date}, $exec_ctx->{effective_end_date});
+        ($s && $e && ref($s) eq 'Time::Piece' && ref($e) eq 'Time::Piece')
+            ? (int(($e->epoch - $s->epoch) / ONE_DAY) + 1)
+            : 0;
+    };
+    my $event_def_changed = (($stored_fp->{event_def} // '') ne ($current_fp->{event_def} // ''));
+    my $baseline_changed  = do {
+        my $stored_bl  = $stored_fp->{baseline_fingerprint} // '';
+        my $current_bl = ($baseline_fp_href && ref($baseline_fp_href) eq 'HASH')
+                       ? ($baseline_fp_href->{fingerprint} // '') : '';
+        $stored_bl && $current_bl && ($stored_bl ne $current_bl);
+    };
+
+    if ($stored_window_days > $current_window_days
+        && $current_window_days > 0
+        && !$event_def_changed
+        && !$baseline_changed) {
+        return {
+            reprocess        => 0,
+            reason           => sprintf(
+                "Stored result uses larger window (%d days > %d days); preserving richer result",
+                $stored_window_days, $current_window_days),
+            reason_category  => 'stored_more_complete',
+            current_fp       => $current_fp,
+            stored_fp        => $stored_fp,
         };
     }
 
@@ -16570,6 +16634,7 @@ sub _group_events_by_fingerprint {
 sub _translate_skip_reason {
     my ($category) = @_;
     return 'unchanged since last analysis'      if $category eq 'skip';
+    return 'stored result is more complete'     if $category eq 'stored_more_complete';
     return 'no changes detected'                if !$category;
     return $category;  # fallback
 }
