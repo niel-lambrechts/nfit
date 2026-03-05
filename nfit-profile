@@ -9907,11 +9907,22 @@ sub calculate_predictive_peak_forecast {
         _calculate_peak_prediction($historical_data_href, $event_config);
 
     # --- Step 3: Calculate the Non-Peak Baseline (excluding all historical peaks) ---
-    # Phase 6: Use pre-computed history-based baseline if provided by orchestrator.
+    # Use pre-computed baseline if the orchestrator has provided one.
+    #
+    # IMPORTANT — semantic distinction:
+    #   When $precomputed_baselines_href is populated from the orchestrator's
+    #   per-event pre-computation (see _execute_automatic_seasonal_discovery),
+    #   the values are POOLED PERCENTILES derived from the full L1 cache with
+    #   peak days filtered out — identical semantics to _get_true_baseline_results.
+    #   This is NOT the same as the history-based daily-aggregate baseline used by
+    #   multiplicative_seasonal.  Mean-of-daily-aggregates cannot reproduce the
+    #   pooled-percentile precision required here; that is precisely why the
+    #   orchestrator calls _get_true_baseline_results (not _get_baseline_from_history)
+    #   for this pre-computation.
     my $true_baseline_results_href;
     if ($precomputed_baselines_href && ref($precomputed_baselines_href) eq 'HASH' && %$precomputed_baselines_href) {
         $true_baseline_results_href = $precomputed_baselines_href;
-        print STDERR "  Φ Predictive Peak [Baseline]: history-based (pre-computed)\n";
+        print STDERR "  Φ Predictive Peak [Baseline]: L1 pooled percentile (pre-computed by orchestrator, reused across buckets)\n";
     } else {
         # Legacy L1-based path (--use-l1-baseline or pre-Phase 6 compatibility)
         $true_baseline_results_href = _get_true_baseline_results($system_cache_dir, $event_name, $event_config, $full_seasonality_config, $exclusions_href, $asof_start_obj, $asof_end_obj);
@@ -16941,6 +16952,69 @@ sub _execute_automatic_seasonal_discovery {
         # Track the previous bucket's combined fingerprint to establish dependency chain
         my $prev_bucket_combined_fp = undef;
 
+        # --- PREDICTIVE PEAK: PRE-COMPUTE L1 BASELINE ONCE PER EVENT ---
+        #
+        # _get_true_baseline_results() reads the entire L1 cache (.nfit.cache.data),
+        # filters peak days, writes a temp file, and runs nfit on it.  Calling this
+        # once per bucket produces O(buckets) full L1 scans — the dominant cost for
+        # --seasonal-scope all runs on large managed systems.
+        #
+        # The L1 cache and the peak exclusion set are INVARIANT across all buckets
+        # within a single run: the L1 cache is a fixed file on disk, and
+        # find_all_historical_periods is called with the canonical reference date
+        # (the run-wide ceiling), which produces the maximal exclusion set.
+        # Individual per-bucket reference dates are always ≤ the canonical date, so
+        # they would exclude the same or fewer peak days.  Using the canonical date
+        # is therefore conservative (excludes the most data), which is the safe
+        # direction for a baseline: it cannot inflate the baseline by including
+        # contaminated peak-day samples.
+        #
+        # SEMANTIC NOTE: this is a pure L1 pooled-percentile computation, not a
+        # daily-aggregate history read.  Mean-of-daily-aggregates cannot reproduce
+        # the pooled-percentile precision that predictive_peak requires — see the
+        # gate at the dispatch block below.  We deliberately do NOT call
+        # _get_baseline_from_history here.
+        #
+        # The pre-computed result is stored in $precomputed_pp_l1_baseline and
+        # injected into exec_ctx as _l1_baseline_precomputed for each bucket that
+        # reaches the dispatch stage.
+        my $precomputed_pp_l1_baseline = undef;
+        my $pp_model_type = $event_cfg->{model} // '';
+
+        if ($pp_model_type eq 'predictive_peak' && !$use_l1_baseline) {
+            print STDERR "  • Pre-computing L1 pooled baseline for event $event_name (single pass, reused across all buckets)\n";
+
+            my $pp_exclusions = undef;
+            if (defined $event_cfg->{exclude_dates}) {
+                my $known_vms = _get_known_vms_from_cache($current_cache_path);
+                $pp_exclusions = _parse_exclusion_dates($event_cfg->{exclude_dates}, $known_vms);
+            }
+
+            # Use eval so a baseline failure here is non-fatal: each bucket will
+            # fall through to the per-bucket _get_true_baseline_results legacy path.
+            eval {
+                $precomputed_pp_l1_baseline = _get_true_baseline_results(
+                    $current_cache_path,
+                    $event_name,
+                    $event_cfg,
+                    $seasonality_config,
+                    $pp_exclusions,
+                    $args_href->{effective_start_date},
+                    $canonical_reference_date,   # run-wide ceiling = maximal exclusion set
+                );
+            };
+            if ($@) {
+                my $err = $@; chomp $err;
+                warn "  [WARN] Pre-computation of L1 baseline failed for event '$event_name': $err\n";
+                warn "  [WARN] Each bucket will fall through to the per-bucket L1 scan.\n";
+                $precomputed_pp_l1_baseline = undef;
+            }
+            elsif ($precomputed_pp_l1_baseline && %$precomputed_pp_l1_baseline) {
+                my $vm_count = scalar keys %$precomputed_pp_l1_baseline;
+                print STDERR "  ✓ L1 pooled baseline pre-computed ($vm_count VM(s))\n";
+            }
+        }
+
         foreach my $bucket_key (@bucket_keys_to_run) {
             # Reset global state to ensure clean execution per bucket
             _reset_seasonal_state();
@@ -17245,8 +17319,11 @@ sub _execute_automatic_seasonal_discovery {
             # are unaffected because baseline enters as a ratio multiplicand
             # where day-weighting bias cancels between numerator and denominator.
             #
-            # Replace history baseline with an L1 metadata stub so that:
-            #  - The consumer falls through to _get_true_baseline_results (L1)
+            # Replace history baseline with an L1 metadata stub and, when available,
+            # inject the pre-computed L1 pooled result so that:
+            #  - The consumer uses the pre-computed result instead of re-scanning L1
+            #  - If pre-computation failed, the consumer falls through to per-bucket
+            #    _get_true_baseline_results (existing behaviour, no regression)
             #  - The storage function records baseline_source = 'l1_cache'
             #  - Snapshot auditability is preserved
             if ($model_type eq 'predictive_peak' && !$use_l1_baseline) {
@@ -17259,8 +17336,14 @@ sub _execute_automatic_seasonal_discovery {
                     months_read     => undef,
                     coverage_by_vm  => undef,
                 };
+                # Inject pre-computed L1 baseline if available (undef = graceful fallback)
+                $exec_ctx->{_l1_baseline_precomputed} = $precomputed_pp_l1_baseline;
+
                 if (($verbose // 0) >= 1) {
-                    print STDERR "      ↳  Baseline: using staged data cache as data source (predictive_peak precision requirement)\n";
+                    my $bl_src = $precomputed_pp_l1_baseline
+                        ? 'pre-computed L1 pooled (reused across buckets)'
+                        : 'per-bucket L1 scan (pre-computation unavailable)';
+                    print STDERR "      ↳  Baseline: $bl_src (predictive_peak pooled-percentile requirement)\n";
                 }
             }
 
@@ -18999,8 +19082,21 @@ sub _execute_predictive_peak {
     }
 
     # Phase 6: Extract pre-computed history baseline (undef if --use-l1-baseline)
-    my $precomputed_baselines = ($args_href->{_baseline_result})
-        ? $args_href->{_baseline_result}{baselines} : undef;
+    #
+    # Priority order:
+    #   1. _l1_baseline_precomputed: L1 pooled percentile computed once per event by
+    #      the orchestrator.  Semantically identical to _get_true_baseline_results —
+    #      preserves pooled-percentile precision.  Eliminates per-bucket L1 scans.
+    #   2. _baseline_result{baselines}: history daily-aggregate baseline.  NOT used for
+    #      predictive_peak (orchestrator deletes this key before dispatch — see gate
+    #      above).  Listed here for completeness only; it will always be undef at
+    #      this point.
+    #   3. undef → calculate_predictive_peak_forecast falls through to the legacy
+    #      per-invocation _get_true_baseline_results call (safety net).
+    my $precomputed_baselines = $args_href->{_l1_baseline_precomputed}
+        // (($args_href->{_baseline_result})
+            ? $args_href->{_baseline_result}{baselines}
+            : undef);
 
     # 5. Calculate Forecast
     my $forecast_results = calculate_predictive_peak_forecast(
