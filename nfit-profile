@@ -1228,6 +1228,9 @@ foreach my $system_serial (@target_systems_to_process)
     # First, determine the full path to the cache we are processing in this iteration.
     my $current_cache_path = defined($system_serial) ? File::Spec->catfile($base_cache_dir, $system_serial) : $nmon_dir;
 
+    # Ensure the canonical history location exists and migrate legacy partitions if needed.
+    _migrate_history_to_canonical($current_cache_path);
+
     # Now, robustly determine the system identifier for logging.
     # Default to the directory name, but prefer the canonical name from the ID file.
     my $system_identifier = basename($current_cache_path); # Tier 2 Fallback identifier
@@ -10550,7 +10553,7 @@ sub read_unified_history {
     my ($system_cache_dir) = @_;
 
     my $legacy_file   = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
-    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $partition_dir = _get_history_dir($system_cache_dir);
 
     my $history_data = {};
 
@@ -10604,66 +10607,6 @@ sub read_unified_history {
 
     # PATH C: New System (Empty)
     return {};
-}
-
-# ==============================================================================
-# SUBROUTINE: write_unified_history
-# PURPOSE:    Writes a new monthly entry to the unified history cache file.
-#             This function handles file locking to prevent data corruption from
-#             concurrent processes. It performs a safe read-modify-write of
-#             the entire data structure.
-# ARGUMENTS:
-#   1. $system_cache_dir (string): The path to a system's cache directory.
-#   2. $month_key (string): The key for the new entry (e.g., "2025-07").
-#   3. $new_data_for_month_href (hash ref): The data for the new monthly entry.
-# RETURNS:
-#   - 1 on success, 0 on failure.
-# ==============================================================================
-sub write_unified_history {
-    my ($system_cache_dir, $month_key, $new_data_for_month_href) = @_;
-
-    my $history_file = File::Spec->catfile($system_cache_dir, $UNIFIED_HISTORY_FILE);
-
-    # Acquire global lock
-    my ($lock_fh, $lock_path);
-    eval {
-        ($lock_fh, $lock_path) = _acquire_history_lock($system_cache_dir);
-    };
-    if ($@) {
-        warn " [WARN] Skipping history write due to lock failure: $@";
-        return 0;
-    }
-    # ------------------------------------------------
-
-    my $success = 0;
-    eval {
-        # Read the existing history file first.
-        my $history_data = read_unified_history($system_cache_dir);
-
-        # Add or overwrite the data for the specified month.
-        $history_data->{$month_key} = $new_data_for_month_href;
-
-        # Write the entire updated data structure back to the file.
-        my $json = JSON->new->pretty->canonical;
-        my $json_text = $json->encode($history_data);
-
-        open my $fh, '>:encoding(utf8)', $history_file or die "Could not open '$history_file' for writing: $!";
-        print $fh $json_text;
-        close $fh;
-        $success = 1;
-    };
-    if ($@) {
-        warn " [WARN] An error occurred while writing to the unified history cache '$history_file': $@";
-        $success = 0;
-    }
-
-    # Release the lock.
-    close $lock_fh;
-
-    # Note: We do NOT unlink the global lock file in the new architecture
-    # to prevent race conditions on file creation. It remains as a sentinel.
-
-    return $success;
 }
 
 # ==============================================================================
@@ -11397,7 +11340,7 @@ sub _mark_scores_invalid_for_snapshot {
 
     return unless ($system_cache_dir && $event_name && $month_key);
 
-    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $partition_dir = _get_history_dir($system_cache_dir);
     my $filepath = File::Spec->catfile($partition_dir, "nfit.hist.${month_key}.json");
 
     return unless (-f $filepath && -s $filepath);
@@ -11580,7 +11523,7 @@ sub update_monthly_history {
         eval { ($lock_fh, $lock_path) = _acquire_history_lock($system_cache_dir); };
         if (!$@) {
             if (-f File::Spec->catfile($system_cache_dir, '.nfit.history.json') &&
-                !-d File::Spec->catfile($system_cache_dir, '.nfit.history')) {
+                !-d _get_history_dir($system_cache_dir)) {
 
                 _migrate_history_to_partitioned($system_cache_dir);
             }
@@ -11665,10 +11608,15 @@ sub update_monthly_history {
         print STDERR "  ✓ No new months to process. History is up to date\n";
     }
 
-
-    # Track if this was a first run (no pre-existing history file)
-    my $history_file = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
-    my $was_first_run = !(-f $history_file);
+    # Track if this was a first run (no pre-existing partitions in the canonical history dir).
+    # _write_full_history dies on failure, so reaching this point confirms a successful write.
+    my $canonical_history_dir = _get_history_dir($system_cache_dir);
+    my $was_first_run = 1;
+    if (-d $canonical_history_dir) {
+        opendir(my $chk_dh, $canonical_history_dir) or die "Cannot open '$canonical_history_dir': $!";
+        $was_first_run = !grep { /^nfit\.hist\.\d{4}-\d{2}\.json$/ } readdir($chk_dh);
+        closedir($chk_dh);
+    }
 
     # --- Phase 3: Enrich with Growth Rationale from L2 Cache ---
     my $was_enriched = _enrich_history_with_growth_rationale($system_cache_dir, $history_data);
@@ -11682,7 +11630,7 @@ sub update_monthly_history {
         print "  ✓ History cache successfully updated.\n";
 
         # If this was the first run, create a post-write backup to protect the newly created file
-        if ($was_first_run && -f $history_file) {
+        if ($was_first_run) {
             print "\n--- Creating Post-Initial-Write Backup ---\n";
             _create_checkpoint_backup($system_cache_dir, 'post-initial-write', 1);
         }
@@ -11970,7 +11918,7 @@ sub _write_full_history {
     if ($@) { die "FATAL: Could not acquire global history lock: $@"; }
 
     # 3. Directory Setup
-    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $partition_dir = _get_history_dir($system_cache_dir);
     unless (-d $partition_dir) {
         make_path($partition_dir) or die "FATAL: Cannot create history directory: $!";
     }
@@ -12382,7 +12330,7 @@ sub _get_history_month_index {
     my ($system_cache_dir) = @_;
 
     my %index;
-    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $partition_dir = _get_history_dir($system_cache_dir);
 
     return \%index unless (-d $partition_dir);
 
@@ -12490,7 +12438,7 @@ sub _read_bounded_history_months {
                             && ref($month_keys_aref) eq 'ARRAY'
                             && @$month_keys_aref);
 
-    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $partition_dir = _get_history_dir($system_cache_dir);
 
     # If the partition directory doesn't exist at all, every month is missing
     unless (-d $partition_dir) {
@@ -13384,7 +13332,7 @@ sub _read_month_metadata_only {
     my ($system_cache_dir, $month_key) = @_;
     return undef unless ($system_cache_dir && $month_key && $month_key =~ /^\d{4}-\d{2}$/);
 
-    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $partition_dir = _get_history_dir($system_cache_dir);
     my $path = File::Spec->catfile($partition_dir, "nfit.hist.${month_key}.json");
     return undef unless (-f $path && -s $path);
 
@@ -13518,6 +13466,132 @@ sub _calculate_aggregate_coverage {
 }
 
 # ==============================================================================
+# SUBROUTINE: _get_history_dir
+# PURPOSE:    Returns the canonical history directory for a given system cache.
+#             The canonical location is APP_ROOT/history/SERIAL, which is
+#             deliberately outside the staging area (APP_ROOT/stage/SERIAL) to
+#             protect history from stage directory restores and cleanups.
+# ARGUMENTS:
+#   1. $system_cache_dir (string): Path to the system's L1 cache (e.g. stage/SERIAL)
+# RETURNS:
+#   String path: APP_ROOT/history/SERIAL
+# ==============================================================================
+sub _get_history_dir {
+    my ($system_cache_dir) = @_;
+    my $serial   = basename($system_cache_dir);
+    my $app_root = dirname(dirname($system_cache_dir));
+    return File::Spec->catfile($app_root, 'history', $serial);
+}
+
+# ==============================================================================
+# SUBROUTINE: _migrate_history_to_canonical
+# PURPOSE:    One-off migration of partitioned history files from the legacy
+#             location (APP_ROOT/stage/SERIAL/.nfit.history/) to the canonical
+#             location (APP_ROOT/history/SERIAL/).
+#
+#             This is safe to call on every run — it returns immediately if the
+#             canonical directory already contains partition files, making it
+#             effectively a no-op after the first successful migration.
+#
+#             Migration rules:
+#               1. Canonical dir already has partitions  → use canonical, no move
+#               2. Legacy dir does not exist             → create canonical, done
+#               3. Legacy dir exists with partitions     → preflight collision
+#                  check, move all, remove legacy dir
+#
+#             On collision (a partition already exists at the target), the run
+#             is aborted with a clear error rather than risking a partial or
+#             corrupted state.
+# ARGUMENTS:
+#   1. $system_cache_dir (string): Path to the system's L1 cache directory.
+# RETURNS:
+#   Nothing. Dies on unrecoverable error.
+# ==============================================================================
+sub _migrate_history_to_canonical {
+    my ($system_cache_dir) = @_;
+
+    my $serial        = basename($system_cache_dir);
+    my $canonical_dir = _get_history_dir($system_cache_dir);
+    my $legacy_dir    = File::Spec->catfile($system_cache_dir, '.nfit.history');
+
+    # Rule 1: Canonical dir already has partition files — nothing to do.
+    if (-d $canonical_dir) {
+        opendir(my $dh, $canonical_dir) or die "FATAL: Cannot open canonical history dir '$canonical_dir': $!";
+        my @existing = grep { /^nfit\.hist\.\d{4}-\d{2}\.json$/ } readdir($dh);
+        closedir($dh);
+        if (@existing) {
+            print STDERR "  ↳  History: $canonical_dir\n" if ($verbose // 0) >= 2;
+            return;
+        }
+    }
+
+    # Rule 2: No legacy dir present (or only a tombstone) — ensure canonical exists.
+    unless (-d $legacy_dir) {
+        make_path($canonical_dir) unless -d $canonical_dir;
+        print STDERR "  ↳  History: $canonical_dir\n" if ($verbose // 0) >= 2;
+        return;
+    }
+
+    # Rule 3: Legacy dir exists — collect partition files for migration.
+    opendir(my $leg_dh, $legacy_dir) or die "FATAL: Cannot open legacy history dir '$legacy_dir': $!";
+    my @parts = sort grep { /^nfit\.hist\.\d{4}-\d{2}\.json$/ } readdir($leg_dh);
+    closedir($leg_dh);
+
+    unless (@parts) {
+        # Legacy dir exists but holds no partitions — create canonical and tombstone legacy.
+        make_path($canonical_dir) unless -d $canonical_dir;
+        my $tombstone = "${legacy_dir}.migrated";
+        rename($legacy_dir, $tombstone) unless -e $tombstone;
+        print STDERR "  ↳  History: $canonical_dir\n" if ($verbose // 0) >= 2;
+        return;
+    }
+
+    # Announce migration before touching anything.
+    print STDERR "  • Migrating history to canonical location\n";
+    print STDERR "  ↳  From: $legacy_dir\n";
+    print STDERR "  ↳  To:   $canonical_dir\n";
+
+    # Preflight: ensure canonical dir exists, then check for collisions.
+    make_path($canonical_dir) unless -d $canonical_dir;
+    my @collisions = grep { -e File::Spec->catfile($canonical_dir, $_) } @parts;
+    if (@collisions) {
+        die "[ERROR] History migration aborted for '$serial' — target file(s) already exist:\n" .
+            "        " . join(', ', @collisions) . "\n" .
+            "        Resolve manually: remove colliding files from '$canonical_dir',\n" .
+            "        or remove '$legacy_dir' if migration was already completed.\n";
+    }
+
+    # Move all partition files (rename is atomic on the same filesystem).
+    for my $file (@parts) {
+        my $src = File::Spec->catfile($legacy_dir, $file);
+        my $dst = File::Spec->catfile($canonical_dir, $file);
+        rename($src, $dst)
+            or die "[ERROR] Could not move '$src' → '$dst': $!\n" .
+                   "        History migration aborted for '$serial'. Inspect both locations.\n";
+    }
+
+    # Clean up legacy dir. Remove known transient artefact types, then attempt rmdir.
+    # If unknown files remain, tombstone the dir to prevent repeated migration attempts.
+    unlink grep { -f } glob("$legacy_dir/*.bak"), glob("$legacy_dir/*.tmp"), glob("$legacy_dir/*.orig");
+    unlink File::Spec->catfile($legacy_dir, $HISTORY_LOCK_FILENAME)
+        if -f File::Spec->catfile($legacy_dir, $HISTORY_LOCK_FILENAME);
+
+    my $moved_count = scalar(@parts);
+    if (rmdir($legacy_dir)) {
+        print STDERR "  ✓ History migrated ($moved_count partition(s) moved)\n";
+    } else {
+        my $tombstone = "${legacy_dir}.migrated";
+        if (rename($legacy_dir, $tombstone)) {
+            print STDERR "  ✓ History migrated ($moved_count partition(s) moved)\n";
+            print STDERR "  [WARN] Legacy directory could not be removed (non-partition files remain); tombstoned\n";
+        } else {
+            print STDERR "  ✓ History migrated ($moved_count partition(s) moved)\n";
+            print STDERR "  [WARN] Legacy directory '$legacy_dir' could not be removed or tombstoned\n";
+        }
+    }
+}
+
+# ==============================================================================
 # SUBROUTINE: _create_checkpoint_backup (Directory Aware & Compressed)
 # PURPOSE:    Creates an atomic, compressed snapshot of the history.
 #             Handles both Legacy (File) and Modern (Directory) structures.
@@ -13541,8 +13615,8 @@ sub _create_checkpoint_backup {
 
     my $timestamp = localtime->strftime('%Y%m%d_%H%M%S');
 
-    # Identify the source (Directory takes precedence over File)
-    my $history_dir_source  = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    # Identify the source - canonical history dir takes precedence over legacy monolith
+    my $history_dir_source  = _get_history_dir($system_cache_dir);
     my $history_file_source = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
 
     my $source_path;
@@ -15507,7 +15581,12 @@ sub build_assimilation_map {
 sub _acquire_history_lock {
     my ($system_cache_dir) = @_;
 
-    my $lock_file = File::Spec->catfile($system_cache_dir, $HISTORY_LOCK_FILENAME);
+    # The lock resides in the canonical history directory alongside the partition files.
+    # Ensure the directory exists before attempting to create the lock file.
+    my $history_dir = _get_history_dir($system_cache_dir);
+    make_path($history_dir) unless -d $history_dir;
+
+    my $lock_file = File::Spec->catfile($history_dir, $HISTORY_LOCK_FILENAME);
 
     open my $lock_fh, '>', $lock_file
         or die "FATAL: Could not create lock file '$lock_file': $!";
@@ -15532,7 +15611,7 @@ sub _migrate_history_to_partitioned {
     my ($system_cache_dir) = @_;
 
     my $legacy_file = File::Spec->catfile($system_cache_dir, '.nfit.history.json');
-    my $partition_dir = File::Spec->catfile($system_cache_dir, '.nfit.history');
+    my $partition_dir = _get_history_dir($system_cache_dir);
 
     return unless -f $legacy_file; # Nothing to migrate
 
