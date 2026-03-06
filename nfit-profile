@@ -79,7 +79,7 @@ my $DEFAULT_DECAY_HALF_LIFE_DAYS_FOR_NFIT = 30;
 my $PATTERN_RATIO_THRESHOLD = 2.0;     # For O vs B pattern determination
 my $HIGH_PEAK_RATIO_THRESHOLD = 5.0;   # For "Very Peaky" shape
 my $LOW_PEAK_RATIO_THRESHOLD  = 2.0;   # For "Moderately Peaky" shape
-my $LIMIT_THRESHOLD_PERC = 0.98;       # P99W1 vs MaxCPU for pressure detection
+my $LIMIT_THRESHOLD_PERC = 0.96;       # P99W1 vs MaxCPU for pressure detection
 
 # RunQ Modifier Thresholds (for calculate_runq_modified_physc)
 my $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD = 2.0; # NormRunQ P90 above this may indicate workload pressure (NOT adaptive)
@@ -781,6 +781,20 @@ if (!$peak_helper_ref && $legacy_peak_helper_ref) {
     $legacy_peak_helper_ref->{name} = $MANDATORY_PEAK_PROFILE_FOR_HINT;
     $peak_helper_ref = $legacy_peak_helper_ref;
     print STDERR "  [WARN] Profile '$LEGACY_MANDATORY_PEAK_PROFILE_FOR_HINT' is deprecated; treating it as '$MANDATORY_PEAK_PROFILE_FOR_HINT'.\n";
+}
+
+# Derive the AbsRunQ key aligned to the mandatory peak profile's percentile.
+# Under --runq-perc-behavior match, nfit computes AbsRunQ at the profile's own
+# -p percentile. Constructing the key here ensures generate_sizing_hint reads
+# the tail-aligned value rather than a hardcoded P90.
+my $MANDATORY_PEAK_ABSRUNQ_KEY;
+{
+    my $peak_flags = $peak_helper_ref->{flags} // '';
+    if ($peak_flags =~ /-p\s+([0-9.]+)/) {
+        $MANDATORY_PEAK_ABSRUNQ_KEY = 'AbsRunQ_P' . clean_perc_label($1);
+    } else {
+        $MANDATORY_PEAK_ABSRUNQ_KEY = 'AbsRunQ_P90';  # Safe fallback
+    }
 }
 
 # IMPORTANT: after aliasing/renaming, re-evaluate whether an actionable P-99W1 exists.
@@ -6730,10 +6744,19 @@ sub generate_sizing_hint
     my @pressure_points;
 
     # Fetch P-99W1's specific RunQ metrics
-    my $p99w1_abs_runq_p90_val_str = looks_like_number($runq_metrics_ref->{'AbsRunQ_P90'}) ? sprintf("%.3f", $runq_metrics_ref->{'AbsRunQ_P90'}) : $na_str_hint;
+    # Use the percentile key aligned to the mandatory peak profile's -p configuration.
+    # Falls back through P99 to P90 for installations not using --runq-perc-behavior match.
+    my $_peak_abs_runq_val = $runq_metrics_ref->{$MANDATORY_PEAK_ABSRUNQ_KEY}
+                          // $runq_metrics_ref->{'AbsRunQ_P99'}
+                          // $runq_metrics_ref->{'AbsRunQ_P90'};
+    my $p99w1_abs_runq_p90_val_str = looks_like_number($_peak_abs_runq_val) ? sprintf("%.3f", $_peak_abs_runq_val) : $na_str_hint;
+    my $p99w1_abs_runq_key_label   = defined $runq_metrics_ref->{$MANDATORY_PEAK_ABSRUNQ_KEY} ? $MANDATORY_PEAK_ABSRUNQ_KEY
+                                   : defined $runq_metrics_ref->{'AbsRunQ_P99'}               ? 'AbsRunQ_P99'
+                                   :                                                             'AbsRunQ_P90';
+
     my $p99w1_norm_runq_p90_val_str = looks_like_number($runq_metrics_ref->{'NormRunQ_P90'}) ? sprintf("%.3f", $runq_metrics_ref->{'NormRunQ_P90'}) : $na_str_hint;
 
-    push @global_pressure_rationale_lines, sprintf("  Input %s AbsRunQ P90     : %s threads (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
+    push @global_pressure_rationale_lines, sprintf("  Input %s %-16s: %s threads (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_key_label, $p99w1_abs_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
     push @global_pressure_rationale_lines, sprintf("  Input %s NormRunQ P90    : %s (from nfit output for %s)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_norm_runq_p90_val_str, $MANDATORY_PEAK_PROFILE_FOR_HINT);
     push @global_pressure_rationale_lines, "";
 
@@ -6759,28 +6782,48 @@ sub generate_sizing_hint
     push @global_pressure_rationale_lines, "";
 
 
-    # 2. Absolute RunQ Pressure (using P-99W1's AbsRunQ_P90)
-    # ... (logic as before, sets $p99w1_has_absolute_runq_pressure, logs to @global_pressure_rationale_lines) ...
-    # ... (ensure push @pressure_points, ... happens if $p99w1_has_absolute_runq_pressure = 1;) ...
+    # 2. Absolute RunQ Pressure (using the tail-aligned AbsRunQ key for the mandatory peak profile)
     my $p99w1_abs_runq_p90_num = ($p99w1_abs_runq_p90_val_str ne $na_str_hint && $p99w1_abs_runq_p90_val_str =~ /^-?[0-9.]+$/) ? ($p99w1_abs_runq_p90_val_str + 0) : undef;
     my $calculated_abs_runq_pressure_ratio = 0;
     my $lpar_max_lcpu_capacity = ($max_cpu_for_vm_numeric > 0 && $smt_used_for_vm_numeric > 0) ? ($max_cpu_for_vm_numeric * $smt_used_for_vm_numeric) : 0;
-    push @global_pressure_rationale_lines, sprintf("  2. Absolute RunQ Pressure Check (%s AbsRunQ P90 vs LPAR Capacity):", $MANDATORY_PEAK_PROFILE_FOR_HINT);
+
+    # Dual-quantile corroboration gate: when the primary key is a high-percentile value
+    # (e.g. P99.75), require that P90 also exceeds the threshold, confirming pressure
+    # is distributed across the tail rather than concentrated in a single extreme spike.
+    # When the primary key IS P90, $p99w1_abs_runq_corr_val is undef and the gate
+    # degrades gracefully to single-quantile (legacy behaviour preserved).
+    my $p99w1_abs_runq_corr_val = ($MANDATORY_PEAK_ABSRUNQ_KEY ne 'AbsRunQ_P90')
+                                ? $runq_metrics_ref->{'AbsRunQ_P90'} : undef;
+    my $p99w1_abs_runq_corr_num = (defined $p99w1_abs_runq_corr_val && looks_like_number($p99w1_abs_runq_corr_val))
+                                ? ($p99w1_abs_runq_corr_val + 0) : undef;
+    my $calculated_abs_runq_corr_ratio = (defined $p99w1_abs_runq_corr_num && $lpar_max_lcpu_capacity > 0)
+                                ? ($p99w1_abs_runq_corr_num / $lpar_max_lcpu_capacity) : undef;
+
+    push @global_pressure_rationale_lines, sprintf("  2. Absolute RunQ Pressure Check (%s %s vs LPAR Capacity):", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_key_label);
+
     # ... (detailed logging lines for AbsRunQ check)
     if (defined $p99w1_abs_runq_p90_num && $lpar_max_lcpu_capacity > 0)
     {
         $calculated_abs_runq_pressure_ratio = $p99w1_abs_runq_p90_num / $lpar_max_lcpu_capacity;
     }
     my $absrunq_cond_met_str = "FALSE";
-    if ($calculated_abs_runq_pressure_ratio > $adaptive_saturation_thresh)
+
+    # Pressure confirmed only when primary ratio exceeds threshold AND, where a
+    # high-percentile key is in use, P90 corroborates — preventing a single extreme
+    # spike from triggering pressure without broader tail evidence.
+    my $upper_tail_corroborates = !defined($calculated_abs_runq_corr_ratio)
+                               || ($calculated_abs_runq_corr_ratio > $adaptive_saturation_thresh);
+    if ($calculated_abs_runq_pressure_ratio > $adaptive_saturation_thresh && $upper_tail_corroborates)
     {
         $p99w1_has_absolute_runq_pressure = 1; # Set the specific flag
         $absrunq_cond_met_str = "TRUE";
-        push @pressure_points, sprintf("RunQAbs_%s(P90=%.2f)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $calculated_abs_runq_pressure_ratio);
+        push @pressure_points, sprintf("RunQAbs_%s(%s=%.2f)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_key_label, $calculated_abs_runq_pressure_ratio);
     }
-    push @global_pressure_rationale_lines, sprintf("     - %s AbsRunQ P90      : %s threads", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str);
+    push @global_pressure_rationale_lines, sprintf("     - %s %-16s: %s threads", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_key_label, $p99w1_abs_runq_p90_val_str);
+    push @global_pressure_rationale_lines, sprintf("     - %s AbsRunQ P90 (corr): %s threads", $MANDATORY_PEAK_PROFILE_FOR_HINT, defined $p99w1_abs_runq_corr_val ? sprintf("%.3f", $p99w1_abs_runq_corr_val) : "N/A (single-quantile mode)");
     push @global_pressure_rationale_lines, sprintf("     - LPAR Max LCPU Capacity  : (%.2f MaxCPU * %d SMT) = %.2f threads", $max_cpu_for_vm_numeric, $smt_used_for_vm_numeric, $lpar_max_lcpu_capacity);
     push @global_pressure_rationale_lines, sprintf("     - Calculated Ratio        : %.4f", $calculated_abs_runq_pressure_ratio);
+    push @global_pressure_rationale_lines, sprintf("     - P90 Corroboration       : %s", $upper_tail_corroborates ? "YES" : "NO (transient — pressure suppressed)");
     push @global_pressure_rationale_lines, sprintf("     - Threshold               : > %.2f", $adaptive_saturation_thresh);
     push @global_pressure_rationale_lines, sprintf("     - Condition Met           : (%.4f > %.2f) -> %s", $calculated_abs_runq_pressure_ratio, $adaptive_saturation_thresh, $absrunq_cond_met_str);
     push @global_pressure_rationale_lines, sprintf("     - %s Specific Absolute RunQ Pressure Flag: %s", $MANDATORY_PEAK_PROFILE_FOR_HINT, $absrunq_cond_met_str);
@@ -6806,9 +6849,9 @@ sub generate_sizing_hint
     push @global_pressure_rationale_lines, sprintf("     - %s NormRunQ P90     : %s", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_norm_runq_p90_val_str);
     push @global_pressure_rationale_lines, sprintf("     - Threshold               : > %.2f", $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD);
     push @global_pressure_rationale_lines, sprintf("     - Condition Met (Norm)    : (%s > %.2f) -> %s", $p99w1_norm_runq_p90_val_str, $WORKLOAD_PRESSURE_NORM_P90_TRIGGER_THRESHOLD, $normrunq_cond1_met_str);
-    push @global_pressure_rationale_lines, sprintf("     - %s AbsRunQ P90      : %s (for magnitude check)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_p90_val_str);
+    push @global_pressure_rationale_lines, sprintf("     - %s %-16s: %s (for magnitude check)", $MANDATORY_PEAK_PROFILE_FOR_HINT, $p99w1_abs_runq_key_label, $p99w1_abs_runq_p90_val_str);
     push @global_pressure_rationale_lines, sprintf("     - Min AbsRunQ Threshold   : %.2f (typically SMT)", $min_abs_runq_for_norm_check);
-    push @global_pressure_rationale_lines, sprintf("     - Condition Met (Mag)     : (%s >= %.2f) -> %s", $p99w1_abs_runq_p90_val_str, $min_abs_runq_for_norm_check, $normrunq_cond2_met_str);
+    push @global_pressure_rationale_lines, sprintf("     - Condition Met (Mag)     : (%s >= %.2f) -> %s", $p99w1_abs_runq_key_label, $min_abs_runq_for_norm_check, $normrunq_cond2_met_str);
     push @global_pressure_rationale_lines, sprintf("     - %s Specific Normalised Workload Pressure Flag: %s", $MANDATORY_PEAK_PROFILE_FOR_HINT, $normrunq_overall_cond_met_str);
     push @global_pressure_rationale_lines, "";
 
