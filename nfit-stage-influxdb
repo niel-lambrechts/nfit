@@ -357,6 +357,163 @@ def _calculate_max_capacity(metadata_dict):
     # Fallback for uncapped LPARs where pool size is not available.
     return float(virtual_cpus)
 
+def read_cache_manifest(manifest_path):
+    """
+    Parses a .nfit.cache.manifest file into a plain dict of key/value strings.
+    Returns an empty dict if the file does not exist or cannot be read.
+    """
+    result = {}
+    if not os.path.exists(manifest_path):
+        return result
+    try:
+        with open(manifest_path, 'r') as fh:
+            for line in fh:
+                if ':' in line:
+                    key, _, value = line.partition(':')
+                    result[key.strip()] = value.strip()
+    except OSError:
+        pass
+    return result
+
+
+def scan_cache_manifests(cache_dir):
+    """
+    Scans cache_dir for serial subdirectories that contain a manifest with a
+    successful build status and a data_end field.
+    Returns a dict of {serial: manifest_dict}.
+    """
+    results = {}
+    if not os.path.isdir(cache_dir):
+        return results
+    for entry in os.scandir(cache_dir):
+        if not entry.is_dir():
+            continue
+        manifest_path = os.path.join(entry.path, '.nfit.cache.manifest')
+        m = read_cache_manifest(manifest_path)
+        if m.get('cache_build_status') == 'success' and m.get('data_end'):
+            results[entry.name] = m
+    return results
+
+
+def _merge_config_states(existing_states, new_states):
+    """
+    Merges two per-VM configuration-state dicts into a single coherent timeline.
+
+    For each VM present in both dicts the last state of the existing timeline is
+    compared with the first state of the incoming timeline (excluding the derived
+    max_capacity field, which is recalculated).  When the metadata is identical
+    the two states are coalesced by extending the existing state's end_epoch to
+    match the incoming state's end_epoch; any remaining incoming states are then
+    appended.  When the metadata differs the incoming states are appended verbatim.
+
+    VMs that appear in only one dict are included unchanged.
+    """
+    merged = {}
+    for vm in set(existing_states.keys()) | set(new_states.keys()):
+        existing = existing_states.get(vm, [])
+        incoming = new_states.get(vm, [])
+
+        if not existing:
+            merged[vm] = incoming
+            continue
+        if not incoming:
+            merged[vm] = existing
+            continue
+
+        # Strip the derived max_capacity field before comparing.
+        def _comparable(meta):
+            return {k: v for k, v in meta.items() if k != 'max_capacity'}
+
+        last_meta  = _comparable(existing[-1]['metadata'])
+        first_meta = _comparable(incoming[0]['metadata'])
+
+        if json.dumps(last_meta, sort_keys=True) == json.dumps(first_meta, sort_keys=True):
+            # Configuration unchanged at the boundary: coalesce and append remainder.
+            coalesced = dict(existing[-1])
+            coalesced['end_epoch'] = incoming[0]['end_epoch']
+            merged[vm] = existing[:-1] + [coalesced] + incoming[1:]
+        else:
+            # Configuration changed at the boundary: append all incoming states.
+            merged[vm] = existing + incoming
+
+    return merged
+
+def find_last_valid_physc_timestamp(filepath, chunk_size=65536):
+    """
+    Scans a sorted CSV file (Timestamp,VMName,PhysC,RunQ) in reverse using
+    fixed-size byte chunks to locate the timestamp of the last row that contains
+    a valid (non-empty, parseable float) PhysC value.
+
+    This is used both to trim incomplete tail-end data produced by InfluxDB
+    ingestion lag before writing the L1 cache, and to determine the effective
+    data_end of an existing cache for --append mode.
+
+    Returns the timestamp string ('YYYY-MM-DD HH:MM:SS'), or None if no valid
+    PhysC row is found in the file.
+    """
+    try:
+        with open(filepath, 'rb') as fh:
+            fh.seek(0, 2)
+            file_size = fh.tell()
+            if file_size == 0:
+                return None
+
+            pos       = file_size
+            remainder = b''
+
+            while pos > 0:
+                read_size = min(chunk_size, pos)
+                pos      -= read_size
+                fh.seek(pos)
+                chunk = fh.read(read_size) + remainder
+                lines = chunk.split(b'\n')
+                # The first element may be a partial line; carry it to the next chunk.
+                remainder = lines[0]
+
+                for raw in reversed(lines[1:]):
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    parts = raw.split(b',')
+                    if len(parts) < 3:
+                        continue
+                    physc_field = parts[2].strip()
+                    if not physc_field:
+                        continue
+                    try:
+                        float(physc_field)
+                    except ValueError:
+                        continue
+                    # Validate that the timestamp field is structurally sound before
+                    # returning it — guards against corrupt rows such as the InfluxDB
+                    # write-race example ('2025-07-06 18:30:vm9,,3.678').
+                    ts_field = parts[0].strip()
+                    if len(ts_field) != 19:
+                        continue
+                    try:
+                        return ts_field.decode('utf-8')
+                    except UnicodeDecodeError:
+                        continue
+
+            # Check any remainder carried out of the loop.
+            if remainder:
+                remainder = remainder.strip()
+                parts = remainder.split(b',')
+                if len(parts) >= 3:
+                    physc_field = parts[2].strip()
+                    if physc_field:
+                        try:
+                            float(physc_field)
+                            ts_field = parts[0].strip()
+                            if len(ts_field) == 19:
+                                return ts_field.decode('utf-8')
+                        except (ValueError, UnicodeDecodeError):
+                            pass
+    except OSError:
+        pass
+
+    return None
+
 def main():
     """Main function for the nfit-stage-influxdb script."""
     # --- Argument Parsing ---
@@ -374,6 +531,13 @@ def main():
     parser.add_argument("--config", help="Optional path to a CSV configuration file for fallback data.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output.")
     parser.add_argument('--version', action='version', version=f'%(prog)s {VERSION}')
+    parser.add_argument("--append", action="store_true",
+        help="Detect the existing cache end date and append only the data missing from that point forward.\n"
+             "Cannot be combined with --cleanup or --startd.")
+    parser.add_argument("--max-cache-days", type=int, default=180, dest="max_cache_days",
+        help="Emit a warning when the total cache span after appending exceeds this many days (0 = unlimited, default: 180).")
+    parser.add_argument("--show-cache-info", action="store_true", dest="show_cache_info",
+        help="Print the cached data window for each discovered serial and exit without querying InfluxDB.")
     args = parser.parse_args()
 
     # --- Initial Setup & Timing ---
@@ -384,28 +548,114 @@ def main():
     print("----------------------------------------------------------------------")
     print(f"Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
 
-    if args.days and (args.startd or args.endd): parser.error("--days cannot be used with --startd or --endd.")
-    if not args.days and not (args.startd and args.endd): parser.error("Must specify a time window using --days or both --startd and --endd.")
+    script_root = os.path.dirname(os.path.abspath(__file__))
+    cache_dir   = args.datadir if args.datadir else os.path.join(script_root, 'stage')
+    tmp_dir     = os.path.join(script_root, 'tmp')
+
+    # --- Early exit: --show-cache-info does not require an InfluxDB connection ---
+    if args.show_cache_info:
+        known = scan_cache_manifests(cache_dir)
+        if not known:
+            print(f"No cached serials found in: {cache_dir}")
+        else:
+            print(f"{'Serial':<20} {'Data Start':<14} {'Data End':<14} {'Span (days)':<12} Staged By")
+            print("-" * 80)
+            for serial in sorted(known.keys()):
+                m = known[serial]
+                data_start = m.get('data_start', 'unknown')
+                data_end   = m.get('data_end',   'unknown')
+                staged_by  = m.get('staged_by',  'unknown')
+                try:
+                    span = str((datetime.strptime(data_end, '%Y-%m-%d') -
+                                datetime.strptime(data_start, '%Y-%m-%d')).days)
+                except ValueError:
+                    span = 'N/A'
+                print(f"{serial:<20} {data_start:<14} {data_end:<14} {span:<12} {staged_by}")
+        sys.exit(0)
+
+    # --- Time-window argument validation ---
+    if args.append and args.cleanup:
+        parser.error("--append and --cleanup are mutually exclusive.")
+    if args.append and args.startd:
+        parser.error("--append determines the start date automatically; --startd cannot be used.")
+    if args.append and args.days:
+        parser.error("--append cannot be combined with --days.")
+    if args.days and (args.startd or args.endd):
+        parser.error("--days cannot be used with --startd or --endd.")
+    if not args.append and not args.days and not (args.startd and args.endd):
+        parser.error("Must specify a time window using --days, both --startd and --endd, or --append.")
+
+    # --- Resolve effective time window ---
+    # serial_append_cutoffs: per-serial row-level cutoff date used in Phase 4 to
+    #   prevent duplicate rows when serials have differing existing cache end dates.
+    # serial_original_starts: preserves the original data_start from each serial's
+    #   manifest so the manifest is updated correctly after an append.
+    serial_append_cutoffs  = {}  # serial -> 'YYYY-MM-DD'
+    serial_original_starts = {}  # serial -> 'YYYY-MM-DD'
 
     if args.days:
-        if args.days <= 0: parser.error("--days must be a positive number.")
-        end_date = datetime.now(timezone.utc)
-        start_date = end_date - timedelta(days=args.days)
-        startd_for_query, endd_for_query = start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-    else:
-        startd_for_query, endd_for_query = args.startd, args.endd
+        if args.days <= 0:
+            parser.error("--days must be a positive number.")
+        end_dt   = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(days=args.days)
+        startd_for_query = start_dt.strftime('%Y-%m-%d')
+        endd_for_query   = end_dt.strftime('%Y-%m-%d')
 
-    script_root = os.path.dirname(os.path.abspath(__file__))
+    elif args.append:
+        endd_for_query = args.endd if args.endd else datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        known = scan_cache_manifests(cache_dir)
+        if not known:
+            print(
+                "WARNING: --append specified but no existing cache manifests were found. "
+                "A full stage will be attempted; please also supply --startd or --days.",
+                file=sys.stderr
+            )
+            # Fall through; startd_for_query must be provided via another mechanism.
+            # This guard prevents a silent failure and gives the operator a clear message.
+            parser.error("No existing cache found for --append. Re-run with --days or --startd/--endd.")
+        else:
+            earliest_end = min(m['data_end'] for m in known.values())
+            append_start = datetime.strptime(earliest_end, '%Y-%m-%d') + timedelta(days=1)
+            startd_for_query = append_start.strftime('%Y-%m-%d')
+
+            for serial, m in known.items():
+                if m.get('data_end'):
+                    serial_data_end = m['data_end']
+                else:
+                    # Manifest predates data_end enrichment; derive from the L1 cache file.
+                    cache_data_path = os.path.join(cache_dir, serial, '.nfit.cache.data')
+                    ts = find_last_valid_physc_timestamp(cache_data_path)
+                    if ts is None:
+                        print(f"WARNING: Cannot determine data_end for {serial} "
+                              f"(manifest lacks data_end and cache file is unreadable). "
+                              f"Skipping this serial for append.", file=sys.stderr)
+                        continue
+                    serial_data_end = ts[:10]
+                    print(f"  INFO: Derived data_end for {serial} from L1 cache file: {serial_data_end}")
+
+                serial_append_cutoffs[serial]  = serial_data_end
+                serial_original_starts[serial] = m.get('data_start', serial_data_end)
+
+            if startd_for_query > endd_for_query:
+                print(f"Cache is already up to date (earliest data_end: {earliest_end}). Nothing to append.")
+                sys.exit(0)
+
+            print(f"Append mode: querying InfluxDB from {startd_for_query} to {endd_for_query}.")
+
+    else:
+        startd_for_query = args.startd
+        endd_for_query   = args.endd
+
     config_path = os.path.join(script_root, 'etc', 'influxdb.conf')
     client, db_version, _ = get_db_client(config_path)
 
-    cache_dir = args.datadir if args.datadir else os.path.join(script_root, 'stage')
-    tmp_dir = os.path.join(script_root, 'tmp')
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
 
-    if args.mgsys: print(f"Target: Managed System(s) '{args.mgsys}'")
-    else: print(f"Target: VMs from --vms or --vmfile argument")
+    if args.mgsys:
+        print(f"Target: Managed System(s) '{args.mgsys}'")
+    else:
+        print(f"Target: VMs from --vms or --vmfile argument")
     print(f"Time Window: {startd_for_query} to {endd_for_query}")
 
     lock_path = os.path.join(cache_dir, '.nfit.cache.lock')
@@ -446,6 +696,24 @@ def main():
             if not discovered_vms:
                 print("\nNo VMs with performance data found in the specified time window. Nothing to do.")
                 sys.exit(0)
+
+            # Determine the effective cache end by scanning backward through the sorted
+            # master file for the last row with a valid PhysC value.  InfluxDB ingestion
+            # lag routinely produces a 3–10 minute tail where PhysC is absent; those rows
+            # carry no sizing information and must not become the recorded data_end.
+            print("- Trimming incomplete tail (InfluxDB ingestion lag)...", end="", flush=True)
+            trim_start = time.time()
+            effective_end_str = find_last_valid_physc_timestamp(master_temp_filename)
+            if effective_end_str is None:
+                print("\nERROR: No rows with a valid PhysC value found in staged data. Cannot continue.", file=sys.stderr)
+                sys.exit(1)
+            raw_end_str = max_ts.strftime('%Y-%m-%d %H:%M:%S')
+            if effective_end_str < raw_end_str:
+                print(f" trimmed tail to {effective_end_str} (raw end was {raw_end_str}). "
+                      f"[DONE: {format_duration(time.time() - trim_start)}]")
+            else:
+                print(f" no trim required (data complete to {effective_end_str}). "
+                      f"[DONE: {format_duration(time.time() - trim_start)}]")
 
             # --- Phase 2: Configuration State Gathering (Robust) ---
             print("\n## Phase 2: Configuration State Discovery")
@@ -586,27 +854,99 @@ def main():
                 cache_data_path = os.path.join(serial_cache_dir, '.nfit.cache.data')
                 vms_for_this_serial = set(data['states'].keys())
 
-                with open(master_temp_filename, 'r', encoding='utf-8') as master_fh, \
-                     open(cache_data_path, 'w', encoding='utf-8') as final_cache_file:
-                    final_cache_file.write(master_fh.readline()) # Write header
-                    for line in master_fh:
-                        try:
-                            if line.split(',', 2)[1] in vms_for_this_serial:
-                                final_cache_file.write(line)
-                        except IndexError:
-                            continue # Ignore malformed lines
-                print(f"    - Performance data cache created. [DONE: {format_duration(time.time() - perf_cache_start)}]")
+                # In append mode, only write rows strictly newer than this serial's
+                # existing cache end date to prevent duplication.
+                serial_cutoff     = serial_append_cutoffs.get(serial) if args.append else None
+                cache_open_mode   = 'a' if (args.append and os.path.exists(cache_data_path)) else 'w'
 
-                # --- Create Configuration State Cache (.nfit.cache.states) ---
-                state_cache_start = time.time()
-                cache_states_path = os.path.join(serial_cache_dir, '.nfit.cache.states')
+                rows_written = 0
+                rows_trimmed = 0
+                with open(master_temp_filename, 'r', encoding='utf-8') as master_fh:
+                    header = master_fh.readline()
+                    with open(cache_data_path, cache_open_mode, encoding='utf-8') as final_cache_file:
+                        if cache_open_mode == 'w':
+                            final_cache_file.write(header)
+                        for line in master_fh:
+                            try:
+                                parts = line.split(',', 3)
+                                row_ts = parts[0]
+
+                                # Tail trim: the master file is sorted, so the first row that
+                                # exceeds effective_end_str means all subsequent rows will too.
+                                if row_ts > effective_end_str:
+                                    rows_trimmed += 1
+                                    break
+
+                                if parts[1] not in vms_for_this_serial:
+                                    continue
+
+                                # Append mode: skip rows already present in the existing cache.
+                                if serial_cutoff and row_ts[:10] <= serial_cutoff:
+                                    continue
+
+                                final_cache_file.write(line)
+                                rows_written += 1
+                            except IndexError:
+                                continue  # Ignore structurally malformed lines.
+
+                action = 'appended to' if cache_open_mode == 'a' else 'created'
+                print(f"    - Performance data cache {action} ({rows_written:,} rows written, "
+                      f"{rows_trimmed:,} tail rows discarded). "
+                      f"[DONE: {format_duration(time.time() - perf_cache_start)}]")
+
+                # --- Create / Update Configuration State Cache (.nfit.cache.states) ---
+                state_cache_start  = time.time()
+                cache_states_path  = os.path.join(serial_cache_dir, '.nfit.cache.states')
+                if args.append and os.path.exists(cache_states_path):
+                    try:
+                        with open(cache_states_path, 'r') as f:
+                            existing_states = json.load(f)
+                        states_to_write = _merge_config_states(existing_states, data['states'])
+                        state_action = 'merged'
+                    except (json.JSONDecodeError, OSError) as e:
+                        print(f"    WARNING: Could not read existing states for merge ({e}). "
+                              f"Overwriting with new data.", file=sys.stderr)
+                        states_to_write = data['states']
+                        state_action    = 'created (fallback overwrite)'
+                else:
+                    states_to_write = data['states']
+                    state_action    = 'created'
+
                 with open(cache_states_path, 'w') as f:
-                    json.dump(data['states'], f, indent=2, allow_nan=False)
-                print(f"    - Configuration state cache (JSON) created. [DONE: {format_duration(time.time() - state_cache_start)}]")
+                    json.dump(states_to_write, f, indent=2, allow_nan=False)
+                print(f"    - Configuration state cache (JSON) {state_action}. "
+                      f"[DONE: {format_duration(time.time() - state_cache_start)}]")
 
                 # --- Write Manifest and ID Files ---
+                # data_end is derived from the trimmed effective_end_str (last row with
+                # valid PhysC), not from the raw InfluxDB max timestamp.  It is stored
+                # here as a cheap cached copy; the L1 cache file itself remains the
+                # source of truth and the reverse-scan fallback for --append mode.
+                manifest_data_start = serial_original_starts.get(serial, min_ts.strftime('%Y-%m-%d')) \
+                    if args.append else min_ts.strftime('%Y-%m-%d')
+                manifest_data_end   = effective_end_str[:10]  # Date portion only.
+
+                if args.max_cache_days > 0:
+                    try:
+                        span_days = (datetime.strptime(manifest_data_end,   '%Y-%m-%d') -
+                                     datetime.strptime(manifest_data_start, '%Y-%m-%d')).days
+                        if span_days > args.max_cache_days:
+                            print(
+                                f"    WARNING: Cache span for {serial} is now {span_days} days, exceeding "
+                                f"--max-cache-days={args.max_cache_days}. Consider re-staging with --cleanup.",
+                                file=sys.stderr
+                            )
+                    except ValueError:
+                        pass
+
                 with open(os.path.join(serial_cache_dir, '.nfit.cache.manifest'), 'w') as f:
-                    f.write(f"cache_build_status: success\nbuild_timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+                    f.write(
+                        f"cache_build_status: success\n"
+                        f"build_timestamp: {datetime.now(timezone.utc).isoformat()}\n"
+                        f"data_start: {manifest_data_start}\n"
+                        f"data_end: {manifest_data_end}\n"
+                        f"staged_by: nfit-stage-influxdb.py v{VERSION}\n"
+                    )
 
                 with open(os.path.join(serial_cache_dir, '.nfit_stage_id'), 'w') as f:
                     f.write(f"Created by nfit-stage-influxdb.py v{VERSION} for system {serial}\n")
