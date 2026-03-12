@@ -514,6 +514,79 @@ def find_last_valid_physc_timestamp(filepath, chunk_size=65536):
 
     return None
 
+def truncate_to_last_valid_physc(filepath, tail_read_size=2 * 1024 * 1024):
+    """
+    Truncates filepath immediately after the last row that contains a valid
+    PhysC value, removing any incomplete tail rows left by InfluxDB ingestion lag.
+
+    Reads at most tail_read_size bytes from the end of the file (default 2 MB),
+    which comfortably covers the observed 3–10 minute ingestion-lag window across
+    a large fleet at 1-minute sample intervals.
+
+    Returns the timestamp string of the last retained row, or None if no valid
+    PhysC row is found within the read window (the file is not modified in that
+    case).
+    """
+    try:
+        with open(filepath, 'r+b') as fh:
+            fh.seek(0, 2)
+            file_size = fh.tell()
+            if file_size == 0:
+                return None
+
+            read_offset = max(0, file_size - tail_read_size)
+            fh.seek(read_offset)
+            tail_bytes = fh.read()
+
+            # When reading from mid-file, lines[0] is a partial line at the chunk
+            # boundary; skip it during the search to avoid a corrupted match.
+            lines     = tail_bytes.split(b'\n')
+            start_idx = 1 if read_offset > 0 else 0
+
+            truncate_after_index = None
+            last_valid_ts        = None
+
+            for i in range(len(lines) - 1, start_idx - 1, -1):
+                raw = lines[i].strip()
+                if not raw:
+                    continue
+                parts = raw.split(b',')
+                if len(parts) < 3:
+                    continue
+                physc_field = parts[2].strip()
+                if not physc_field:
+                    continue
+                try:
+                    float(physc_field)
+                except ValueError:
+                    continue
+                ts_field = parts[0].strip()
+                if len(ts_field) != 19:
+                    continue
+                try:
+                    last_valid_ts = ts_field.decode('utf-8')
+                except UnicodeDecodeError:
+                    continue
+                truncate_after_index = i
+                break
+
+            if truncate_after_index is None:
+                return None
+
+            # Compute the byte offset of the end of the found line within tail_bytes.
+            # split(b'\n') consumes each separator, so each lines[j] is followed by
+            # exactly one '\n' byte; add 1 per line up to and including the target.
+            byte_offset_in_tail = sum(len(lines[j]) + 1 for j in range(truncate_after_index + 1))
+            truncate_point = read_offset + byte_offset_in_tail
+
+            if truncate_point <= file_size:
+                fh.truncate(truncate_point)
+
+        return last_valid_ts
+
+    except OSError:
+        return None
+
 def main():
     """Main function for the nfit-stage-influxdb script."""
     # --- Argument Parsing ---
@@ -558,7 +631,7 @@ def main():
         if not known:
             print(f"No cached serials found in: {cache_dir}")
         else:
-            print(f"{'Serial':<20} {'Data Start':<14} {'Data End':<14} {'Span (days)':<12} Staged By")
+            print(f"{'Serial':<20} {'Data Start':<14} {'Data End':<22} {'Span (days)':<12} Staged By")
             print("-" * 80)
             for serial in sorted(known.keys()):
                 m = known[serial]
@@ -566,11 +639,11 @@ def main():
                 data_end   = m.get('data_end',   'unknown')
                 staged_by  = m.get('staged_by',  'unknown')
                 try:
-                    span = str((datetime.strptime(data_end, '%Y-%m-%d') -
-                                datetime.strptime(data_start, '%Y-%m-%d')).days)
+                    span = str((datetime.strptime(data_end[:10], '%Y-%m-%d') -
+                                datetime.strptime(data_start[:10], '%Y-%m-%d')).days)
                 except ValueError:
                     span = 'N/A'
-                print(f"{serial:<20} {data_start:<14} {data_end:<14} {span:<12} {staged_by}")
+                print(f"{serial:<20} {data_start:<14} {data_end:<22} {span:<12} {staged_by}")
         sys.exit(0)
 
     # --- Time-window argument validation ---
@@ -615,26 +688,33 @@ def main():
             parser.error("No existing cache found for --append. Re-run with --days or --startd/--endd.")
         else:
             earliest_end = min(m['data_end'] for m in known.values())
-            append_start = datetime.strptime(earliest_end, '%Y-%m-%d') + timedelta(days=1)
-            startd_for_query = append_start.strftime('%Y-%m-%d')
+            # Use the date of the earliest data_end, not +1 day, so that the
+            # transition day is re-queried in full.  Per-row cutoffs at full
+            # timestamp precision prevent duplication of already-stored rows.
+            startd_for_query = earliest_end[:10]
 
             for serial, m in known.items():
-                if m.get('data_end'):
-                    serial_data_end = m['data_end']
+                manifest_end = m.get('data_end', '')
+                if len(manifest_end) == 19:
+                    # Full timestamp from an enriched manifest — use directly.
+                    serial_data_end = manifest_end
                 else:
-                    # Manifest predates data_end enrichment; derive from the L1 cache file.
+                    # Date-only value (from the first-generation manifest) or absent:
+                    # derive the full timestamp via reverse scan so that the cutoff
+                    # comparison operates at second precision.
                     cache_data_path = os.path.join(cache_dir, serial, '.nfit.cache.data')
                     ts = find_last_valid_physc_timestamp(cache_data_path)
                     if ts is None:
                         print(f"WARNING: Cannot determine data_end for {serial} "
-                              f"(manifest lacks data_end and cache file is unreadable). "
+                              f"(manifest data_end lacks second precision and reverse scan failed). "
                               f"Skipping this serial for append.", file=sys.stderr)
                         continue
-                    serial_data_end = ts[:10]
-                    print(f"  INFO: Derived data_end for {serial} from L1 cache file: {serial_data_end}")
+                    serial_data_end = ts
+                    print(f"  INFO: Derived full-precision data_end for {serial} "
+                          f"from L1 cache: {serial_data_end}")
 
                 serial_append_cutoffs[serial]  = serial_data_end
-                serial_original_starts[serial] = m.get('data_start', serial_data_end)
+                serial_original_starts[serial] = m.get('data_start', serial_data_end[:10])
 
             if startd_for_query > endd_for_query:
                 print(f"Cache is already up to date (earliest data_end: {earliest_end}). Nothing to append.")
@@ -854,10 +934,22 @@ def main():
                 cache_data_path = os.path.join(serial_cache_dir, '.nfit.cache.data')
                 vms_for_this_serial = set(data['states'].keys())
 
-                # In append mode, only write rows strictly newer than this serial's
-                # existing cache end date to prevent duplication.
-                serial_cutoff     = serial_append_cutoffs.get(serial) if args.append else None
-                cache_open_mode   = 'a' if (args.append and os.path.exists(cache_data_path)) else 'w'
+                # In append mode, first truncate the existing L1 cache in-place to
+                # remove any incomplete tail rows from InfluxDB ingestion lag, then
+                # open for append.  The trimmed end timestamp becomes the row-level
+                # cutoff so that only new, non-overlapping rows are written.
+                serial_cutoff   = None
+                cache_open_mode = 'a' if (args.append and os.path.exists(cache_data_path)) else 'w'
+                if args.append and os.path.exists(cache_data_path):
+                    trunc_ts = truncate_to_last_valid_physc(cache_data_path)
+                    if trunc_ts is None:
+                        print(f"    WARNING: Could not determine truncation point for {serial}. "
+                              f"Falling back to manifest cutoff; existing tail rows may remain.",
+                              file=sys.stderr)
+                        serial_cutoff = serial_append_cutoffs.get(serial)
+                    else:
+                        print(f"    - Existing cache trimmed in-place to {trunc_ts}.")
+                        serial_cutoff = trunc_ts
 
                 rows_written = 0
                 rows_trimmed = 0
@@ -880,8 +972,9 @@ def main():
                                 if parts[1] not in vms_for_this_serial:
                                     continue
 
-                                # Append mode: skip rows already present in the existing cache.
-                                if serial_cutoff and row_ts[:10] <= serial_cutoff:
+                                # Append mode: skip rows at or before the trimmed cutoff
+                                # timestamp; full-second precision closes any stitching gap.
+                                if serial_cutoff and row_ts <= serial_cutoff:
                                     continue
 
                                 final_cache_file.write(line)
@@ -924,7 +1017,7 @@ def main():
                 # source of truth and the reverse-scan fallback for --append mode.
                 manifest_data_start = serial_original_starts.get(serial, min_ts.strftime('%Y-%m-%d')) \
                     if args.append else min_ts.strftime('%Y-%m-%d')
-                manifest_data_end   = effective_end_str[:10]  # Date portion only.
+                manifest_data_end   = effective_end_str  # Full timestamp; L1 cache is source of truth.
 
                 if args.max_cache_days > 0:
                     try:
