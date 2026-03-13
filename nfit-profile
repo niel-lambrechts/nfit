@@ -1784,632 +1784,266 @@ foreach my $system_serial (@target_systems_to_process)
     # This block now uses a conditional to call the correct logging subroutine
     # based on the analysis model that was run. It also now captures all hint
     # components for later use in the CSV report, improving efficiency
-    if ($is_multiplicative_forecast_run) {
-        # We pass the current assimilation map (initial_results) to the forecast engine.
-        my ($forecast_results, $historic_data) = calculate_multiplicative_forecast(
-            $current_cache_path,
-            $system_identifier,
-            $effective_event_name, # defined in the scope above (line 333)
-            $effective_config,     # defined in the scope above (line 334)
-            $seasonality_config,
-            $assimilation_map_ref,  # Pass current results if needed
-            $exclusions,
-            $effective_start_date_obj,
-            $effective_end_date_obj
-        );
 
-        # Guard against empty results from failed baseline calculation
-        unless ($forecast_results && scalar keys %$forecast_results > 0) {
-            warn "  [WARN] Multiplicative forecast returned no results for event '$effective_event_name'. Skipping.\n";
-            # Skip the rest of the multiplicative processing
-        }
-        else {
+    _phase("Applying modifiers and generating rationale");
+    # --- FINAL POST-PROCESSING, HINT GENERATION, and RATIONALE LOGGING ---
 
-            # Merge the forecast results into the main results table
-            # (calculate_multiplicative_forecast already populates global %seasonal_debug_info)
-            $historic_data_for_csv_href = $historic_data;
+    # --- Progress Bar Initialization ---
+    my $total_vms = scalar @vm_order;
+    my $total_prof = scalar @profiles;
+    my $total_units_for_progress = $total_vms * $total_prof;
+    my $done_units_for_progress = 0;
+    my $vm_count_for_progress = 0;
+    my $show_profile_progress_flag = ($verbose || -t STDERR);
 
-            # Calculate Horizon Metadata
-            my ($next_start, $next_end) = determine_event_period($effective_config, $effective_end_date_obj, 'forecast');
-            my $horizon_meta = undef;
-            if ($next_end) {
-                my $gen_time = Time::Piece->new();
-                my $days_diff = int(($next_end->epoch - $gen_time->epoch) / 86400);
-                $days_diff = 0 if $days_diff < 0;
-                $horizon_meta = { target_date => $next_end->ymd, days => $days_diff };
-            }
+    foreach my $vm_name (@vm_order) {
+        $vm_count_for_progress++;
 
-            # Store the multiplicative_seasonal forecast results to unified history
-            _store_model_forecast_to_history(
-                    $current_cache_path,
-                    $effective_event_name,
-                    'multiplicative_seasonal',
-                    $forecast_results,
-                    $effective_config,
-                    $horizon_meta,
-                    $analysis_context
-                    );
+        # Get this VM's complete map entry.
+        my $vm_map_ref = $assimilation_map_ref->{$vm_name};
+        next unless (ref($vm_map_ref) eq 'HASH');
+        $vm_map_ref->{Configuration}{vm_name} = $vm_name; # Self-reference for convenience
 
-            # Overwrite the main results table with the forecast results
-            %results_table = %$forecast_results;
+        # --- Phase 1: Generate Hints and Pressure Flags ---
+        my ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str, $pressure_rationale_text, $p99w1_has_abs_pressure, $p99w1_has_norm_pressure) =
+            generate_sizing_hint(
+                $vm_map_ref,
+                $log_fh_for_system,
+                $adaptive_runq_saturation_thresh
+            );
 
-            # Populate the global vm_order array so the reporter knows which VMs to process
-            @vm_order = sort keys %results_table;
+        # Store hint results in the map for use by other functions and the CSV writer.
+        $vm_map_ref->{Hinting}{AutoTier} = $hint_type_tier;
+        $vm_map_ref->{Hinting}{Pattern} = $hint_pattern_shape;
+        $vm_map_ref->{Hinting}{Pressure} = $pressure_bool;
+        $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
+        $vm_map_ref->{Hinting}{P99W1_AbsRunQPressure} = $p99w1_has_abs_pressure;
+        $vm_map_ref->{Hinting}{P99W1_NormRunQPressure} = $p99w1_has_norm_pressure;
+        $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
+        $tier_override_for_csv{$vm_name} = $vm_tier_overrides{$vm_name} // "";
 
-            # Update assimilation map with forecast values for CSV reporter
-            foreach my $vm_name (@vm_order) {
-                $assimilation_map_ref->{$vm_name} //= {};
-                $assimilation_map_ref->{$vm_name}{CoreResults} //= {};
-                $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
-            }
+        # --- [NEW] Standardise Growth for Recency Decay ---
+        # If this is a recency_decay run, we must ensure ALL profiles use the
+        # growth adjustment from the stable "Source" profile (e.g. G3),
+        # rather than their own potentially volatile/zero adjustment.
+        my $seasonal_cfg = (defined $apply_seasonality_event && exists $seasonality_config->{$apply_seasonality_event})
+            ? $seasonality_config->{$apply_seasonality_event}
+            : {};
+        if (($seasonal_cfg->{model} // '') eq 'recency_decay') {
 
-            # Path for the multiplicative seasonal model, which needs a unique log format.
-            # We must populate the assimilation map with hints so the CSV writer can read them.
-            foreach my $vm_name (@vm_order) {
-                # Get the authoritative map entry for this VM
-                my $vm_map_ref = $assimilation_map_ref->{$vm_name};
+            # 1. Determine Source Profile (Pattern/Tier Logic)
+            #    Priority: UserOverride -> AutoHint -> Default 'G'
+            my $user_tier = $vm_map_ref->{Hinting}{FinalTierForVM} // "";
+            my $auto_tier = $vm_map_ref->{Hinting}{AutoTier} // "G";
+            my $pattern_source = ($user_tier ne "") ? $user_tier : $auto_tier;
 
-                # 1. Self-Reference & Metrics
-                $vm_map_ref->{Configuration}{vm_name} = $vm_name;
-                $vm_map_ref->{RunQMetrics} //= $per_profile_runq_metrics{$vm_name} || {};
-
-                # 2. Generate Hints
-                # Call generate_sizing_hint using the assimilation map (not a temp hash).
-                my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
-                    generate_sizing_hint(
-                        $vm_map_ref,
-                        undef,  # No log file handle needed here
-                        $adaptive_runq_saturation_thresh
-                    );
-
-                # 3. Store Hints
-                $vm_map_ref->{Hinting}{AutoTier}       = $hint_type_tier;
-                $vm_map_ref->{Hinting}{Pattern}        = $hint_pattern_shape;
-                $vm_map_ref->{Hinting}{Pressure}       = $hint_pressure_bool;
-                $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
-
-                # 4. Populate legacy globals (for safety)
-                $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
-                $hint_pattern_for_csv{$vm_name}   = $hint_pattern_shape;
-                $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
-                $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
-
-                # Populate Tier Override for CSV and Logic
-                $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
-                $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
-
-                # 5. Calculate RunQ Modifiers (Tactical/Strategic/Potential)
-                # Determine source profile (Logic borrowed from main loop)
-                my $user_tier = $vm_tier_overrides{$vm_name} // "";
-                my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
-                my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
-                $pattern_char //= 'G';
-                my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-                my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
-
-                # 6. Iterate all profiles to apply modifiers
-                foreach my $profile (@profiles) {
-                    my $p_name = $profile->{name};
-
-                    # Guard P-99W1 (Pure Signal)
-                    # Ensure we do not apply RunQ modifiers to the statistical ceiling.
-                    next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
-
-                    my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-                    my %adaptive_thresholds = %$adaptive_thresholds_href;
-
-                    # Calculate modified value (Forecast + RunQ)
-                    my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
-                        $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
-                    );
-
-                    # Update the CoreResults with the FINAL adjusted value
-                    # This ensures the CSV shows the Forecast INCLUDING the RunQ modifier
-                    if (looks_like_number($adjusted_physc)) {
-                        $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
-                    }
-
-                    # Persist per-profile debug info for downstream consumers (CSV VM_Comments, rationale, etc.)
-                    if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
-                        $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$p_name} = $debug_info_ref;
-                    }
-
-                    # Step 3: Per-profile rVCPU
-                    # - RunQ_hi_threads: AbsRunQ value actually used for this profile’s logic (already selected)
-                    # - rENT_P: final entitlement recommendation for this profile (growth-adjusted, plus any narrow RunQ additive)
-                    # - rVCPU envelope: clamp to vendor-safe band relative to rENT_P
-                    my $rvcpu_final;
-                    my $rvcpu_raw;
-                    my $rvcpu_min;
-                    my $rvcpu_max;
-
-                    my $runq_hi_threads = undef;
-                    if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
-                        my $v = $debug_info_ref->{'AbsRunQValueUsedForCalc'};
-                        $runq_hi_threads = (defined $v && looks_like_number($v)) ? ($v + 0) : undef;
-                    }
-
-                    my $rENT_P = (defined $adjusted_physc && looks_like_number($adjusted_physc)) ? ($adjusted_physc + 0) : undef;
-                    my $smt_for_vcpu = (defined $vm_map_ref->{Configuration}{smt} && looks_like_number($vm_map_ref->{Configuration}{smt}))
-                                     ? ($vm_map_ref->{Configuration}{smt} + 0)
-                                     : undef;
-
-                    # Tier-aware headroom for rVCPU
-                    my $ml_tier_str = $p_name;
-                    $ml_tier_str =~ s/-.*//;
-                    my $rvcpu_tier_num = 3;
-                    if ($ml_tier_str =~ /(\d)$/) {
-                        $rvcpu_tier_num = $1;
-                    } elsif ($ml_tier_str eq 'P') {
-                        $rvcpu_tier_num = 1;
-                    }
-
-                    my $rvcpu_tier_factor = $VCPU_TIER_HEADROOM_FACTORS{$rvcpu_tier_num} // 1.00;
-
-                    # Interval-adaptive divisor for Gate 1 (dispatch sizing).
-                    # This is a divisor (target utilisation), not a multiplier.
-                    my $runq_width_divisor = $RUNQ_TARGET_HEADROOM_FACTOR;
-                    $runq_width_divisor = 0.80 if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
-
-                    if (defined $adaptive_thresholds_href && ref($adaptive_thresholds_href) eq 'HASH'
-                        && defined $adaptive_thresholds_href->{runq_width_divisor}
-                        && looks_like_number($adaptive_thresholds_href->{runq_width_divisor})
-                        && $adaptive_thresholds_href->{runq_width_divisor} > 0) {
-                        $runq_width_divisor = $adaptive_thresholds_href->{runq_width_divisor} + 0;
-                    }
-
-                    # Hard safety clamps (never allow divide-by-zero or absurd divisors).
-                    my $MIN_RUNQ_WIDTH_DIVISOR = 0.50;
-                    my $MAX_RUNQ_WIDTH_DIVISOR = 1.00;
-                    $runq_width_divisor = 0.80 if (!defined $runq_width_divisor || !looks_like_number($runq_width_divisor) || $runq_width_divisor <= 0);
-                    $runq_width_divisor = $MIN_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor < $MIN_RUNQ_WIDTH_DIVISOR);
-                    $runq_width_divisor = $MAX_RUNQ_WIDTH_DIVISOR if ($runq_width_divisor > $MAX_RUNQ_WIDTH_DIVISOR);
-
-                    if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0 && defined $rENT_P && $rENT_P > 0) {
-                        # Workload-driven width requirement (threads -> cores -> vCPUs), tier-adjusted
-                        my $required_threads = ($runq_hi_threads / $runq_width_divisor) * $rvcpu_tier_factor;
-                        my $required_cores   = $required_threads / $smt_for_vcpu;
-                        $rvcpu_raw = int($required_cores);
-                        $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil for positive values
-
-                        # Envelope from rENT_P (growth-aware)
-                        my $min_v = $rENT_P * $VCPU_RATIO_MIN;
-                        my $max_v = $rENT_P * $VCPU_RATIO_MAX;
-                        $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
-                        $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
-
-                        # Clamp
-                        $rvcpu_final = $rvcpu_raw;
-                        $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
-                        $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
-                    }
-
-                    $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : '';
-
-                    # If this is the source profile, save the modifiers for the CSV columns
-                    if ($p_name eq $runq_source_profile_name) {
-                        $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
-                        $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
-                        $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
-                        $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
-                    }
-                }
-
-            }
-            log_multiplicative_seasonal_rationale($open_log_files{$system_identifier}, $seasonality_config->{$apply_seasonality_event}, $analysis_context, $assimilation_map_ref);
-        }
-    } elsif ($is_predictive_peak_model_run) {
-        # Path for the new predictive peak model
-        # The predictive_peak model uses linear regression on historical seasonal peaks.
-        my $forecast_results = calculate_predictive_peak_forecast(
-            $current_cache_path,
-            $system_identifier,
-            $effective_event_name,
-            $effective_config,
-            $seasonality_config,
-            $adaptive_runq_saturation_thresh,
-            $exclusions,
-            $effective_start_date_obj,
-            $effective_end_date_obj
-        );
-
-        # Determine Forecast Horizon for Metadata (anchored to effective end date)
-        my $asof_end = $effective_end_date_obj // $end_date;
-        my ($next_start, $next_end) = determine_event_period($effective_config, $asof_end, 'forecast');
-        my $horizon_meta = undef;
-        if ($next_end) {
-            my $ref_time = (defined $asof_end && ref($asof_end) eq 'Time::Piece') ? $asof_end : Time::Piece->new();
-
-            my $days_diff = int(($next_end->epoch - $ref_time->epoch) / 86400);
-            $days_diff = 0 if $days_diff < 0;
-
-            $horizon_meta = {
-                target_date => $next_end->ymd,
-                days        => $days_diff
-            };
-        }
-
-        # Store the predictive_peak forecast results to unified history
-        _store_model_forecast_to_history(
-            $current_cache_path,
-            $effective_event_name,
-            'predictive_peak',
-            $forecast_results,
-            $effective_config,
-            $horizon_meta,
-            $analysis_context
-        );
-
-        # Overwrite the main results table with the forecast
-        %results_table = %$forecast_results;
-
-        # Populate the global vm_order array so the reporter knows which VMs to process.
-        @vm_order = sort keys %results_table;
-
-        # Generate and store the necessary hint/pressure data for each VM for the CSV.
-        # fix: Hydrate the Assimilation Map Correctly ---
-        foreach my $vm_name (@vm_order) {
-
-            # 1. Update CoreResults in the map with the forecasted values
-            {
-                my ($cfg_ok, $cfg_warn) = _validate_vm_configuration(
-                    $vm_name, $assimilation_map_ref->{$vm_name}{Configuration} // {}, 'standard'
-                );
-                if (!$cfg_ok) { print STDERR "  $cfg_warn\n"; next; }
-            }
-
-            $assimilation_map_ref->{$vm_name} //= {};
-            $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
-
-            # 2. Ensure self-reference exists
-            $assimilation_map_ref->{$vm_name}{Configuration}{vm_name} = $vm_name;
-            $assimilation_map_ref->{$vm_name}{RunQMetrics} //= $per_profile_runq_metrics{$vm_name} || {};
-
-            # 3. Generate Hints using the MAP (Single Source of Truth)
-            my ($hint_type_tier, $hint_pattern_shape, $hint_pressure_bool, $pressure_detail_str, $rationale, $has_abs, $has_norm) =
-                generate_sizing_hint(
-                    $assimilation_map_ref->{$vm_name},
-                    undef,  # No log file handle needed here
-                    $adaptive_runq_saturation_thresh
-                );
-
-            # 4. Store hints back into the map
-            # Ensure per-VM Configuration has a stable vm_name for downstream hinting/CSV logic.
-            $assimilation_map_ref->{$vm_name}{Configuration} //= {};
-            $assimilation_map_ref->{$vm_name}{Configuration}{vm_name} //= $vm_name;
-
-            $assimilation_map_ref->{$vm_name}{Hinting}{Pattern}        = $hint_pattern_shape;
-            $assimilation_map_ref->{$vm_name}{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
-            $assimilation_map_ref->{$vm_name}{Hinting}{AutoTier}       = $hint_type_tier;
-            $assimilation_map_ref->{$vm_name}{Hinting}{Pressure}       = $hint_pressure_bool;
-            $assimilation_map_ref->{$vm_name}{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
-
-            # 5. Populate legacy globals for safety
-            $hint_tier_for_csv{$vm_name}      = $hint_type_tier;
-            $hint_pattern_for_csv{$vm_name}   = $hint_pattern_shape;
-            $hint_pressure_for_csv{$vm_name}  = $hint_pressure_bool;
-            $pressure_details_for_csv{$vm_name} = $pressure_detail_str // 'N/A';
-            # Populate Tier Override for CSV and Logic
-            $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
-
-            # 6. Calculate RunQ Modifiers (Copy of Multiplicative Logic)
-            my $user_tier = $vm_tier_overrides{$vm_name} // "";
-            my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
             my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
-            $pattern_char //= 'G';
+            $pattern_char //= 'G'; # Default to General
+
+            # Map pattern to the standard Tier-3 planning profile
             my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-            my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+            my $growth_source_profile = $pat_map{$pattern_char} // 'G3-95W15';
 
-            my ($runq_source_profile_obj) = grep { $_->{name} eq $runq_source_profile_name } @profiles;
+            # 2. Get the Standard Adjustment (from the Source Profile's growth)
+            #    Growth adjustments were populated into {Growth}{adjustments} during assimilation.
+            my $standard_growth_adj = $vm_map_ref->{Growth}{adjustments}{$growth_source_profile} // 0;
 
-            if ($runq_source_profile_obj) {
-                my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-                my %adaptive_thresholds = %$adaptive_thresholds_href;
+            # 3. Store metadata for Logging
+            $vm_map_ref->{Growth}{StandardAdjustment} = {
+                Value  => $standard_growth_adj,
+                Source => $growth_source_profile
+            };
 
-                my (undef, $debug_info_ref) = calculate_runq_modified_physc(
-                    $vm_name, $assimilation_map_ref->{$vm_name}, $runq_source_profile_obj, \%pressure_flags, \%adaptive_thresholds
+            # 4. [CRITICAL] Pre-calculate CSVModifiers for recency_decay BEFORE the profile loop.
+            #    The recency_decay model requires RunQ_Potential to be available, but CSVModifiers
+            #    are normally populated in Phase 2 (after this block). We must calculate them here.
+            my ($growth_source_profile_obj) = grep { $_->{name} eq $growth_source_profile } @profiles;
+
+            if ($growth_source_profile_obj) {
+                my %pressure_flags_rd = (
+                    abs_pressure  => $vm_map_ref->{Hinting}{P99W1_AbsRunQPressure}  // 0,
+                    norm_pressure => $vm_map_ref->{Hinting}{P99W1_NormRunQPressure} // 0
+                );
+                my %adaptive_thresholds_rd = %$adaptive_thresholds_href;
+
+                my (undef, $debug_info_ref_rd) = calculate_runq_modified_physc(
+                    $vm_name, $vm_map_ref, $growth_source_profile_obj,
+                    \%pressure_flags_rd, \%adaptive_thresholds_rd
                 );
 
-                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
-                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
-                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
-                $assimilation_map_ref->{$vm_name}{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+                # Populate CSVModifiers early so the profile loop can use them
+                $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref_rd->{'FinalAdditive'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref_rd->{'RunQ_Strategic'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref_rd->{'RunQ_Potential'};
+                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $growth_source_profile;
             }
 
-            # 7. Iterate all profiles to apply modifiers (FIX: Was missing in manual path)
-            foreach my $profile (@profiles) {
-                my $p_name = $profile->{name};
+            # 5. Apply to ALL profiles (Update CoreResults)
+            #    This ensures the CSV and the Logger see the standardised value (Base + StandardGrowth + RunQ).
 
-                # --- GUARD: Skip RunQ Modifiers for P-99W1 ---
-                next if ($p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT);
+            foreach my $prof (@profiles) {
+                my $p_name = $prof->{name};
 
-                my %pressure_flags = ( abs_pressure => $has_abs, norm_pressure => $has_norm );
-                my %adaptive_thresholds = %$adaptive_thresholds_href;
-
-                my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
-                    $vm_name, $assimilation_map_ref->{$vm_name}, $profile, \%pressure_flags, \%adaptive_thresholds
-                );
-
-                if (looks_like_number($adjusted_physc)) {
-                    $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $adjusted_physc);
+                # EXEMPTION: Special Handling for the peak helper profile
+                if (defined $p_name && $p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                    print {$log_fh_for_system}
+                      "  - The $MANDATORY_PEAK_PROFILE_FOR_HINT profile is a special case used for peak analysis.\n"
+                      if ($log_fh_for_system);
+                    print {$log_fh_for_system}
+                      "  - NO growth or RunQ modifiers are applied to this value (measurement-only peak reference).\n"
+                      if ($log_fh_for_system);
+                    next;
                 }
 
-                # Persist per-profile debug info for downstream consumers (CSV VM_Comments, rationale, etc.)
-                if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
-                    $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileDebugInfo}{$p_name} = $debug_info_ref;
+                # Get the raw base value (pre-growth) directly from the Growth stash
+                my $base_val = $vm_map_ref->{Growth}{base_values}{$p_name};
+
+                if (defined $base_val && looks_like_number($base_val)) {
+                    # A. Start with Base + StandardGrowth
+                    my $final_val = $base_val + $standard_growth_adj;
+
+                    # B. Add RunQ Modifier (Latent Demand / Potential)
+                    #    CRITICAL: For recency_decay, we use RunQ_Potential (raw queue physics)
+                    #    rather than RunQ_Tactical (change-managed, gated increment).
+                    #    Rationale: recency_decay is a pure operational forecast answering
+                    #    "What is actual demand now?" - it should not be subject to
+                    #    change management gates that constrain monthly resizing plans.
+                    # Guard against anomaly sentinels propagated from the RunQ source profile.
+                    my $runq_mod = (defined $vm_map_ref->{CSVModifiers}{RunQ_Potential}
+                        && looks_like_number($vm_map_ref->{CSVModifiers}{RunQ_Potential}))
+                        ? $vm_map_ref->{CSVModifiers}{RunQ_Potential} + 0 : 0;
+
+                    $final_val += $runq_mod;
+
+                    # Update the authoritative CoreResults map
+                    $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $final_val);
                 }
             }
-
-            # 8. Update Peak Value logic
-            my $baseline_peak = $seasonal_debug_info{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT}{'TrueBaseline'} // 0;
-            my $predicted_peak = $seasonal_debug_info{$vm_name}{$MANDATORY_PEAK_PROFILE_FOR_HINT}{'PredictedPeak'} // 0;
-
-            # Store the effective peak back into the map
-            $assimilation_map_ref->{$vm_name}{CoreResults}{ProfileValues}{$PEAK_PROFILE_NAME} =
-                ($baseline_peak > $predicted_peak) ? $baseline_peak : $predicted_peak;
         }
-        log_predictive_peak_rationale($open_log_files{$system_identifier}, $seasonality_config->{$apply_seasonality_event}, $analysis_context);
-    } else {
-        _phase("Applying modifiers and generating rationale");
-        # --- FINAL POST-PROCESSING, HINT GENERATION, and RATIONALE LOGGING ---
 
-        # --- Progress Bar Initialization ---
-        my $total_vms = scalar @vm_order;
-        my $total_prof = scalar @profiles;
-        my $total_units_for_progress = $total_vms * $total_prof;
-        my $done_units_for_progress = 0;
-        my $vm_count_for_progress = 0;
-        my $show_profile_progress_flag = ($verbose || -t STDERR);
+        # Log the detailed pressure rationale text once per VM.
+        if ($log_fh_for_system) {
+            print {$log_fh_for_system} "\n######################################################################\n";
+            print {$log_fh_for_system} "# Rationale for VM: $vm_name\n";
+            print {$log_fh_for_system} "######################################################################\n\n";
+            print {$log_fh_for_system} $pressure_rationale_text . "\n" if ($pressure_rationale_text);
+        }
 
-        foreach my $vm_name (@vm_order) {
-            $vm_count_for_progress++;
+        # --- Phase 2: Calculate Modifiers (ONCE) and Final Profile Values ---
 
-            # Get this VM's complete map entry.
-            my $vm_map_ref = $assimilation_map_ref->{$vm_name};
-            next unless (ref($vm_map_ref) eq 'HASH');
-            $vm_map_ref->{Configuration}{vm_name} = $vm_name; # Self-reference for convenience
+        # First, determine the single source profile for RunQ modifiers for this VM
+        # GUARD: For recency_decay models, CSVModifiers were already calculated in the
+        # dedicated block above. Skip recalculation to avoid overwriting with values
+        # computed from the already-modified ProfileValues.
+        my $seasonal_cfg_p2 = (defined $apply_seasonality_event && exists $seasonality_config->{$apply_seasonality_event})
+            ? $seasonality_config->{$apply_seasonality_event}
+          : {};
+        my $skip_phase2_modifiers = (($seasonal_cfg_p2->{model} // '') eq 'recency_decay');
 
-            # --- Phase 1: Generate Hints and Pressure Flags ---
-            my ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str, $pressure_rationale_text, $p99w1_has_abs_pressure, $p99w1_has_norm_pressure) =
-                generate_sizing_hint(
-                    $vm_map_ref,
-                    $log_fh_for_system,
-                    $adaptive_runq_saturation_thresh
-                );
+        # Priority: User TIER > AutoTier > Fallback to 'G'.
+        my $user_tier_override_runq = $vm_map_ref->{Hinting}{FinalTierForVM} // "";
+        my $auto_tier_runq = $vm_map_ref->{Hinting}{AutoTier} // "G";
 
-            # Store hint results in the map for use by other functions and the CSV writer.
-            $vm_map_ref->{Hinting}{AutoTier} = $hint_type_tier;
-            $vm_map_ref->{Hinting}{Pattern} = $hint_pattern_shape;
-            $vm_map_ref->{Hinting}{Pressure} = $pressure_bool;
-            $vm_map_ref->{Hinting}{PressureDetail} = $pressure_detail_str // 'N/A';
-            $vm_map_ref->{Hinting}{P99W1_AbsRunQPressure} = $p99w1_has_abs_pressure;
-            $vm_map_ref->{Hinting}{P99W1_NormRunQPressure} = $p99w1_has_norm_pressure;
-            $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
-            $tier_override_for_csv{$vm_name} = $vm_tier_overrides{$vm_name} // "";
+        my $pattern_source_runq = ($user_tier_override_runq ne "") ? $user_tier_override_runq : $auto_tier_runq;
+        my ($hint_pattern) = ($pattern_source_runq =~ /^([A-Z])/);
+        $hint_pattern //= 'G'; # Default to 'G' if regex fails
 
-            # --- [NEW] Standardise Growth for Recency Decay ---
-            # If this is a recency_decay run, we must ensure ALL profiles use the
-            # growth adjustment from the stable "Source" profile (e.g. G3),
-            # rather than their own potentially volatile/zero adjustment.
-            my $seasonal_cfg = (defined $apply_seasonality_event && exists $seasonality_config->{$apply_seasonality_event})
-                ? $seasonality_config->{$apply_seasonality_event}
-                : {};
-            if (($seasonal_cfg->{model} // '') eq 'recency_decay') {
+        my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
+        my $runq_source_profile_name = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
 
-                # 1. Determine Source Profile (Pattern/Tier Logic)
-                #    Priority: UserOverride -> AutoHint -> Default 'G'
-                my $user_tier = $vm_map_ref->{Hinting}{FinalTierForVM} // "";
-                my $auto_tier = $vm_map_ref->{Hinting}{AutoTier} // "G";
-                my $pattern_source = ($user_tier ne "") ? $user_tier : $auto_tier;
+        # Find the profile object for the source profile
+        my ($runq_source_profile_obj) = grep { $_->{name} eq $runq_source_profile_name } @profiles;
 
-                my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
-                $pattern_char //= 'G'; # Default to General
+        # Only recalculate CSVModifiers if this is NOT a recency_decay run
+        # (recency_decay already populated these values correctly)
+        if ($runq_source_profile_obj && !$skip_phase2_modifiers) {
+            my %pressure_flags = ( abs_pressure => $p99w1_has_abs_pressure, norm_pressure => $p99w1_has_norm_pressure );
+            my %adaptive_thresholds = %$adaptive_thresholds_href;
 
-                # Map pattern to the standard Tier-3 planning profile
-                my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-                my $growth_source_profile = $pat_map{$pattern_char} // 'G3-95W15';
+            # Calculate modifiers ONLY for the source profile
+            my (undef, $debug_info_ref) = calculate_runq_modified_physc(
+                $vm_name, $vm_map_ref, $runq_source_profile_obj, \%pressure_flags, \%adaptive_thresholds
+            );
 
-                # 2. Get the Standard Adjustment (from the Source Profile's growth)
-                #    Growth adjustments were populated into {Growth}{adjustments} during assimilation.
-                my $standard_growth_adj = $vm_map_ref->{Growth}{adjustments}{$growth_source_profile} // 0;
+            # Store the authoritative modifiers for the CSV report
+            $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
+            $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
+            $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
+            $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+        }
 
-                # 3. Store metadata for Logging
-                $vm_map_ref->{Growth}{StandardAdjustment} = {
-                    Value  => $standard_growth_adj,
-                    Source => $growth_source_profile
-                };
+        # Now, iterate through all profiles to size them and log rationale
+        foreach my $profile (@profiles) {
+            my $profile_name = $profile->{name};
+            $done_units_for_progress++;
 
-                # 4. [CRITICAL] Pre-calculate CSVModifiers for recency_decay BEFORE the profile loop.
-                #    The recency_decay model requires RunQ_Potential to be available, but CSVModifiers
-                #    are normally populated in Phase 2 (after this block). We must calculate them here.
-                my ($growth_source_profile_obj) = grep { $_->{name} eq $growth_source_profile } @profiles;
-
-                if ($growth_source_profile_obj) {
-                    my %pressure_flags_rd = (
-                        abs_pressure  => $vm_map_ref->{Hinting}{P99W1_AbsRunQPressure}  // 0,
-                        norm_pressure => $vm_map_ref->{Hinting}{P99W1_NormRunQPressure} // 0
-                    );
-                    my %adaptive_thresholds_rd = %$adaptive_thresholds_href;
-
-                    my (undef, $debug_info_ref_rd) = calculate_runq_modified_physc(
-                        $vm_name, $vm_map_ref, $growth_source_profile_obj,
-                        \%pressure_flags_rd, \%adaptive_thresholds_rd
-                    );
-
-                    # Populate CSVModifiers early so the profile loop can use them
-                    $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref_rd->{'FinalAdditive'};
-                    $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref_rd->{'RunQ_Strategic'};
-                    $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref_rd->{'RunQ_Potential'};
-                    $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $growth_source_profile;
-                }
-
-                # 5. Apply to ALL profiles (Update CoreResults)
-                #    This ensures the CSV and the Logger see the standardised value (Base + StandardGrowth + RunQ).
-
-                foreach my $prof (@profiles) {
-                    my $p_name = $prof->{name};
-
-                    # EXEMPTION: Special Handling for the peak helper profile
-                    if (defined $p_name && $p_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
-                        print {$log_fh_for_system}
-                          "  - The $MANDATORY_PEAK_PROFILE_FOR_HINT profile is a special case used for peak analysis.\n"
-                          if ($log_fh_for_system);
-                        print {$log_fh_for_system}
-                          "  - NO growth or RunQ modifiers are applied to this value (measurement-only peak reference).\n"
-                          if ($log_fh_for_system);
-                        next;
-                    }
-
-                    # Get the raw base value (pre-growth) directly from the Growth stash
-                    my $base_val = $vm_map_ref->{Growth}{base_values}{$p_name};
-
-                    if (defined $base_val && looks_like_number($base_val)) {
-                        # A. Start with Base + StandardGrowth
-                        my $final_val = $base_val + $standard_growth_adj;
-
-                        # B. Add RunQ Modifier (Latent Demand / Potential)
-                        #    CRITICAL: For recency_decay, we use RunQ_Potential (raw queue physics)
-                        #    rather than RunQ_Tactical (change-managed, gated increment).
-                        #    Rationale: recency_decay is a pure operational forecast answering
-                        #    "What is actual demand now?" - it should not be subject to
-                        #    change management gates that constrain monthly resizing plans.
-                        # Guard against anomaly sentinels propagated from the RunQ source profile.
-                        my $runq_mod = (defined $vm_map_ref->{CSVModifiers}{RunQ_Potential}
-                            && looks_like_number($vm_map_ref->{CSVModifiers}{RunQ_Potential}))
-                            ? $vm_map_ref->{CSVModifiers}{RunQ_Potential} + 0 : 0;
-
-                        $final_val += $runq_mod;
-
-                        # Update the authoritative CoreResults map
-                        $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $final_val);
-                    }
-                }
+            # Progress bar
+            if ($show_profile_progress_flag) {
+                my $perc_done = ($total_units_for_progress > 0) ? (100.0 * $done_units_for_progress / $total_units_for_progress) : 0;
+                my $profile_name_for_progress = $profile->{name};
+                printf STDERR "\r    • Processing VM %d/%d (%s), Profile %d/%d (%s) [%.1f%%]...",
+                    $vm_count_for_progress,
+                    $total_vms,
+                    $vm_name,
+                    ($done_units_for_progress % $total_prof) || $total_prof,
+                    $total_prof,
+                    $profile_name_for_progress,
+                    $perc_done;
             }
 
-            # Log the detailed pressure rationale text once per VM.
-            if ($log_fh_for_system) {
-                print {$log_fh_for_system} "\n######################################################################\n";
-                print {$log_fh_for_system} "# Rationale for VM: $vm_name\n";
-                print {$log_fh_for_system} "######################################################################\n\n";
-                print {$log_fh_for_system} $pressure_rationale_text . "\n" if ($pressure_rationale_text);
-            }
+            my $base_physc_for_log = $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name};
+            next unless (defined $base_physc_for_log && looks_like_number($base_physc_for_log));
 
-            # --- Phase 2: Calculate Modifiers (ONCE) and Final Profile Values ---
-
-            # First, determine the single source profile for RunQ modifiers for this VM
-            # GUARD: For recency_decay models, CSVModifiers were already calculated in the
-            # dedicated block above. Skip recalculation to avoid overwriting with values
-            # computed from the already-modified ProfileValues.
-            my $seasonal_cfg_p2 = (defined $apply_seasonality_event && exists $seasonality_config->{$apply_seasonality_event})
-                ? $seasonality_config->{$apply_seasonality_event}
-              : {};
-            my $skip_phase2_modifiers = (($seasonal_cfg_p2->{model} // '') eq 'recency_decay');
-
-            # Priority: User TIER > AutoTier > Fallback to 'G'.
-            my $user_tier_override_runq = $vm_map_ref->{Hinting}{FinalTierForVM} // "";
-            my $auto_tier_runq = $vm_map_ref->{Hinting}{AutoTier} // "G";
-
-            my $pattern_source_runq = ($user_tier_override_runq ne "") ? $user_tier_override_runq : $auto_tier_runq;
-            my ($hint_pattern) = ($pattern_source_runq =~ /^([A-Z])/);
-            $hint_pattern //= 'G'; # Default to 'G' if regex fails
-
-            my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-            my $runq_source_profile_name = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
-
-            # Find the profile object for the source profile
-            my ($runq_source_profile_obj) = grep { $_->{name} eq $runq_source_profile_name } @profiles;
-
-            # Only recalculate CSVModifiers if this is NOT a recency_decay run
-            # (recency_decay already populated these values correctly)
-            if ($runq_source_profile_obj && !$skip_phase2_modifiers) {
+            if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
+                log_peak_profile_rationale($log_fh_for_system, $vm_map_ref, $profile, $base_physc_for_log);
+            } else {
+                # Recalculate for logging, but do NOT store these values for the CSV
                 my %pressure_flags = ( abs_pressure => $p99w1_has_abs_pressure, norm_pressure => $p99w1_has_norm_pressure );
                 my %adaptive_thresholds = %$adaptive_thresholds_href;
 
-                # Calculate modifiers ONLY for the source profile
-                my (undef, $debug_info_ref) = calculate_runq_modified_physc(
-                    $vm_name, $vm_map_ref, $runq_source_profile_obj, \%pressure_flags, \%adaptive_thresholds
+                my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+                    $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
                 );
 
-                # Store the authoritative modifiers for the CSV report
-                $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
-                $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
-                $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
-                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
-            }
-
-            # Now, iterate through all profiles to size them and log rationale
-            foreach my $profile (@profiles) {
-                my $profile_name = $profile->{name};
-                $done_units_for_progress++;
-
-                # Progress bar
-                if ($show_profile_progress_flag) {
-                    my $perc_done = ($total_units_for_progress > 0) ? (100.0 * $done_units_for_progress / $total_units_for_progress) : 0;
-                    my $profile_name_for_progress = $profile->{name};
-                    printf STDERR "\r    • Processing VM %d/%d (%s), Profile %d/%d (%s) [%.1f%%]...",
-                        $vm_count_for_progress,
-                        $total_vms,
-                        $vm_name,
-                        ($done_units_for_progress % $total_prof) || $total_prof,
-                        $total_prof,
-                        $profile_name_for_progress,
-                        $perc_done;
+                # Persist per-profile debug info for downstream consumers (CSV VM_Comments, etc.)
+                if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                    $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$profile_name} = $debug_info_ref;
                 }
 
-                my $base_physc_for_log = $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name};
-                next unless (defined $base_physc_for_log && looks_like_number($base_physc_for_log));
+                # CRITICAL: For recency_decay models, ProfileValues was ALREADY correctly calculated
+                # in the dedicated block above (base + growth + runq_potential). We must NOT
+                # overwrite it here, as calculate_runq_modified_physc would double-apply modifications.
+                my $seasonal_cfg = (defined $apply_seasonality_event && exists $seasonality_config->{$apply_seasonality_event})
+                    ? $seasonality_config->{$apply_seasonality_event}
+                    : {};
+                my $is_recency_decay_model = (($seasonal_cfg->{model} // '') eq 'recency_decay');
 
-                if ($profile_name eq $MANDATORY_PEAK_PROFILE_FOR_HINT) {
-                    log_peak_profile_rationale($log_fh_for_system, $vm_map_ref, $profile, $base_physc_for_log);
+                my $final_csv_value;
+                if ($is_recency_decay_model) {
+                    # Use the pre-calculated value (do NOT overwrite)
+                    $final_csv_value = $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name};
                 } else {
-                    # Recalculate for logging, but do NOT store these values for the CSV
-                    my %pressure_flags = ( abs_pressure => $p99w1_has_abs_pressure, norm_pressure => $p99w1_has_norm_pressure );
-                    my %adaptive_thresholds = %$adaptive_thresholds_href;
-
-                    my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
-                        $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
-                    );
-
-                    # Persist per-profile debug info for downstream consumers (CSV VM_Comments, etc.)
-                    if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
-                        $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$profile_name} = $debug_info_ref;
-                    }
-
-                    # CRITICAL: For recency_decay models, ProfileValues was ALREADY correctly calculated
-                    # in the dedicated block above (base + growth + runq_potential). We must NOT
-                    # overwrite it here, as calculate_runq_modified_physc would double-apply modifications.
-                    my $seasonal_cfg = (defined $apply_seasonality_event && exists $seasonality_config->{$apply_seasonality_event})
-                        ? $seasonality_config->{$apply_seasonality_event}
-                        : {};
-                    my $is_recency_decay_model = (($seasonal_cfg->{model} // '') eq 'recency_decay');
-
-                    my $final_csv_value;
-                    if ($is_recency_decay_model) {
-                        # Use the pre-calculated value (do NOT overwrite)
-                        $final_csv_value = $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name};
-                    } else {
-                        # Standard path: store the newly calculated value
-                        $final_csv_value = looks_like_number($adjusted_physc) ? sprintf("%.3f", $adjusted_physc) : "N/A";
-                        $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name} = $final_csv_value;
-                    }
-
-                    my $raw_states_aref_for_log = $vm_map_ref->{RawNfitStates} || [];
-
-                    log_profile_rationale(
-                        $log_fh_for_system, $vm_map_ref, $profile,
-                        $base_physc_for_log, $final_csv_value, $debug_info_ref,
-                        $raw_states_aref_for_log,
-                        $adaptive_runq_saturation_thresh
-                    );
+                    # Standard path: store the newly calculated value
+                    $final_csv_value = looks_like_number($adjusted_physc) ? sprintf("%.3f", $adjusted_physc) : "N/A";
+                    $vm_map_ref->{CoreResults}{ProfileValues}{$profile_name} = $final_csv_value;
                 }
+
+                my $raw_states_aref_for_log = $vm_map_ref->{RawNfitStates} || [];
+
+                log_profile_rationale(
+                    $log_fh_for_system, $vm_map_ref, $profile,
+                    $base_physc_for_log, $final_csv_value, $debug_info_ref,
+                    $raw_states_aref_for_log,
+                    $adaptive_runq_saturation_thresh
+                );
             }
-
-       }
-
-        # --- Progress Bar Finalization ---
-        if ($show_profile_progress_flag) {
-            printf STDERR "\r    • Processing complete. (100.0%%)%s\n", ' ' x 70;
         }
+
+   }
+
+    # --- Progress Bar Finalization ---
+    if ($show_profile_progress_flag) {
+        printf STDERR "\r    • Processing complete. (100.0%%)%s\n", ' ' x 70;
     }
 
     # -- Reporting and Reset Block --
