@@ -9829,7 +9829,7 @@ sub log_multiplicative_seasonal_rationale
 # Returns undef on cold-start to signal graceful skip.
 # ==============================================================================
 sub determine_seasonal_analysis_path {
-    my ($event_config, $system_cache_dir, $event_name) = @_;
+    my ($event_config, $system_cache_dir, $event_name, $anchor_bucket) = @_;
 
     # This function is only relevant for models that have historical prerequisites.
     my $model_to_run = $event_config->{model} // '';
@@ -9857,7 +9857,15 @@ sub determine_seasonal_analysis_path {
     my $unified_history = read_unified_history($system_cache_dir);
 
     my $history_count = 0;
-    foreach my $month_data (values %$unified_history) {
+    foreach my $month_key (keys %$unified_history) {
+        # Blind the history count to the anchor bucket: partitions written by
+        # later staging batches must not influence the analysis path decision
+        # for an earlier batch window.  Without this guard, re-processing an
+        # early batch reads the full accumulated history and incorrectly reports
+        # sufficient history for events that were cold-start at that point in time.
+        next if (defined $anchor_bucket && $month_key gt $anchor_bucket);
+
+        my $month_data = $unified_history->{$month_key};
         next unless exists $month_data->{SeasonalEventSnapshots}{$event_name};
 
         if ($count_occurrences) {
@@ -18218,7 +18226,75 @@ sub _parse_anchor_date_string {
 
 # ==============================================================================
 # SUBROUTINE: _execute_multiplicative_seasonal
-# PURPOSE:    Executes the Multiplicative Seasonal model for a specific event.
+# PURPOSE:    Executes the multiplicative seasonal forecast model for a single
+#             event occurrence (or one intra-bucket occurrence when called from
+#             _execute_multiplicative_seasonal_bucket_aggregated).
+#
+#             Determines whether sufficient prior history exists to compute a
+#             seasonal multiplier, runs the single-pass analysis engine over the
+#             event window, applies RunQ modifiers per profile, merges forecast
+#             values while preserving the immutable PeakValue measurement, and
+#             writes the result to the partitioned history store.
+#
+# ARGUMENTS:
+#   $event_name         (string)   - Seasonal event name as defined in
+#                                    nfit.seasonality.cfg.
+#   $event_config       (hashref)  - Resolved configuration block for the event,
+#                                    including model, period, duration_days,
+#                                    baseline_period_days, exclude_dates, etc.
+#   $current_cache_path (string)   - Absolute path to the system staging cache
+#                                    directory (the L1 cache root for this system).
+#   $profiles_aref      (arrayref) - Profile definition hashrefs (name, flags).
+#   $exec_ctx           (hashref)  - Execution context assembled by the
+#                                    orchestrator.  Required keys:
+#                                      anchor_bucket          (string YYYY-MM)
+#                                      anchor_source          (string)
+#                                      effective_start_date   (Time::Piece)
+#                                      effective_end_date     (Time::Piece)
+#                                      occurrence_start       (Time::Piece|undef)
+#                                      cache_start_date       (Time::Piece)
+#                                      cache_end_date         (Time::Piece)
+#                                      sampling_interval      (integer, seconds)
+#                                      adaptive_saturation_thresh (numeric)
+#                                      adaptive_target_norm_runq  (numeric)
+#                                      adaptive_max_efficiency_reduction (numeric)
+#                                      adaptive_thresholds_href   (hashref)
+#                                      bucket_occurrence_count     (integer)
+#                                      bucket_occurrence_end_dates (arrayref)
+#                                      _baseline_result       (hashref|undef)
+#                                      _fingerprints          (hashref|undef)
+#                                      _baseline_meta         (hashref|undef)
+#                                      system_identifier      (string)
+#   $seasonality_config (hashref)  - Full parsed seasonality configuration;
+#                                    used when a fallback event is selected.
+#   $opts_href          (hashref)  - Optional output control flags:
+#                                      store_history  (bool, default 1)
+#                                      emit_csv       (bool, default 1)
+#                                      emit_rationale (bool, default 1)
+#                                    Suppressed during intra-bucket aggregation
+#                                    passes; enabled on the final aggregated write.
+#
+# RETURNS:
+#   hashref  { vm_name => { profile_name => forecast_value, ... }, ... }
+#   Empty hashref ({}) if all VMs are eliminated by the VM scope filter.
+#   Returns nothing (undef) on cold start (insufficient prior history and no
+#   valid fallback event).
+#
+# NOTES:
+#   - PeakValue is an immutable historical fact observed during the event
+#     period only (not the baseline window).  It is captured before ProfileValues
+#     is overwritten by forecast results and restored unconditionally afterwards.
+#     Do not modify this behaviour.
+#   - The P-99W1 profile is exempt from RunQ modifier application and is
+#     similarly preserved as a measurement value throughout.
+#   - determine_seasonal_analysis_path is called with the anchor_bucket as a
+#     blinding cutoff so that history partitions written by later staging batches
+#     do not influence the analysis path decision for an earlier batch window.
+#     Removing this cutoff causes false "sufficient history" reports on bootstrap
+#     months when the full multi-batch history has already been accumulated.
+#   - $exec_ctx->{_baseline_result} carries a history-based pre-computed
+#     baseline; if absent the model falls back to the L1 pooled-distribution
+#     path inside calculate_multiplicative_forecast.
 # ==============================================================================
 sub _execute_multiplicative_seasonal {
     my ($event_name, $event_config, $current_cache_path, $profiles_aref, $exec_ctx, $seasonality_config, $opts_href) = @_;
@@ -18236,7 +18312,7 @@ sub _execute_multiplicative_seasonal {
 
     # 1. Determine analysis path (history check) & Load Config
     my $effective_event_name = determine_seasonal_analysis_path(
-        $event_config, $current_cache_path, $event_name
+        $event_config, $current_cache_path, $event_name, $exec_ctx->{anchor_bucket}
     );
 
     # Handle cold-start graceful skip
@@ -18819,7 +18895,71 @@ sub _execute_multiplicative_seasonal {
 
 # ==============================================================================
 # SUBROUTINE: _execute_recency_decay
-# PURPOSE:    Executes the Recency Decay model for a specific event.
+# PURPOSE:    Executes the recency decay forecast model for a single event.
+#
+#             Projects forward-looking demand by applying exponential time-decay
+#             weights to the historical workload, biasing the result towards
+#             the most recent observations.  Unlike the history-dependent models,
+#             recency_decay does not require prior event snapshots and can
+#             produce a forecast from the first batch.
+#
+#             Runs the single-pass analysis engine anchored to the current
+#             effective end date (Time Zero), applies RunQ modifiers, populates
+#             ClippingInfo from the most recent L1 cache state, and writes the
+#             result to the partitioned history store.
+#
+# ARGUMENTS:
+#   $event_name         (string)   - Seasonal event name as defined in
+#                                    nfit.seasonality.cfg.
+#   $event_config       (hashref)  - Resolved configuration block for the event.
+#   $current_cache_path (string)   - Absolute path to the system staging cache
+#                                    directory.
+#   $profiles_aref      (arrayref) - Profile definition hashrefs (name, flags).
+#   $args_href          (hashref)  - Execution context assembled by the
+#                                    orchestrator.  Required keys:
+#                                      anchor_date            (Time::Piece)
+#                                      anchor_bucket          (string YYYY-MM)
+#                                      anchor_source          (string)
+#                                      effective_start_date   (Time::Piece)
+#                                      effective_end_date     (Time::Piece)
+#                                      cache_start_date       (Time::Piece)
+#                                      cache_end_date         (Time::Piece)
+#                                      sampling_interval      (integer, seconds)
+#                                      decay_over_states      (bool)
+#                                      adaptive_saturation_thresh (numeric)
+#                                      adaptive_target_norm_runq  (numeric)
+#                                      adaptive_max_efficiency_reduction (numeric)
+#                                      adaptive_thresholds_href   (hashref)
+#                                      bucket_occurrence_count     (integer)
+#                                      bucket_occurrence_end_dates (arrayref)
+#                                      _fingerprints          (hashref|undef)
+#                                      _baseline_meta         (hashref|undef)
+#                                      system_identifier      (string)
+#   $seasonality_config (hashref)  - Full parsed seasonality configuration
+#                                    (currently unused but retained for
+#                                    interface consistency with other executors).
+#
+# RETURNS:
+#   hashref reference  \%recency_results_for_history
+#     { vm_name => { profile_name => value, ... }, ... }
+#   Returns nothing (undef) if decay_over_states is active or the event period
+#   cannot be determined.
+#   Returns empty hashref ({}) if all VMs are eliminated by the VM scope filter.
+#
+# NOTES:
+#   - anchor_date is mandatory.  The global $nfit_analysis_reference_date_str
+#     is set from it to establish Time Zero for decay weight calculations.
+#     The effective_end_date passed by the orchestrator is already clamped to
+#     this anchor; do not re-clamp it here.
+#   - recency_decay is incompatible with --decay-over-states.  The function
+#     returns early with a warning rather than producing incorrect output.
+#   - ClippingInfo is sourced from the last entry in RawNfitStates
+#     (the most recent L1 state) rather than from _assemble_seasonal_snapshot,
+#     which is the path used by multiplicative_seasonal and predictive_peak.
+#     Both paths must remain consistent in their ClippingInfo schema.
+#   - This model does not call determine_seasonal_analysis_path and therefore
+#     is not subject to the history blinding cutoff.  It produces a valid
+#     forecast from the first batch without any prior historical snapshot.
 # ==============================================================================
 sub _execute_recency_decay {
     my ($event_name, $event_config, $current_cache_path, $profiles_aref, $args_href, $seasonality_config) = @_;
@@ -19173,14 +19313,83 @@ sub _execute_recency_decay {
 
 # ==============================================================================
 # SUBROUTINE: _execute_predictive_peak
-# PURPOSE:    Executes the Predictive Peak model for a specific event.
+# PURPOSE:    Executes the predictive peak forecast model for a single event.
+#
+#             Projects the next event peak by combining a current-trend baseline
+#             (derived from prior monthly history or, as a fallback, the L1
+#             pooled-percentile path) with a seasonal multiplier computed from
+#             accumulated historical peak-to-baseline ratios.  Requires at least
+#             one prior Zone 1 historical snapshot for the event, making
+#             --update-history a prerequisite for first use.
+#
+#             Runs the single-pass analysis engine over the event window, applies
+#             RunQ modifiers per profile, and writes the result to the
+#             partitioned history store.
+#
+# ARGUMENTS:
+#   $event_name         (string)   - Seasonal event name as defined in
+#                                    nfit.seasonality.cfg.
+#   $event_config       (hashref)  - Resolved configuration block for the event.
+#   $current_cache_path (string)   - Absolute path to the system staging cache
+#                                    directory.
+#   $profiles_aref      (arrayref) - Profile definition hashrefs (name, flags).
+#   $args_href          (hashref)  - Execution context assembled by the
+#                                    orchestrator.  Required keys:
+#                                      anchor_bucket               (string YYYY-MM)
+#                                      anchor_source               (string)
+#                                      effective_start_date        (Time::Piece)
+#                                      effective_end_date          (Time::Piece)
+#                                      cache_start_date            (Time::Piece)
+#                                      cache_end_date              (Time::Piece)
+#                                      sampling_interval           (integer, seconds)
+#                                      adaptive_saturation_thresh  (numeric)
+#                                      adaptive_target_norm_runq   (numeric)
+#                                      adaptive_max_efficiency_reduction (numeric)
+#                                      adaptive_thresholds_href    (hashref)
+#                                      bucket_occurrence_count     (integer)
+#                                      bucket_occurrence_end_dates (arrayref)
+#                                      _l1_baseline_precomputed    (hashref|undef)
+#                                      _baseline_result            (hashref|undef)
+#                                      _fingerprints               (hashref|undef)
+#                                      _baseline_meta              (hashref|undef)
+#                                      system_identifier           (string)
+#   $seasonality_config (hashref)  - Full parsed seasonality configuration;
+#                                    used when a fallback event is selected.
+#
+# RETURNS:
+#   Nothing (implicit undef).  Results are written directly to the partitioned
+#   history store via _store_model_forecast_to_history.
+#   Returns nothing (undef) silently on cold start or if all VMs are eliminated
+#   by the VM scope filter.
+#
+# NOTES:
+#   - determine_seasonal_analysis_path is called with the anchor_bucket as a
+#     blinding cutoff.  See _execute_multiplicative_seasonal NOTES for the full
+#     rationale; the same concern applies here.
+#   - Baseline priority order for calculate_predictive_peak_forecast:
+#       1. _l1_baseline_precomputed  — L1 pooled percentile, pre-computed once
+#          per event by the orchestrator.  Semantically equivalent to a direct
+#          _get_true_baseline_results call and preserves pooled-percentile
+#          precision.  Use this path whenever available.
+#       2. _baseline_result{baselines} — history daily-aggregate baseline.  The
+#          orchestrator explicitly removes this key before dispatching to
+#          predictive_peak; it will always be undef at this point.  Listed for
+#          completeness only.
+#       3. undef — falls through to the legacy per-invocation
+#          _get_true_baseline_results call inside the forecast function.
+#          This path is the safety net for direct invocations that bypass the
+#          orchestrator.
+#   - Unlike multiplicative_seasonal, this model does not preserve or restore
+#     PeakValue explicitly; PeakValue semantics are handled inside
+#     calculate_predictive_peak_forecast via the TrueBaseline/PredictedPeak
+#     fields specific to this model.
 # ==============================================================================
 sub _execute_predictive_peak {
     my ($event_name, $event_config, $current_cache_path, $profiles_aref, $args_href, $seasonality_config) = @_;
 
     # 1. Determine analysis path
     my $effective_event_name = determine_seasonal_analysis_path(
-        $event_config, $current_cache_path, $event_name
+        $event_config, $current_cache_path, $event_name, $args_href->{anchor_bucket}
     );
 
     # Handle cold-start graceful skip
