@@ -2751,6 +2751,27 @@ sub run_single_pass_from_manifest {
     # Structure: $daily_raw_data{$vm}{$transform_key}{$date_str} = packed_binary
     my %daily_raw_data;
 
+    # Per-day raw peak accumulator — Track 2 Layer B source (DailyPeakSeries).
+    # Stores the highest raw PhysC observed for each (VM, transform_key, calendar day)
+    # that passes the transform's time filter.  Unlike %daily_raw_data, which packs
+    # smoothed rolling-average values for percentile computation, this accumulates
+    # a single running maximum of the unsmoothed PhysC value.
+    # Structure: $daily_peak_raw_data{$vm}{$transform_key}{$date_str} = $physc_float
+    my %daily_peak_raw_data;
+
+    # Stores the wall-clock timestamp (Time::Piece->datetime, ISO 8601 local) at which
+    # the global raw peak was observed per VM.  Updated in parallel with %raw_peak_tracker.
+    # Used to populate peak_timestamp in OccurrencePeaks[] (T2.S5).
+    my %raw_peak_timestamp_tracker;
+
+    # Per-transform peak timestamp accumulator.
+    # Tracks the raw PhysC maximum and its wall-clock timestamp per (VM, transform key)
+    # within the transform's effective time window (after steps 4a/4b in process_data_point).
+    # Unlike %raw_peak_timestamp_tracker (VM-level, pre-filter), this is time-filter-aware
+    # and therefore statistically valid for per-profile OccurrencePeaks.peak_timestamp.
+    # Structure: $peak_transform_ts_tracker{$vm}{$key} = { value => float, timestamp => str }
+    my %peak_transform_ts_tracker;
+
     # --- Load or build cache index for date-range optimisation ---
     my $cache_index;
     my $seek_offset = 0;
@@ -2926,6 +2947,9 @@ sub run_single_pass_from_manifest {
             end_date_str              => $end_date_str,
             smt_fallback              => $smt_value,
             raw_peak_tracker          => \%raw_peak_tracker,
+            raw_peak_timestamp_tracker => \%raw_peak_timestamp_tracker,
+            daily_peak_raw_data_ref   => \%daily_peak_raw_data,
+            peak_transform_ts_tracker  => \%peak_transform_ts_tracker,
             enable_clipping_detection => $enable_clipping_detection,
 
             # --- NEW CONTEXT FLAGS ---
@@ -2959,6 +2983,12 @@ sub run_single_pass_from_manifest {
     );
     # --- Finalise Daily Metrics separately ---
     my $daily_final_metrics = finalize_daily_metrics(\%daily_raw_data, $manifest, $args_ref);
+
+    # --- Finalise Daily Peak Metrics (DailyPeakSeries, Track 2) ---
+    my $daily_peak_final_metrics = finalize_daily_peak_metrics(\%daily_peak_raw_data, $manifest, $args_ref);
+
+    # --- Finalise Per-Transform Peak Timestamps ---
+    my $peak_ts_final = finalize_peak_transform_timestamps(\%peak_transform_ts_tracker, $manifest);
 
     # 9. Determine if this is an aggregated run and choose the correct output path
     my @output_objects;
@@ -3034,7 +3064,10 @@ sub run_single_pass_from_manifest {
                 $final_metrics,
                 $manifest,
                 \%raw_peak_tracker, # Pass raw peak tracker
-                $daily_final_metrics
+                \%raw_peak_timestamp_tracker,
+                $daily_final_metrics,
+                $daily_peak_final_metrics,
+                $peak_ts_final
             );
             push @output_objects, $output_obj if defined $output_obj;
         }
@@ -3046,8 +3079,11 @@ sub run_single_pass_from_manifest {
             $states_by_vm,
             \%transform_states,
             \%raw_peak_tracker, # Note: ensure you are passing raw_peak_tracker if not already
+            \%raw_peak_timestamp_tracker,
             $args_ref,
-            $daily_final_metrics
+            $daily_final_metrics,
+            $daily_peak_final_metrics,
+            $peak_ts_final
         ) };
     }
 
@@ -3071,11 +3107,23 @@ sub run_single_pass_from_manifest {
 sub process_data_point {
     my ($tp, $vm, $physc, $runq, $manifest, $states_by_vm, $analysis_data, $raw_data, $transform_states, $persistent_transform_states, $daily_raw_data_ref, $filters) = @_;
 
-    # --- FIX: TRACK TRUE RAW PEAK ---
-    # For every valid data point, before any filtering, update the absolute max
-    # raw PhysC value seen for this VM. This is the new source for the 'Peak' value.
+    # --- TRACK TRUE RAW PEAK AND PEAK TIMESTAMP ---
+    # Updated before any time or VM filter so the global maximum is never missed.
+    # %raw_peak_timestamp_tracker is updated in lock-step: only when physc genuinely
+    # exceeds the stored maximum do we overwrite both the value and the timestamp.
+    # Where two samples are tied, the first-seen timestamp is kept (no update on equal).
     my $raw_peak_tracker = $filters->{raw_peak_tracker};
-    $raw_peak_tracker->{$vm} = $physc if (looks_like_number($physc) && $physc > ($raw_peak_tracker->{$vm} // 0));
+    my $raw_peak_timestamp_tracker = $filters->{raw_peak_timestamp_tracker};
+    if (looks_like_number($physc) && $physc > ($raw_peak_tracker->{$vm} // 0)) {
+        $raw_peak_tracker->{$vm}           = $physc;
+        $raw_peak_timestamp_tracker->{$vm} = $tp->datetime;
+    }
+
+    # Extract daily peak accumulator reference for use inside the transform loop.
+    my $daily_peak_raw_data_ref = $filters->{daily_peak_raw_data_ref};
+
+    # Extract per-transform peak timestamp accumulator reference.
+    my $peak_transform_ts_tracker_ref = $filters->{peak_transform_ts_tracker};
 
     # 1. Apply global VM filter passed from the orchestrator.
     return unless (exists $filters->{vms_to_process}{$vm} && exists $states_by_vm->{$vm});
@@ -3185,6 +3233,39 @@ sub process_data_point {
             }
         }
 
+        # --- Per-Day Raw Peak Accumulation (DailyPeakSeries, Track 2) ---
+        # Accumulates the highest unsmoothed PhysC observed for this (VM, transform key,
+        # calendar day) that has passed the transform's time and weekday filters above.
+        # Stored independently of %daily_raw_data and independent of whether $rolling_avg
+        # is defined — raw peaks are captured even during EMA warm-up periods.
+        # $physc is guaranteed numeric by the outer data-loop guard (line ~2875).
+        if (defined $daily_peak_raw_data_ref && $entry->{metric} eq 'PhysC') {
+            my $date_key = $tp->ymd;
+            if (!defined $daily_peak_raw_data_ref->{$vm}{$key}{$date_key}
+                    || $physc > $daily_peak_raw_data_ref->{$vm}{$key}{$date_key}) {
+                $daily_peak_raw_data_ref->{$vm}{$key}{$date_key} = $physc;
+            }
+        }
+
+        # --- Per-Transform Peak Timestamp Accumulation ---
+        # Tracks the raw PhysC maximum and its timestamp within this transform's effective
+        # time window, i.e. after steps 4a and 4b have passed.  All profiles attached to
+        # this transform key share identical time-filter semantics (enforced by key
+        # construction in build_transform_manifest), so one timestamp per transform key
+        # is valid for every attached profile.
+        # Note: peak_timestamp is the timestamp of the raw transform-scoped PhysC peak,
+        # not the timestamp of the percentile or smoothed standard_peak_value.  It is
+        # the most useful practical forensic field for identifying when peak demand occurred.
+        if (defined $peak_transform_ts_tracker_ref && $entry->{metric} eq 'PhysC') {
+            my $current = $peak_transform_ts_tracker_ref->{$vm}{$key};
+            if (!defined $current || $physc > $current->{value}) {
+                $peak_transform_ts_tracker_ref->{$vm}{$key} = {
+                    value     => $physc,
+                    timestamp => $tp->datetime,
+                };
+            }
+        }
+
         # 4f. Conditionally gather raw data if clipping detection is enabled.
         if ($filters->{enable_clipping_detection} && $entry->{metric} eq 'PhysC') {
             # Use a different hash to store raw data streams.
@@ -3266,7 +3347,7 @@ sub finalize_daily_metrics {
     foreach my $vm (keys %$daily_raw_data) {
         foreach my $transform_key (keys %{$daily_raw_data->{$vm}}) {
             my $transform_info = $manifest->{$transform_key};
-            next unless $transform_info; # Should always exist, but safe to check
+            next unless $transform_info && $transform_info->{profiles};
 
             foreach my $date_str (keys %{$daily_raw_data->{$vm}{$transform_key}}) {
                 my $packed = $daily_raw_data->{$vm}{$transform_key}{$date_str};
@@ -3296,6 +3377,103 @@ sub finalize_daily_metrics {
         }
     }
     return \%daily_final;
+}
+
+# ==============================================================================
+# SUBROUTINE: finalize_daily_peak_metrics
+# PURPOSE:    Converts %daily_peak_raw_data into a profile-keyed hash of
+#             per-day raw peak values, suitable for emission as DailyPeakSeries.
+#
+#             Unlike finalize_daily_metrics, which unpacks packed binary streams
+#             and computes a configured percentile of the smoothed rolling average,
+#             this function reads a single pre-computed running maximum per
+#             (VM, transform_key, date) and maps it to every profile attached to
+#             that transform key via the manifest.
+#
+#             The output is a flat date-keyed hash.  Serialisation to the sorted
+#             array-of-objects format required by DailyPeakSeries is performed at
+#             JSON emission time (T2.S2), not here.
+#
+#             sanitised_peak_value is deliberately omitted.  No statistically
+#             honest day-scoped clipping estimate exists; omission is explicit and
+#             unambiguous.  See implementation plan T2.S1 for the full rationale.
+#
+# ARGUMENTS:
+#   $daily_peak_raw_data — hashref: {$vm}{$transform_key}{$date_str} = $physc_float
+#   $manifest            — hashref: the active transform manifest
+#   $args_ref            — hashref: CLI/config args (for rounding parameters)
+#
+# RETURNS:
+#   hashref: {$vm}{$profile_name}{$date_str} = $raw_peak_value
+# ==============================================================================
+sub finalize_daily_peak_metrics {
+    my ($daily_peak_raw_data, $manifest, $args_ref) = @_;
+    my %daily_peak_final;
+
+    my $round_increment = (defined $args_ref->{round_arg}) ? $args_ref->{round_arg} : $DEFAULT_ROUND_INCREMENT;
+    my $rounding_method = (defined $args_ref->{round_arg}) ? 'standard' : 'none';
+
+    foreach my $vm (keys %$daily_peak_raw_data) {
+        foreach my $transform_key (keys %{$daily_peak_raw_data->{$vm}}) {
+            my $transform_info = $manifest->{$transform_key};
+            next unless $transform_info && $transform_info->{profiles};
+
+            foreach my $date_str (keys %{$daily_peak_raw_data->{$vm}{$transform_key}}) {
+                my $raw_peak = $daily_peak_raw_data->{$vm}{$transform_key}{$date_str};
+                next unless defined $raw_peak && looks_like_number($raw_peak);
+
+                # Map each profile attached to this transform key to the raw peak value.
+                # Multiple profiles may share a transform key (e.g. different percentile
+                # directives on the same EMA window); all receive the same raw peak.
+                foreach my $profile_name (keys %{$transform_info->{profiles}}) {
+                    my $val = apply_rounding($raw_peak, $round_increment, $rounding_method);
+                    $daily_peak_final{$vm}{$profile_name}{$date_str} = $val;
+                }
+            }
+        }
+    }
+
+    return \%daily_peak_final;
+}
+
+# ==============================================================================
+# SUBROUTINE: finalize_peak_transform_timestamps
+# PURPOSE:    Converts %peak_transform_ts_tracker into a profile-keyed map of
+#             peak timestamps for use in OccurrencePeaks.peak_timestamp.
+#
+#             Each transform key maps to one or more profiles via the manifest.
+#             Because all profiles sharing a transform key have identical time-filter
+#             semantics (enforced by build_transform_manifest key construction), one
+#             timestamp per transform key is valid for every attached profile.
+#
+# ARGUMENTS:
+#   $tracker   — hashref: {$vm}{$key} = { value => float, timestamp => str }
+#   $manifest  — hashref: the active transform manifest
+#
+# RETURNS:
+#   hashref: {$vm}{$profile_name} = $timestamp_str
+# ==============================================================================
+sub finalize_peak_transform_timestamps {
+    my ($tracker, $manifest) = @_;
+    my %result;
+
+    foreach my $vm (keys %$tracker) {
+        foreach my $key (keys %{$tracker->{$vm}}) {
+            my $transform_info = $manifest->{$key};
+            next unless $transform_info && $transform_info->{profiles};
+
+            my $timestamp = $tracker->{$vm}{$key}{timestamp};
+            next unless defined $timestamp;
+
+            foreach my $profile_name (keys %{$transform_info->{profiles}}) {
+                # First-write-wins across transform keys sharing a profile name
+                # (should not occur by manifest construction, but defensive).
+                $result{$vm}{$profile_name} //= $timestamp;
+            }
+        }
+    }
+
+    return \%result;
 }
 
 # ==============================================================================
@@ -3417,7 +3595,7 @@ sub calculate_percentiles_from_packed {
 #             ensuring the output format is correct for the analysis model used.
 # ==============================================================================
 sub assemble_output {
-    my ($final_metrics_href, $manifest_href, $states_by_vm_href, $transform_states_href, $raw_peak_tracker_ref, $args_ref, $daily_metrics_href) = @_;
+    my ($final_metrics_href, $manifest_href, $states_by_vm_href, $transform_states_href, $raw_peak_tracker_ref, $raw_peak_timestamp_tracker_ref, $args_ref, $daily_metrics_href, $daily_peak_metrics_href, $peak_ts_href) = @_;
 
     my @output_objects;
 
@@ -3584,6 +3762,11 @@ sub assemble_output {
             if (@output_objects && exists $raw_peak_tracker_ref->{$vm_name}) {
                 $output_objects[-1]->{metadata}{peakPhyscFromLatestState} = apply_rounding($raw_peak_tracker_ref->{$vm_name}, $round_increment, $rounding_method);
             }
+            # Emit peak timestamp alongside the raw peak value.  Both are VM-level
+            # metadata; both are attached to the final state object for the VM.
+            if (@output_objects && defined $raw_peak_timestamp_tracker_ref->{$vm_name}) {
+                $output_objects[-1]->{metadata}{peakTimestampFromLatestState} = $raw_peak_timestamp_tracker_ref->{$vm_name};
+            }
 
             # --- NEW: Inject Daily Profile Series into the latest state ---
             # Since standard runs break data into states, we attach the VM-wide daily series
@@ -3598,6 +3781,41 @@ sub assemble_output {
                         # (Avoids autovivification of empty profile keys)
                         if (exists $last_obj->{metrics}{physc}{$profile_name}) {
                             $last_obj->{metrics}{physc}{$profile_name}{DailySeries} = $daily_metrics_href->{$vm_name}{$profile_name};
+                        }
+                    }
+                }
+            }
+
+            # --- DailyPeakSeries injection (Track 2) ---
+            # Attached to the final state object for the VM, mirroring the DailySeries pattern.
+            # Emitted as a sorted array of {date, raw_peak_value} objects.
+            # Omitted entirely when no peak data is available for this VM — absence is
+            # cleaner than an empty array for downstream consumers.
+            if (@output_objects && defined $daily_peak_metrics_href
+                    && exists $daily_peak_metrics_href->{$vm_name}) {
+                my $last_obj = $output_objects[-1];
+                if ($last_obj->{vmName} eq $vm_name) {
+                    foreach my $profile_name (keys %{$daily_peak_metrics_href->{$vm_name}}) {
+                        if (exists $last_obj->{metrics}{physc}{$profile_name}) {
+                            my $date_map = $daily_peak_metrics_href->{$vm_name}{$profile_name};
+                            $last_obj->{metrics}{physc}{$profile_name}{DailyPeakSeries} = [
+                                map  { { date => $_, raw_peak_value => 0 + $date_map->{$_} } }
+                                sort keys %$date_map
+                            ];
+                        }
+                    }
+                }
+            }
+
+            # --- PeakTimestamp injection (per-transform, time-filter-aware) ---
+            if (@output_objects && defined $peak_ts_href
+                    && exists $peak_ts_href->{$vm_name}) {
+                my $last_obj = $output_objects[-1];
+                if ($last_obj->{vmName} eq $vm_name) {
+                    foreach my $profile_name (keys %{$peak_ts_href->{$vm_name}}) {
+                        if (exists $last_obj->{metrics}{physc}{$profile_name}) {
+                            $last_obj->{metrics}{physc}{$profile_name}{PeakTimestamp} =
+                                $peak_ts_href->{$vm_name}{$profile_name};
                         }
                     }
                 }
@@ -3736,7 +3954,8 @@ sub _safe_dig {
 #             This is the dedicated output path for decay/growth models.
 # ==============================================================================
 sub assemble_aggregated_output {
-    my ($vm_name, $aggregated_metrics_href, $growth_results_href, $states_by_vm_href, $args_ref, $final_metrics_href, $manifest_href, $raw_peak_tracker_ref, $daily_metrics_href) = @_;
+    my ($vm_name, $aggregated_metrics_href, $growth_results_href, $states_by_vm_href, $args_ref, $final_metrics_href, $manifest_href, $raw_peak_tracker_ref, $raw_peak_timestamp_tracker_ref, $daily_metrics_href, $daily_peak_metrics_href, $peak_ts_href) = @_;
+
 
     my $rounding_method = 'none';
     my $round_increment;
@@ -3809,6 +4028,28 @@ sub assemble_aggregated_output {
             $output_obj->{metrics}{physc}{$profile_name}{DailySeries} = $daily_metrics_href->{$vm_name}{$profile_name};
         }
 
+        # --- DailyPeakSeries block (Track 2) ---
+        # Emitted as a sorted array of {date, raw_peak_value} objects alongside DailySeries.
+        # Omitted entirely when no peak data is available for this profile — absence is
+        # cleaner than an empty array for downstream consumers (nfit-profile T2.S3).
+        if (defined $daily_peak_metrics_href
+                && exists $daily_peak_metrics_href->{$vm_name}{$profile_name}
+                && exists $output_obj->{metrics}{physc}{$profile_name}) {
+            my $date_map = $daily_peak_metrics_href->{$vm_name}{$profile_name};
+            $output_obj->{metrics}{physc}{$profile_name}{DailyPeakSeries} = [
+                map  { { date => $_, raw_peak_value => 0 + $date_map->{$_} } }
+                sort keys %$date_map
+            ];
+        }
+
+        # --- PeakTimestamp injection (per-transform, time-filter-aware) ---
+        if (defined $peak_ts_href
+                && exists $output_obj->{metrics}{physc}{$profile_name}
+                && defined $peak_ts_href->{$vm_name}{$profile_name}) {
+            $output_obj->{metrics}{physc}{$profile_name}{PeakTimestamp} =
+                $peak_ts_href->{$vm_name}{$profile_name};
+        }
+
         # --- GrowthRationale block ---
         # Inject the rationale directly into this profile's block,
         # not the top-level debug hash.
@@ -3845,6 +4086,10 @@ sub assemble_aggregated_output {
     # Use the TRUE raw peak from the tracker (Point 10, Peak Invariant)
     if (exists $raw_peak_tracker_ref->{$vm_name}) {
         $output_obj->{metadata}{peakPhyscFromLatestState} = apply_rounding($raw_peak_tracker_ref->{$vm_name}, $round_increment, $rounding_method);
+    }
+    # Emit peak timestamp alongside the raw peak value for occurrence-level audit.
+    if (defined $raw_peak_timestamp_tracker_ref->{$vm_name}) {
+        $output_obj->{metadata}{peakTimestampFromLatestState} = $raw_peak_timestamp_tracker_ref->{$vm_name};
     }
     $output_obj->{metrics}{runq} = $aggregated_metrics_href->{_RunQ} if exists $aggregated_metrics_href->{_RunQ};
 

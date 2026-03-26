@@ -10583,7 +10583,8 @@ sub _execute_history_pass {
 # ==============================================================================
 sub _assemble_seasonal_snapshot {
     my ($peak_results_href, $baseline_results_href, $residual_results_href,
-        $event_config, $event_name, $peak_end, $profiles_aref, $baseline_start, $baseline_end) = @_;
+        $event_config, $event_name, $peak_end, $profiles_aref, $baseline_start, $baseline_end,
+        $peak_start, $manifest_href) = @_;
 
     # Validate that profiles array was passed correctly
     unless (ref($profiles_aref) eq 'ARRAY' && @$profiles_aref) {
@@ -10602,6 +10603,30 @@ sub _assemble_seasonal_snapshot {
     my %baseline_period_results;
     my %clipping_info_results;
     my %residual_results_final;
+
+    # --- Pre-compute OccurrencePeaks invariants ---
+    # These values are constant for all (VM, profile) pairs within this occurrence.
+    # window_duration_days: calendar span of the peak window (inclusive of both endpoints).
+    # manifest_fingerprint: reproducibility fingerprint of this nfit invocation context,
+    #   keyed on the sanitised manifest and peak window dates — the inputs that
+    #   materially determine the occurrence's peak value.  MD5 is used for internal
+    #   change detection (not cryptographic security), consistent with the codebase.
+    my $window_duration_days = (defined $peak_start && defined $peak_end)
+        ? int(($peak_end->epoch - $peak_start->epoch) / 86400) + 1
+        : undef;
+
+    my $manifest_fp = undef;
+    if (defined $manifest_href && defined $peak_start && defined $peak_end) {
+        require Digest::MD5;
+        my $fp_payload = JSON->new->canonical->encode({
+            manifest   => $manifest_href,
+            peak_start => $peak_start->ymd,
+            peak_end   => $peak_end->ymd,
+        });
+        $manifest_fp = Digest::MD5::md5_hex($fp_payload);
+    }
+
+    my %occurrence_peaks_results;
 
     # ======================================================================
     # STEP 1: Extract baseline values for all VMs and profiles
@@ -10730,6 +10755,58 @@ sub _assemble_seasonal_snapshot {
                 my $residual = $sanitised_peak_values{$vm_name} - $standard_peak_value;
                 $residual_results_final{$vm_name}{$profile_name} = ($residual > 0) ? $residual : 0;
             }
+
+            # --- Build OccurrencePeaks record for this (VM, profile) ---
+            # Only assembled when a peak value was found and $peak_start is available.
+            # sanitised_peak_value is emitted only when a genuine unclipped estimate
+            # exists — omitted rather than forced to undef or raw when unavailable.
+            if (defined $standard_peak_value && defined $peak_start) {
+                my $occ_id = $peak_start->ymd . '_to_' . $peak_end->ymd;
+
+                # peak_timestamp: wall-clock timestamp of the raw PhysC maximum within
+                # this transform's effective time window (post-filter, per-transform scope).
+                # Sourced from metrics.physc.<profile>.PeakTimestamp, which is emitted by
+                # finalize_peak_transform_timestamps in nfit.pl.
+                # Note: this is the timestamp of the raw transform-scoped peak, not the
+                # timestamp of the percentile/smoothed standard_peak_value itself.
+                my $peak_ts = defined $source_state
+                    ? _safe_dig($source_state, 'metrics', 'physc', $profile_name, 'PeakTimestamp')
+                    : undef;
+
+                # sample_days_in_window: count of DailyPeakSeries entries in this profile's
+                # source state.  nfit ran with --startdate/$peak_start --enddate/$peak_end
+                # so all entries are already within the window — no date filtering needed.
+                my $dps_aref = defined $source_state
+                    ? _safe_dig($source_state, 'metrics', 'physc', $profile_name, 'DailyPeakSeries')
+                    : undef;
+                my $sample_days = (ref($dps_aref) eq 'ARRAY') ? scalar(@$dps_aref) : 0;
+
+                # Clipping fields — sourced from the already-assembled ClippingInfo.
+                my $clip_info   = $clipping_info_results{$vm_name}{$profile_name};
+                my $is_clipped  = ($clip_info && $clip_info->{isClipped}) ? 1 : 0;
+                my $unclipped_est = ($clip_info && $is_clipped)
+                    ? $clip_info->{unclippedPeakEstimate}
+                    : undef;
+
+                my %occ_record = (
+                    occurrence_id        => $occ_id,
+                    occurrence_start     => $peak_start->ymd,
+                    occurrence_end       => $peak_end->ymd,
+                    window_duration_days => $window_duration_days,
+                    sample_days_in_window => $sample_days,
+                    vm                   => $vm_name,
+                    profile              => $profile_name,
+                    raw_peak_value       => 0 + $standard_peak_value,
+                    peak_source          => $is_clipped ? 'clipping_adjusted' : 'raw',
+                    clipped              => $is_clipped ? JSON::true : JSON::false,
+                    history_schema_version => 'v1',
+                );
+                $occ_record{peak_timestamp} = $peak_ts if defined $peak_ts;
+                $occ_record{sanitised_peak_value} = 0 + $unclipped_est if defined $unclipped_est;
+                $occ_record{manifest_fingerprint} = $manifest_fp   if defined $manifest_fp;
+
+                push @{$occurrence_peaks_results{$vm_name}{$profile_name}}, \%occ_record;
+            }
         }
     }
 
@@ -10765,6 +10842,16 @@ sub _assemble_seasonal_snapshot {
         return undef;
     }
 
+    # Flatten %occurrence_peaks_results into the per-event array expected by consumers.
+    # Per-profile arrays are concatenated; for the common case of one occurrence per
+    # (VM, profile) per month this produces a single-element array per combination.
+    my @occurrence_peaks_flat;
+    foreach my $vm_name (sort keys %occurrence_peaks_results) {
+        foreach my $profile_name (sort keys %{$occurrence_peaks_results{$vm_name}}) {
+            push @occurrence_peaks_flat, @{$occurrence_peaks_results{$vm_name}{$profile_name}};
+        }
+    }
+
     # Assemble the final snapshot structure
     return {
         eventName     => $event_name,
@@ -10781,6 +10868,8 @@ sub _assemble_seasonal_snapshot {
             'ClippingInfo'   => \%clipping_info_results,
             'PeakResidual'   => \%residual_results_final,
             'MetadataPeak'   => \%metadata_peak_results,  # Absolute raw peak per VM
+            # OccurrencePeaks omitted entirely when absent — per omission-over-empty principle.
+            (@occurrence_peaks_flat ? ('OccurrencePeaks' => \@occurrence_peaks_flat) : ()),
         }
     };
 
@@ -11334,6 +11423,8 @@ sub _generate_seasonal_snapshot_for_period {
         \@profiles,  # Pass profiles array explicitly to ensure correct scoping
         $baseline_start,
         $baseline_end,
+        $peak_start,
+        $main_historical_manifest,
     );
 
     return $snapshot_result;
@@ -11490,6 +11581,47 @@ sub _generate_monthly_and_seasonal_history {
         # --- PHASE 1: Generate MonthlyWorkloadAnalysis ---
         print "\n--- Processing Month: $month_key (Period: $start_str to $end_str) ---\n";
         my $workload_analysis = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str, $adaptive_runq_saturation_thresh);
+
+        # --- Merge DailyPeakSeries: first-write-wins against existing history ---
+        # Capture the existing DailyPeakSeries from this month's partition before the
+        # wholesale overwrite below.  For each (VM, profile) in the new L1 output,
+        # merge incoming dates against existing dates and write the merged result back
+        # into $workload_analysis before it is committed to $history_data_href.
+        #
+        # This is the only place in the write path where DailyPeakSeries merge occurs.
+        # DailyProfileSeries does not yet have an equivalent wired merge; that is a
+        # pre-existing condition and is out of scope for this step.
+        {
+            my $existing_mwa = _safe_dig($history_data_href, $month_key, 'MonthlyWorkloadAnalysis') // {};
+            my $total_added   = 0;
+            my $total_skipped = 0;
+
+            foreach my $vm_name (keys %$workload_analysis) {
+                my $l1_dps = $workload_analysis->{$vm_name}{DailyPeakSeries};
+                next unless $l1_dps && ref($l1_dps) eq 'HASH' && %$l1_dps;
+
+                foreach my $profile_name (keys %$l1_dps) {
+                    my $l1_series      = $l1_dps->{$profile_name};
+                    my $existing_series = _safe_dig($existing_mwa, $vm_name, 'DailyPeakSeries', $profile_name);
+
+                    my ($merged_aref, $stats) = _merge_daily_peak_series($existing_series, $l1_series);
+
+                    $total_added   += $stats->{added};
+                    $total_skipped += $stats->{skipped};
+
+                    if (@$merged_aref) {
+                        $workload_analysis->{$vm_name}{DailyPeakSeries}{$profile_name} = $merged_aref;
+                    } else {
+                        delete $workload_analysis->{$vm_name}{DailyPeakSeries}{$profile_name};
+                    }
+                }
+            }
+
+            if ($total_added > 0 || $total_skipped > 0) {
+                print STDERR "  [INFO] DailyPeakSeries merge for $month_key: "
+                    . "$total_added date(s) added, $total_skipped preserved (first-write-wins).\n";
+            }
+        }
 
         # --- Populate the in-memory hash ---
         $history_data_href->{$month_key} = {
@@ -12058,6 +12190,81 @@ sub _merge_daily_profile_series {
             ProcessedDays => $processed_days,
         },
     };
+}
+
+# ==============================================================================
+# SUBROUTINE: _merge_daily_peak_series
+# PURPOSE:    Merges a DailyPeakSeries from the current L1 run into the existing
+#             history series for one (VM, profile) combination, using FIRST-WRITE-
+#             WINS semantics.  Existing date values are never overwritten — only
+#             genuinely new dates are added.
+#
+#             Internal representation: a date-keyed hash is used throughout the
+#             merge to provide O(1) presence checks and avoid O(n²) array
+#             comparison.  The emitted result is a sorted array of objects to
+#             match the DailyPeakSeries schema contract.
+#
+#             Merge invariants:
+#               - first-write-wins: once a date is committed, its value is immutable
+#               - output is always chronologically sorted (ISO date sort order)
+#               - re-running with the same input is idempotent: no duplicates added
+#
+# ARGUMENTS:
+#   1. $existing_series_aref (arrayref | undef):
+#        Current [{date=>, raw_peak_value=>}, ...] from the history partition.
+#        undef or [] for a new month with no prior data.
+#   2. $l1_series_aref (arrayref | undef):
+#        [{date=>, raw_peak_value=>}, ...] from the current L1 nfit.pl run.
+#
+# RETURNS:
+#   ($merged_aref, $merge_stats_href)
+#   $merged_aref       — arrayref of {date=>, raw_peak_value=>}, sorted by date
+#   $merge_stats_href  — {added => N, skipped => N, total => N}
+# ==============================================================================
+sub _merge_daily_peak_series {
+    my ($existing_series_aref, $l1_series_aref) = @_;
+
+    my %by_date;    # Internal date-keyed working representation
+    my $added   = 0;
+    my $skipped = 0;
+
+    # 1. Deserialise existing history into the working hash.
+    if ($existing_series_aref && ref($existing_series_aref) eq 'ARRAY') {
+        foreach my $entry (@$existing_series_aref) {
+            next unless ref($entry) eq 'HASH';
+            my $date = $entry->{date};
+            my $val  = $entry->{raw_peak_value};
+            next unless defined $date && $date =~ /^\d{4}-\d{2}-\d{2}$/;
+            next unless defined $val  && looks_like_number($val);
+            $by_date{$date} = 0 + $val;
+        }
+    }
+
+    # 2. Merge incoming L1 series — first-write-wins.
+    if ($l1_series_aref && ref($l1_series_aref) eq 'ARRAY') {
+        foreach my $entry (@$l1_series_aref) {
+            next unless ref($entry) eq 'HASH';
+            my $date = $entry->{date};
+            my $val  = $entry->{raw_peak_value};
+            next unless defined $date && $date =~ /^\d{4}-\d{2}-\d{2}$/;
+            next unless defined $val  && looks_like_number($val);
+
+            if (exists $by_date{$date}) {
+                $skipped++;    # Existing date — preserve, do not overwrite
+            } else {
+                $by_date{$date} = 0 + $val;
+                $added++;
+            }
+        }
+    }
+
+    # 3. Serialise back to sorted array of objects.
+    my $merged_aref = [
+        map  { { date => $_, raw_peak_value => $by_date{$_} } }
+        sort keys %by_date
+    ];
+
+    return ($merged_aref, { added => $added, skipped => $skipped, total => scalar keys %by_date });
 }
 
 # ==============================================================================
@@ -14247,6 +14454,15 @@ sub _assemble_monthly_analysis {
                 # Temporarily store in collated table for final assembly
                 $collated_results_table{$vm_name}{_DailySeries}{$profile_name} = $daily_series;
             }
+            # --- Harvest DailyPeakSeries Data (Track 2) ---
+            # DailyPeakSeries is an array of {date, raw_peak_value} objects emitted by
+            # nfit.pl (T2.S2).  The array-of-objects format is preserved as-is; no
+            # transformation is applied here.  Merge semantics are handled separately
+            # in _merge_daily_peak_series (T2.S4) during the --update-history write path.
+            my $daily_peak_series = _safe_dig($last_state_data, 'metrics', 'physc', $profile_name, 'DailyPeakSeries');
+            if (ref($daily_peak_series) eq 'ARRAY' && scalar(@$daily_peak_series) > 0) {
+                $collated_results_table{$vm_name}{_DailyPeakSeries}{$profile_name} = $daily_peak_series;
+            }
         }
 
         # ------------------------------------------------------------------
@@ -14272,11 +14488,20 @@ sub _assemble_monthly_analysis {
             },
             ProfileValues  => $collated_results_table{$vm_name},
             DailyProfileSeries => $collated_results_table{$vm_name}{_DailySeries} || {},
+            DailyPeakSeries    => $collated_results_table{$vm_name}{_DailyPeakSeries} || {},
             ClippingInfo   => $clipping_info_for_vm
         };
 
         # Cleanup: Remove the temporary _DailySeries key from ProfileValues to keep the schema clean
         delete $analysis_results{$vm_name}{ProfileValues}{_DailySeries};
+
+        # Inject DailyPeakSeries only when data was harvested — absence is preferred over
+        # an empty structure, keeping history partitions clean and consumers unambiguous.
+        if (exists $collated_results_table{$vm_name}{_DailyPeakSeries}) {
+            $analysis_results{$vm_name}{DailyPeakSeries} =
+                $collated_results_table{$vm_name}{_DailyPeakSeries};
+        }
+        delete $collated_results_table{$vm_name}{_DailyPeakSeries};
     }
 
     return \%analysis_results;
