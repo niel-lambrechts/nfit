@@ -10663,7 +10663,12 @@ sub _assemble_seasonal_snapshot {
     # ======================================================================
     # STEP 2: Extract sanitised peak values for residual calculation
     # ======================================================================
-    my %sanitised_peak_values;  # Used for residual calculation
+    # Note: %sanitised_peak_values is an internal Perl variable used exclusively
+    # to compute PeakResidual (the difference between the residual profile's peak
+    # and the primary profile's peak within the same event window).  It has no
+    # connection to the OccurrencePeaks JSON field formerly named sanitised_peak_value,
+    # now renamed to latent_peak_value.  Do not conflate the two.
+    my %sanitised_peak_values;
 
     if (defined $event_config->{residual_peak_profile} &&
         $event_config->{residual_peak_profile} ne '' &&
@@ -10757,11 +10762,41 @@ sub _assemble_seasonal_snapshot {
             }
 
             # --- Build OccurrencePeaks record for this (VM, profile) ---
-            # Only assembled when a peak value was found and $peak_start is available.
-            # sanitised_peak_value is emitted only when a genuine unclipped estimate
-            # exists — omitted rather than forced to undef or raw when unavailable.
+            # raw_peak_value is sourced from DailyPeakSeries within the occurrence window
+            # when available — this is the true time-filtered raw PhysC maximum for this
+            # profile, not the profile's configured EMA-smoothed percentile.  Falls back
+            # to $standard_peak_value (the smoothed percentile) for pre-Track-2 history
+            # partitions that lack DailyPeakSeries.
+            #
+            # latent_peak_value (formerly sanitised_peak_value) is the Tobit-inspired
+            # estimate of unconstrained demand: standard_peak_value + unmetDemandEstimate.
+            # It is higher than raw_peak_value by construction and represents hidden demand
+            # above the hardware ceiling, not a cleaned version of the observed signal.
+            # Emitted only when genuine clipping is detected.
             if (defined $standard_peak_value && defined $peak_start) {
                 my $occ_id = $peak_start->ymd . '_to_' . $peak_end->ymd;
+
+                # Derive raw_peak_value from DailyPeakSeries within the occurrence window.
+                # DailyPeakSeries stores the per-day raw PhysC maximum within the profile's
+                # time filter — no EMA, no percentile — making it the correct Layer A raw source.
+                my $dps_aref = defined $source_state
+                    ? _safe_dig($source_state, 'metrics', 'physc', $profile_name, 'DailyPeakSeries')
+                    : undef;
+                my $dps_raw_peak = undef;
+                if (ref($dps_aref) eq 'ARRAY') {
+                    my $peak_start_ymd = $peak_start->ymd;
+                    my $peak_end_ymd   = $peak_end->ymd;
+                    foreach my $entry (@$dps_aref) {
+                        my $d = $entry->{date}          // next;
+                        my $v = $entry->{raw_peak_value} // next;
+                        next if $d lt $peak_start_ymd || $d gt $peak_end_ymd;
+                        next unless looks_like_number($v);
+                        $dps_raw_peak = $v
+                            if (!defined $dps_raw_peak || $v > $dps_raw_peak);
+                    }
+                }
+                # Use DPS-derived raw peak when available; fall back to smoothed percentile.
+                my $occurrence_raw_peak = $dps_raw_peak // $standard_peak_value;
 
                 # peak_timestamp: wall-clock timestamp of the raw PhysC maximum within
                 # this transform's effective time window (post-filter, per-transform scope).
@@ -10781,11 +10816,34 @@ sub _assemble_seasonal_snapshot {
                     : undef;
                 my $sample_days = (ref($dps_aref) eq 'ARRAY') ? scalar(@$dps_aref) : 0;
 
-                # Clipping fields — sourced from the already-assembled ClippingInfo.
+                # latent_peak_value — sourced from the already-assembled ClippingInfo.
+                # Base uses $occurrence_raw_peak (DPS-derived or fallback) to remain
+                # consistent with the new raw_peak_value source.
                 my $clip_info   = $clipping_info_results{$vm_name}{$profile_name};
                 my $is_clipped  = ($clip_info && $clip_info->{isClipped}) ? 1 : 0;
-                my $unclipped_est = ($clip_info && $is_clipped)
-                    ? $clip_info->{unclippedPeakEstimate}
+                my $unmet_demand = ($clip_info && $is_clipped)
+                    ? ($clip_info->{unmetDemandEstimate} // 0)
+                    : undef;
+
+                # Recompute latent estimate against the DPS-derived raw peak so the
+                # two values share the same base rather than mixing sources.
+                my $latent_peak = (defined $unmet_demand)
+                    ? ($occurrence_raw_peak + $unmet_demand)
+                    : undef;
+
+                # sanitised_peak_value: P99.75 of the full raw 1-minute PhysC stream
+                # within the occurrence window, sourced from ClippingInfo.rawP9975.
+                # Computed by _calculate_clipping_metrics from the packed raw stream
+                # that is only available when --enable-clipping-detection is active
+                # (which the peak pass always enables in the --update-history path).
+                # This is a minimally smoothed near-peak: the 99.75th percentile of
+                # the unsmoothed time-filter-constrained 1-minute data, excluding only
+                # the top 0.25% of observations. It is lower than or equal to
+                # raw_peak_value (the true maximum) and higher than any EMA-smoothed
+                # profile percentile. Absent when clipping detection was not active
+                # or the raw stream was insufficient (< 10 samples).
+                my $sanitised_peak = $clip_info
+                    ? $clip_info->{rawP9975}
                     : undef;
 
                 my %occ_record = (
@@ -10796,13 +10854,14 @@ sub _assemble_seasonal_snapshot {
                     sample_days_in_window => $sample_days,
                     vm                   => $vm_name,
                     profile              => $profile_name,
-                    raw_peak_value       => 0 + $standard_peak_value,
+                    raw_peak_value       => 0 + $occurrence_raw_peak,
                     peak_source          => $is_clipped ? 'clipping_adjusted' : 'raw',
                     clipped              => $is_clipped ? JSON::true : JSON::false,
                     history_schema_version => 'v1',
                 );
                 $occ_record{peak_timestamp} = $peak_ts if defined $peak_ts;
-                $occ_record{sanitised_peak_value} = 0 + $unclipped_est if defined $unclipped_est;
+                $occ_record{sanitised_peak_value}  = 0 + $sanitised_peak if defined $sanitised_peak;
+                $occ_record{latent_peak_value}    = 0 + $latent_peak if defined $latent_peak;
                 $occ_record{manifest_fingerprint} = $manifest_fp   if defined $manifest_fp;
 
                 push @{$occurrence_peaks_results{$vm_name}{$profile_name}}, \%occ_record;
