@@ -394,6 +394,62 @@ def scan_cache_manifests(cache_dir):
             results[entry.name] = m
     return results
 
+# Insert immediately before it:
+def scan_cache_directories(cache_dir):
+    """
+    Scans cache_dir for serial subdirectories that contain a .nfit.cache.data
+    file and derives the data window directly from the L1 cache content.
+
+    data_end is obtained via reverse scan (find_last_valid_physc_timestamp) and
+    is therefore always a full-precision 'YYYY-MM-DD HH:MM:SS' timestamp.
+    data_start is read from the first data row of the cache file.
+
+    The manifest file, if present, is consulted only for supplementary fields
+    such as staged_by; it is never required.
+
+    Returns a dict of {serial: info_dict}.
+    """
+    results = {}
+    if not os.path.isdir(cache_dir):
+        return results
+
+    for entry in os.scandir(cache_dir):
+        if not entry.is_dir():
+            continue
+        cache_data_path = os.path.join(entry.path, '.nfit.cache.data')
+        if not os.path.isfile(cache_data_path):
+            continue
+
+        data_end = find_last_valid_physc_timestamp(cache_data_path)
+        if not data_end:
+            continue  # Empty or unreadable — skip.
+
+        data_start = None
+        try:
+            with open(cache_data_path, 'r', encoding='utf-8') as fh:
+                fh.readline()  # Skip header row.
+                for line in fh:
+                    parts = line.split(',', 1)
+                    if parts and parts[0].strip():
+                        data_start = parts[0].strip()
+                        break
+        except OSError:
+            pass
+
+        if not data_start:
+            data_start = data_end[:10]
+
+        # Supplement with manifest fields where available.
+        manifest_path = os.path.join(entry.path, '.nfit.cache.manifest')
+        m = read_cache_manifest(manifest_path)
+
+        results[entry.name] = {
+            'data_start': data_start,
+            'data_end':   data_end,
+            'staged_by':  m.get('staged_by', 'unknown'),
+        }
+
+    return results
 
 def _merge_config_states(existing_states, new_states):
     """
@@ -627,7 +683,7 @@ def main():
 
     # --- Early exit: --show-cache-info does not require an InfluxDB connection ---
     if args.show_cache_info:
-        known = scan_cache_manifests(cache_dir)
+        known = scan_cache_directories(cache_dir)
         if not known:
             print(f"No cached serials found in: {cache_dir}")
         else:
@@ -676,51 +732,31 @@ def main():
 
     elif args.append:
         endd_for_query = args.endd if args.endd else datetime.now(timezone.utc).strftime('%Y-%m-%d')
-        known = scan_cache_manifests(cache_dir)
+        known = scan_cache_directories(cache_dir)
         if not known:
             print(
-                "WARNING: --append specified but no existing cache manifests were found. "
-                "A full stage will be attempted; please also supply --startd or --days.",
+                "ERROR: --append specified but no existing L1 cache was found. "
+                "Re-run with --days or --startd/--endd to perform a full stage.",
                 file=sys.stderr
             )
-            # Fall through; startd_for_query must be provided via another mechanism.
-            # This guard prevents a silent failure and gives the operator a clear message.
-            parser.error("No existing cache found for --append. Re-run with --days or --startd/--endd.")
-        else:
-            earliest_end = min(m['data_end'] for m in known.values())
-            # Use the date of the earliest data_end, not +1 day, so that the
-            # transition day is re-queried in full.  Per-row cutoffs at full
-            # timestamp precision prevent duplication of already-stored rows.
-            startd_for_query = earliest_end[:10]
+            sys.exit(1)
 
-            for serial, m in known.items():
-                manifest_end = m.get('data_end', '')
-                if len(manifest_end) == 19:
-                    # Full timestamp from an enriched manifest — use directly.
-                    serial_data_end = manifest_end
-                else:
-                    # Date-only value (from the first-generation manifest) or absent:
-                    # derive the full timestamp via reverse scan so that the cutoff
-                    # comparison operates at second precision.
-                    cache_data_path = os.path.join(cache_dir, serial, '.nfit.cache.data')
-                    ts = find_last_valid_physc_timestamp(cache_data_path)
-                    if ts is None:
-                        print(f"WARNING: Cannot determine data_end for {serial} "
-                              f"(manifest data_end lacks second precision and reverse scan failed). "
-                              f"Skipping this serial for append.", file=sys.stderr)
-                        continue
-                    serial_data_end = ts
-                    print(f"  INFO: Derived full-precision data_end for {serial} "
-                          f"from L1 cache: {serial_data_end}")
+        earliest_end = min(m['data_end'] for m in known.values())
+        # Use the date of the earliest data_end, not +1 day, so that the transition
+        # day is re-queried in full.  Per-row cutoffs at full-precision timestamps
+        # in Phase 4 prevent duplication of already-stored rows.
+        startd_for_query = earliest_end[:10]
 
-                serial_append_cutoffs[serial]  = serial_data_end
-                serial_original_starts[serial] = m.get('data_start', serial_data_end[:10])
+        for serial, m in known.items():
+            # data_end is always a full-precision timestamp from the reverse scan.
+            serial_append_cutoffs[serial]  = m['data_end']
+            serial_original_starts[serial] = m['data_start'][:10]
 
-            if startd_for_query > endd_for_query:
-                print(f"Cache is already up to date (earliest data_end: {earliest_end}). Nothing to append.")
-                sys.exit(0)
+        if startd_for_query > endd_for_query:
+            print(f"Cache is already up to date (earliest data_end: {earliest_end}). Nothing to append.")
+            sys.exit(0)
 
-            print(f"Append mode: querying InfluxDB from {startd_for_query} to {endd_for_query}.")
+        print(f"Append mode: querying InfluxDB from {startd_for_query} to {endd_for_query}.")
 
     else:
         startd_for_query = args.startd
