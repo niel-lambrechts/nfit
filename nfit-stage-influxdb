@@ -249,44 +249,60 @@ def join_sorted_files(sorted_files, master_temp_filename):
     finally:
         for handle in file_handles.values(): handle.close()
 
-def get_config_events_robust(client, db_version, field, measurement, entity_filter, start_date, end_date, verbose=False):
-    """Performs a robust two-phase query to capture both the baseline configuration and any changes during the analysis period."""
-    events = []
-    last_known_values = {}
+def get_config_events_by_measurement(client, db_version, fields, measurement, entity_filter, start_date, end_date, verbose=False):
+    """
+    Issues two InfluxDB queries (baseline anchor + analysis window) for all
+    supplied fields from a single measurement in one round trip each, rather
+    than one pair of queries per field.
 
-    # Phase 1: Get the last known value BEFORE the analysis window.
-    start_date_obj = datetime.strptime(start_date, '%Y-%m-%d')
-    baseline_start_date_obj = start_date_obj - timedelta(days=365)
-    baseline_start_str = baseline_start_date_obj.strftime('%Y-%m-%d')
-    baseline_time_filter = f"time >= '{baseline_start_str}T00:00:00Z' AND time < '{start_date}T00:00:00Z'"
-    baseline_query = f'SELECT LAST("{field}") AS "{field}" FROM "{measurement}" WHERE {entity_filter} AND {baseline_time_filter} GROUP BY "host"'
+    Returns a dict of {field: [{'ts': int, 'host': str, 'value': any}]}.
+    All fields in the list must reside in the same measurement.
+    """
+    events_by_field   = {f: [] for f in fields}
+    last_known_values = {f: {} for f in fields}  # field -> {vm_name: last_value}
 
+    select_clause = ', '.join(f'LAST("{f}") AS "{f}"' for f in fields)
+    start_date_obj          = datetime.strptime(start_date, '%Y-%m-%d')
+    baseline_start_str      = (start_date_obj - timedelta(days=365)).strftime('%Y-%m-%d')
+    baseline_time_filter    = f"time >= '{baseline_start_str}T00:00:00Z' AND time < '{start_date}T00:00:00Z'"
+    analysis_time_filter    = f"time >= '{start_date}T00:00:00Z' AND time <= '{end_date}T23:59:59Z'"
+    anchor_epoch            = int(start_date_obj.replace(tzinfo=timezone.utc).timestamp())
+
+    # --- Baseline: last known value per field before the analysis window ---
+    baseline_query  = (f'SELECT {select_clause} FROM "{measurement}" '
+                       f'WHERE {entity_filter} AND {baseline_time_filter} GROUP BY "host"')
     baseline_results = execute_query(client, baseline_query, db_version, verbose)
     for series in baseline_results.items():
-        if 'host' in series[0][1] and series[0][1]['host']:
-            vm_name = series[0][1]['host']
-            points = list(series[1])
-            if points:
-                value = points[0].get(field)
-                if value is not None:
-                    ts = int(start_date_obj.replace(tzinfo=timezone.utc).timestamp())
-                    events.append({'ts': ts, 'host': vm_name, 'value': value})
-                    last_known_values[vm_name] = value
+        if not (series[0][1].get('host')):
+            continue
+        vm_name = series[0][1]['host']
+        points  = list(series[1])
+        if not points:
+            continue
+        for f in fields:
+            value = points[0].get(f)
+            if value is not None:
+                events_by_field[f].append({'ts': anchor_epoch, 'host': vm_name, 'value': value})
+                last_known_values[f][vm_name] = value
 
-    # Phase 2: Get all changes DURING the analysis window using sparse sampling.
-    analysis_time_filter = f"time >= '{start_date}T00:00:00Z' AND time <= '{end_date}T23:59:59Z'"
-    changes_query = f'SELECT LAST("{field}") AS "{field}" FROM "{measurement}" WHERE {entity_filter} AND {analysis_time_filter} GROUP BY time(6h), "host" ORDER BY time ASC'
-    change_results = execute_query(client, changes_query, db_version, verbose)
-
+    # --- Analysis window: detect changes at 6-hour resolution ---
+    changes_query   = (f'SELECT {select_clause} FROM "{measurement}" '
+                       f'WHERE {entity_filter} AND {analysis_time_filter} '
+                       f'GROUP BY time(6h), "host" ORDER BY time ASC')
+    change_results  = execute_query(client, changes_query, db_version, verbose)
     for series in change_results.items():
-        if 'host' in series[0][1] and series[0][1]['host']:
-            vm_name = series[0][1]['host']
-            for point in series[1]:
-                current_value = point.get(field)
-                if current_value is not None and current_value != last_known_values.get(vm_name):
-                    events.append({'ts': int(parse_utc_string(point['time']).timestamp()), 'host': vm_name, 'value': current_value})
-                    last_known_values[vm_name] = current_value
-    return events
+        if not (series[0][1].get('host')):
+            continue
+        vm_name = series[0][1]['host']
+        for point in series[1]:
+            ts = int(parse_utc_string(point['time']).timestamp())
+            for f in fields:
+                current_value = point.get(f)
+                if current_value is not None and current_value != last_known_values[f].get(vm_name):
+                    events_by_field[f].append({'ts': ts, 'host': vm_name, 'value': current_value})
+                    last_known_values[f][vm_name] = current_value
+
+    return events_by_field
 
 def load_fallback_config(config_path, verbose=False):
     """Loads VM configuration from a CSV file for fallback."""
@@ -835,16 +851,27 @@ def main():
             print("\n## Phase 2: Configuration State Discovery")
             phase2_start_time = time.time()
             all_config_events = defaultdict(list)
-            numeric_fields = {'entitlement': 'cpu_util', 'smtthreads': 'config', 'desired_vcpus': 'lpar_format1', 'pool_id': 'processor_pool', 'phys_cpus_pool': 'processor_pool', 'processorMHz': 'config'}
-            non_numeric_fields = {'serial_no': 'server', 'capped': 'partition_type', 'processorModel': 'config', 'processorFamily': 'config'}
-            config_fields = {**numeric_fields, **non_numeric_fields}
 
-            for field, measurement in config_fields.items():
-                change_events = get_config_events_robust(client, db_version, field, measurement, entity_filter, startd_for_query, endd_for_query, args.verbose)
-                print(f"- Attribute '{field}' (anchor: {startd_for_query}): identified {len(change_events)} states.")
-                internal_metric_key = next((key for key, val in CONFIG_FIELD_MAP.items() if val == field), field)
-                for event in change_events:
-                    all_config_events[event['host']].append({'ts': event['ts'], 'key': internal_metric_key, 'value': event['value']})
+            config_measurements = {
+                'cpu_util':       ['entitlement'],
+                'config':         ['smtthreads', 'processorMHz', 'processorModel', 'processorFamily'],
+                'lpar_format1':   ['desired_vcpus'],
+                'processor_pool': ['pool_id', 'phys_cpus_pool'],
+                'server':         ['serial_no'],
+                'partition_type': ['capped'],
+            }
+
+            for measurement, fields in config_measurements.items():
+                events_by_field = get_config_events_by_measurement(
+                    client, db_version, fields, measurement,
+                    entity_filter, startd_for_query, endd_for_query, args.verbose
+                )
+                for field, change_events in events_by_field.items():
+                    internal_metric_key = next((key for key, val in CONFIG_FIELD_MAP.items() if val == field), field)
+                    print(f"- Attribute '{field}' (anchor: {startd_for_query}): identified {len(change_events)} states.")
+                    for event in change_events:
+                        all_config_events[event['host']].append({'ts': event['ts'], 'key': internal_metric_key, 'value': event['value']})
+
             print(f"[DONE: {format_duration(time.time() - phase2_start_time)}]")
 
             # --- Phase 3: Building State Timelines ---
