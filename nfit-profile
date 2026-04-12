@@ -7050,6 +7050,148 @@ sub _build_vm_scope_filter_from_strings {
     return \%result;
 }
 
+sub _resolve_layer_a_occurrence_value {
+    my ($occurrence_entry_href, $prefer_latent) = @_;
+
+    $prefer_latent = defined $prefer_latent ? $prefer_latent : 1;
+
+    return undef unless (ref($occurrence_entry_href) eq 'HASH');
+
+    # Latent-demand truth is preferred for clipping-aware consumers when it is
+    # explicitly requested and the occurrence carries a latent estimate.
+    if ($prefer_latent
+        && defined $occurrence_entry_href->{latent_peak_value}
+        && looks_like_number($occurrence_entry_href->{latent_peak_value})) {
+        return {
+            value          => 0 + $occurrence_entry_href->{latent_peak_value},
+            layer_a_source => 'occurrence_latent_peak',
+            is_latent      => 1,
+            is_raw         => 0,
+            is_fallback    => 0,
+            notes          => 'Resolved from OccurrencePeaks[].latent_peak_value',
+        };
+    }
+
+    # Otherwise prefer the raw occurrence-level peak when it is available.
+    if (defined $occurrence_entry_href->{raw_peak_value}
+        && looks_like_number($occurrence_entry_href->{raw_peak_value})) {
+        return {
+            value          => 0 + $occurrence_entry_href->{raw_peak_value},
+            layer_a_source => 'occurrence_raw_peak',
+            is_latent      => 0,
+            is_raw         => 1,
+            is_fallback    => 0,
+            notes          => 'Resolved from OccurrencePeaks[].raw_peak_value',
+        };
+    }
+
+    return undef;
+}
+
+sub _resolve_layer_a_peak_from_snapshot {
+    my ($hist_results_href, $vm_name, $profile_name, $prefer_latent, $event_name, $month_key) = @_;
+
+    $prefer_latent = defined $prefer_latent ? $prefer_latent : 1;
+    $event_name    = defined $event_name    ? $event_name    : 'unknown_event';
+    $month_key     = defined $month_key     ? $month_key     : 'unknown_month';
+
+    return undef unless (ref($hist_results_href) eq 'HASH');
+
+    # ------------------------------------------------------------------
+    # Primary path: OccurrencePeaks[] rich Layer A truth
+    # ------------------------------------------------------------------
+    my $occurrence_peaks_aref = $hist_results_href->{OccurrencePeaks};
+    if (ref($occurrence_peaks_aref) eq 'ARRAY' && @$occurrence_peaks_aref) {
+        my @matching = grep {
+            ref($_) eq 'HASH'
+                && defined $_->{vm}
+                && defined $_->{profile}
+                && $_->{vm} eq $vm_name
+                && $_->{profile} eq $profile_name
+        } @$occurrence_peaks_aref;
+
+        if (@matching > 1) {
+            warn sprintf(
+                "  [WARN] Duplicate OccurrencePeaks candidates for event '%s', month '%s', VM '%s', profile '%s' - using last entry.\n",
+                $event_name, $month_key, $vm_name, $profile_name
+            );
+        }
+
+        if (@matching) {
+            my $resolved = _resolve_layer_a_occurrence_value($matching[-1], $prefer_latent);
+            return $resolved if $resolved;
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Secondary path: preserve legacy latent-aware behaviour for older
+    # history partitions that carry clipping correction but not rich
+    # occurrence-level records.
+    # ------------------------------------------------------------------
+    if ($prefer_latent) {
+        my $legacy_unclipped = _safe_dig(
+            $hist_results_href, 'ClippingInfo', $vm_name, $profile_name, 'unclippedPeakEstimate'
+        );
+        if (defined $legacy_unclipped && looks_like_number($legacy_unclipped)) {
+            return {
+                value          => 0 + $legacy_unclipped,
+                layer_a_source => 'legacy_unclipped_estimate_fallback',
+                is_latent      => 1,
+                is_raw         => 0,
+                is_fallback    => 1,
+                notes          => 'Resolved from legacy ClippingInfo.unclippedPeakEstimate fallback',
+            };
+        }
+    }
+
+    # ------------------------------------------------------------------
+    # Final compatibility fallback: scalar summary fields
+    # ------------------------------------------------------------------
+    my $legacy_historic_peak = _safe_dig($hist_results_href, 'HistoricPeak', $vm_name, $profile_name);
+    if (defined $legacy_historic_peak && looks_like_number($legacy_historic_peak)) {
+        return {
+            value          => 0 + $legacy_historic_peak,
+            layer_a_source => 'legacy_historicpeak_fallback',
+            is_latent      => 0,
+            is_raw         => 0,
+            is_fallback    => 1,
+            notes          => 'Resolved from legacy HistoricPeak fallback',
+        };
+    }
+
+    my $legacy_peak_value = _safe_dig($hist_results_href, 'PeakValue', $vm_name, $profile_name);
+    if (defined $legacy_peak_value && looks_like_number($legacy_peak_value)) {
+        return {
+            value          => 0 + $legacy_peak_value,
+            layer_a_source => 'legacy_peakvalue_fallback',
+            is_latent      => 0,
+            is_raw         => 0,
+            is_fallback    => 1,
+            notes          => 'Resolved from legacy PeakValue fallback',
+        };
+    }
+
+    return undef;
+}
+
+sub _format_layer_a_source_summary {
+    my ($history_aref) = @_;
+
+    return 'N/A'
+        unless (ref($history_aref) eq 'ARRAY' && @$history_aref);
+
+    my %counts;
+    foreach my $entry (@$history_aref) {
+        next unless ref($entry) eq 'HASH';
+        my $src = $entry->{layer_a_source} // 'unknown';
+        $counts{$src}++;
+    }
+
+    return 'N/A' unless %counts;
+
+    return join(', ', map { "$_=$counts{$_}" } sort keys %counts);
+}
+
 # ==============================================================================
 # SUBROUTINE: calculate_multiplicative_forecast (NEW ROBUST DESIGN)
 # PURPOSE:    Calculates a forecast using the multiplicative seasonal model.
@@ -7469,19 +7611,39 @@ sub calculate_multiplicative_forecast {
                     my @multipliers;
                     my @residuals;
                     foreach my $hist_event (@history_for_this_event) {
-                        my $hist_results = $hist_event->{results};
-                        my $hist_peak = $hist_results->{HistoricPeak}{$vm_name}{$p_name};
-                        if (defined $hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate} && looks_like_number($hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate})) {
-                            $hist_peak = $hist_results->{ClippingInfo}{$vm_name}{$p_name}{unclippedPeakEstimate};
-                        }
-                        my $hist_base = $hist_results->{HistoricBaseline}{$vm_name}{$p_name};
-                        my $hist_residual = $hist_results->{PeakResidual}{$vm_name}{$p_name};
+                        my $hist_results  = $hist_event->{results};
+                        my $hist_month    = $hist_event->{_month_key} // 'unknown_month';
+                        my $hist_base     = _safe_dig($hist_results, 'HistoricBaseline', $vm_name, $p_name);
+                        my $hist_residual = _safe_dig($hist_results, 'PeakResidual', $vm_name, $p_name);
 
-                        if (defined $hist_peak && defined $hist_base && $hist_base > 0.001) {
-                            push @multipliers, { value => $hist_peak / $hist_base, date => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d') };
+                        my $resolved_peak = _resolve_layer_a_peak_from_snapshot(
+                            $hist_results,
+                            $vm_name,
+                            $p_name,
+                            1,                  # Phase 1 rule: multiplicative path prefers latent truth
+                            $active_event_name,
+                            $hist_month,
+                        );
+
+                        if ($resolved_peak
+                            && defined $resolved_peak->{value}
+                            && looks_like_number($resolved_peak->{value})
+                            && defined $hist_base
+                            && looks_like_number($hist_base)
+                            && $hist_base > 0.001) {
+
+                            push @multipliers, {
+                                value          => $resolved_peak->{value} / $hist_base,
+                                date           => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d'),
+                                layer_a_source => $resolved_peak->{layer_a_source},
+                            };
                         }
+
                         if (defined $hist_residual && looks_like_number($hist_residual)) {
-                            push @residuals, { value => $hist_residual, date => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d') };
+                            push @residuals, {
+                                value => $hist_residual,
+                                date  => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d')
+                            };
                         }
                     }
                     next unless @multipliers;
@@ -7572,21 +7734,24 @@ sub calculate_multiplicative_forecast {
                 $observed_peak_val = $initial_results_table_href->{$vm_name}{CoreResults}{ProfileValues}{$p_name};
             }
 
+            my $hist_mult_history_aref = $vm_historic_multipliers{$p_name}{$event_name}{'history'} // [];
+
             $seasonal_debug_info{$vm_name}{$p_name} = {
-                historical_multipliers => $vm_historic_multipliers{$p_name}{$event_name}{'history'},
-                multiplier_n         => scalar(@{$vm_historic_multipliers{$p_name}{$event_name}{'history'} // []}),
-                baseline             => $current_baseline_val,
-                baseline_source      => $baseline_source_log,
-                trend_factor         => $trend_adjustment_factor,
-                multiplier           => $final_multiplier,
-                volatility           => $volatility_buffer,
-                forecasted_residual  => $forecasted_residual,
-                amplification_factor => $amplification,
-                forecast             => $final_recommendation,
-                observed_peak        => $observed_peak_val,  # Store for history
-                OutlierWarning       => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings),
-                active_events        => $active_events_str,
-                is_bootstrap_run     => $is_bootstrap_run,
+                historical_multipliers => $hist_mult_history_aref,
+                multiplier_n           => scalar(@{$hist_mult_history_aref}),
+                layer_a_source_summary => _format_layer_a_source_summary($hist_mult_history_aref),
+                baseline               => $current_baseline_val,
+                baseline_source        => $baseline_source_log,
+                trend_factor           => $trend_adjustment_factor,
+                multiplier             => $final_multiplier,
+                volatility             => $volatility_buffer,
+                forecasted_residual    => $forecasted_residual,
+                amplification_factor   => $amplification,
+                forecast               => $final_recommendation,
+                observed_peak          => $observed_peak_val,  # Store for history
+                OutlierWarning         => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings),
+                active_events          => $active_events_str,
+                is_bootstrap_run       => $is_bootstrap_run,
             };
         }
         $final_forecasts{$vm_name} = $vm_forecasts;
@@ -9415,6 +9580,9 @@ sub log_multiplicative_seasonal_rationale
             print {$fh} "  CPU Forecasting Model: Multiplicative Seasonal Forecast ($apply_seasonality_event)\n\n";
             printf {$fh} "  %-${label_width}s : %.4f cores\n", "Current Baseline Value", $s_data->{baseline};
             printf {$fh} "  %-${label_width}s : %.4f\n", "Historical Multiplier", $s_data->{multiplier};
+            if (defined $s_data->{layer_a_source_summary} && $s_data->{layer_a_source_summary} ne '') {
+                printf {$fh} "  %-${label_width}s : %s\n", "Layer A Source Summary", $s_data->{layer_a_source_summary};
+            }
 
             # Add detailed breakdown of how the multiplier was derived
             if (exists $s_data->{historical_multipliers} && ref($s_data->{historical_multipliers}) eq 'ARRAY' && @{$s_data->{historical_multipliers}}) {
@@ -9994,6 +10162,7 @@ sub _get_historical_peak_data {
 
     my %peaks_by_profile;
     my %residuals_by_profile; # New hash for residual data.
+    my %layer_a_source_counts;
 
     foreach my $event (@event_history) {
         my $date = $event->{_month_key} . "-01"; # Use the first of the month as the date for the time series.
@@ -10001,16 +10170,31 @@ sub _get_historical_peak_data {
         my $peak_results = $event->{results}{'PeakValue'} || {};
         my $residual_results = $event->{results}{'PeakResidual'} || {};
 
-        # Process PeakValue data.
+        # Process historical peak data using rich occurrence-level Layer A truth
+        # where available.  Phase 1 rule: predictive_peak prefers latent truth.
         foreach my $vm (keys %$peak_results) {
             foreach my $profile (keys %{$peak_results->{$vm}}) {
-                my $value = $peak_results->{$vm}{$profile};
-                if (exists $hist_results->{ClippingInfo}{$vm}{$profile}{unclippedPeakEstimate}) {
-                    $value = $hist_results->{ClippingInfo}{$vm}{$profile}{unclippedPeakEstimate};
-                }
-                if (defined $value && looks_like_number($value)) {
-                    push @{$peaks_by_profile{$profile}{$vm}}, { value => $value, date => $date };
-                }
+                my $resolved_peak = _resolve_layer_a_peak_from_snapshot(
+                    $hist_results,
+                    $vm,
+                    $profile,
+                    1,          # Phase 1 rule: predictive_peak prefers latent truth
+                    $event_name,
+                    $event->{_month_key},
+                );
+
+                next unless ($resolved_peak
+                    && defined $resolved_peak->{value}
+                    && looks_like_number($resolved_peak->{value}));
+
+                # debugging
+                $layer_a_source_counts{$resolved_peak->{layer_a_source}}++;
+
+                push @{$peaks_by_profile{$profile}{$vm}}, {
+                    value          => $resolved_peak->{value},
+                    date           => $date,
+                    layer_a_source => $resolved_peak->{layer_a_source},
+                };
             }
         }
 
@@ -10023,6 +10207,11 @@ sub _get_historical_peak_data {
                 }
             }
         }
+    }
+
+    if (%layer_a_source_counts) {
+        my $summary = join(', ', map { "$_=$layer_a_source_counts{$_}" } sort keys %layer_a_source_counts);
+        print STDERR "  Φ Predictive Peak [Layer A source summary]: $summary\n";
     }
 
     # Return a hash containing both data series.
