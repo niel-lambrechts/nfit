@@ -248,6 +248,47 @@ my $VCPU_PEAK_CRED_MIN     = 0.65;   # Never discount PhysC peak by more than 35
 # work requires the throughput-aware floor (Stage 3), not this discount.
 my $VCPU_PEAK_CRED_DISCOUNT_ENABLED = 0;
 
+# --- Layer 5: Conditional Dispatch Reserve (Task 1 - retired) ---
+# The dispatch reserve added VPs when rVCPU would collapse to VP_Min and one
+# of three uncertainty triggers fired. All three are either a falsified
+# premise or duplicated evidence already counted elsewhere in the rVCPU chain:
+#
+#   1. LowCorroboration (runnable density < 0.70). FALSIFIED PREMISE - the
+#      same one $VCPU_PEAK_CRED_DISCOUNT_ENABLED documents above. At SMT-8,
+#      density < 0.70 is <5.6 threads per consumed core, which covers most of
+#      a normal estate. It added VPs to precisely the consolidation
+#      candidates this reserve should not have widened.
+#   2. GrowthAdj (growth > 0.25 cores). DUPLICATED. Growth already raises
+#      rENT, which already raises ceil(rENT) -> VP_Min. The reserve added
+#      width for growth a second time.
+#   3. Pressure (RunQ pressure). DUPLICATED TWICE. Pressure already drives
+#      the RunQ additive (-> rENT -> VP_Min) and VP_RunQ (the dispatch-width
+#      driver computed upstream of the reserve). The reserve added a third
+#      increment for the same evidence.
+#
+# Disabled by default. The reserve computation is retained, unexecuted,
+# behind this switch so a narrow, evidence-gated reinstatement remains
+# possible after back-testing (see nFit - Interim VP Right-Sizing
+# Implementation Strategy, Task 1).
+my $VCPU_DISPATCH_RESERVE_ENABLED = 0;
+
+# --- Peak floor: PAE/AAE headroom multiplier (Task 2 - shadow diagnostic) ---
+# p99w1_factor_eff multiplies the yield-aware active-core floor (Stage 3) by
+# up to ~1.375x based on PAE/AAE burst evidence. Since the yield-floor work,
+# that floor *is* the yield floor: it is derived from the P-99W1 peak, so the
+# peak's burst is already carried in it. Multiplying the floor back up by
+# PAE/AAE - which is itself sourced from the same peak profile - cancels the
+# yield floor's deliberate throughput-for-width trade-off, and the floor can
+# never govern while this multiplier is live.
+#
+# Disabled by default: p99w1_factor_eff is held at 1.00 so the yield floor
+# governs unmultiplied. PAE, AAE and the shadow headroom value they would
+# have produced remain computed and logged at every site (see $headroom /
+# P99W1Mult in the rationale) - they stay the correct diagnostic of chronic
+# bursting, just not evidence about the *width* a proposed configuration
+# needs (see nFit - Interim VP Right-Sizing Implementation Strategy, Task 2).
+my $VCPU_PAE_AAE_HEADROOM_ENABLED = 0;
+
 # --- SMT yield curve: DEFAULT COMMERCIAL PLANNING CURVE ---
 # Throughput of one POWER core running k threads, relative to that core running a
 # single thread.
@@ -296,6 +337,28 @@ my %VCPU_TIER_HEADROOM_FACTORS = (
     4 => 0.95,  # Tier 4: Slightly moderated width
 );
 
+# Task 4: Tier-aware rate limiting on VP reduction (rVCPU_Tactical).
+# Fraction of CURRENT VPs that may be removed in a single cycle, keyed on
+# $rvcpu_tier_num (tier 'P' collapses to 1, matching %TIER_THROUGHPUT_RETENTION
+# and %VCPU_TIER_HEADROOM_FACTORS above).
+#
+# This is the FOURTH place tier appetite appears in the rVCPU chain. It is
+# legitimate here because it governs CHANGE RATE, not sizing - a different
+# question from the other three (profile percentile -> rENT -> ceil(rENT);
+# $rvcpu_tier_num -> VP_RunQ via %VCPU_TIER_HEADROOM_FACTORS; and
+# %TIER_THROUGHPUT_RETENTION -> the yield floor). Do not fold this into
+# those three, and do not remove it as apparent double-counting.
+#
+# Back-test candidates, not findings (nFit - Interim VP Right-Sizing
+# Implementation Strategy, Task 4 / open question 1). Tier 2 is interpolated
+# pending its own back-test evidence.
+my %VCPU_TIER_STAGE1_STEP_FRACTION = (
+    1 => 0.25,  # P/tier-1: strictest - latency-sensitive, move cautiously
+    2 => 0.35,  # Tier 2: interpolated pending back-test
+    3 => 0.50,  # Tier 3: most permissive
+    4 => 0.50,  # Tier 4: most permissive
+);
+my $VCPU_TIER_STAGE1_STEP_MIN_VP = 1;  # Floor so small partitions can still move
 
 my $ENTITLEMENT_BURST_ALLOWANCE_FACTOR = 0.25;          # Allow uncapped VMs to burst 25% over their entitlement before pressure is assessed
 my $BURST_ALLOWANCE_MIN_FACTOR = 0.0;
@@ -1048,6 +1111,8 @@ foreach my $p (@csv_visible_profiles) {
     push @output_header_cols_csv, $p->{name};
     if (defined $p->{name} && $p->{name} ne $MANDATORY_PEAK_PROFILE_FOR_HINT) {
         push @output_header_cols_csv, $p->{name} . "_rVCPU";
+        push @output_header_cols_csv, $p->{name} . "_rVCPU_Stage1Safe";
+        push @output_header_cols_csv, $p->{name} . "_rVCPU_Tactical";
     }
 }
 
@@ -3904,6 +3969,31 @@ sub log_profile_rationale
     # rVCPU is stored per profile name in CoreResults
     my $rv = $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_being_adjusted};
     my $re = $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$profile_being_adjusted} // {};
+
+    # Task 3: Stage-1-safe VP recommendation. Implementable now, entitlement
+    # untouched - see nFit - Interim VP Right-Sizing Implementation Strategy.
+    if (defined $re->{Stage1Safe} && looks_like_number($re->{Stage1Safe})) {
+        my $s1_needs_change = ($re->{Stage1SafeNeedsCoordinatedChange}) ? 1 : 0;
+        my $s1_stale_note = ($re->{CurrentEntStale}) ? ' [current entitlement unavailable - fell back to VP_Min]' : '';
+        printf {$fh} "  - Stage1Safe VCPUs (rVCPU_Stage1Safe)                : %s virtual processors%s\n",
+            $re->{Stage1Safe}, $s1_stale_note;
+        printf {$fh} "    Governed by          : %s.\n", ($re->{Stage1SafeGovernedBy} // $na);
+        if ($s1_needs_change) {
+            printf {$fh} "    Coordinated change needed: YES - rVCPU (%s) is below rVCPU_Stage1Safe (%s); reaching rVCPU requires reducing entitlement first.\n",
+                ($rvcpu_final_log // $na), $re->{Stage1Safe};
+        } else {
+            printf {$fh} "    Coordinated change needed: NO - rVCPU_Stage1Safe is implementable now, entitlement untouched.\n";
+        }
+    }
+
+    # Task 4: Tier-aware rate-limited step toward rVCPU_Stage1Safe. Implementation
+    # risk control, not a sizing recommendation - see Task 4, nFit - Interim VP
+    # Right-Sizing Implementation Strategy.
+    if (defined $re->{Tactical} && looks_like_number($re->{Tactical})) {
+        printf {$fh} "  - Tactical VCPUs (rVCPU_Tactical, this cycle)        : %s virtual processors\n",
+            $re->{Tactical};
+        printf {$fh} "    %s.\n", ($re->{TacticalNote} // $na);
+    }
 
     # Practical audit trail: explain each width constraint in a capacity-planner-friendly way
     # (kept concise; detailed engineer-level fields remain in the "Detail:" line below).
@@ -6820,9 +6910,12 @@ sub calculate_runq_modified_physc
                 my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
                 my $aae_component = ($aae_raw > 0) ? (($aae_raw < 0.10 ? $aae_raw : 0.10) / 0.10) * 0.15 : 0.0;
 
+                # Task 2: shadow diagnostic by default - see $VCPU_PAE_AAE_HEADROOM_ENABLED.
+                # $headroom is still computed and logged (as $p99w1_mult) so PAE/AAE
+                # chronic-burst evidence stays visible; it is not applied to the floor.
                 my $headroom = ($pae_component + $aae_component) * $rvcpu_tier_factor;
-                $p99w1_factor_eff = 1.00 + $headroom;
-                $p99w1_mult = $headroom;  # For rationale: the headroom portion above 1.00
+                $p99w1_factor_eff = $VCPU_PAE_AAE_HEADROOM_ENABLED ? (1.00 + $headroom) : 1.00;
+                $p99w1_mult = $headroom;  # Shadow diagnostic: portion above 1.00 that would apply if enabled
 
                 my $floor_v = ($p99w1_adjusted + 0) * $p99w1_factor_eff;
 
@@ -6897,6 +6990,13 @@ sub calculate_runq_modified_physc
             $dispatch_reserve_pre_final = $rvcpu_final;
 
             RESERVE_CALC: {
+                # Task 1: retired - see $VCPU_DISPATCH_RESERVE_ENABLED for why all three
+                # triggers below are either a falsified premise or duplicated evidence.
+                # Checked first so that while disabled, $dispatch_reserve_vp and
+                # $dispatch_reserve_reason are never touched and stay at their
+                # initialised (0, '') values - no rationale text is produced.
+                last RESERVE_CALC unless $VCPU_DISPATCH_RESERVE_ENABLED;
+
                 last RESERVE_CALC unless (defined $rvcpu_final && defined $rvcpu_min && defined $rvcpu_max);
 
                 # Only trigger if final would otherwise equal or near the floor
@@ -7027,8 +7127,103 @@ sub calculate_runq_modified_physc
 
         }
 
+        # ================================================================
+        # Task 3: Stage-1-safe VP recommendation
+        # ================================================================
+        # rVCPU (above) is bounded below by ceil(rENT), the RECOMMENDED
+        # entitlement, so implementing it may require a coordinated
+        # entitlement change. rVCPU_Stage1Safe uses ceil(CURRENT
+        # entitlement) instead, so it is implementable now, entitlement
+        # untouched (Stage 1 of the two-stage cycle: cut VPs, hold
+        # entitlement, let true consumption become visible before
+        # entitlement is revisited next cycle).
+        # ================================================================
+        my $current_ent_numeric = (defined $current_entitlement_str && $current_entitlement_str ne ""
+                                    && looks_like_number($current_entitlement_str))
+                                 ? ($current_entitlement_str + 0) : undef;
+        my $current_ent_stale = (!defined $current_ent_numeric || $current_ent_numeric <= 0) ? 1 : 0;
+
+        my $vp_current_ent_floor;
+        if ($current_ent_stale) {
+            # Watch for: current entitlement unavailable or stale on this execution
+            # path. Do not invent a VP floor from unknown data - fall back to the
+            # recommended envelope minimum (VP_Min) so Stage1Safe degrades to the
+            # coordinated figure rather than silently under-reporting.
+            $vp_current_ent_floor = $rvcpu_min;
+        } else {
+            $vp_current_ent_floor = int($current_ent_numeric);
+            $vp_current_ent_floor++ if ($current_ent_numeric > $vp_current_ent_floor); # ceil
+        }
+
+        # max() includes $rvcpu_final (the coordinated rVCPU) so rVCPU_Stage1Safe
+        # >= rVCPU holds by construction in every case, including upsize scenarios
+        # where current entitlement is below recommended.
+        my $rvcpu_stage1safe = max(grep { defined $_ } ($vp_current_ent_floor, $rvcpu_raw, $p99w1_floor_vcpu, $rvcpu_final));
+
+        my $stage1safe_governed;
+        if (defined $vp_current_ent_floor && $rvcpu_stage1safe == $vp_current_ent_floor) {
+            $stage1safe_governed = $current_ent_stale
+                ? sprintf("Minimum VPs from rENT_P (%s) [current entitlement unavailable]", $rvcpu_min // 'N/A')
+                : sprintf("Current entitlement floor (%d)", $vp_current_ent_floor);
+        } elsif (defined $p99w1_floor_vcpu && $rvcpu_stage1safe == $p99w1_floor_vcpu) {
+            $stage1safe_governed = sprintf("Peak floor (%d)", $p99w1_floor_vcpu);
+        } elsif (defined $rvcpu_raw && $rvcpu_stage1safe == $rvcpu_raw) {
+            $stage1safe_governed = sprintf("RunQ dispatch sizing (%d)", $rvcpu_raw);
+        } else {
+            $stage1safe_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
+        }
+
+        # TRUE when the coordinated rVCPU is lower than Stage1Safe: reaching the
+        # coordinated figure needs entitlement to actually move first, not just VPs.
+        my $stage1safe_needs_coordinated_change =
+            (defined $rvcpu_final && $rvcpu_stage1safe > $rvcpu_final) ? 1 : 0;
+
+        # ================================================================
+        # Task 4: Tier-aware rate limiting on VP reduction (rVCPU_Tactical)
+        # ================================================================
+        # Steps CURRENT VPs toward rVCPU_Stage1Safe, limited per cycle by tier
+        # appetite (strictest for P/tier-1, most permissive for tiers 3-4).
+        # Never steps below the strategic target (Stage1Safe) and never steps
+        # up - upward moves follow entitlement, not this rate limiter.
+        my $current_vp_numeric = (defined $vcpu_for_lpar_numeric && looks_like_number($vcpu_for_lpar_numeric) && $vcpu_for_lpar_numeric > 0)
+                                ? ($vcpu_for_lpar_numeric + 0) : undef;
+
+        my $rvcpu_tactical;
+        my $tactical_note;
+        if (!defined $current_vp_numeric) {
+            # Watch for: current VP count unavailable. No safe step can be computed
+            # without a starting point - hold at Stage1Safe (the most conservative,
+            # already-validated figure) rather than inventing a step.
+            $rvcpu_tactical = $rvcpu_stage1safe;
+            $tactical_note = "current VP count unavailable - held at rVCPU_Stage1Safe";
+        } elsif ($rvcpu_stage1safe >= $current_vp_numeric) {
+            # No reduction due (or an upsize scenario). Upward moves follow
+            # entitlement, not this rate limiter, so hold at current VPs.
+            $rvcpu_tactical = $current_vp_numeric;
+            $tactical_note = "no reduction due; upward moves follow entitlement";
+        } else {
+            my $step_fraction = $VCPU_TIER_STAGE1_STEP_FRACTION{$rvcpu_tier_num} // $VCPU_TIER_STAGE1_STEP_FRACTION{3};
+            my $reduction_needed = $current_vp_numeric - $rvcpu_stage1safe;
+            my $max_step = $step_fraction * $current_vp_numeric;
+            $max_step = $VCPU_TIER_STAGE1_STEP_MIN_VP if ($max_step < $VCPU_TIER_STAGE1_STEP_MIN_VP);
+            my $step = ($reduction_needed < $max_step) ? $reduction_needed : $max_step;
+
+            my $rvcpu_tactical_raw = $current_vp_numeric - $step;
+            $rvcpu_tactical = int($rvcpu_tactical_raw);
+            $rvcpu_tactical++ if ($rvcpu_tactical_raw > $rvcpu_tactical); # ceil: never remove more than budgeted
+
+            # Never step below the strategic target. Guaranteed by construction
+            # above (step <= reduction_needed); re-asserted as a hard clamp.
+            $rvcpu_tactical = $rvcpu_stage1safe if ($rvcpu_tactical < $rvcpu_stage1safe);
+
+            $tactical_note = sprintf("stepped %.2f of %.2f VPs needed (tier %s cap %.0f%%)",
+                $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
+        }
+
         # Persist for CSV and rationale consumers
         $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_name} = defined($rvcpu_final) ? $rvcpu_final : '';
+        $vm_map_ref->{CoreResults}{Profile_rVCPU_Stage1Safe}{$profile_name} = $rvcpu_stage1safe;
+        $vm_map_ref->{CoreResults}{Profile_rVCPU_Tactical}{$profile_name} = $rvcpu_tactical;
         $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$profile_name} = {
             Raw            => $rvcpu_raw,
             Min            => $rvcpu_min,
@@ -7058,6 +7253,14 @@ sub calculate_runq_modified_physc
             RunQEnvelopeBasis    => defined $runq_envelope_basis ? sprintf("%.3f", $runq_envelope_basis) : undef,
             OrigMin              => $orig_rvcpu_min,
             OrigMax              => $orig_rvcpu_max,
+            Stage1Safe                    => $rvcpu_stage1safe,
+            Stage1SafeGovernedBy          => $stage1safe_governed,
+            Stage1SafeNeedsCoordinatedChange => $stage1safe_needs_coordinated_change,
+            CurrentEntCores               => (defined $current_ent_numeric ? sprintf("%.2f", $current_ent_numeric) : undef),
+            CurrentEntStale               => $current_ent_stale,
+            Tactical                      => $rvcpu_tactical,
+            TacticalNote                  => $tactical_note,
+            CurrentVPs                    => $current_vp_numeric,
         };
 
         # Mirror into debug_info
@@ -7090,6 +7293,13 @@ sub calculate_runq_modified_physc
         $debug_info{'rVCPU_RunQEnvelopeBasis'}    = defined $runq_envelope_basis ? sprintf("%.3f", $runq_envelope_basis) : 'N/A';
         $debug_info{'rVCPU_OrigMin'}              = defined $orig_rvcpu_min ? $orig_rvcpu_min : 'N/A';
         $debug_info{'rVCPU_OrigMax'}              = defined $orig_rvcpu_max ? $orig_rvcpu_max : 'N/A';
+        $debug_info{'rVCPU_Stage1Safe'}           = defined($rvcpu_stage1safe) ? $rvcpu_stage1safe : 'N/A';
+        $debug_info{'rVCPU_Stage1SafeGovernedBy'} = $stage1safe_governed // 'N/A';
+        $debug_info{'rVCPU_Stage1SafeNeedsCoordinatedChange'} = $stage1safe_needs_coordinated_change ? 1 : 0;
+        $debug_info{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
+        $debug_info{'rVCPU_Tactical'}             = defined($rvcpu_tactical) ? $rvcpu_tactical : 'N/A';
+        $debug_info{'rVCPU_TacticalNote'}         = $tactical_note // 'N/A';
+        $debug_info{'rVCPU_CurrentVPs'}           = defined($current_vp_numeric) ? $current_vp_numeric : 'N/A';
     };
 
     return ($runq_modified_rec, \%debug_info);
@@ -9505,6 +9715,29 @@ sub _write_standard_csv_report {
                     $rvcpu_out = $core->{Profile_rVCPU}{$pname} + 0;
                     $max_rvcpu_seen = $rvcpu_out if (!defined $max_rvcpu_seen || $rvcpu_out > $max_rvcpu_seen);
                     push @data_row_csv, $rvcpu_out;
+
+                    # Task 3: prefer the authoritative Stage1Safe value alongside rVCPU. If it is
+                    # missing for some reason, fall back to rvcpu_out itself - a safe floor that
+                    # trivially satisfies rVCPU_Stage1Safe >= rVCPU rather than leaving it blank.
+                    my $stage1safe_out = $rvcpu_out;
+                    if (defined $core->{Profile_rVCPU_Stage1Safe}
+                        && ref($core->{Profile_rVCPU_Stage1Safe}) eq 'HASH'
+                        && defined $core->{Profile_rVCPU_Stage1Safe}{$pname}
+                        && looks_like_number($core->{Profile_rVCPU_Stage1Safe}{$pname})) {
+                        $stage1safe_out = $core->{Profile_rVCPU_Stage1Safe}{$pname} + 0;
+                    }
+                    push @data_row_csv, $stage1safe_out;
+
+                    # Task 4: prefer the authoritative Tactical value. Fall back to rvcpu_out
+                    # (current rVCPU) if missing - never blank, and never above Stage1Safe/rVCPU.
+                    my $tactical_out = $rvcpu_out;
+                    if (defined $core->{Profile_rVCPU_Tactical}
+                        && ref($core->{Profile_rVCPU_Tactical}) eq 'HASH'
+                        && defined $core->{Profile_rVCPU_Tactical}{$pname}
+                        && looks_like_number($core->{Profile_rVCPU_Tactical}{$pname})) {
+                        $tactical_out = $core->{Profile_rVCPU_Tactical}{$pname} + 0;
+                    }
+                    push @data_row_csv, $tactical_out;
                     next;
                 }
 
@@ -9734,9 +9967,12 @@ sub _write_standard_csv_report {
                         my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
                         my $aae_component = ($aae_raw > 0) ? (($aae_raw < 0.10 ? $aae_raw : 0.10) / 0.10) * 0.15 : 0.0;
 
+                        # Task 2: shadow diagnostic by default - see $VCPU_PAE_AAE_HEADROOM_ENABLED.
+                        # $headroom is still computed and logged (as $p99w1_mult) so PAE/AAE
+                        # chronic-burst evidence stays visible; it is not applied to the floor.
                         my $headroom = ($pae_component + $aae_component) * $rvcpu_tier_factor;
-                        $p99w1_factor_eff = 1.00 + $headroom;
-                        $p99w1_mult = $headroom;  # Rationale: the headroom portion above 1.00
+                        $p99w1_factor_eff = $VCPU_PAE_AAE_HEADROOM_ENABLED ? (1.00 + $headroom) : 1.00;
+                        $p99w1_mult = $headroom;  # Shadow diagnostic: portion above 1.00 that would apply if enabled
 
                         my $floor_v = ($p99w1_adjusted + 0) * $p99w1_factor_eff;
 
@@ -9759,8 +9995,81 @@ sub _write_standard_csv_report {
                     $rvcpu_out = $rvcpu_final;
                     $max_rvcpu_seen = $rvcpu_final if (!defined $max_rvcpu_seen || $rvcpu_final > $max_rvcpu_seen);
 
+                    # ================================================================
+                    # Task 3: Stage-1-safe VP recommendation (CSV fallback path)
+                    # ================================================================
+                    my $current_ent_numeric = (defined $cfg->{entitlement} && looks_like_number($cfg->{entitlement}))
+                                             ? ($cfg->{entitlement} + 0) : undef;
+                    my $current_ent_stale = (!defined $current_ent_numeric || $current_ent_numeric <= 0) ? 1 : 0;
+
+                    my $vp_current_ent_floor;
+                    if ($current_ent_stale) {
+                        # Watch for: current entitlement unavailable or stale on this execution
+                        # path. Fall back to the recommended envelope minimum (VP_Min).
+                        $vp_current_ent_floor = $rvcpu_min;
+                    } else {
+                        $vp_current_ent_floor = int($current_ent_numeric);
+                        $vp_current_ent_floor++ if ($current_ent_numeric > $vp_current_ent_floor); # ceil
+                    }
+
+                    my $rvcpu_stage1safe = max(grep { defined $_ } ($vp_current_ent_floor, $rvcpu_raw, $p99w1_floor_vcpu, $rvcpu_final));
+
+                    my $stage1safe_governed;
+                    if (defined $vp_current_ent_floor && $rvcpu_stage1safe == $vp_current_ent_floor) {
+                        $stage1safe_governed = $current_ent_stale
+                            ? sprintf("Minimum VPs from rENT_P (%s) [current entitlement unavailable]", $rvcpu_min // 'N/A')
+                            : sprintf("Current entitlement floor (%d)", $vp_current_ent_floor);
+                    } elsif (defined $p99w1_floor_vcpu && $rvcpu_stage1safe == $p99w1_floor_vcpu) {
+                        $stage1safe_governed = sprintf("Peak floor (%d)", $p99w1_floor_vcpu);
+                    } elsif (defined $rvcpu_raw && $rvcpu_stage1safe == $rvcpu_raw) {
+                        $stage1safe_governed = sprintf("RunQ dispatch sizing (%d)", $rvcpu_raw);
+                    } else {
+                        $stage1safe_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
+                    }
+
+                    my $stage1safe_needs_coordinated_change =
+                        (defined $rvcpu_final && $rvcpu_stage1safe > $rvcpu_final) ? 1 : 0;
+
+                    # ================================================================
+                    # Task 4: Tier-aware rate limiting on VP reduction (CSV fallback path)
+                    # ================================================================
+                    my $current_vp_numeric = (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus}) && $cfg->{virtual_cpus} > 0)
+                                            ? ($cfg->{virtual_cpus} + 0) : undef;
+
+                    my $rvcpu_tactical;
+                    my $tactical_note;
+                    if (!defined $current_vp_numeric) {
+                        # Watch for: current VP count unavailable. Hold at Stage1Safe rather
+                        # than inventing a step.
+                        $rvcpu_tactical = $rvcpu_stage1safe;
+                        $tactical_note = "current VP count unavailable - held at rVCPU_Stage1Safe";
+                    } elsif ($rvcpu_stage1safe >= $current_vp_numeric) {
+                        # No reduction due (or an upsize scenario). Upward moves follow
+                        # entitlement, not this rate limiter, so hold at current VPs.
+                        $rvcpu_tactical = $current_vp_numeric;
+                        $tactical_note = "no reduction due; upward moves follow entitlement";
+                    } else {
+                        my $step_fraction = $VCPU_TIER_STAGE1_STEP_FRACTION{$rvcpu_tier_num} // $VCPU_TIER_STAGE1_STEP_FRACTION{3};
+                        my $reduction_needed = $current_vp_numeric - $rvcpu_stage1safe;
+                        my $max_step = $step_fraction * $current_vp_numeric;
+                        $max_step = $VCPU_TIER_STAGE1_STEP_MIN_VP if ($max_step < $VCPU_TIER_STAGE1_STEP_MIN_VP);
+                        my $step = ($reduction_needed < $max_step) ? $reduction_needed : $max_step;
+
+                        my $rvcpu_tactical_raw = $current_vp_numeric - $step;
+                        $rvcpu_tactical = int($rvcpu_tactical_raw);
+                        $rvcpu_tactical++ if ($rvcpu_tactical_raw > $rvcpu_tactical); # ceil: never remove more than budgeted
+
+                        # Never step below the strategic target (re-asserted as a hard clamp).
+                        $rvcpu_tactical = $rvcpu_stage1safe if ($rvcpu_tactical < $rvcpu_stage1safe);
+
+                        $tactical_note = sprintf("stepped %.2f of %.2f VPs needed (tier %s cap %.0f%%)",
+                            $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
+                    }
+
                     # Persist rVCPU + explain so rationale can print an audit trail
                     $vm_map_ref->{CoreResults}{Profile_rVCPU}{$pname} = $rvcpu_final;
+                    $vm_map_ref->{CoreResults}{Profile_rVCPU_Stage1Safe}{$pname} = $rvcpu_stage1safe;
+                    $vm_map_ref->{CoreResults}{Profile_rVCPU_Tactical}{$pname} = $rvcpu_tactical;
                     $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$pname} = {
                         Raw               => $rvcpu_raw,
                         Min               => $rvcpu_min,
@@ -9790,6 +10099,14 @@ sub _write_standard_csv_report {
                         RunQEnvelopeBasis    => undef,
                         OrigMin              => undef,
                         OrigMax              => undef,
+                        Stage1Safe                    => $rvcpu_stage1safe,
+                        Stage1SafeGovernedBy          => $stage1safe_governed,
+                        Stage1SafeNeedsCoordinatedChange => $stage1safe_needs_coordinated_change,
+                        CurrentEntCores               => (defined $current_ent_numeric ? sprintf("%.2f", $current_ent_numeric) : undef),
+                        CurrentEntStale               => $current_ent_stale,
+                        Tactical                      => $rvcpu_tactical,
+                        TacticalNote                  => $tactical_note,
+                        CurrentVPs                    => $current_vp_numeric,
                     };
 
                     # ALSO persist into per-profile debug info used by rationale (prevents stale labels such as AbsRunQ_P95)
@@ -9813,9 +10130,24 @@ sub _write_standard_csv_report {
                     $di->{'rVCPU_P99W1OccupancyIntervalCorr'}        = sprintf("%.2f", $runq_cred_corr);
                     $di->{'rVCPU_P99W1RunnableDensitySuffix'} = $runq_cred_corr_suffix;
                     $di->{'rVCPU_Final'}            = defined $rvcpu_final ? $rvcpu_final : "N/A";
+                    $di->{'rVCPU_Stage1Safe'}           = defined($rvcpu_stage1safe) ? $rvcpu_stage1safe : "N/A";
+                    $di->{'rVCPU_Stage1SafeGovernedBy'} = $stage1safe_governed // "N/A";
+                    $di->{'rVCPU_Stage1SafeNeedsCoordinatedChange'} = $stage1safe_needs_coordinated_change ? 1 : 0;
+                    $di->{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
+                    $di->{'rVCPU_Tactical'}           = defined($rvcpu_tactical) ? $rvcpu_tactical : "N/A";
+                    $di->{'rVCPU_TacticalNote'}       = $tactical_note // "N/A";
+                    $di->{'rVCPU_CurrentVPs'}         = defined($current_vp_numeric) ? $current_vp_numeric : "N/A";
                 }
 
                 push @data_row_csv, $rvcpu_out;
+                push @data_row_csv, (defined $vm_map_ref->{CoreResults}{Profile_rVCPU_Stage1Safe}{$pname}
+                                      && looks_like_number($vm_map_ref->{CoreResults}{Profile_rVCPU_Stage1Safe}{$pname}))
+                                     ? ($vm_map_ref->{CoreResults}{Profile_rVCPU_Stage1Safe}{$pname} + 0)
+                                     : $rvcpu_out;
+                push @data_row_csv, (defined $vm_map_ref->{CoreResults}{Profile_rVCPU_Tactical}{$pname}
+                                      && looks_like_number($vm_map_ref->{CoreResults}{Profile_rVCPU_Tactical}{$pname}))
+                                     ? ($vm_map_ref->{CoreResults}{Profile_rVCPU_Tactical}{$pname} + 0)
+                                     : $rvcpu_out;
             }
         }
 
@@ -19700,9 +20032,12 @@ sub _execute_multiplicative_seasonal {
                     my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
                     my $aae_component = ($aae_raw > 0) ? (($aae_raw < 0.10 ? $aae_raw : 0.10) / 0.10) * 0.15 : 0.0;
 
+                    # Task 2: shadow diagnostic by default - see $VCPU_PAE_AAE_HEADROOM_ENABLED.
+                    # $headroom is still computed and logged (as $p99w1_mult) so PAE/AAE
+                    # chronic-burst evidence stays visible; it is not applied to the floor.
                     my $headroom = ($pae_component + $aae_component) * $rvcpu_tier_factor;
-                    $p99w1_factor_eff = 1.00 + $headroom;
-                    $p99w1_mult = $headroom;  # Rationale: the headroom portion above 1.00
+                    $p99w1_factor_eff = $VCPU_PAE_AAE_HEADROOM_ENABLED ? (1.00 + $headroom) : 1.00;
+                    $p99w1_mult = $headroom;  # Shadow diagnostic: portion above 1.00 that would apply if enabled
 
                     my $floor_v = ($p99w1_adjusted + 0) * $p99w1_factor_eff;
 
@@ -19722,7 +20057,88 @@ sub _execute_multiplicative_seasonal {
                 $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
             }
 
+            # ================================================================
+            # Task 3: Stage-1-safe VP recommendation (seasonal path)
+            # ================================================================
+            # Overwrites the Profile_rVCPU_Stage1Safe value calculate_runq_modified_physc
+            # set earlier in this loop (line ~19649 call), exactly as Profile_rVCPU
+            # itself is overwritten below - the seasonal rENT_P supersedes the
+            # standard-path figure, so Stage1Safe must be re-derived from it too.
+            # ================================================================
+            my $current_ent_numeric = (defined $vm_map_ref->{Configuration}{entitlement}
+                                        && looks_like_number($vm_map_ref->{Configuration}{entitlement}))
+                                     ? ($vm_map_ref->{Configuration}{entitlement} + 0) : undef;
+            my $current_ent_stale = (!defined $current_ent_numeric || $current_ent_numeric <= 0) ? 1 : 0;
+
+            my $vp_current_ent_floor;
+            if ($current_ent_stale) {
+                # Watch for: current entitlement unavailable or stale on this execution
+                # path. Fall back to the recommended envelope minimum (VP_Min).
+                $vp_current_ent_floor = $rvcpu_min;
+            } else {
+                $vp_current_ent_floor = int($current_ent_numeric);
+                $vp_current_ent_floor++ if ($current_ent_numeric > $vp_current_ent_floor); # ceil
+            }
+
+            my $rvcpu_stage1safe = max(grep { defined $_ } ($vp_current_ent_floor, $rvcpu_raw, $p99w1_floor_vcpu, $rvcpu_final));
+
+            my $stage1safe_governed;
+            if (defined $vp_current_ent_floor && $rvcpu_stage1safe == $vp_current_ent_floor) {
+                $stage1safe_governed = $current_ent_stale
+                    ? sprintf("Minimum VPs from rENT_P (%s) [current entitlement unavailable]", $rvcpu_min // 'N/A')
+                    : sprintf("Current entitlement floor (%d)", $vp_current_ent_floor);
+            } elsif (defined $p99w1_floor_vcpu && $rvcpu_stage1safe == $p99w1_floor_vcpu) {
+                $stage1safe_governed = sprintf("Peak floor (%d)", $p99w1_floor_vcpu);
+            } elsif (defined $rvcpu_raw && $rvcpu_stage1safe == $rvcpu_raw) {
+                $stage1safe_governed = sprintf("RunQ dispatch sizing (%d)", $rvcpu_raw);
+            } else {
+                $stage1safe_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
+            }
+
+            my $stage1safe_needs_coordinated_change =
+                (defined $rvcpu_final && $rvcpu_stage1safe > $rvcpu_final) ? 1 : 0;
+
+            # ================================================================
+            # Task 4: Tier-aware rate limiting on VP reduction (seasonal path)
+            # ================================================================
+            my $current_vp_numeric = (defined $vm_map_ref->{Configuration}{virtual_cpus}
+                                       && looks_like_number($vm_map_ref->{Configuration}{virtual_cpus})
+                                       && $vm_map_ref->{Configuration}{virtual_cpus} > 0)
+                                    ? ($vm_map_ref->{Configuration}{virtual_cpus} + 0) : undef;
+
+            my $rvcpu_tactical;
+            my $tactical_note;
+            if (!defined $current_vp_numeric) {
+                # Watch for: current VP count unavailable. Hold at Stage1Safe rather
+                # than inventing a step.
+                $rvcpu_tactical = $rvcpu_stage1safe;
+                $tactical_note = "current VP count unavailable - held at rVCPU_Stage1Safe";
+            } elsif ($rvcpu_stage1safe >= $current_vp_numeric) {
+                # No reduction due (or an upsize scenario). Upward moves follow
+                # entitlement, not this rate limiter, so hold at current VPs.
+                $rvcpu_tactical = $current_vp_numeric;
+                $tactical_note = "no reduction due; upward moves follow entitlement";
+            } else {
+                my $step_fraction = $VCPU_TIER_STAGE1_STEP_FRACTION{$rvcpu_tier_num} // $VCPU_TIER_STAGE1_STEP_FRACTION{3};
+                my $reduction_needed = $current_vp_numeric - $rvcpu_stage1safe;
+                my $max_step = $step_fraction * $current_vp_numeric;
+                $max_step = $VCPU_TIER_STAGE1_STEP_MIN_VP if ($max_step < $VCPU_TIER_STAGE1_STEP_MIN_VP);
+                my $step = ($reduction_needed < $max_step) ? $reduction_needed : $max_step;
+
+                my $rvcpu_tactical_raw = $current_vp_numeric - $step;
+                $rvcpu_tactical = int($rvcpu_tactical_raw);
+                $rvcpu_tactical++ if ($rvcpu_tactical_raw > $rvcpu_tactical); # ceil: never remove more than budgeted
+
+                # Never step below the strategic target (re-asserted as a hard clamp).
+                $rvcpu_tactical = $rvcpu_stage1safe if ($rvcpu_tactical < $rvcpu_stage1safe);
+
+                $tactical_note = sprintf("stepped %.2f of %.2f VPs needed (tier %s cap %.0f%%)",
+                    $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
+            }
+
             $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : "";
+            $vm_map_ref->{CoreResults}{Profile_rVCPU_Stage1Safe}{$p_name} = $rvcpu_stage1safe;
+            $vm_map_ref->{CoreResults}{Profile_rVCPU_Tactical}{$p_name} = $rvcpu_tactical;
             $vm_map_ref->{CoreResults}{Profile_rVCPU_Explain}{$p_name} = {
                 Raw            => $rvcpu_raw,
                 Min            => $rvcpu_min,
@@ -19752,6 +20168,14 @@ sub _execute_multiplicative_seasonal {
                 RunQEnvelopeBasis    => undef,
                 OrigMin              => undef,
                 OrigMax              => undef,
+                Stage1Safe                    => $rvcpu_stage1safe,
+                Stage1SafeGovernedBy          => $stage1safe_governed,
+                Stage1SafeNeedsCoordinatedChange => $stage1safe_needs_coordinated_change,
+                CurrentEntCores               => (defined $current_ent_numeric ? sprintf("%.2f", $current_ent_numeric) : undef),
+                CurrentEntStale               => $current_ent_stale,
+                Tactical                      => $rvcpu_tactical,
+                TacticalNote                  => $tactical_note,
+                CurrentVPs                    => $current_vp_numeric,
             };
             if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
                 # Persist the paired key/value used for rVCPU so rationale cannot drift.
@@ -19769,6 +20193,13 @@ sub _execute_multiplicative_seasonal {
                 $debug_info_ref->{'rVCPU_P99W1AdjPeak'}   = defined($p99w1_adjusted) ? sprintf("%.2f", $p99w1_adjusted) : "N/A";
                 $debug_info_ref->{'rVCPU_P99W1RawPeak'}   = defined($p99w1_cores)    ? sprintf("%.2f", $p99w1_cores)    : "N/A";
                 $debug_info_ref->{'rVCPU_Final'} = defined($rvcpu_final) ? $rvcpu_final : "N/A";
+                $debug_info_ref->{'rVCPU_Stage1Safe'}           = defined($rvcpu_stage1safe) ? $rvcpu_stage1safe : "N/A";
+                $debug_info_ref->{'rVCPU_Stage1SafeGovernedBy'} = $stage1safe_governed // "N/A";
+                $debug_info_ref->{'rVCPU_Stage1SafeNeedsCoordinatedChange'} = $stage1safe_needs_coordinated_change ? 1 : 0;
+                $debug_info_ref->{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
+                $debug_info_ref->{'rVCPU_Tactical'}             = defined($rvcpu_tactical) ? $rvcpu_tactical : "N/A";
+                $debug_info_ref->{'rVCPU_TacticalNote'}         = $tactical_note // "N/A";
+                $debug_info_ref->{'rVCPU_CurrentVPs'}           = defined($current_vp_numeric) ? $current_vp_numeric : "N/A";
             }
 
             if ($p_name eq $runq_source_profile_name) {
