@@ -87,6 +87,106 @@ my $RUNQ_PRESSURE_P90_SATURATION_THRESHOLD = 1.5;       # AbsRunQ P90 / (MaxCPU 
 my $RUNQ_ADDITIVE_TOLERANCE_FACTOR = 1.8;               # Tolerate AbsRunQ up to this Factor x Base_Profile_PhysC's LCPU capacity (NOT adaptive)
 my $RUNQ_TARGET_HEADROOM_FACTOR = 0.80;                 # Target headroom below the tolerance ceiling (aim below the red line)
 
+# Fraction of the NON-GUARANTEED dispatch band that a tier's queue may count on
+# being served. 0.00 = judge the queue against the entitlement guarantee alone;
+# 1.00 = count the full reachable band (the historical behaviour for any LPAR
+# configured with vCPU:Ent >= 2). Expressed against the band rather than against
+# entitlement so that the control is EVR-neutral: a fraction of entitlement would
+# mean "everything" on a 2:1 LPAR and "a quarter" on an 8:1 LPAR at the same
+# setting. Keys mirror %DEFAULT_RUNQ_TARGETS so that per-label config overrides
+# remain possible; the values are tier-major. Back-test candidates.
+my %DISPATCH_BUDGET_BY_TIER = (
+    'P'  => 0.05,                                    # Mission-critical: the guarantee, essentially
+    'O1' => 0.15, 'G1' => 0.15, 'B1' => 0.15,        # Tier 1: slight reliance on pool grace
+    'O2' => 0.35, 'G2' => 0.35, 'B2' => 0.35,        # Tier 2: moderate reliance
+    'O3' => 0.60, 'G3' => 0.60, 'B3' => 0.60,        # Tier 3: substantial reliance
+    'O4' => 1.00, 'G4' => 1.00, 'B4' => 1.00,        # Tier 4: full reliance (unchanged behaviour)
+);
+
+# --- RunQ efficiency (entitlement) reduction ---
+# Disabled. The mechanism reduced a profile's PhysC value towards a RunQ-derived
+# "efficient target", on the premise that PhysC unaccompanied by runnable threads
+# is dispatch overhead and therefore recoverable. Three independent findings
+# retire it:
+#
+#   1. FALSIFIED PREMISE. Estate evidence puts the low-occupancy population at
+#      1.2-3.9 runnable threads per consumed core. On the commercial SMT yield
+#      curve that is 88-51% of a solo core per thread: the work is running fast,
+#      not idling. Low occupancy means threads are receiving near-full cores.
+#   2. WRONG LEVER. Entitlement is a guarantee, not a ceiling. Reducing it on an
+#      uncapped LPAR does not pack threads, does not change the run queue and does
+#      not reduce consumption - it moves capacity from the guaranteed band into
+#      the pool-dependent band. Packing is governed by VP count, which is where
+#      the yield-aware active-core floor now applies the same evidence correctly.
+#   3. IMMATERIAL. It was worth -1.53 cores across a 97-VM estate.
+#
+# The RunQ additive path is unaffected: it answers a different question (demand
+# that PhysC cannot express because dispatch is censored).
+my $RUNQ_EFFICIENCY_REDUCTION_ENABLED = 0;
+
+# --- PhysC corroboration of RunQ-derived capacity demand (additive path) ---
+# The excess-thread arithmetic answers "how many cores of dispatch WIDTH do
+# these threads need?" and the answer is then applied to ENTITLEMENT, which is
+# capacity. The two coincide only when the partition was actually prevented
+# from consuming what it needed. Peak PhysC against reachable capacity tells us
+# whether it was: pinned near the ceiling means demand was censored and the
+# queue is the only witness; ample unused headroom means the partition could
+# have taken more capacity and chose not to.
+my $ADDITIVE_CENSORING_RATIO_FULL_TRUST = 0.90;  # Peak PhysC >= this share of reachable -> censored, trust the queue fully
+my $ADDITIVE_CENSORING_RATIO_NO_TRUST   = 0.70;  # Peak PhysC <= this share of reachable -> PhysC is a valid witness, suppress
+# Refusal signature: a partition that queues yet never exceeds its entitlement,
+# whilst uncapped, is asking for pool capacity and not receiving it. Its PhysC
+# headroom is then an artefact of the refusal, not evidence of sufficiency.
+my $ADDITIVE_REFUSAL_PAE_THRESHOLD      = 0.05;
+
+# --- Phase 2: Tier-graded final additive safety cap ---
+# The final hard cap on RunQ_Tactical was previously a flat 40% of entitlement,
+# which collapses to noise on micro-partitions and ignores tier importance.
+# Performance tiers (P, O1/O2, G1/G2, B1/B2) receive a higher percentage and a
+# higher small-entitlement floor. The floor raises only the cap ceiling; the
+# additive itself remains demand-derived and never exceeds the raw requirement.
+# All values are back-test candidates.
+my $FINAL_ADDITIVE_CAP_PCT_ENT_PERF = 0.60;  # Performance tiers: cap at 60% of Ent
+my $FINAL_ADDITIVE_CAP_PCT_ENT_STD  = 0.40;  # Efficiency tiers: retain 40% of Ent
+my $FINAL_ADDITIVE_CAP_FLOOR_PERF   = 0.75;  # Performance tiers: cap never below 0.75 cores
+my $FINAL_ADDITIVE_CAP_FLOOR_STD    = 0.30;  # Efficiency tiers: cap never below 0.30 cores
+my $FINAL_ADDITIVE_CAP_ABS_MAX      = 2.0;   # Absolute ceiling per monthly increment (unchanged)
+
+# --- Phase 4: Tier-adaptive downsizing appetite ---
+# Volatility entry gate (NormRunQ P90/P50) per tier number: higher tolerance on
+# lower-importance tiers admits bursty-but-mostly-idle right-sizing candidates.
+my %TIER_VOLATILITY_CAUTION_THRESHOLD = ( 1 => 2.5, 2 => 2.5, 3 => 3.0, 4 => 3.5 );
+# Blend-weight ceiling per tier number: the BasePhysC anchor weight used when
+# blending towards the RunQ-derived efficient target. Lower = more aggressive.
+# The effective weight is min(P50-selected weight, tier ceiling).
+my %TIER_BLEND_BASE_WEIGHT_CEILING    = ( 1 => 0.85, 2 => 0.85, 3 => 0.70, 4 => 0.55 );
+
+# --- Corrective: P-tier conservative downsizing mode ---
+# Mission-critical VMs are no longer exempt from downsizing (a grossly
+# oversized VM must be called out honestly regardless of criticality), but the
+# risk appetite is reduced: stricter volatility gate, heavier BasePhysC
+# anchoring, and a damped final reduction. RunQ_Potential remains undamped.
+my $P_TIER_VOLATILITY_CAUTION_THRESHOLD = 2.0;   # Stricter than the tier-1 gate (2.5)
+my $P_TIER_BLEND_BASE_WEIGHT_FLOOR      = 0.75;  # Was 0.90: the strict P target (0.25) already
+                                                 # encodes the tier appetite; a heavy blend floor
+                                                 # on top of it double-counted the same caution.
+my $P_TIER_MAX_REDUCTION_FACTOR         = 0.10;  # Replaces the 0.50 damping multiplier. A bound
+                                                 # leaves small honest signals intact and only
+                                                 # engages on large reductions; a multiplier scaled
+                                                 # every signal, honest or not, into a crumb.
+
+# Smallest implementable entitlement increment. Tactical recommendations below
+# this cannot be actioned by a planner, so they are suppressed rather than
+# reported as churn. This is an implementability floor, NOT a noise floor:
+# measurements (RunQ_Potential / RunQ_Strategic) are never deadbanded.
+my $MIN_MEANINGFUL_ADJUSTMENT_CORES = 0.05;
+
+# NOTE: the separate additive tolerance ladder has been retired. The tolerance
+# ceiling is now DERIVED from %DEFAULT_RUNQ_TARGETS (see _resolve_runq_target
+# and the additive path), so the downsizing and additive paths can never pursue
+# contradictory queue depths, and a single ruling on risk appetite governs both
+# directions.
+
 # VCPU sizing policy (stress-driven, slot-aware, rENT-bounded)
 # Note: rVCPU is emitted per profile. The envelope is computed from the profile's rENT (growth-aware).
 my $VCPU_RATIO_MIN = 1.00;                              # Minimum allowable VCPU >= ~1.00x entitlement (rounded up to nearest whole number)
@@ -111,19 +211,78 @@ my $VCPU_PEAK_HEADROOM_DYNAMIC = 1;
 my $VCPU_PEAK_HEADROOM_MULT_MIN = 0.90;
 my $VCPU_PEAK_HEADROOM_MULT_MAX = 1.20;
 
-# RunQ credibility adjustment for P99W1 peak floor.
-# When RunQ-derived core demand is well below PhysC peak, the gap likely reflects
-# VP dispatch overhead (idle spin, cache warming, folding) rather than true workload.
-# The adjustment discounts PhysC peak proportionally, bounded by a minimum credibility.
+# Runnable-density assessment of the P99W1 peak floor.
+# HISTORICAL: these constants once discounted the PhysC peak when RunQ-derived
+# core demand fell well below it, on the premise that the gap reflected VP
+# dispatch overhead. That premise is falsified - low density means each thread is
+# receiving close to a full core, which is how low-concurrency work runs fastest.
+# The discount is disabled ($VCPU_PEAK_CRED_DISCOUNT_ENABLED) and superseded by
+# the yield-aware active-core floor. Retained only so the comparison can be
+# re-enabled during back-testing.
 my $VCPU_PEAK_CRED_BIAS    = 0.15;   # Benefit-of-doubt for PhysC (I/O, interrupts, cache affinity)
 my $VCPU_PEAK_CRED_MIN     = 0.65;   # Never discount PhysC peak by more than 35%
 
+# --- Stage 1c: RunQ runnable-density discount on the P99W1 peak floor ---
+# When enabled, the P99W1 PhysC peak was discounted by max(CRED_MIN, occupancy +
+# CRED_BIAS) before setting the rVCPU peak floor, on the premise that a peak with
+# few runnable threads reflects VP dispatch overhead rather than real work.
+#
+# Disabled by default. Two independent reasons:
+#
+#   1. FALSIFIED PREMISE. Estate evidence puts the low-occupancy population at
+#      1.2-3.9 runnable threads per consumed core. Under the commercial SMT
+#      yield curve Y(k) = 1 + 0.45*log2(k), that is 88-51% of a solo core per
+#      thread - the work is running fast, not idling. Low occupancy means each
+#      thread is receiving nearly a full core, which is how low-concurrency work
+#      achieves its throughput. Discounting the peak recommends packing it and
+#      destroying that throughput.
+#
+#   2. WRONG ESTIMATOR. The ratio compares two independently derived percentiles
+#      (P99W1 PhysC against AbsRunQ_P99W1) that need not share a timestamp.
+#      NormRunQ pairs the same quantity per sample before aggregating, and the
+#      two disagree materially (vm1: 1.947 unpaired against 1.08 paired).
+#      E[X/Y] != E[X]/E[Y]; the paired form is correct.
+#
+# The occupancy ratio remains computed and published as a shadow diagnostic.
+# Genuine VP over-provisioning is real, but separating it from low-concurrency
+# work requires the throughput-aware floor (Stage 3), not this discount.
+my $VCPU_PEAK_CRED_DISCOUNT_ENABLED = 0;
+
+# --- SMT yield curve: DEFAULT COMMERCIAL PLANNING CURVE ---
+# Throughput of one POWER core running k threads, relative to that core running a
+# single thread.
+#
+# PROVENANCE: a configured POLICY ASSUMPTION, not an IBM-published constant. IBM
+# documentation supports the MECHANISM and DIRECTION (threads slow as more share a
+# core; SMT raises aggregate capacity substantially), but not these exact points.
+# They vary by POWER generation, vpm_throughput_mode and workload class. Note also
+# that Y(k) = 1 + 0.45*log2(k) reproduces them exactly with a single fitted
+# parameter - a good fit is not evidence the points are right, particularly if the
+# source that supplied them fitted a log model of its own. Calibrate against
+# benchmark or estate outcomes before treating the floor as a precise guarantee.
+#
+# Compute-intensive workloads yield far less (roughly 1.00/1.15/1.25/1.35).
+# Selecting a curve per workload needs signals not staged (%usr vs %sys, CPI,
+# cache behaviour); inferring it from the profile letter would repeat the
+# pattern-major error. Commercial is assumed.
+my $SMT_YIELD_CURVE_NAME    = 'commercial-default';
+my $SMT_YIELD_CURVE_VERSION = 1;
+my $SMT_YIELD_CURVE_SOURCE  = 'configured-policy';
+my %SMT_YIELD_CURVE = ( 1 => 1.00, 2 => 1.45, 4 => 1.90, 8 => 2.35 );
+my @SMT_YIELD_POINTS;   # lazily built, sorted [k, y] - see _smt_yield
+
+# Fraction of estimated current throughput that must survive consolidation onto
+# fewer active cores. Keyed on $rvcpu_tier_num to match the existing rVCPU tier
+# convention (%VCPU_TIER_HEADROOM_FACTORS); tier 'P' collapses to 1 there.
+# Back-test candidates.
+my %TIER_THROUGHPUT_RETENTION = ( 1 => 0.95, 2 => 0.90, 3 => 0.85, 4 => 0.80 );
+
 # Micro-partition RunQ envelope override.
-# When a tiny partition (rENT < threshold) has strong RunQ evidence (cred_ratio > threshold)
+# When a tiny partition (rENT < threshold) has strong RunQ evidence (runnable_density > threshold)
 # that exceeds the PhysC-derived envelope, allow VP envelope to expand to meet RunQ demand.
 # This addresses scheduling disadvantage in micro-partitions where PhysC under-reports true demand.
 my $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH  = 0.50;  # rENT_P must be below this
-my $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH = 1.50;  # cred_ratio must exceed this
+my $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH = 1.50;  # runnable_density must exceed this
 my $MICRO_PARTITION_RUNQ_MAX_VP_CAP           = 6;     # Absolute VP ceiling for override
 
 # Tier-aware rVCPU headroom factors
@@ -292,11 +451,33 @@ my $CPU_FLATLINING_PARTIAL_RUNQ_RATIO_FLOOR         = 0.60;  # Partial: require 
 my $POOL_CONSTRAINT_CONFIDENCE_FACTOR = 0.80; # Reduction factor for additive CPU if VM is in a non-default pool
 
 # --- Built-in default Target NormRunQ values for the adaptive heuristic ---
+# Idealised run-queue depth per logical CPU that sizing aims for, per tier.
+#
+# SEMANTICS (confirmed with IBM): the AIX/nmon run-queue metrics count threads
+# that are RUNNING plus threads WAITING for a processor - not waiting threads
+# alone. The target is therefore TOTAL RUNNABLE threads per logical CPU at the
+# recommended size:
+#   0.25 = a quarter of the dispatch slots occupied (4x headroom)
+#   1.00 = every dispatch slot occupied, nothing waiting (saturation boundary)
+#   1.50 = 50% over-subscribed: one thread waiting for every two running
+#   2.00 = one thread waiting for every thread running - poor practice at any tier
+# Each rung is additionally evaluated at its own profile percentile and window
+# (tier 1 = p99/W5 ... tier 4 = p90/W15), so the ladder carries a second,
+# compounding gradient: a tier-4 rung tolerates a deeper queue AND is measured
+# at a more forgiving percentile.
+#
+# TIER-MAJOR: risk appetite is a function of the tier NUMBER alone. The pattern
+# letter is a time-window selector in nfit_profiles.cfg (-online / -batch / 24h)
+# and carries no latency information: G1-99W5, O1-99W5 and B1-99W5 are identical
+# but for their time filter. Keys are retained per pattern so that per-label
+# overrides in nfit_profiles.cfg keep working; the values are tier-major.
+# All values are back-test candidates.
 my %DEFAULT_RUNQ_TARGETS = (
-    'P'  => 0.25,
-    'O1' => 0.30, 'O2' => 0.40, 'O3' => 0.50, 'O4' => 0.65,
-    'G1' => 0.80, 'G2' => 0.90, 'G3' => 1.00, 'G4' => 1.10,
-    'B1' => 1.20, 'B2' => 1.30, 'B3' => 1.40, 'B4' => 1.50,
+    'P'  => 0.25,                                    # Mission-critical: near-zero queueing
+    'O1' => 0.45, 'G1' => 0.45, 'B1' => 0.45,        # Tier 1
+    'O2' => 0.70, 'G2' => 0.70, 'B2' => 0.70,        # Tier 2
+    'O3' => 1.00, 'G3' => 1.00, 'B3' => 1.00,        # Tier 3 (anchor: unchanged)
+    'O4' => 1.50, 'G4' => 1.50, 'B4' => 1.50,        # Tier 4
 );
 my %custom_runq_targets;
 my %tier_override_for_csv;
@@ -1549,11 +1730,10 @@ foreach my $system_serial (@target_systems_to_process)
         print {$LOG_FH} "                     Converts the credible peak (cores) to an rVCPU floor, with headroom\n";
         print {$LOG_FH} "                     influenced by policy/tier and evidence bands.\n";
         print {$LOG_FH} "\n";
-        print {$LOG_FH} "  Credible peak      Peak_P-99W1 after RunQ corroboration adjustment.\n";
-        print {$LOG_FH} "                     If run queue evidence implies materially fewer runnable threads than\n";
-        print {$LOG_FH} "                     PhysC suggests, the gap may reflect scheduler effects (including folding)\n";
-        print {$LOG_FH} "                     or bursts not visible in RunQ indicators. Credible peak discounts the\n";
-        print {$LOG_FH} "                     peak signal proportionally (bounded by minimum credibility).\n";
+        print {$LOG_FH} "  Peak coverage      Peak_P-99W1 scaled by RunQ runnable density.\n";
+        print {$LOG_FH} "                     Runnable density is runnable threads per consumed core, divided by SMT. Low\n";
+        print {$LOG_FH} "                     occupancy means each thread received close to a full core - it does not\n";
+        print {$LOG_FH} "                     imply the PhysC was unbacked or wasteful.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  Downsize Guard\n";
         print {$LOG_FH} "  Bands (GREEN/\n";
@@ -1831,20 +2011,29 @@ foreach my $system_serial (@target_systems_to_process)
             : {};
         if (($seasonal_cfg->{model} // '') eq 'recency_decay') {
 
-            # 1. Determine Source Profile (Pattern/Tier Logic)
+            # 1. Determine Source Profiles (Pattern/Tier Logic)
             #    Priority: UserOverride -> AutoHint -> Default 'G'
-            my $user_tier = $vm_map_ref->{Hinting}{FinalTierForVM} // "";
-            my $auto_tier = $vm_map_ref->{Hinting}{AutoTier} // "G";
+            my $user_tier = $vm_tier_overrides{$vm_name} // "";
+            my $auto_tier = $vm_map_ref->{Hinting}{FinalTierForVM}
+                // $vm_map_ref->{Hinting}{AutoTier} // "G";
             my $pattern_source = ($user_tier ne "") ? $user_tier : $auto_tier;
 
             my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
             $pattern_char //= 'G'; # Default to General
 
-            # Map pattern to the standard Tier-3 planning profile
+            # Growth standardisation remains anchored to the stable tier-3
+            # planning profile: tier-1 (99W5) growth series are noisier, and
+            # standardised growth must not inherit that volatility.
             my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
             my $growth_source_profile = $pat_map{$pattern_char} // 'G3-95W15';
 
-            # 2. Get the Standard Adjustment (from the Source Profile's growth)
+            # The RunQ modifier source, by contrast, is tier-resolved (Phase 2)
+            # so the planner-facing columns inherit the tier-aware tolerance,
+            # scaling and cap machinery.
+            my ($runq_source_profile_name, $runq_source_label) =
+                _resolve_runq_source_profile($user_tier, $auto_tier, \@profiles);
+
+            # 2. Get the Standard Adjustment (from the Growth Source Profile)
             #    Growth adjustments were populated into {Growth}{adjustments} during assimilation.
             my $standard_growth_adj = $vm_map_ref->{Growth}{adjustments}{$growth_source_profile} // 0;
 
@@ -1857,9 +2046,9 @@ foreach my $system_serial (@target_systems_to_process)
             # 4. [CRITICAL] Pre-calculate CSVModifiers for recency_decay BEFORE the profile loop.
             #    The recency_decay model requires RunQ_Potential to be available, but CSVModifiers
             #    are normally populated in Phase 2 (after this block). We must calculate them here.
-            my ($growth_source_profile_obj) = grep { $_->{name} eq $growth_source_profile } @profiles;
+            my ($runq_source_profile_obj) = grep { $_->{name} eq $runq_source_profile_name } @profiles;
 
-            if ($growth_source_profile_obj) {
+            if ($runq_source_profile_obj) {
                 my %pressure_flags_rd = (
                     abs_pressure  => $vm_map_ref->{Hinting}{P99W1_AbsRunQPressure}  // 0,
                     norm_pressure => $vm_map_ref->{Hinting}{P99W1_NormRunQPressure} // 0
@@ -1867,7 +2056,7 @@ foreach my $system_serial (@target_systems_to_process)
                 my %adaptive_thresholds_rd = %$adaptive_thresholds_href;
 
                 my (undef, $debug_info_ref_rd) = calculate_runq_modified_physc(
-                    $vm_name, $vm_map_ref, $growth_source_profile_obj,
+                    $vm_name, $vm_map_ref, $runq_source_profile_obj,
                     \%pressure_flags_rd, \%adaptive_thresholds_rd
                 );
 
@@ -1875,7 +2064,7 @@ foreach my $system_serial (@target_systems_to_process)
                 $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref_rd->{'FinalAdditive'};
                 $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref_rd->{'RunQ_Strategic'};
                 $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref_rd->{'RunQ_Potential'};
-                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $growth_source_profile;
+                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_label;
             }
 
             # 5. Apply to ALL profiles (Update CoreResults)
@@ -1941,15 +2130,18 @@ foreach my $system_serial (@target_systems_to_process)
         my $skip_phase2_modifiers = (($seasonal_cfg_p2->{model} // '') eq 'recency_decay');
 
         # Priority: User TIER > AutoTier > Fallback to 'G'.
-        my $user_tier_override_runq = $vm_map_ref->{Hinting}{FinalTierForVM} // "";
-        my $auto_tier_runq = $vm_map_ref->{Hinting}{AutoTier} // "G";
+        # NOTE: the first argument must be the genuine user override only.
+        # FinalTierForVM folds the auto hint in (override // hint), so passing
+        # it as the user tier mislabelled hint-derived sources as "(TIER)".
+        my $user_tier_override_runq = $vm_tier_overrides{$vm_name} // "";
+        my $auto_tier_runq = $vm_map_ref->{Hinting}{FinalTierForVM}
+            // $vm_map_ref->{Hinting}{AutoTier} // "G";
 
-        my $pattern_source_runq = ($user_tier_override_runq ne "") ? $user_tier_override_runq : $auto_tier_runq;
-        my ($hint_pattern) = ($pattern_source_runq =~ /^([A-Z])/);
-        $hint_pattern //= 'G'; # Default to 'G' if regex fails
-
-        my %pattern_to_profile_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-        my $runq_source_profile_name = $pattern_to_profile_map{$hint_pattern} // 'G3-95W15';
+        # Tier-resolved RunQ source (Phase 2): the planner-facing RunQ_* columns
+        # are computed through the profile matching the VM's confirmed or hinted
+        # tier, so the tier-aware tolerance, scaling and cap machinery engages.
+        my ($runq_source_profile_name, $runq_source_label) =
+            _resolve_runq_source_profile($user_tier_override_runq, $auto_tier_runq, \@profiles);
 
         # Find the profile object for the source profile
         my ($runq_source_profile_obj) = grep { $_->{name} eq $runq_source_profile_name } @profiles;
@@ -1969,7 +2161,7 @@ foreach my $system_serial (@target_systems_to_process)
             $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
             $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
             $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
-            $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+            $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_label;
         }
 
         # Now, iterate through all profiles to size them and log rationale
@@ -2653,11 +2845,21 @@ sub log_profile_rationale
     my $lpar_max_cpu_cfg_val_from_config = $cfg->{max_cpu};
     my $curr_ent_numeric = (defined $entitlement_val && looks_like_number($entitlement_val)) ? ($entitlement_val + 0) : undef;
 
-    # Source from map's RunQMetrics block
+    # Source from the map's RunQMetrics block, preferring the values and
+    # provenance the modifier calculation actually consumed (published in its
+    # debug info), so the rationale log always reflects the true measurement
+    # source rather than the legacy unified collation.
     my $runq = $vm_map_ref->{RunQMetrics};
-    my $runq_metrics_source_profile_name_for_this_calc = $runq->{SourceProfile};
-    my $normP50_for_this_calc = $runq->{'NormRunQ_P50'};
-    my $normP90_for_this_calc = $runq->{'NormRunQ_P90'};
+    my $runq_metrics_source_profile_name_for_this_calc =
+        $calc_debug_info_ref->{'RunQMetricsSourceName'} // $runq->{SourceProfile};
+    my $normP50_for_this_calc =
+        (defined $calc_debug_info_ref->{'NormRunQ_P50_Val'} && $calc_debug_info_ref->{'NormRunQ_P50_Val'} ne 'N/A')
+            ? $calc_debug_info_ref->{'NormRunQ_P50_Val'}
+            : $runq->{'NormRunQ_P50'};
+    my $normP90_for_this_calc =
+        (defined $calc_debug_info_ref->{'NormRunQ_P90_Val'} && $calc_debug_info_ref->{'NormRunQ_P90_Val'} ne 'N/A')
+            ? $calc_debug_info_ref->{'NormRunQ_P90_Val'}
+            : $runq->{'NormRunQ_P90'};
     my $abs_runq_value_used_for_calc = $calc_debug_info_ref->{AbsRunQValueUsedForCalc};
 
     # Source other values
@@ -3348,28 +3550,38 @@ sub log_profile_rationale
             ($secondary_txt ? " $secondary_txt" : '');
 
         # Credibility-adjusted peak line (only when adjustment was applied)
-        my $re_cred = (defined $re->{P99W1CredRatio} && looks_like_number($re->{P99W1CredRatio})) ? ($re->{P99W1CredRatio} + 0) : 1.00;
+        my $re_cred = (defined $re->{P99W1RunnableDensity} && looks_like_number($re->{P99W1RunnableDensity})) ? ($re->{P99W1RunnableDensity} + 0) : 1.00;
         if ($re_cred < 1.00 && defined $re->{P99W1RawPeak} && defined $re->{P99W1AdjPeak}) {
             # Recompute effective credibility for display (matches computation path)
-            my $re_cred_eff = $re_cred + $VCPU_PEAK_CRED_BIAS;
-            $re_cred_eff = $VCPU_PEAK_CRED_MIN if ($re_cred_eff < $VCPU_PEAK_CRED_MIN);
-            $re_cred_eff = 1.00 if ($re_cred_eff > 1.00);
-            my $re_cred_suffix = (defined $re->{P99W1CredRatioSuffix}) ? $re->{P99W1CredRatioSuffix} : '';
-            printf {$fh} "    Credible peak:                                         %s cores (PhysC %s x %.3f effective credibility; corroboration ratio %.3f%s).\n",
+            my $re_cred_eff = 1.00;
+            if ($VCPU_PEAK_CRED_DISCOUNT_ENABLED) {
+                $re_cred_eff = $re_cred + $VCPU_PEAK_CRED_BIAS;
+                $re_cred_eff = $VCPU_PEAK_CRED_MIN if ($re_cred_eff < $VCPU_PEAK_CRED_MIN);
+                $re_cred_eff = 1.00 if ($re_cred_eff > 1.00);
+            }
+            my $re_cred_suffix = (defined $re->{P99W1RunnableDensitySuffix}) ? $re->{P99W1RunnableDensitySuffix} : '';
+            printf {$fh} "    Peak coverage basis:                                   %s cores (yield-aware active-core floor from a %s-core P99W1 peak).\n",
                 $re->{P99W1AdjPeak},
-                $re->{P99W1RawPeak},
-                $re_cred_eff,
-                $re_cred,
-                $re_cred_suffix;
+                $re->{P99W1RawPeak};
+            if (defined $calc_debug_info_ref->{'rVCPU_YieldFloorReason'}
+                && $calc_debug_info_ref->{'rVCPU_YieldFloorReason'} ne 'N/A') {
+                printf {$fh} "      Throughput basis:                                    %s\n", $calc_debug_info_ref->{'rVCPU_YieldFloorReason'};
+                printf {$fh} "      (SMT yield: one core running k threads delivers Y(k) times a single thread's throughput;\n";
+                printf {$fh} "       commercial curve Y(1)=1.00, Y(2)=1.45, Y(4)=1.90, Y(8)=2.35. Packing work onto fewer\n";
+                printf {$fh} "       cores raises k and lowers per-thread speed - this floor bounds that trade by tier.)\n";
+            }
 
-            # Diagnostic hint when credibility discount is material (>30% of peak unexplained by RunQ)
+            # Diagnostic hint when RunQ runnable density is low relative to the PhysC peak.
             if ($re_cred < 0.70 && looks_like_number($re->{P99W1RawPeak}) && looks_like_number($re->{P99W1AdjPeak})) {
-                my $discount_cores = sprintf("%.2f", $re->{P99W1RawPeak} - $re->{P99W1AdjPeak});
-                my $discount_pct   = sprintf("%.0f", (1.0 - ($re->{P99W1AdjPeak} / $re->{P99W1RawPeak})) * 100);
-                printf {$fh} "\n    PLANNER NOTE: Low RunQ corroboration - approximately %s cores (%s%%) of the P99W1 peak\n", $discount_cores, $discount_pct;
-                printf {$fh} "                  is not backed by run queue evidence and may reflect scheduler effects (including over-provisioning/folding)\n";
-                printf {$fh} "                  or short-lived bursts not visible in the RunQ indicators.\n";
-                printf {$fh} "                  Review the LPAR's current VP count (%s VPs) relative to observed workload concurrency.\n",
+                my $threads_per_core = sprintf("%.2f", $re_cred * 8);
+                printf {$fh} "\n    PLANNER NOTE [Low runnable density]: at its P99W1 peak this workload averaged\n";
+                printf {$fh} "                  approximately %s runnable threads per consumed core - low occupancy relative\n", $threads_per_core;
+                printf {$fh} "                  to the observed PhysC peak of %s cores.\n", $re->{P99W1RawPeak};
+                printf {$fh} "                  This does NOT mean the PhysC is unbacked or wasteful: low occupancy means each\n";
+                printf {$fh} "                  thread is receiving close to a full core, which is how low-concurrency work runs\n";
+                printf {$fh} "                  fastest. It may equally indicate excessive VP width or scheduler overhead.\n";
+                printf {$fh} "                  Distinguishing these requires throughput-aware (SMT-yield) assessment.\n";
+                printf {$fh} "                  Review the LPAR's current VP count (%s) relative to observed workload concurrency.\n",
                     (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus})) ? sprintf("%d VPs", $cfg->{virtual_cpus}) : 'unknown';
             }
         }
@@ -3385,7 +3597,7 @@ sub log_profile_rationale
             ($re->{P99W1Mult} // 'N/A'),
             ($re->{P99W1RawPeak} // 'N/A'),
             ($re->{P99W1AdjPeak} // 'N/A'),
-            ($re->{P99W1CredRatio} // 'N/A'),
+            ($re->{P99W1RunnableDensity} // 'N/A'),
             ($re->{RunQKeyUsed} // 'N/A'),
             ($re->{RunQHiThreads} // 'N/A');
 
@@ -3530,7 +3742,14 @@ sub log_profile_rationale
             printf {$fh} "    - Base for Upsizing                                : %s cores (PhysC after Downsizing)\n", $physc_after_downsizing_B_log;
             printf {$fh} "    - Effective LCPUs at Base                          : %s threads\n", ($calc_debug_info_ref->{'EffectiveLCPUsAtBase'} // $na);
             printf {$fh} "    - Excess Threads Calculated                        : %s threads\n", ($calc_debug_info_ref->{'ExcessThreads'} // $na);
-            printf {$fh} "    - Raw Additive CPU                                 : %s cores (excess threads / SMT)\n", ($calc_debug_info_ref->{'RawAdditive'} // $na);
+            printf {$fh} "    - Raw Additive CPU (queue reading)                 : %s cores (excess threads / SMT)\n", ($calc_debug_info_ref->{'AdditiveRawUncorroborated'} // $na);
+            printf {$fh} "    - PhysC Corroboration Factor                       : %s\n", ($calc_debug_info_ref->{'AdditiveCorroborationFactor'} // $na);
+            printf {$fh} "        Basis                                          : %s\n", ($calc_debug_info_ref->{'AdditiveCorroborationReason'} // $na);
+            printf {$fh} "        Peak-sourced burst evidence                    : PAE %s / AAE %s (source: %s)\n",
+                ($calc_debug_info_ref->{'PhysC_Peak_PAE'} // $na),
+                ($calc_debug_info_ref->{'PhysC_Peak_AAE'} // $na),
+                ($calc_debug_info_ref->{'PhysC_Peak_Diag_Source'} // $na);
+            printf {$fh} "    - Corroborated Additive CPU                        : %s cores\n", ($calc_debug_info_ref->{'RawAdditive'} // $na);
             printf {$fh} "    - Entitlement-Based Cap                            : %s cores (Max Additive Cap: %s)\n",
             (defined $calc_debug_info_ref->{'HotThreadWLDampenedAdditiveFrom'} && $calc_debug_info_ref->{'HotThreadWLDampeningApplied'} eq "True"
                 ? $calc_debug_info_ref->{'HotThreadWLDampenedAdditiveFrom'}
@@ -3580,7 +3799,12 @@ sub log_profile_rationale
 
         # --- Section E: Maximum CPU Sizing Sanity Checks ---
         print {$fh} "Section E: Maximum CPU Sizing Sanity Checks\n";
-        printf {$fh} "  - Recommendation before Max Sanity Check             : %s cores\n", ($calc_debug_info_ref->{'PreMaxCpuCapRec'} // $na);
+        if (defined $calc_debug_info_ref->{'BudgetFloorReason'} && $calc_debug_info_ref->{'BudgetFloorReason'} ne 'N/A') {
+            printf {$fh} "  - Tier Guarantee Floor (dispatch budget)             : %s cores\n", ($calc_debug_info_ref->{'BudgetFloorCores'} // $na);
+            printf {$fh} "      Basis                                           : %s\n", $calc_debug_info_ref->{'BudgetFloorReason'};
+            printf {$fh} "      Applied                                         : %s\n", ($calc_debug_info_ref->{'BudgetFloorApplied'} // 'No');
+        }
+        printf {$fh} "  - Recommendation before Max Sanity Check             : %s cores\n",
         printf {$fh} "  - LPAR MaxCPU (from VM config)                       : %s cores\n", $lpar_max_cpu_display_A_log_sec;
         printf {$fh} "  - Entitlement (for forecast multiplier)              : %s cores\n", $entitlement_display_A_log_sec;
         printf {$fh} "  - Forecast Multiplier Used                           : %s\n", ($calc_debug_info_ref->{'ForecastMultiplier'} // $na);
@@ -3698,7 +3922,7 @@ sub log_profile_rationale
 
     my $p_raw    = (defined $re->{P99W1RawPeak} && looks_like_number($re->{P99W1RawPeak})) ? ($re->{P99W1RawPeak} + 0) : undef;
     my $p_adj    = (defined $re->{P99W1AdjPeak} && looks_like_number($re->{P99W1AdjPeak})) ? ($re->{P99W1AdjPeak} + 0) : undef;
-    my $p_cred   = (defined $re->{P99W1CredRatio} && looks_like_number($re->{P99W1CredRatio})) ? ($re->{P99W1CredRatio} + 0) : undef;
+    my $p_cred   = (defined $re->{P99W1RunnableDensity} && looks_like_number($re->{P99W1RunnableDensity})) ? ($re->{P99W1RunnableDensity} + 0) : undef;
     my $p_fact   = (defined $re->{P99W1FactorEff} && looks_like_number($re->{P99W1FactorEff})) ? ($re->{P99W1FactorEff} + 0) : undef;
 
     # Dispatch reserve (extract early so it's in scope for final decision logging)
@@ -3739,9 +3963,12 @@ sub log_profile_rationale
         # 2) Peak Coverage (credibility-adjusted peak floor)
         if (defined $p_raw && defined $p_adj && defined $p_cred && defined $p_fact) {
             # Recompute effective credibility from stored raw ratio (matches computation path)
-            my $p_cred_eff = $p_cred + $VCPU_PEAK_CRED_BIAS;
-            $p_cred_eff = $VCPU_PEAK_CRED_MIN if ($p_cred_eff < $VCPU_PEAK_CRED_MIN);
-            $p_cred_eff = 1.00 if ($p_cred_eff > 1.00);
+            my $p_cred_eff = 1.00;
+            if ($VCPU_PEAK_CRED_DISCOUNT_ENABLED) {
+                $p_cred_eff = $p_cred + $VCPU_PEAK_CRED_BIAS;
+                $p_cred_eff = $VCPU_PEAK_CRED_MIN if ($p_cred_eff < $VCPU_PEAK_CRED_MIN);
+                $p_cred_eff = 1.00 if ($p_cred_eff > 1.00);
+            }
             # Convert to percentages for planner clarity
             my $cred_pct = sprintf("%.0f", $p_cred_eff * 100);
             my $discount_pct = sprintf("%.0f", (1.0 - $p_cred_eff) * 100);
@@ -3880,13 +4107,16 @@ sub log_profile_rationale
     }
 
     # Credibility-adjusted peak line (only when adjustment was applied)
-    my $sf_cred = (defined $calc_debug_info_ref->{'rVCPU_P99W1CredRatio'} && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1CredRatio'}))
-                ? ($calc_debug_info_ref->{'rVCPU_P99W1CredRatio'} + 0) : 1.00;
+    my $sf_cred = (defined $calc_debug_info_ref->{'rVCPU_P99W1RunnableDensity'} && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1RunnableDensity'}))
+                ? ($calc_debug_info_ref->{'rVCPU_P99W1RunnableDensity'} + 0) : 1.00;
     if ($sf_cred < 1.00 && defined $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} && defined $calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'}) {
         # Recompute effective credibility for display (matches computation path)
-        my $sf_cred_eff = $sf_cred + $VCPU_PEAK_CRED_BIAS;
-        $sf_cred_eff = $VCPU_PEAK_CRED_MIN if ($sf_cred_eff < $VCPU_PEAK_CRED_MIN);
-        $sf_cred_eff = 1.00 if ($sf_cred_eff > 1.00);
+        my $sf_cred_eff = 1.00;
+        if ($VCPU_PEAK_CRED_DISCOUNT_ENABLED) {
+            $sf_cred_eff = $sf_cred + $VCPU_PEAK_CRED_BIAS;
+            $sf_cred_eff = $VCPU_PEAK_CRED_MIN if ($sf_cred_eff < $VCPU_PEAK_CRED_MIN);
+            $sf_cred_eff = 1.00 if ($sf_cred_eff > 1.00);
+        }
         my $cred_eff_pct = sprintf("%.0f", $sf_cred_eff * 100);
         my $cred_disc_pct = sprintf("%.0f", (1.0 - $sf_cred_eff) * 100);
         my $corr_pct = sprintf("%.0f", $sf_cred * 100);
@@ -3897,15 +4127,16 @@ sub log_profile_rationale
             $cred_disc_pct,
             $corr_pct;
 
-        # Diagnostic hint when credibility discount is material (>30% of peak unexplained by RunQ)
-        # Diagnostic hint when credibility discount is material (>30% of peak unexplained by RunQ)
+        # Diagnostic hint when RunQ runnable density is low relative to the PhysC peak.
         if ($sf_cred < 0.70
             && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1RawPeak'})
             && looks_like_number($calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'})) {
             my $sf_disc_cores = sprintf("%.2f", $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} - $calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'});
             my $sf_disc_pct   = sprintf("%.0f", (1.0 - ($calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'} / $calc_debug_info_ref->{'rVCPU_P99W1RawPeak'})) * 100);
-            printf {$fh} "    PLANNER NOTE [High CPU / Low RunQ]: Low RunQ corroboration detected (cred=%.2f).\n", $sf_cred;
-            printf {$fh} "      Approximately %s cores (%s%%) of the P99W1 peak is not backed by run queue evidence.\n", $sf_disc_cores, $sf_disc_pct;
+            printf {$fh} "    PLANNER NOTE [High PhysC / Low runnable density]: occupancy %.2f (approximately %.2f runnable threads per consumed core).\n", $sf_cred, $sf_cred * 8;
+            printf {$fh} "      The P99W1 peak was consumed at low runnable-thread density. This is NOT evidence that the\n";
+            printf {$fh} "      CPU is unbacked: at low occupancy each thread receives close to a full core, which is how\n";
+            printf {$fh} "      low-concurrency work achieves its throughput. Candidate explanations:\n";
             printf {$fh} "      Possible causes:\n";
             printf {$fh} "        - Over-provisioned VPs causing scheduler overhead (VP folding/unfolding latency)\n";
             printf {$fh} "        - Single-threaded dominant workload or application loop (high %%usr, low concurrency)\n";
@@ -3984,7 +4215,7 @@ sub log_profile_rationale
         ($calc_debug_info_ref->{'rVCPU_P99W1Mult'} // $na),
         ($calc_debug_info_ref->{'rVCPU_P99W1RawPeak'} // $na),
         ($calc_debug_info_ref->{'rVCPU_P99W1AdjPeak'} // $na),
-        ($calc_debug_info_ref->{'rVCPU_P99W1CredRatio'} // $na),
+        ($calc_debug_info_ref->{'rVCPU_P99W1RunnableDensity'} // $na),
         ($calc_debug_info_ref->{'rVCPU_RunQKeyUsed'} // $na),
         ($calc_debug_info_ref->{'rVCPU_RunQHiThreads'} // $na),
         (($calc_debug_info_ref->{'rVCPU_DispatchReserveVP'} // 0) > 0
@@ -4262,6 +4493,367 @@ sub apply_tier_aware_upsizing_scaling {
     return \%result;
 }
 
+# ==============================================================================
+# SUBROUTINE: _tier_guarantee_floor
+# PURPOSE:    Smallest entitlement at which this tier's reliance on unguaranteed
+#             (pool) capacity stays within its declared dispatch budget.
+#
+#             Demand above the guarantee is served from the pool - that is
+#             DEPENDENCY. The room between the guarantee and what the LPAR can
+#             reach is the non-guaranteed BAND. The budget declares how far into
+#             that band a tier may rely:
+#
+#                 Demand - Ent  <=  Budget x (Reachable - Ent)
+#                 Ent  >=  (Demand - Budget x Reachable) / (1 - Budget)
+#
+#             This supersedes the AAE/PAE guardrail, which measured dependency
+#             against the entitlement the VM has TODAY whilst the decision
+#             concerns the entitlement it should have TOMORROW - and which, being
+#             profile-relative, returned contradictory verdicts on 34% of a
+#             97-VM estate (the same partition reading PAE 1.0000 on one profile
+#             and 0.0000 on another).
+#
+#             Demand is the observed peak (P-99W1). Where PhysC is censored the
+#             peak under-reads and this floor under-protects; that is precisely
+#             where the additive path's queue evidence takes over, so the two
+#             mechanisms cover each other's blind spots.
+# ARGUMENTS:  1. $demand_cores  Observed peak PhysC
+#             2. $reachable_cores  min(VP, Pool), or entitlement when capped
+#             3. $is_capped
+#             4. $budget        Tier dispatch budget (fraction of the band)
+#             5. $tier_label    For the rationale string
+# RETURNS:    ($floor_cores, $reason) - $floor_cores undef when no floor applies
+# ==============================================================================
+sub _tier_guarantee_floor {
+    my ($demand_cores, $reachable_cores, $is_capped, $budget, $tier_label) = @_;
+    $tier_label = 'unknown' unless (defined $tier_label && length $tier_label);
+
+    return (undef, "no floor: observed peak PhysC unavailable")
+        unless (defined $demand_cores && looks_like_number($demand_cores) && $demand_cores > 0);
+    return (undef, "no floor: dispatch budget unresolved")
+        unless (defined $budget && looks_like_number($budget) && $budget >= 0);
+
+    # Capped LPAR: Reachable == Ent, so the band is zero and the algebra collapses
+    # to Ent >= Demand at every tier. Nothing designed this - it falls out. A
+    # capped partition cannot borrow, so cutting below its observed peak
+    # introduces throttling that did not previously exist.
+    if ($is_capped) {
+        return ($demand_cores, sprintf(
+            "capped LPAR: no non-guaranteed band exists, so the guarantee must cover the whole observed peak (%.2f cores) regardless of tier",
+            $demand_cores));
+    }
+
+    return (undef, "no floor: reachable capacity unavailable")
+        unless (defined $reachable_cores && looks_like_number($reachable_cores) && $reachable_cores > 0);
+
+    if ($budget >= 1.0 - $FLOAT_EPSILON) {
+        return (undef, sprintf(
+            "no floor: tier '%s' budget 1.00 permits reliance on the entire non-guaranteed band",
+            $tier_label));
+    }
+
+    if ($demand_cores > $reachable_cores + $FLOAT_EPSILON) {
+        return ($reachable_cores, sprintf(
+            "INFEASIBLE: observed peak %.2f cores exceeds reachable capacity %.2f - the configuration changed after measurement, or PhysC is censored. Review MaxCPU/VP. Floor pinned at reachable.",
+            $demand_cores, $reachable_cores));
+    }
+
+    my $floor = ($demand_cores - ($budget * $reachable_cores)) / (1.0 - $budget);
+    $floor = 0            if ($floor < 0);
+    $floor = $demand_cores if ($floor > $demand_cores);   # defensive: floor <= demand whenever reachable >= demand
+
+    return ($floor, sprintf(
+        "tier '%s' budget %.0f%%: peak demand %.2f cores, reachable %.2f. Guarantee must be >= %.2f so that pool reliance (%.2f cores) stays within %.0f%% of the non-guaranteed band (%.2f cores)",
+        $tier_label, $budget * 100, $demand_cores, $reachable_cores, $floor,
+        $demand_cores - $floor, $budget * 100, $reachable_cores - $floor));
+}
+
+# ==============================================================================
+# SUBROUTINE: _resolve_dispatch_budget
+# PURPOSE:    Resolve the tier's dispatch budget. Mirrors _resolve_runq_target:
+#             the tier NUMBER carries the appetite; the pattern letter is a
+#             time-window selector and carries none.
+# ARGUMENTS:  1. $final_tier (string): tier label, e.g. 'G1', 'B3', 'P'.
+# RETURNS:    ($budget, $reason)
+# ==============================================================================
+sub _resolve_dispatch_budget {
+    my ($final_tier) = @_;
+    $final_tier = '' unless defined $final_tier;
+
+    return ($DISPATCH_BUDGET_BY_TIER{$final_tier}, "tier '$final_tier'")
+        if exists $DISPATCH_BUDGET_BY_TIER{$final_tier};
+    return ($DISPATCH_BUDGET_BY_TIER{'P'}, "fallback: mission-critical 'P' rung")
+        if ($final_tier =~ /^P/i);
+
+    my ($num) = ($final_tier =~ /(\d)$/);
+    $num = 3 unless (defined $num && $num >= 1 && $num <= 4);
+    return ($DISPATCH_BUDGET_BY_TIER{'G' . $num}, "fallback: tier-$num rung");
+}
+
+# ==============================================================================
+# SUBROUTINE: _smt_yield
+# PURPOSE:    Throughput of one core running $k threads, relative to that core
+#             running a single thread. Log-linear interpolation between the
+#             configured points; clamped at both ends.
+# ARGUMENTS:  1. $k (threads per core)
+# RETURNS:    yield multiplier (>= 1.0)
+# ==============================================================================
+sub _smt_yield {
+    my ($k) = @_;
+
+    unless (@SMT_YIELD_POINTS) {
+        @SMT_YIELD_POINTS = map { [ $_ + 0, $SMT_YIELD_CURVE{$_} + 0 ] }
+                            sort { $a <=> $b } keys %SMT_YIELD_CURVE;
+    }
+    return 1.00 unless (@SMT_YIELD_POINTS);
+    return $SMT_YIELD_POINTS[0][1]  if (!defined $k || $k <= $SMT_YIELD_POINTS[0][0]);
+    return $SMT_YIELD_POINTS[-1][1] if ($k >= $SMT_YIELD_POINTS[-1][0]);
+
+    for my $i (0 .. $#SMT_YIELD_POINTS - 1) {
+        my ($k0, $y0) = @{ $SMT_YIELD_POINTS[$i] };
+        my ($k1, $y1) = @{ $SMT_YIELD_POINTS[$i + 1] };
+        next unless ($k >= $k0 && $k <= $k1);
+        my $span = log($k1) - log($k0);
+        return $y0 if ($span <= 0);
+        return $y0 + (($y1 - $y0) * ((log($k) - log($k0)) / $span));
+    }
+    return $SMT_YIELD_POINTS[-1][1];
+}
+
+# ==============================================================================
+# SUBROUTINE: _yield_aware_active_core_floor
+# PURPOSE:    Smallest number of concurrently active cores that retains the
+#             required share of the workload's estimated throughput at its
+#             observed peak.
+#
+#             Estimated throughput on C active cores, with R runnable threads:
+#                 T(C) = C * Y(clamp(R/C, curve bounds))
+#             T is strictly increasing in C: in the interpolated region
+#             dT/dC = Y(k) - 0.45/ln2 = Y(k) - 0.649 >= 0.35 for k >= 1, and it is
+#             linear in the clamped regions. The floor is therefore unique and
+#             bisection is sound. T(0) = 0 < target <= T(peak), so the bracket
+#             [0, peak] is always valid.
+#
+#             k below 1 (PhysC exceeding runnable threads) is not a physical
+#             state - a thread cannot consume more than one core - but arises
+#             because RunQ is sampled instantaneously whilst PhysC is averaged
+#             over the interval. It is clamped to 1 rather than trusted, which is
+#             the conservative reading: the peak stands almost untouched.
+#
+#             For an UNCAPPED LPAR this is an active-core (and hence VP) floor.
+#             For a CAPPED LPAR, entitlement is the dispatch ceiling, so it also
+#             bounds entitlement - exposed via debug, not yet wired.
+# ARGUMENTS:  1. $active_cores     Cores executing the work at the peak. Currently
+#                                  the PhysC peak, which INCLUDES ceded/idle
+#                                  consumption. PhysB (physical processors busy)
+#                                  is the correct input and is not yet staged.
+#                                  Because PhysB <= PhysC, the true threads-per-
+#                                  busy-core is HIGHER than we compute, so this
+#                                  floor is systematically CONSERVATIVE: it keeps
+#                                  more width than PhysB evidence would justify.
+#                                  IBM's guidance is explicit that VP decisions
+#                                  should not rest on PhysC alone.
+#             2. $threads_per_core Paired runnable density x SMT at the same tail
+#             3. $retention        Required throughput share (0 < r <= 1)
+# RETURNS:    ($floor_cores, $reason) or (undef, $reason) when not computable
+# ==============================================================================
+sub _yield_aware_active_core_floor {
+    my ($active_cores, $threads_per_core, $retention) = @_;
+
+    return (undef, 'peak PhysC unavailable')
+        unless (defined $active_cores && looks_like_number($active_cores) && $active_cores > 0);
+    return (undef, 'paired occupancy unavailable - no throughput estimate possible')
+        unless (defined $threads_per_core && looks_like_number($threads_per_core) && $threads_per_core > 0);
+    return ($active_cores, 'retention >= 100%: no consolidation permitted')
+        unless (defined $retention && looks_like_number($retention) && $retention > 0 && $retention < 1.0);
+
+    my $k0_raw = $threads_per_core + 0;
+    my $k0     = ($k0_raw < 1.0) ? 1.0 : $k0_raw;
+    my $threads = $k0 * $active_cores;              # implied runnable threads at the peak
+    my $t0      = $active_cores * _smt_yield($k0);
+    my $target  = $retention * $t0;
+
+    my ($lo, $hi) = (0.0, $active_cores + 0);
+    my $iter = 0;
+    while (($hi - $lo) > 0.001 && $iter++ < 60) {
+        my $mid = ($lo + $hi) / 2;
+        my $t_mid = ($mid > 0) ? ($mid * _smt_yield($threads / $mid)) : 0;
+        if ($t_mid >= $target) { $hi = $mid } else { $lo = $mid }
+    }
+    $hi = $active_cores if ($hi > $active_cores);
+
+    my $reason = sprintf(
+        "%.2f threads/core%s at a %.2f-core peak -> yield %.3f, throughput %.2f units; retaining %.0f%% (%.2f units) needs %.2f active cores (%.0f%% of peak) [curve: %s v%d, %s]",
+        $k0_raw, (($k0_raw < 1.0) ? " (clamped to 1.00: RunQ sampling artefact)" : ""),
+        $active_cores, _smt_yield($k0), $t0, $retention * 100, $target, $hi,
+        ($active_cores > 0 ? ($hi / $active_cores) * 100 : 0),
+        $SMT_YIELD_CURVE_NAME, $SMT_YIELD_CURVE_VERSION, $SMT_YIELD_CURVE_SOURCE);
+
+    return ($hi, $reason);
+}
+
+# ==============================================================================
+# SUBROUTINE: _resolve_peak_runnable_density
+# PURPOSE:    Return the PAIRED runnable-density estimate for the P99W1 peak:
+#             runnable threads per consumed thread slot, formed per sample by
+#             nfit as runq/(physc*smt) BEFORE smoothing and percentiling.
+#
+#             Supersedes the estimator that divided AbsRunQ_P99W1 by SMT and then
+#             by PhysC_P99W1. Both express runq/(physc*smt), but that form is a
+#             ratio of two percentiles which need not come from the same minute,
+#             whereas NormRunQ is a percentile of per-sample ratios.
+#             E[X/Y] != E[X]/E[Y], and the two disagree materially in production
+#             (vm1: 1.947 unpaired against 1.08 paired).
+#
+#             Prefers the peak profile's own block at its PhysC-aligned tail,
+#             degrading through coarser tails, then the unified collation.
+# ARGUMENTS:  1. $vm_map_ref
+# RETURNS:    ($occupancy, $source_label) or (undef, undef)
+# ==============================================================================
+sub _resolve_peak_runnable_density {
+    my ($vm_map_ref) = @_;
+    return (undef, undef) unless (ref($vm_map_ref) eq 'HASH');
+
+    my @tails = ('NormRunQ_P99.75', 'NormRunQ_P99', 'NormRunQ_P98', 'NormRunQ_P95', 'NormRunQ_P90');
+    my @sources;
+
+    if (ref($vm_map_ref->{RunQMetricsByProfile}) eq 'HASH') {
+        foreach my $pk ($MANDATORY_PEAK_PROFILE_FOR_HINT, $LEGACY_MANDATORY_PEAK_PROFILE_FOR_HINT) {
+            next unless (defined $pk && ref($vm_map_ref->{RunQMetricsByProfile}{$pk}) eq 'HASH');
+            push @sources, [ $vm_map_ref->{RunQMetricsByProfile}{$pk}, $pk ];
+        }
+    }
+    push @sources, [ $vm_map_ref->{RunQMetrics}, 'unified collation' ]
+        if (ref($vm_map_ref->{RunQMetrics}) eq 'HASH');
+
+    foreach my $src (@sources) {
+        my ($blk, $label) = @$src;
+        foreach my $tail (@tails) {
+            next unless (defined $blk->{$tail} && looks_like_number($blk->{$tail}));
+            return ($blk->{$tail} + 0, sprintf("%s %s (paired)", $label, $tail));
+        }
+    }
+    return (undef, undef);
+}
+
+# ==============================================================================
+# SUBROUTINE: _resolve_runq_target
+# PURPOSE:    Resolve the idealised run-queue depth (runnable threads per
+#             logical CPU) that sizing should aim for, given a tier label.
+#             This is the single source of truth for BOTH the downsizing path
+#             (which sizes towards this depth) and the additive path (whose
+#             tolerance ceiling is derived from it), so the two directions
+#             cannot diverge.
+# ARGUMENTS:  1. $final_tier (string): tier label, e.g. 'G1', 'B3', 'P'.
+# RETURNS:    ($target, $reason)
+# ==============================================================================
+sub _resolve_runq_target {
+    my ($final_tier) = @_;
+    $final_tier = '' unless defined $final_tier;
+
+    if (exists $custom_runq_targets{$final_tier}) {
+        return ($custom_runq_targets{$final_tier},
+                "User-defined target for tier '$final_tier' from nfit.profiles.cfg");
+    }
+    if (exists $DEFAULT_RUNQ_TARGETS{$final_tier}) {
+        return ($DEFAULT_RUNQ_TARGETS{$final_tier},
+                "Built-in tier-major target for tier '$final_tier'");
+    }
+    if ($final_tier =~ /^P/i) {
+        return ($DEFAULT_RUNQ_TARGETS{'P'}, "Fallback: mission-critical 'P' rung");
+    }
+
+    # Tier-major fallback: the tier NUMBER carries the appetite, so an
+    # unrecognised or number-less label decays to the tier-3 rung. The previous
+    # fallback keyed on the pattern letter, which encodes only the measurement
+    # window and therefore cannot imply a risk appetite.
+    my ($num) = ($final_tier =~ /(\d)$/);
+    $num = 3 unless (defined $num && $num >= 1 && $num <= 4);
+    return (($DEFAULT_RUNQ_TARGETS{'G' . $num} // $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC),
+            "Fallback: tier-$num rung (pattern letter carries no risk appetite)");
+}
+
+# ==============================================================================
+# SUBROUTINE: _resolve_runq_source_profile
+# PURPOSE:    Resolve the RunQ modifier source profile for a VM from its tier
+#             classification, honouring the priority chain:
+#                 User TIER (confirmed) -> Auto Hint -> Default ('G3')
+#             Resolution is number-aware: 'O1' resolves to the O1-* profile
+#             rather than the historical flat tier-3 mapping. Tier 'P' resolves
+#             to the mission-critical actionable profile so that the P-tier
+#             downsizing prohibition and performance-grade caps engage on the
+#             planner-facing CSV columns.
+# ARGUMENTS:
+#   1. $user_tier     (string): Confirmed tier from the VM config (may be '').
+#   2. $auto_tier     (string): Auto-detected tier hint (may be '').
+#   3. $profiles_aref (array ref): Loaded profile objects ({name, csv_output, ...}).
+# RETURNS:
+#   - ($profile_name, $label): the resolved profile name (guaranteed to name a
+#     loaded profile where possible, falling back to 'G3-95W15'), and a
+#     provenance-suffixed label for the RunQ_Source CSV column,
+#     e.g. "O1-99W5 (TIER)".
+# ==============================================================================
+sub _resolve_runq_source_profile {
+    my ($user_tier, $auto_tier, $profiles_aref) = @_;
+
+    my $LEGACY_DEFAULT = 'G3-95W15';
+    $user_tier //= '';
+    $auto_tier //= '';
+
+    # 1. Establish the tier token and its provenance.
+    my ($token, $provenance);
+    if ($user_tier =~ /^\s*([A-Za-z]\d?)/) {
+        $token = uc($1); $provenance = 'TIER';
+    } elsif ($auto_tier =~ /^\s*([A-Za-z]\d?)/) {
+        $token = uc($1); $provenance = 'Hint';
+    } else {
+        $token = 'G3';   $provenance = 'Default';
+    }
+
+    # 2. Normalise the token to a pattern letter and a tier number.
+    #    A missing or out-of-range tier number decays to the conservative
+    #    tier-3 rung (historical behaviour preserved).
+    my ($letter, $digit) = ($token =~ /^([OGBP])(\d?)$/);
+    if (!defined $letter) { $letter = 'G'; $digit = ''; $provenance = 'Default'; }
+
+    # The auto-detected hint supplies the TIME WINDOW (letter) from observed
+    # data, which it does reliably. It cannot supply the RISK APPETITE (number):
+    # business importance is not inferable from CPU behaviour, and a wrong guess
+    # of tier 1 applies the strictest queue target, the smallest dispatch budget
+    # and the largest upsizing scaling to a workload nobody has declared
+    # critical. Hinted tiers therefore resolve to the neutral tier-3 rung; only
+    # a confirmed user TIER unlocks tier-specific appetite in either direction.
+    if ($provenance ne 'TIER') {
+        $digit = '3';
+    }
+    $digit = '3' if (!defined $digit || $digit eq '' || $digit < 1 || $digit > 4);
+
+    # First matching profile for a name prefix, preferring CSV-visible profiles
+    # (this excludes helper profiles such as the -50W median companions).
+    my $find_by_prefix = sub {
+        my ($prefix) = @_;
+        my @matches = grep { defined $_->{name} && index($_->{name}, $prefix) == 0 } @$profiles_aref;
+        my ($visible) = grep { $_->{csv_output} } @matches;
+        return $visible // $matches[0];
+    };
+
+    my $resolved;
+
+    # 3. Tier 'P' maps to the mission-critical actionable profile when loaded,
+    #    so the P-tier downsizing prohibition governs the CSV columns.
+    if ($letter eq 'P') {
+        ($resolved) = grep { defined $_->{name} && $_->{name} eq $MISSION_CRITICAL_PROFILE_NAME } @$profiles_aref;
+    }
+
+    # 4. Otherwise (or if the P profile is not loaded) resolve letter+digit,
+    #    then decay towards the tier-3 rung, then the legacy default.
+    $resolved //= $find_by_prefix->("${letter}${digit}-");
+    $resolved //= $find_by_prefix->("${letter}3-");
+
+    my $name = (defined $resolved && defined $resolved->{name}) ? $resolved->{name} : $LEGACY_DEFAULT;
+    return ($name, sprintf("%s (%s)", $name, $provenance));
+}
+
 # --- calculate_runq_modified_physc (with enhanced efficiency logic and detailed debug output) ---
 # Calculates the final PhysC value for a profile after applying efficiency factors
 # and RunQ-driven additive CPU adjustments.
@@ -4293,19 +4885,62 @@ sub calculate_runq_modified_physc
     # RunQ Metrics from the map
     my $na_str = 'N/A';
 
-    my $runq_metrics_ref = $vm_map_ref->{RunQMetrics};
-    my $norm_runq_p25_str = $runq_metrics_ref->{'NormRunQ_P25'} // $na_str;
-    my $norm_runq_p50_str = $runq_metrics_ref->{'NormRunQ_P50'} // $na_str;
-    my $norm_runq_p75_str = $runq_metrics_ref->{'NormRunQ_P75'} // $na_str;
-    my $norm_runq_p90_str = $runq_metrics_ref->{'NormRunQ_P90'} // $na_str;
+    # --- Per-profile measurement provenance (key-level fallback) ---
+    # Prefer the RunQ percentile block computed for THIS profile, which carries
+    # the profile's own time filter (-online / -batch / 24x7) and smoothing
+    # window. Fall back key-by-key to the legacy unified block for any
+    # percentile the profile's nfit run did not emit, and fall back entirely
+    # when per-profile blocks are absent (seasonal / history-primed maps),
+    # preserving prior behaviour on those paths. The unified block reference
+    # is retained because flat-lining detection deliberately consumes the
+    # peak-window view further down.
+    my $runq_metrics_ref = $vm_map_ref->{RunQMetrics};   # unified (legacy) block
+    my $runq_profile_block_ref =
+        (ref($vm_map_ref->{RunQMetricsByProfile}) eq 'HASH')
+            ? $vm_map_ref->{RunQMetricsByProfile}{$profile_name}
+            : undef;
+    $runq_profile_block_ref = undef
+        unless (ref($runq_profile_block_ref) eq 'HASH'
+                && scalar(grep { $_ ne 'SourceProfile' } keys %$runq_profile_block_ref));
+
+    my $runq_used_profile_local    = 0;
+    my $runq_used_unified_fallback = 0;
+    my $_resolve_runq_metric = sub {
+        my ($key) = @_;
+        if (defined $runq_profile_block_ref && defined $runq_profile_block_ref->{$key}) {
+            $runq_used_profile_local = 1;
+            return $runq_profile_block_ref->{$key};
+        }
+        my $val = (ref($runq_metrics_ref) eq 'HASH') ? $runq_metrics_ref->{$key} : undef;
+        $runq_used_unified_fallback = 1 if defined $val;
+        return $val;
+    };
+
+    my $norm_runq_p25_str = $_resolve_runq_metric->('NormRunQ_P25') // $na_str;
+    my $norm_runq_p50_str = $_resolve_runq_metric->('NormRunQ_P50') // $na_str;
+    my $norm_runq_p75_str = $_resolve_runq_metric->('NormRunQ_P75') // $na_str;
+    my $norm_runq_p90_str = $_resolve_runq_metric->('NormRunQ_P90') // $na_str;
 
     # Determine which AbsRunQ percentile value to use based on profile behaviour.
     my $abs_runq_key_to_use = "AbsRunQ_P90"; # Default to fixed
     if ($runq_perc_behavior_mode eq 'match' && $profile_ref->{flags} =~ /-p\s+([0-9.]+)/) {
         $abs_runq_key_to_use = "AbsRunQ_P" . clean_perc_label($1);
     }
-    my $abs_runq_p_value_str = $runq_metrics_ref->{$abs_runq_key_to_use} // $na_str;
+    my $abs_runq_p_value_str = $_resolve_runq_metric->($abs_runq_key_to_use) // $na_str;
     my $abs_runq_key_for_debug = $abs_runq_key_to_use;
+
+    # Human-readable measurement provenance for rationale logging.
+    my $runq_metrics_source_name;
+    if ($runq_used_profile_local && $runq_used_unified_fallback) {
+        $runq_metrics_source_name = sprintf("%s (profile-local; unified fallback for missing keys)", $profile_name);
+    } elsif ($runq_used_profile_local) {
+        $runq_metrics_source_name = sprintf("%s (profile-local)", $profile_name);
+    } else {
+        my $unified_src = (ref($runq_metrics_ref) eq 'HASH' && defined $runq_metrics_ref->{SourceProfile})
+            ? $runq_metrics_ref->{SourceProfile}
+            : 'RunQMetrics';
+        $runq_metrics_source_name = sprintf("%s (unified collation)", $unified_src);
+    }
 
     # Pressure flags and adaptive thresholds passed in from the main loop
     my $p99w1_overall_vm_has_abs_runq_pressure  = $pressure_flags_href->{abs_pressure};
@@ -4317,7 +4952,8 @@ sub calculate_runq_modified_physc
     # The tier for all modifier calculations must come from the profile being processed,
     # not the global VM hint, to ensure logical consistency.
     my $final_tier = $profile_ref->{name};
-    $final_tier =~ s/-.*//; # Extract the tier part (e.g., "G2-98W10" -> "G2")
+    $final_tier =~ s/-.*$//o; # Extract the tier part (e.g., "G2-98W10" -> "G2")
+    $final_tier =~ s/^\s+|\s+$//g; # remove any whitespace
 
     my %debug_info;
 
@@ -4329,6 +4965,7 @@ sub calculate_runq_modified_physc
     # --- Initialize all debug fields to sensible defaults or N/A ---
     $debug_info{'AbsRunQKeyUsed'} = $abs_runq_key_for_debug // 'N/A (key not provided)';
     $debug_info{'AbsRunQValueUsedForCalc'} = $abs_runq_p_value_str;
+    $debug_info{'RunQMetricsSourceName'} = $runq_metrics_source_name;
     $debug_info{'BasePhysC'} = $selected_tier_physc_value_str // $na_str;
     $profile_runq_behavior_setting //= 'default';
 
@@ -4449,8 +5086,24 @@ sub calculate_runq_modified_physc
     my $abs_runq_p_numeric  = ($abs_runq_p_value_str ne $na_str && $abs_runq_p_value_str  =~ /^-?[0-9.]+$/) ? ($abs_runq_p_value_str + 0)  : undef;
     $debug_info{'NormRunQ_P90_Val'} = (defined $norm_p90_numeric) ? sprintf("%.2f", $norm_p90_numeric) : $na_str;
     # ------------------------------------------------------------------
-    # Harvest per-profile PhysC diagnostics (DailySeries-based approximation)
+    # Harvest PhysC diagnostics (DailySeries-based approximation)
     # ------------------------------------------------------------------
+    # Two scopes are harvested and the distinction is material:
+    #
+    #   Profile-local : PAE/AAE/IQRC through THIS profile's smoothed percentile
+    #                   series. Retained unchanged, and still the sole input to
+    #                   the downsizing guardrail, which reasons about the value
+    #                   it is protecting.
+    #   Peak-sourced  : PAE/AAE through the unfiltered peak profile - the
+    #                   partition's ACTUAL burst behaviour, and the only valid
+    #                   basis for asking whether it receives unguaranteed
+    #                   capacity when it asks.
+    #
+    # The two diverge sharply. A partition peaking at 2.5x its entitlement
+    # reports PAE 0.31 through a G1 lens and PAE 0.00 through a G3 lens, because
+    # G3's 95th-percentile-over-15-minute series never crosses the entitlement
+    # line. The profile-local figure is true of the profile and false of the
+    # partition, so corroboration logic must not consume it.
     my $physc_diag = _safe_dig($vm_map_ref, 'Diagnostics', 'PhysC', $profile_name);
     if (ref($physc_diag) eq 'HASH') {
         if (defined $physc_diag->{PAE} && looks_like_number($physc_diag->{PAE})) {
@@ -4463,6 +5116,23 @@ sub calculate_runq_modified_physc
             $debug_info{'PhysC_Daily_IQRC'} = sprintf("%.4f", $physc_diag->{IQRC} + 0);
         }
     }
+
+    # Peak-sourced burst evidence, used only by corroboration logic.
+    my ($peak_pae_numeric, $peak_aae_numeric);
+    my $peak_diag_source = $na_str;
+    foreach my $peak_key ($MANDATORY_PEAK_PROFILE_FOR_HINT, $LEGACY_MANDATORY_PEAK_PROFILE_FOR_HINT) {
+        my $peak_diag = _safe_dig($vm_map_ref, 'Diagnostics', 'PhysC', $peak_key);
+        next unless (ref($peak_diag) eq 'HASH');
+        next unless (defined $peak_diag->{PAE} && looks_like_number($peak_diag->{PAE}));
+        $peak_pae_numeric = $peak_diag->{PAE} + 0;
+        $peak_aae_numeric = (defined $peak_diag->{AAE} && looks_like_number($peak_diag->{AAE}))
+                          ? ($peak_diag->{AAE} + 0) : undef;
+        $peak_diag_source = $peak_key;
+        last;
+    }
+    $debug_info{'PhysC_Peak_PAE'}         = defined($peak_pae_numeric) ? sprintf("%.4f", $peak_pae_numeric) : $na_str;
+    $debug_info{'PhysC_Peak_AAE'}         = defined($peak_aae_numeric) ? sprintf("%.4f", $peak_aae_numeric) : $na_str;
+    $debug_info{'PhysC_Peak_Diag_Source'} = $peak_diag_source;
 
     # ------------------------------------------------------------------
     # Headroom diagnostics (threads & cores)
@@ -4717,148 +5387,120 @@ sub calculate_runq_modified_physc
         }
     }
 
-    # Calculate Effective LCPUs for Pressure
+    # ------------------------------------------------------------------
+    # Effective Dispatch Threads (Allowance) - tier dispatch budget model
+    # ------------------------------------------------------------------
+    # The allowance answers one question: how many dispatch threads may this
+    # workload's queue COUNT ON being served?
+    #
+    #   Guaranteed = Ent x SMT             (PowerVM guarantees this capacity)
+    #   Reachable  = min(VP, Pool) x SMT   (best case, an uncontended pool)
+    #   Allowance  = Guaranteed + Budget x (Reachable - Guaranteed)
+    #
+    # The budget is the fraction of the non-guaranteed band that the tier is
+    # willing to rely on: a business decision about how much pool grace a
+    # workload of this importance may depend upon.
+    #
+    # This replaces the EVR-derived burst factor, which inferred the allowance
+    # from the vCPU:Entitlement ratio and therefore granted the LARGEST
+    # allowance - and so the LEAST pressure sensitivity - to precisely those
+    # partitions most dependent on unguaranteed capacity. It also retires the
+    # max(theoretical, observed peak) selection, whose denominator followed
+    # demand: a partition that had already burst inflated its own allowance and
+    # suppressed its own pressure ratio. Whether bursting is actually honoured
+    # is corroborated separately by the measured PAE/AAE evidence.
+    #
+    # The pool CONTENTION heuristic is retired with it: inferring contention
+    # from a VM's share of its pool was a guess, and the "middle band" this
+    # model creates does not need it - the band exists precisely because pool
+    # delivery is unknowable. The pool SIZE bound is retained below, since that
+    # is a physical fact rather than an inference.
     my ($effective_lcpus_for_pressure_calc, $pressure_basis_rationale);
     my $max_cpu_for_lpar_numeric = (defined $max_cpu_config_str && looks_like_number($max_cpu_config_str)) ? ($max_cpu_config_str + 0) : 0;
-    my $base_burst_factor = 0.50;
 
-    my $evr_num;              # EVR used for tiering (Ent floored to 1.0)
-    my $evr_raw_num;          # Raw EVR (vCPU/Entitlement) for reporting
-    my $evr_str = $na_str;    # Display EVR (raw)
-    my $evr_tier_note = '';   # Optional note when Ent < 1.0 (to explain tiering EVR)
+    my $ent_is_valid = (defined $curr_ent_numeric && looks_like_number($curr_ent_numeric) && $curr_ent_numeric > 0) ? 1 : 0;
+    my $smt_is_valid = (defined $smt_used && looks_like_number($smt_used) && $smt_used > 0) ? 1 : 0;
+    my $vcpu_is_valid = (defined $vcpu_for_lpar_numeric && looks_like_number($vcpu_for_lpar_numeric) && $vcpu_for_lpar_numeric > 0) ? 1 : 0;
+    my $pool_is_valid = (defined $pool_cpu_for_lpar_numeric && looks_like_number($pool_cpu_for_lpar_numeric) && $pool_cpu_for_lpar_numeric > 0) ? 1 : 0;
 
-    my $evr_low = 1.25;   # “low headroom intent”
-    my $evr_mod = 1.50;   # “moderate / burst-oriented”
-    my $evr_hi  = 2.00;   # “vendor line / cap benefit”
-
-    my $evr_tier_rationale = "Conservative/Standard (EVR < ${evr_low}x)";
-
-    if (defined $curr_ent_numeric && $curr_ent_numeric > 0
-        && defined $vcpu_for_lpar_numeric && $vcpu_for_lpar_numeric > 0) {
-
-        # Keep the entitlement floor to avoid tiny-ent skew;
-        # optionally also suppress EVR-based boosts for ent < 1.0.
-        my $ent_for_evr = max($curr_ent_numeric, 1.0);
-
-        # Raw EVR (for display): vCPU / Entitlement
-        $evr_raw_num = $vcpu_for_lpar_numeric / $curr_ent_numeric;
-        $evr_str     = sprintf("%.1f:1", $evr_raw_num);
-
-        # Tiering EVR (for headroom policy): vCPU / max(Entitlement, 1.0)
-        $evr_num = $vcpu_for_lpar_numeric / $ent_for_evr;
-
-        # If Entitlement is fractional, explain why the tiering EVR differs from the raw EVR.
-        if ($curr_ent_numeric < 1.0) {
-            $evr_tier_note = sprintf(
-                "         - EVR used for headroom tiering (Ent floor 1.0) : %s/%.1f = %.1fx\n",
-                $vcpu_for_lpar_numeric, $ent_for_evr, $evr_num
-            );
-        }
-
-        # Optional: cap benefit above 2.0 so EVR doesn't inflate allowance indefinitely.
-        my $evr_effective = min($evr_num, $evr_hi);
-
-        if ($evr_num >= $evr_hi) {
-            # High EVR: classify it, but cap the headroom benefit.
-            $base_burst_factor  = 1.00;   # capped benefit
-            $evr_tier_rationale = sprintf("High (LPAR is configured for bursting: EVR %.1fx >= ${evr_hi}x; base headroom set to 100%% and capped)", $evr_num);
-        } elsif ($evr_effective >= $evr_mod) {
-            $base_burst_factor  = 1.00;
-            $evr_tier_rationale = sprintf("Moderate (EVR %.1fx >= ${evr_mod}x)", $evr_num);
-        } elsif ($evr_effective >= $evr_low) {
-            $base_burst_factor  = 0.75;
-            $evr_tier_rationale = sprintf("Low headroom intent (EVR %.1fx >= ${evr_low}x)", $evr_num);
-        } else {
-            $base_burst_factor  = 0.50;
-        }
+    # Absolute dispatch ceiling: no allowance may exceed the configured width.
+    my $absolute_ceiling_lcpus = 0;
+    if ($smt_is_valid) {
+        $absolute_ceiling_lcpus = ($max_cpu_for_lpar_numeric > 0) ? ($max_cpu_for_lpar_numeric * $smt_used)
+                                : ($vcpu_is_valid ? ($vcpu_for_lpar_numeric * $smt_used) : 0);
     }
-    my $pool_constraint_multiplier = 1.0;
-    my $pool_constraint_rationale = "Default Pool (ID 0), no constraint applied";
-    if ($is_in_non_default_pool && $pool_cpu_for_lpar_numeric > 0 && $curr_ent_numeric > 0) {
-        my $vm_share_of_pool = $curr_ent_numeric / $pool_cpu_for_lpar_numeric;
-        $pool_constraint_multiplier = 1.0 - (0.3 * min(1.0, $vm_share_of_pool * 2));
-        $pool_constraint_multiplier = max(0.7, $pool_constraint_multiplier);
-        $pool_constraint_rationale = sprintf("User Pool (Share %.1f%%), multiplier of %.2f applied", $vm_share_of_pool*100, $pool_constraint_multiplier);
+
+    # Reachable cores: a capped LPAR can never exceed its entitlement, so its
+    # non-guaranteed band is legitimately zero and no tier receives a budget.
+    my $is_capped_lpar = (defined $cfg_ref->{is_capped} && $cfg_ref->{is_capped}) ? 1 : 0;
+    my $reachable_cores = 0;
+    my $reachable_reason;
+    if ($is_capped_lpar) {
+        $reachable_cores = $ent_is_valid ? $curr_ent_numeric : 0;
+        $reachable_reason = "capped LPAR: reachable == entitlement, no non-guaranteed band";
+    } elsif ($vcpu_is_valid && $pool_is_valid) {
+        $reachable_cores = min($vcpu_for_lpar_numeric, $pool_cpu_for_lpar_numeric);
+        $reachable_reason = sprintf("uncapped: min(VP %.2f, Pool %.2f)", $vcpu_for_lpar_numeric, $pool_cpu_for_lpar_numeric);
+    } elsif ($vcpu_is_valid) {
+        $reachable_cores = $vcpu_for_lpar_numeric;
+        $reachable_reason = sprintf("uncapped: VP %.2f (pool size unknown)", $vcpu_for_lpar_numeric);
+    } else {
+        $reachable_cores = $ent_is_valid ? $curr_ent_numeric : 0;
+        $reachable_reason = "VP count unavailable: reachable defaulted to entitlement";
     }
-    my $final_burst_allowance = $base_burst_factor * $pool_constraint_multiplier;
-    my $theoretical_lcpus = ($curr_ent_numeric * (1 + $final_burst_allowance)) * $smt_used;
 
-    # handle potentially undefined P-99W1 values
-    my $p99w1_physc_val_str = looks_like_number($pure_p99w1_physc) ? sprintf("%.3f", $pure_p99w1_physc) : $na_str;
-    my $p99w1_physc_val = ($p99w1_physc_val_str ne $na_str && $p99w1_physc_val_str =~ /^-?[0-9.]+\z/)
-        ? ($p99w1_physc_val_str + 0)
-        : 0;
-    my $capacity_headroom = ($max_cpu_for_lpar_numeric > 0) ? (1 - ($p99w1_physc_val / $max_cpu_for_lpar_numeric)) : 0;
-    my $headroom_confidence_modifier = 1.0;
-    my $headroom_rationale = "High Headroom (>30%), full confidence in observed peak";
-    if ($capacity_headroom < 0.10) {
-        $headroom_confidence_modifier = 0.75;
-        $headroom_rationale = sprintf("Low Headroom (%.1f%%), low confidence in further bursting", $capacity_headroom * 100);
-    } elsif ($capacity_headroom < 0.30) {
-        $headroom_confidence_modifier = 0.90;
-        $headroom_rationale = sprintf("Medium Headroom (%.1f%%), medium confidence", $capacity_headroom * 100);
+    my $guaranteed_lcpus = ($ent_is_valid && $smt_is_valid) ? ($curr_ent_numeric * $smt_used) : 0;
+    my $reachable_lcpus  = $smt_is_valid ? ($reachable_cores * $smt_used) : 0;
+    $reachable_lcpus = min($reachable_lcpus, $absolute_ceiling_lcpus) if ($absolute_ceiling_lcpus > 0);
+    $reachable_lcpus = max($reachable_lcpus, $guaranteed_lcpus);
+
+    my ($dispatch_budget, $dispatch_budget_reason) = _resolve_dispatch_budget($final_tier);
+    my $non_guaranteed_band = max(0, $reachable_lcpus - $guaranteed_lcpus);
+
+    my $allowance_method;
+    if (!$ent_is_valid || !$smt_is_valid) {
+        # Without a usable entitlement or SMT there is no guarantee to anchor
+        # against. Fall back to the reachable ceiling (the previous, most
+        # permissive behaviour) rather than synthesising a tiny allowance that
+        # would manufacture false pressure.
+        $effective_lcpus_for_pressure_calc = ($reachable_lcpus > 0) ? $reachable_lcpus : $absolute_ceiling_lcpus;
+        $allowance_method = "Fallback: entitlement or SMT unavailable, allowance = reachable ceiling";
+    } else {
+        $effective_lcpus_for_pressure_calc = $guaranteed_lcpus + ($dispatch_budget * $non_guaranteed_band);
+        $allowance_method = "Guaranteed + Budget x (Reachable - Guaranteed)";
     }
-    my $confidence_adjusted_peak_lcpus = ($p99w1_physc_val * $smt_used) * $headroom_confidence_modifier;
-    my $absolute_ceiling_lcpus = $max_cpu_for_lpar_numeric > 0 ? ($max_cpu_for_lpar_numeric * $smt_used) : ($vcpu_for_lpar_numeric * $smt_used);
+    $effective_lcpus_for_pressure_calc = min($effective_lcpus_for_pressure_calc, $absolute_ceiling_lcpus) if ($absolute_ceiling_lcpus > 0);
+    $effective_lcpus_for_pressure_calc = max($effective_lcpus_for_pressure_calc, 0);
 
-    # Effective Dispatch Threads (Allowance):
-    #   - Select the larger of theoretical vs observed capacity
-    #   - Then cap that allowance at the maximum dispatch threads (MaxCPU * SMT)
-    my $selected_allowance_lcpus = max($theoretical_lcpus, $confidence_adjusted_peak_lcpus);
-    $effective_lcpus_for_pressure_calc = min($absolute_ceiling_lcpus, $selected_allowance_lcpus);
+    my $ceiling_is_binding = ($absolute_ceiling_lcpus > 0 && $reachable_lcpus >= $absolute_ceiling_lcpus - 0.0001) ? 1 : 0;
 
-    # Pre-compute planner-friendly deltas for rationale output.
-    my $gap_vs_observed = $effective_lcpus_for_pressure_calc - $confidence_adjusted_peak_lcpus;
-    my $gap_vs_theoretical = $effective_lcpus_for_pressure_calc - $theoretical_lcpus;
-    my $gap_vs_observed_pct = ($confidence_adjusted_peak_lcpus > 0)
-        ? (($gap_vs_observed / $confidence_adjusted_peak_lcpus) * 100)
-        : 0;
-    my $gap_vs_theoretical_pct = ($theoretical_lcpus > 0)
-        ? (($gap_vs_theoretical / $theoretical_lcpus) * 100)
-        : 0;
-
-    # Cap binding status: did the MaxCPU ceiling actually constrain the selected allowance?
-    my $cap_is_binding = ($absolute_ceiling_lcpus + 0.0 < $selected_allowance_lcpus - 0.0001) ? 1 : 0;
-    my $cap_status_str = $cap_is_binding ? 'MaxCPU constrained' : 'not MaxCPU constrained';
-
-    # Allowance binding flags (rounded-output safe):
-    my $binding_theoretical = (abs($gap_vs_theoretical) < 0.05) ? ' [binding]' : '';
     $pressure_basis_rationale = sprintf(
-        "\n   1. Theoretical Dispatch Capacity\n".
-        "      - vCPU-to-Entitlement Ratio (EVR)       : %s\n".
-        "         - EVR (vCPU/Ent)                     : %s/%s = %.1fx\n".
-        "%s".
-        "      - Uncapped Headroom Factor (Base)       : %.0f%% (Reason: %s)\n".
-        "      - Pool Headroom / Contention Factor     : %.2fx (Reason: %s)\n".
-        "      => Theoretical Dispatch Threads         : %.2f Ent * (1 + %.2f Uncapped Headroom (Calculated)) * %d SMT = %.1f\n".
-        "         - Uncapped Headroom (Calculated)     : %.0f%% (base %.0f%% x pool %.2f)\n".
-        "   2. Observed Dispatch Capacity (Evidence-based)\n".
-        "      - Observed Peak (P-99W1)                : %.2f cores (Headroom: %.1f%%)\n".
-        "      - Confidence Modifier                   : %.2fx (Reason: %s)\n".
-        "      => Observed Dispatch Threads (adjusted) : (%.2f Cores * %d SMT) * %.2f = %.1f\n".
-        "   3. Effective Allowance and Decision\n".
-        "      - Effective Dispatch Threads (allowance): %.1f\n".
-        "         - Selected from                      : max(%.1f Theoretical, %.1f Observed) = %.1f\n".
-        "         - Capped by                          : MaxCPU %.1f (%s)\n".
-        "         - Gap vs Observed Allowance          : %+.1f threads (%+.1f%%)\n".
-        "         - Gap vs Theoretical Allowance       : %+.1f threads (%+.1f%%)%s\n".
-        "         - Method                             : min(%.1f Max LCPUs, max(%.1f Theoretical, %.1f Observed))",
-        $evr_str,
-        $vcpu_for_lpar_numeric, $curr_ent_numeric, (defined $evr_raw_num ? $evr_raw_num : 'N/A'),
-        $evr_tier_note,
-        $base_burst_factor*100, $evr_tier_rationale,
-        $pool_constraint_multiplier, $pool_constraint_rationale,
-        $curr_ent_numeric, $final_burst_allowance, $smt_used, $theoretical_lcpus,
-        $base_burst_factor * 100 * $pool_constraint_multiplier, $base_burst_factor*100, $pool_constraint_multiplier,
-        $p99w1_physc_val, $capacity_headroom*100,
-        $headroom_confidence_modifier, $headroom_rationale,
-        $p99w1_physc_val, $smt_used, $headroom_confidence_modifier, $confidence_adjusted_peak_lcpus,
-        $effective_lcpus_for_pressure_calc,
-        $theoretical_lcpus, $confidence_adjusted_peak_lcpus, $selected_allowance_lcpus,
-        $absolute_ceiling_lcpus, $cap_status_str,
-        $gap_vs_observed, $gap_vs_observed_pct,
-        $gap_vs_theoretical, $gap_vs_theoretical_pct, $binding_theoretical,
-        $absolute_ceiling_lcpus, $theoretical_lcpus, $confidence_adjusted_peak_lcpus
+        "\n   1. Guaranteed Dispatch Capacity (PowerVM entitlement)\n".
+        "      - Entitlement                           : %s cores\n".
+        "      => Guaranteed Dispatch Threads          : %s Ent * %s SMT = %.1f\n".
+        "   2. Reachable Dispatch Capacity (best case, uncontended pool)\n".
+        "      - Reachable Cores                       : %.2f (%s)\n".
+        "      => Reachable Dispatch Threads           : %.2f Cores * %s SMT = %.1f (%s)\n".
+        "      - Non-Guaranteed Band                   : %.1f - %.1f = %.1f threads\n".
+        "   3. Tier Dispatch Budget and Decision\n".
+        "      - Profile Tier                          : %s\n".
+        "      - Dispatch Budget                       : %.0f%% of the non-guaranteed band (%s)\n".
+        "        (how far into unguaranteed capacity this tier's queue may count on being served)\n".
+        "      => Effective Dispatch Threads (allowance): %.1f + (%.2f * %.1f) = %.1f\n".
+        "         - Absolute Ceiling                   : %.1f threads (%s)\n".
+        "         - Method                             : %s",
+        ($ent_is_valid ? sprintf("%.2f", $curr_ent_numeric) : $na_str),
+        ($ent_is_valid ? sprintf("%.2f", $curr_ent_numeric) : $na_str),
+        ($smt_is_valid ? $smt_used : $na_str), $guaranteed_lcpus,
+        $reachable_cores, $reachable_reason,
+        $reachable_cores, ($smt_is_valid ? $smt_used : $na_str), $reachable_lcpus,
+        ($ceiling_is_binding ? "ceiling-bound" : "within ceiling"),
+        $reachable_lcpus, $guaranteed_lcpus, $non_guaranteed_band,
+        $final_tier,
+        $dispatch_budget * 100, $dispatch_budget_reason,
+        $guaranteed_lcpus, $dispatch_budget, $non_guaranteed_band, $effective_lcpus_for_pressure_calc,
+        $absolute_ceiling_lcpus, ($ceiling_is_binding ? "binding on reachable" : "not binding"),
+        $allowance_method
     );
 
     my $norm_p25_numeric = ($norm_runq_p25_str ne $na_str && $norm_runq_p25_str =~ /^-?[0-9.]+$/) ? ($norm_runq_p25_str + 0) : undef;
@@ -4885,7 +5527,11 @@ sub calculate_runq_modified_physc
     $debug_info{'NormRunQ_IQRC_Val'} = (defined $normrunq_iqrc_val) ? sprintf("%.3f", $normrunq_iqrc_val) : $na_str;
     $debug_info{'RunQPressure_P90_Val'} = sprintf("%.4f", $runq_pressure_p_val);
     $debug_info{'PressureBasisRationale'} = $pressure_basis_rationale;
-    $debug_info{'BurstAllowanceUsed'} = sprintf("%.2f%% (EVR-based, Pool-adjusted)", $final_burst_allowance * 100);
+    $debug_info{'BurstAllowanceUsed'} = sprintf("%.0f%% of the non-guaranteed band (%s): %.1f of %.1f reachable threads counted",
+        $dispatch_budget * 100, $dispatch_budget_reason, $effective_lcpus_for_pressure_calc, $reachable_lcpus);
+    $debug_info{'GuaranteedDispatchThreads'} = sprintf("%.1f", $guaranteed_lcpus);
+    $debug_info{'ReachableDispatchThreads'}  = sprintf("%.1f", $reachable_lcpus);
+    $debug_info{'DispatchBudgetFraction'}    = sprintf("%.2f", $dispatch_budget);
     $debug_info{'SmallEntitlementHandlerActive'} = ($curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) ? "Yes" : "No";
 
     # =========================
@@ -4902,29 +5548,51 @@ sub calculate_runq_modified_physc
         my $effective_p50_for_volatility = ($norm_p50_numeric > 0.0001) ? max($norm_p50_numeric, $MIN_P50_DENOMINATOR_FOR_VOLATILITY) : $MIN_P50_DENOMINATOR_FOR_VOLATILITY;
         my $volatility_ratio = (defined $norm_p90_numeric && $effective_p50_for_volatility > 0.0001) ? ($norm_p90_numeric / $effective_p50_for_volatility) : 1.0;
         $debug_info{'EffVolatilityRatio'} = sprintf("%.2f", $volatility_ratio);
-        $debug_info{'EffCondVolatilityMet'} = ($volatility_ratio < $VOLATILITY_CAUTION_THRESHOLD);
+
+        # Tier-adaptive volatility entry gate (Phase 4): lower-importance tiers
+        # tolerate spikier NormRunQ before downsizing is disqualified, admitting
+        # bursty-but-mostly-idle right-sizing candidates on tiers 3-4.
+        my $tier_num_for_downsize = ($final_tier =~ /(\d)$/) ? $1 : (($final_tier =~ /^P/) ? 1 : 3);
+
+        # P-tier conservative downsizing mode (corrective): mission-critical
+        # VMs and the P-99W1 actionable profile may be honestly downsized when
+        # the RunQ evidence supports it, but with reduced risk appetite
+        # (stricter volatility gate, heavier anchoring, damped reduction)
+        # instead of the previous blunt prohibition.
+        my $vm_tier_for_downsize = _safe_dig($vm_map_ref, 'Hinting', 'FinalTierForVM') // '';
+        my $p_tier_conservative_mode =
+            (($vm_tier_for_downsize =~ /^P\d?$/i) ||
+             (defined $profile_name && $profile_name eq $MISSION_CRITICAL_PROFILE_NAME)) ? 1 : 0;
+
+        my $volatility_caution_threshold_eff =
+            $TIER_VOLATILITY_CAUTION_THRESHOLD{$tier_num_for_downsize} // $VOLATILITY_CAUTION_THRESHOLD;
+        $volatility_caution_threshold_eff = min($volatility_caution_threshold_eff, $P_TIER_VOLATILITY_CAUTION_THRESHOLD)
+            if $p_tier_conservative_mode;
+        $debug_info{'EffCondVolatilityMet'} = ($volatility_ratio < $volatility_caution_threshold_eff);
         if (!$debug_info{'EffCondVolatilityMet'}) {
-            $debug_info{'DownsizingReason'} = sprintf("Skipped CPU Downsizing: Workload volatile (NormP90/P50 ratio %.2f >= %.2f). No analytical reduction.", $volatility_ratio, $VOLATILITY_CAUTION_THRESHOLD);
+            $debug_info{'DownsizingReason'} = sprintf("Skipped CPU Downsizing: Workload volatile (NormP90/P50 ratio %.2f >= %.2f, tier %s gate). No analytical reduction.", $volatility_ratio, $volatility_caution_threshold_eff, $final_tier);
         }
         elsif (!$debug_info{'EffCondNormP50Met'}) {
-            $debug_info{'DownsizingReason'} = sprintf("Skipped CPU Downsizing: NormRunQ P50 (%.2f) not below threshold (%.2f) for efficiency consideration. No analytical reduction.", $norm_p50_numeric, $NORM_P50_THRESHOLD_FOR_EFFICIENCY_CONSIDERATION);
+            # NormRunQ = AbsRunQ / (PhysC x SMT): runnable threads per thread
+            # slot of the cores actually CONSUMED. It is self-normalising and so
+            # blind to absolute load - a partition consuming 0.5 cores and one
+            # consuming 15 both sit near 1.00. This gate does not ask "is the VM
+            # quiet?". It asks "is a material share of this profile's PhysC
+            # unaccounted for by runnable threads?", which is the precondition
+            # for the RunQ efficiency reduction: the claim that such PhysC is
+            # dispatch overhead rather than work.
+            #
+            # Declining here does NOT miss over-provisioning. Absolute
+            # right-sizing is carried by the profile's own PhysC value against
+            # the configured entitlement - the primary signal - which this gate
+            # never touches.
+            $debug_info{'DownsizingReason'} = sprintf(
+                "Skipped RunQ efficiency reduction: NormRunQ P50 (%.2f) >= %.2f - the consumed cores' thread slots are substantially occupied, so this profile's PhysC is corroborated by runnable threads and none of it is attributable to dispatch overhead. This is not a statement that the VM is busy; absolute right-sizing is carried by the profile PhysC value (%.4f cores) against the configured entitlement.",
+                $norm_p50_numeric, $NORM_P50_THRESHOLD_FOR_EFFICIENCY_CONSIDERATION,
+                ($eff_p_base_numeric // 0));
         }
         else {
-            my $target_norm_runq_eff_calc;
-            my $adaptive_target_reason;
-            my $tier_to_check = $final_tier;
-            if (exists $custom_runq_targets{$tier_to_check}) {
-                $target_norm_runq_eff_calc = $custom_runq_targets{$tier_to_check};
-                $adaptive_target_reason = "User-defined target for tier '$tier_to_check' from nfit.profiles.cfg";
-            } elsif (exists $DEFAULT_RUNQ_TARGETS{$tier_to_check}) {
-                $target_norm_runq_eff_calc = $DEFAULT_RUNQ_TARGETS{$tier_to_check};
-                $adaptive_target_reason = "Built-in default target for tier '$tier_to_check'";
-            } else {
-                my ($pattern) = ($final_tier =~ /^([OGBP])/);
-                my $base_tier = $pattern // 'G';
-                $target_norm_runq_eff_calc = $DEFAULT_RUNQ_TARGETS{$base_tier} // $DEFAULT_TARGET_NORM_RUNQ_FOR_EFFICIENCY_CALC;
-                $adaptive_target_reason = "Fallback target for base pattern '$base_tier'";
-            }
+            my ($target_norm_runq_eff_calc, $adaptive_target_reason) = _resolve_runq_target($final_tier);
             $debug_info{'AdaptiveTargetNormRunQReason'} = "$adaptive_target_reason: ${target_norm_runq_eff_calc}";
             my $p_efficient_target_raw = ($smt_used * $target_norm_runq_eff_calc > 0.0001) ? ($abs_runq_p_numeric / ($smt_used * $target_norm_runq_eff_calc)) : $eff_p_base_numeric + 1;
             $debug_info{'EffPEfficientTargetRaw'} = sprintf("%.4f", $p_efficient_target_raw);
@@ -4941,6 +5609,21 @@ sub calculate_runq_modified_physc
                 $efficient_target_weight = 1.0 - $base_physc_weight;
                 $blending_details_str = sprintf("NormP50 (%.2f) < %.2f, using moderate blend (%.0f%% Base / %.0f%% Target).", $norm_p50_numeric, $NORM_P50_MODERATE_THRESH_FOR_BLEND2, $base_physc_weight*100, $efficient_target_weight*100);
             }
+
+            # Tier-adaptive blend ceiling (Phase 4): tiers 3-4 anchor less to
+            # the current BasePhysC, letting the RunQ-derived efficient target
+            # carry more weight. Tiers 1-2 retain the historical 85/15 anchor.
+            my $tier_blend_ceiling = $TIER_BLEND_BASE_WEIGHT_CEILING{$tier_num_for_downsize} // $BLEND_WEIGHT_BASE_DEFAULT_LOW_P50;
+            if ($base_physc_weight > $tier_blend_ceiling) {
+                $base_physc_weight = $tier_blend_ceiling;
+                $efficient_target_weight = 1.0 - $base_physc_weight;
+                $blending_details_str .= sprintf(" Tier %s ceiling applied: %.0f%% Base / %.0f%% Target.", $final_tier, $base_physc_weight*100, $efficient_target_weight*100);
+            }
+            if ($p_tier_conservative_mode && $base_physc_weight < $P_TIER_BLEND_BASE_WEIGHT_FLOOR) {
+                $base_physc_weight = $P_TIER_BLEND_BASE_WEIGHT_FLOOR;
+                $efficient_target_weight = 1.0 - $base_physc_weight;
+                $blending_details_str .= sprintf(" P-tier conservative floor applied: %.0f%% Base / %.0f%% Target.", $base_physc_weight*100, $efficient_target_weight*100);
+            }
             $debug_info{'EffBlendWeightBase'}   = sprintf("%.2f", $base_physc_weight);
             $debug_info{'EffBlendWeightTarget'} = sprintf("%.2f", $efficient_target_weight);
             $debug_info{'EffBlendReason'}       = $blending_details_str;
@@ -4949,9 +5632,20 @@ sub calculate_runq_modified_physc
             $debug_info{'EffComparisonBaseVsTargetMet'} = ($eff_p_base_numeric > $blended_efficient_target);
             if ($debug_info{'EffComparisonBaseVsTargetMet'})
             {
+                # RunQ_Potential is a MEASUREMENT and must carry no business
+                # policy: report the raw gap between BasePhysC and the
+                # RunQ-derived efficient target. The blend is a shrinkage device
+                # (and now carries tier ceilings/floors), so folding it into
+                # Potential contaminated the signal and made the measurement
+                # move whenever policy moved. This mirrors the additive path,
+                # where Potential is the raw, uncapped demand.
+                my $raw_potential_reduction_cores = max(0, $eff_p_base_numeric - $p_efficient_target_raw);
+                $debug_info{'RunQ_Potential'} = sprintf("%.4f", -1 * $raw_potential_reduction_cores);
+                $debug_info{'EffRawPotentialReduction'} = sprintf("%.4f", $raw_potential_reduction_cores);
+
+                # The blended target continues to govern the recommendation path.
                 my $potential_reduction_cores = $eff_p_base_numeric - $blended_efficient_target;
                 $debug_info{'EffPotentialReduction'} = sprintf("%.4f", $potential_reduction_cores);
-                $debug_info{'RunQ_Potential'} = sprintf("%.4f", -1 * $potential_reduction_cores);
                 my $base_max_reduction_factor;
                 my $size_aware_cap_reason;
                 if ($eff_p_base_numeric < 1.0) {
@@ -4980,8 +5674,34 @@ sub calculate_runq_modified_physc
                 $debug_info{'EffMaxAllowableReductionPerc'} = $current_max_reduction_perc_val * 100;
                 my $max_allowable_reduction_cores = $eff_p_base_numeric * $current_max_reduction_perc_val;
                 $debug_info{'EffMaxAllowableReductionCores'} = sprintf("%.4f", $max_allowable_reduction_cores);
+                # P-tier conservative mode applies a BOUND, not a multiplier.
+                # The strict P target (0.25 threads/LCPU) already encodes the
+                # mission-critical appetite; a further multiplier reduced honest
+                # signals to unimplementable crumbs. A bound only engages when
+                # the opportunity is large.
+                if ($p_tier_conservative_mode) {
+                    my $p_tier_cap_cores = $eff_p_base_numeric * $P_TIER_MAX_REDUCTION_FACTOR;
+                    if ($p_tier_cap_cores < $max_allowable_reduction_cores) {
+                        $max_allowable_reduction_cores = $p_tier_cap_cores;
+                        $debug_info{'EffMaxAllowableReductionPerc'}  = $P_TIER_MAX_REDUCTION_FACTOR * 100;
+                        $debug_info{'EffMaxAllowableReductionCores'} = sprintf("%.4f", $max_allowable_reduction_cores);
+                        $debug_info{'EffReductionCapReason'} .= sprintf(" (P-tier conservative bound: %.0f%% of base)", $P_TIER_MAX_REDUCTION_FACTOR * 100);
+                    }
+                }
+
                 my $actual_reduction_cores = min($potential_reduction_cores, $max_allowable_reduction_cores);
                 $actual_reduction_cores = max(0, $actual_reduction_cores);
+
+                # Implementability deadband (reduction path). Snapped here, before
+                # the reduction propagates into $efficiency_factor_numeric, so the
+                # reported modifier and the applied sizing remain coherent.
+                # RunQ_Potential is set above from the raw gap and is unaffected.
+                if ($actual_reduction_cores > 0 && $actual_reduction_cores < $MIN_MEANINGFUL_ADJUSTMENT_CORES) {
+                    $debug_info{'TacticalDeadbandApplied'} = sprintf(
+                        "True: reduction of %.4f cores is below the smallest implementable entitlement increment (%.2f cores); suppressed. RunQ_Potential retains the measured opportunity.",
+                        $actual_reduction_cores, $MIN_MEANINGFUL_ADJUSTMENT_CORES);
+                    $actual_reduction_cores = 0;
+                }
                 $debug_info{'EffActualReductionCores'} = sprintf("%.4f", $actual_reduction_cores);
                 $debug_info{'RunQ_Strategic'} = sprintf("%.4f", -1 * ($actual_reduction_cores+0));
                 if ($actual_reduction_cores > 0.0001) {
@@ -5012,12 +5732,11 @@ sub calculate_runq_modified_physc
 
     my $skip_downsizing_reason;
 
-    # Mission-critical peak-coverage policy: P-tier sizing never applies efficiency downsizing.
-    # The workload must be able to service observed peaks without queueing, so any reduction
-    # based on "efficiency" (spin/cache-warm overhead) is intentionally suppressed.
-    if (defined $profile_name && $profile_name eq $MISSION_CRITICAL_PROFILE_NAME) {
-        $skip_downsizing_reason = "P-tier profile: CPU downsizing permanently disabled.";
-    }
+    # Mission-critical policy (revised): P-tier VMs and the P-99W1 actionable
+    # profile are no longer exempt from downsizing. A grossly oversized VM is
+    # called out honestly regardless of criticality; the reduced risk appetite
+    # is applied analytically in Section C (P-tier conservative mode: stricter
+    # volatility gate, heavier BasePhysC anchoring, damped reduction).
 
     if (($p99w1_overall_vm_has_abs_runq_pressure && $p99w1_overall_vm_has_abs_runq_pressure) || ($p99w1_overall_vm_has_norm_runq_pressure && $p99w1_overall_vm_has_norm_runq_pressure)) {
         $skip_downsizing_reason = sprintf("VM's %s profile shows RunQ pressure.", $MANDATORY_PEAK_PROFILE_FOR_HINT);
@@ -5210,7 +5929,25 @@ sub calculate_runq_modified_physc
             }
         }
     }
-    if (defined $skip_downsizing_reason) {
+    if (!$RUNQ_EFFICIENCY_REDUCTION_ENABLED) {
+        # Single choke point: every reduction-family Strategic/Potential setter
+        # runs above this line; the additive path sets them below it and
+        # legitimately overwrites. Withdrawing them here leaves RunQ_Potential
+        # carrying exactly one quantity - unmet capacity demand - which makes the
+        # column coherent and, for the first time, summable across an estate.
+        # ANOMALY markers (DBW/XRQ) are preserved: they are diagnostics, not
+        # reduction opportunities.
+        $base_adjusted_physc       = $eff_p_base_numeric;
+        $efficiency_factor_numeric = 1.0;
+        $debug_info{'DownsizingReason'} =
+            "RunQ efficiency reduction retired: entitlement is a guarantee, not a dispatch ceiling, so reducing it neither packs threads nor lowers consumption on an uncapped LPAR. The dispatch-width evidence this mechanism used is now applied to rVCPU via the yield-aware active-core floor (Section F)."
+            . (defined $skip_downsizing_reason ? sprintf(" [a guard would also have fired: %s]", $skip_downsizing_reason) : "");
+        $debug_info{'RunQ_Strategic'} = "0.0000"
+            if (defined $debug_info{'RunQ_Strategic'} && looks_like_number($debug_info{'RunQ_Strategic'}));
+        $debug_info{'RunQ_Potential'} = "0.0000"
+            if (defined $debug_info{'RunQ_Potential'} && looks_like_number($debug_info{'RunQ_Potential'}));
+    }
+    elsif (defined $skip_downsizing_reason) {
         $base_adjusted_physc = $eff_p_base_numeric;
         $efficiency_factor_numeric = 1.0;
         $debug_info{'DownsizingReason'} = "Skipped Applying Downsizing: " . $skip_downsizing_reason;
@@ -5310,6 +6047,9 @@ sub calculate_runq_modified_physc
     my $apply_additive_logic = ($is_runq_pressure || $is_workload_pressure_calc);
     my $additive_cpu = 0.0;
     my $raw_additive_cpu = 0.0;
+    # The queue's own reading, before PhysC corroboration. Retained so that the
+    # anomaly sentinel and the audit trail see what the queue actually said.
+    my $raw_additive_uncorroborated = 0.0;
     my $max_additive_cap_sliding = 0.0;
     my $capped_raw_additive_val = 0.0;
     my $volatility_confidence_factor = 1.0;
@@ -5325,19 +6065,29 @@ sub calculate_runq_modified_physc
         # --- Tier-Aware Tolerance Factor ---
         # Select the tolerance for calculating "excess threads" based on the VM's tier.
         # Performance-critical tiers have a much lower tolerance for queuing.
-        my $tolerance_factor = $RUNQ_ADDITIVE_TOLERANCE_FACTOR; # Default to 1.80
-
-        if ($final_tier eq 'P') {
-            # Extreme Performance (e.g., VIO Servers) - virtually no tolerance for queuing.
-            $tolerance_factor = 1.10;
-        } elsif ($final_tier =~ /^O1$/) {
-            # High Performance (e.g., Core OLTP DBs) - very low tolerance.
-            $tolerance_factor = 1.25;
-        } elsif ($final_tier =~ /^O2$|^G1$|^G2$/) {
-            # Balanced Performance (e.g., Web Apps, General DBs) - moderate tolerance.
-            $tolerance_factor = 1.50;
-        }
-        # Efficiency Tiers (G3, G4, B1-B4) will use the default 1.80.
+        # Tier-aware tolerance, sourced from a single table so that the additive
+        # operating point (tolerance x headroom factor) stays consistently above
+        # the corresponding %DEFAULT_RUNQ_TARGETS reduction target for every
+        # rung. Previously B1-B4, O3, O4 and G4 all fell through to the flat
+        # 1.80 default, which left Batch without a tier gradient and inverted the
+        # B4 rung against its own reduction target.
+        # The tolerance ceiling is derived from the tier's idealised queue depth
+        # rather than from a second, independently maintained ladder. Since the
+        # additive path drives towards (tolerance x $RUNQ_TARGET_HEADROOM_FACTOR),
+        # setting tolerance = target / headroom makes the additive operating
+        # point EQUAL the downsizing target by construction: the two directions
+        # aim at the same queue depth, and the crossover defect (B4 previously
+        # added cores towards 1.44/LCPU whilst downsizing targeted 1.50/LCPU)
+        # becomes structurally impossible. The gap between the target and the
+        # trigger is a natural hysteresis band of 1/headroom - 1 (25% at 0.80).
+        my ($tolerance_target, $tolerance_target_reason) = _resolve_runq_target($final_tier);
+        my $tolerance_factor = ($RUNQ_TARGET_HEADROOM_FACTOR > 0)
+            ? ($tolerance_target / $RUNQ_TARGET_HEADROOM_FACTOR)
+            : $RUNQ_ADDITIVE_TOLERANCE_FACTOR;
+        $debug_info{'AdditiveToleranceFactorSource'} = sprintf(
+            "%s: target %.2f threads/LCPU -> tolerance %.2f (trigger); operating point %.2f threads/LCPU",
+            $tolerance_target_reason, $tolerance_target, $tolerance_factor,
+            $tolerance_factor * $RUNQ_TARGET_HEADROOM_FACTOR);
 
         my $capacity_threshold_for_excess = $tolerance_factor * $effective_lcpus_for_pressure_calc;
 
@@ -5364,6 +6114,63 @@ sub calculate_runq_modified_physc
                 ($abs_runq_p_numeric // 0.0), $capacity_threshold_target, $excess_threads
             );
             $raw_additive_cpu = $excess_threads / $smt_used if $smt_used > 0;
+            $raw_additive_uncorroborated = $raw_additive_cpu;
+
+            # --- PhysC corroboration of the queue-derived capacity demand ---
+            # Without this gate a partition peaking at a quarter of its
+            # reachable capacity can still receive an entitlement uplift several
+            # times its measured consumption, contradicting the principle that
+            # the RunQ modifier is a secondary adjustment. Where PhysC is a
+            # valid witness and reports slack, the runnable threads need
+            # dispatch SLOTS (assessed as rVCPU in Section F), not guaranteed
+            # capacity.
+            my $censoring_ratio;
+            my $corroboration_factor = 1.0;
+            my $corroboration_reason;
+
+            if ($is_capped_lpar) {
+                $corroboration_reason = "Capped LPAR: PhysC cannot exceed entitlement and is therefore not an independent capacity witness. Queue reading trusted in full.";
+            } elsif (!defined $pure_p99w1_physc || !looks_like_number($pure_p99w1_physc) || $reachable_cores <= $FLOAT_EPSILON) {
+                $corroboration_reason = "Peak PhysC or reachable capacity unavailable; no corroboration possible. Queue reading trusted in full.";
+            } else {
+                $censoring_ratio = ($pure_p99w1_physc + 0) / $reachable_cores;
+
+                if ($censoring_ratio >= $ADDITIVE_CENSORING_RATIO_FULL_TRUST) {
+                    $corroboration_factor = 1.0;
+                    $corroboration_reason = sprintf(
+                        "Peak PhysC %.3f of %.2f reachable cores (%.0f%%): demand is censored by the dispatch ceiling, so PhysC cannot see it and the queue is the only witness. Full trust.",
+                        $pure_p99w1_physc, $reachable_cores, $censoring_ratio * 100);
+                } elsif ($censoring_ratio <= $ADDITIVE_CENSORING_RATIO_NO_TRUST) {
+                    $corroboration_factor = 0.0;
+                    $corroboration_reason = sprintf(
+                        "Peak PhysC %.3f of %.2f reachable cores (%.0f%%): the LPAR left %.0f%% of its reachable capacity unused, so its runnable threads are not capacity-starved. Queue-derived capacity demand suppressed; dispatch width is assessed separately in Section F.",
+                        $pure_p99w1_physc, $reachable_cores, $censoring_ratio * 100, (1 - $censoring_ratio) * 100);
+                } else {
+                    $corroboration_factor = ($censoring_ratio - $ADDITIVE_CENSORING_RATIO_NO_TRUST)
+                                          / ($ADDITIVE_CENSORING_RATIO_FULL_TRUST - $ADDITIVE_CENSORING_RATIO_NO_TRUST);
+                    $corroboration_reason = sprintf(
+                        "Peak PhysC %.3f of %.2f reachable cores (%.0f%%): partially censored. Queue-derived capacity demand scaled by %.2f.",
+                        $pure_p99w1_physc, $reachable_cores, $censoring_ratio * 100, $corroboration_factor);
+                }
+
+                # NOTE: a "refusal override" was trialled here - restoring full
+                # trust when a queueing LPAR never exceeded its entitlement, on
+                # the theory that it was asking for pool capacity and being
+                # denied. Validation showed the signature is inverted: PAE ~= 0
+                # overwhelmingly identifies partitions that never reach their
+                # guarantee at all (peaks at 37% and 92% of entitlement), not
+                # partitions being denied beyond it. Refusal is not observable
+                # from PhysC and RunQ alone - it requires pool-level free-core
+                # telemetry (lparstat 'app'), which is not staged. The override
+                # is deliberately absent rather than approximated.
+            }
+
+            $raw_additive_cpu *= $corroboration_factor;
+
+            $debug_info{'AdditiveCensoringRatio'}      = defined($censoring_ratio) ? sprintf("%.4f", $censoring_ratio) : $na_str;
+            $debug_info{'AdditiveCorroborationFactor'} = sprintf("%.2f", $corroboration_factor);
+            $debug_info{'AdditiveCorroborationReason'} = $corroboration_reason;
+            $debug_info{'AdditiveRawUncorroborated'}   = sprintf("%.4f", $raw_additive_uncorroborated);
 
             # Determine the business policy scaling factor based on the VM's final tier.
             if (defined $final_tier && $final_tier =~ /(\d)$/) {
@@ -5385,8 +6192,13 @@ sub calculate_runq_modified_physc
             # IMPORTANT: This cap is applied ONLY to the TACTICAL path.
             my ($max_add_abs1, $max_add_perc2, $max_add_perc3, $max_add_perc_else);
 
-            # Determine which tier group the VM falls into
-            if ($final_tier =~ /^[PO]1$|^[PO]2$|^G1$|^G2$/) {
+            # Determine which tier group the VM falls into.
+            # Performance group: mission-critical 'P' plus all tier-1/tier-2
+            # classifications (O1/O2, G1/G2, B1/B2). Bare 'P' was previously
+            # unmatched and fell into the conservative group; batch tier-1/2 are
+            # now deliberately included, as a saturated overnight B1 chain is as
+            # throughput-critical as its online counterpart.
+            if ($final_tier =~ /^P\d?$|^[OGB][12]$/) {
                 # Performance Tiers (Aggressive Response)
                 $max_add_abs1      = 2.0;  # Allow up to +2.0 cores for small critical VMs
                 $max_add_perc2     = 1.50; # 150% of Ent
@@ -5489,13 +6301,17 @@ sub calculate_runq_modified_physc
             $debug_info{'RunQ_Strategic'} = $strategic_val;
 
             # 3. Check for pathological state (Signal Inversion)
-            if ($raw_additive_cpu > $sanity_bound) {
-                # Handle pathological state (Signal Inversion)
+            # Deliberately evaluated against the UNCORROBORATED reading: a queue
+            # large enough to trip this bound is an anomaly worth surfacing
+            # whether or not PhysC corroborates it. Suppressing it because the
+            # LPAR had spare capacity would hide the more interesting case -
+            # threads runnable in volume whilst capacity goes unused.
+            if ($raw_additive_uncorroborated > $sanity_bound) {
                 $debug_info{'RunQ_Potential'} = "ANOMALY (XRQ)";
                 $debug_info{'RunQ_Strategic'} = $max_cpu_for_lpar_numeric;
                 $debug_info{'ReasonForSignalInversion'} = sprintf(
-                    "Raw Additive CPU (%.2f) exceeded sanity bound (%.2f), indicating a probable system backlog or malfunction.",
-                    $raw_additive_cpu, $sanity_bound
+                    "Raw Additive CPU (%.2f, uncorroborated) exceeded sanity bound (%.2f), indicating a probable system backlog or malfunction.",
+                    $raw_additive_uncorroborated, $sanity_bound
                 );
             }
 
@@ -5560,7 +6376,12 @@ sub calculate_runq_modified_physc
     # The EntCap provides a safe incremental limit based on entitlement alone.
     # The HeadCap is now computed for diagnostic/rationale purposes only.
 
-    my $cap_from_ent = $curr_ent_numeric * 0.40;
+    # Tier-graded EntCap percentage with a small-entitlement floor (Phase 2).
+    my $is_performance_tier_for_cap = ($final_tier =~ /^P\d?$|^[OGB][12]$/) ? 1 : 0;
+    my $cap_pct_of_ent = $is_performance_tier_for_cap
+        ? $FINAL_ADDITIVE_CAP_PCT_ENT_PERF
+        : $FINAL_ADDITIVE_CAP_PCT_ENT_STD;
+    my $cap_from_ent = $curr_ent_numeric * $cap_pct_of_ent;
     my $headroom = ($virtual_max_cpu > $curr_ent_numeric) ? ($virtual_max_cpu - $curr_ent_numeric) : 0;
     my $cap_from_headroom = $headroom * 0.50;
 
@@ -5581,17 +6402,28 @@ sub calculate_runq_modified_physc
     }
 
     my $gated_cap = $primary_cap * $pressure_gate_modifier;
-    my $relative_floor = 0.02 * max($curr_ent_numeric, 1.0);
-    my $final_safety_cap_value = max($relative_floor, $gated_cap);
-    $final_safety_cap_value = min($final_safety_cap_value, 2.0);
 
-    # Build cap rationale (now EntCap-only for Tactical; HeadCap is diagnostic)
+    # Small-entitlement floor (Phase 2): for micro-partitions a
+    # percentage-of-entitlement cap collapses to a value too small to ever
+    # address demand (e.g. 40% of a 0.41-core LPAR is 0.16 cores against
+    # multi-core queue evidence). The floor raises only the cap ceiling; the
+    # additive remains demand-derived and never exceeds the raw requirement.
+    my $tier_cap_floor = $is_performance_tier_for_cap
+        ? $FINAL_ADDITIVE_CAP_FLOOR_PERF
+        : $FINAL_ADDITIVE_CAP_FLOOR_STD;
+    my $final_safety_cap_value = max($tier_cap_floor, $gated_cap);
+    $final_safety_cap_value = min($final_safety_cap_value, $FINAL_ADDITIVE_CAP_ABS_MAX);
+
+    # Build cap rationale (EntCap-only for Tactical; HeadCap is diagnostic)
+    my $floor_note = ($final_safety_cap_value > $gated_cap + 0.0001)
+        ? sprintf(" [tier floor %.2f applied]", $tier_cap_floor)
+        : "";
     my $cap_rationale;
     if ($headcap_would_bind) {
-        $cap_rationale = sprintf("EntCap=%.2f * PresGate=%.2f -> %.4f (HeadCap=%.2f would be lower but Tactical is demand-oriented)",
-            $cap_from_ent, $pressure_gate_modifier, $final_safety_cap_value, $cap_from_headroom);
+        $cap_rationale = sprintf("EntCap=%.2f * PresGate=%.2f -> %.4f%s (HeadCap=%.2f would be lower but Tactical is demand-oriented)",
+            $cap_from_ent, $pressure_gate_modifier, $final_safety_cap_value, $floor_note, $cap_from_headroom);
     } else {
-        $cap_rationale = sprintf("EntCap=%.2f * PresGate=%.2f -> %.4f", $cap_from_ent, $pressure_gate_modifier, $final_safety_cap_value);
+        $cap_rationale = sprintf("EntCap=%.2f * PresGate=%.2f -> %.4f%s", $cap_from_ent, $pressure_gate_modifier, $final_safety_cap_value, $floor_note);
     }
 
     if ($additive_cpu > $final_safety_cap_value) {
@@ -5629,6 +6461,18 @@ sub calculate_runq_modified_physc
         my $actual_reduction = (defined $debug_info{'EffActualReductionCores'} && looks_like_number($debug_info{'EffActualReductionCores'})) ? ($debug_info{'EffActualReductionCores'} + 0) : 0;
         $final_tactical_modifier = -1 * $actual_reduction;
     }
+
+    # Implementability deadband (additive path). $additive_cpu is zeroed with the
+    # reported modifier so that $calculated_demand, synthesised below, stays
+    # coherent with the CSV recommendation. Measurements are untouched.
+    if ($final_tactical_modifier > $FLOAT_EPSILON && $final_tactical_modifier < $MIN_MEANINGFUL_ADJUSTMENT_CORES) {
+        $debug_info{'TacticalDeadbandApplied'} = sprintf(
+            "True: Tactical +%.4f cores is below the smallest implementable entitlement increment (%.2f cores); suppressed. RunQ_Potential/RunQ_Strategic retain the measured values.",
+            $final_tactical_modifier, $MIN_MEANINGFUL_ADJUSTMENT_CORES);
+        $final_tactical_modifier = 0;
+        $additive_cpu = 0.0;
+    }
+
     $debug_info{'RunQ_Tactical'} = $final_tactical_modifier;
     $debug_info{'FinalAdditive'} = sprintf("%.4f", $final_tactical_modifier);
 
@@ -5654,6 +6498,24 @@ sub calculate_runq_modified_physc
     # Final Synthesis + MaxCPU
     # =========================
     my $calculated_demand = $base_adjusted_physc + $additive_cpu;
+
+    # --- Tier guarantee floor (dispatch budget applied to entitlement) ---
+    # Placed before $rENT_P_planning and $runq_modified_rec so both inherit it.
+    # This is throughput assurance expressed on PhysC evidence: if the hypervisor
+    # has moved consumption above the guarantee, the guarantee should follow, in
+    # proportion to what the tier is willing to leave riding on pool grace.
+    my ($budget_floor_cores, $budget_floor_reason) = _tier_guarantee_floor(
+        $pure_p99w1_physc, $reachable_cores, $is_capped_lpar, $dispatch_budget, $final_tier);
+
+    $debug_info{'BudgetFloorCores'}  = defined($budget_floor_cores) ? sprintf("%.4f", $budget_floor_cores) : 'N/A';
+    $debug_info{'BudgetFloorReason'} = $budget_floor_reason // 'N/A';
+    $debug_info{'BudgetFloorApplied'} = 'No';
+
+    if (defined $budget_floor_cores && $budget_floor_cores > $calculated_demand + $FLOAT_EPSILON) {
+        $debug_info{'BudgetFloorApplied'} = sprintf("Yes: raised %.4f -> %.4f cores (+%.4f)",
+            $calculated_demand, $budget_floor_cores, $budget_floor_cores - $calculated_demand);
+        $calculated_demand = $budget_floor_cores;
+    }
 
     # Preserve the workload-driven (planning) entitlement before any MaxCPU sanity capping.
     # This is the "what the workload needs" value, independent of current environment limits.
@@ -5694,7 +6556,7 @@ sub calculate_runq_modified_physc
         my $p99w1_floor_vcpu;
         my $p99w1_factor_eff;
         my $p99w1_mult;
-        my $cred_ratio = 1.00;
+        my $runnable_density = 1.00;
         my $p99w1_adjusted;
 
         # Dispatch reserve variables (Layer 5: uncertainty/reserve adjustments)
@@ -5865,39 +6727,85 @@ sub calculate_runq_modified_physc
 
             # Peak-aware floor from P-99W1 (mandatory helper profile)
             if (defined $pure_p99w1_physc && looks_like_number($pure_p99w1_physc) && $pure_p99w1_physc > 0) {
-                # RunQ credibility adjustment: verify PhysC peak against RunQ evidence.
-                # When RunQ-derived core demand is significantly below PhysC, the gap
-                # likely reflects VP dispatch overhead rather than true workload demand.
+                # RunQ runnable-density assessment of the P99W1 peak.
+                #
+                # CAUTION: the discount applied below rests on the premise that a
+                # PhysC peak with few runnable threads reflects dispatch overhead.
+                # Estate evidence contradicts this. At 1.2-3.9 runnable threads per
+                # consumed core (the observed low-occupancy range), the commercial
+                # SMT yield curve Y(k) = 1 + 0.45*log2(k) puts per-thread throughput
+                # at 88-51% of a solo core: the work is running fast, not idling.
+                # Low occupancy is a WIDTH observation, not a capacity one.
+                #
+                # ESTIMATOR CAVEAT: this ratio compares two independently derived
+                # percentiles (P99W1 PhysC against AbsRunQ_P99W1) that need not come
+                # from the same minute. NormRunQ pairs the same quantity per sample
+                # before aggregating, and the two disagree materially (vm1: 1.947
+                # here against NormRunQ P90 1.08). E[X/Y] != E[X]/E[Y]; the paired
+                # form is correct. Superseded by paired metrics in nfit (Stage 2).
                 $p99w1_adjusted = $pure_p99w1_physc;
-
-                # Credibility uses a tail-to-tail comparison: P99W1 PhysC vs AbsRunQ_P99W1.
-                # The per-profile RunQ percentile (P90/P95/P98/P99) is correct for Gate 1
-                # (dispatch sizing), but the credibility check asks whether the P99W1 PhysC
-                # peak is corroborated, which requires a matching tail RunQ percentile.
                 #
                 # Prefer the peak-helper-aligned W1 RunQ tail for credibility, so we
                 # compare like-for-like: P99W1 PhysC vs AbsRunQ_P99W1 (window=1).
-                my $runq_p99w1_for_cred =
-                    $vm_map_ref->{RunQMetrics}{AbsRunQ_P99W1} //
-                    $vm_map_ref->{RunQMetrics}{AbsRunQ_P99};
+                # Paired runnable density (Stage 2): NormRunQ already IS
+                # runq/(physc*smt), formed per sample inside nfit. No arithmetic is
+                # needed here - only a lookup at the PhysC-aligned tail.
+                my ($paired_density, $occupancy_source) = _resolve_peak_runnable_density($vm_map_ref);
+                if (defined $paired_density) {
+                    # Interval correction is identity at the native 60s cadence and
+                    # only engages on coarser staging, where the RunQ numerator is
+                    # undercounted at the tail.
+                    $runnable_density = $paired_density * $runq_cred_corr;
+                    $debug_info{'rVCPU_RunnableDensitySource'} = $occupancy_source;
 
-                if (defined $runq_p99w1_for_cred && $runq_p99w1_for_cred > 0 && defined $smt_for_vcpu && $smt_for_vcpu > 0) {
-                    my $runq_peak_cores_raw = $runq_p99w1_for_cred / $smt_for_vcpu;
-                    my $runq_peak_cores = $runq_peak_cores_raw * $runq_cred_corr;
-                    $cred_ratio = $runq_peak_cores / $pure_p99w1_physc;
-                    my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
-                    $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
-                    $credibility = 1.00 if ($credibility > 1.00);
-                    $p99w1_adjusted = $pure_p99w1_physc * $credibility;
+                    # Runnable threads per consumed CORE, for the planner note.
+                    # ThreadsPerCore = NormRunQ * SMT exactly: SMT is constant within
+                    # a config state and percentiles are equivariant under
+                    # multiplication by a positive constant, so no separate nfit
+                    # transform is required.
+                    $debug_info{'rVCPU_RunQThreadsPerPhysC'} =
+                        (defined $smt_for_vcpu && $smt_for_vcpu > 0)
+                            ? sprintf("%.2f", $runnable_density * $smt_for_vcpu) : 'N/A';
+
+                    # Yield-aware active-core floor (Stage 3). This replaces the
+                    # withdrawn occupancy discount, which multiplied the peak by an
+                    # arbitrary max(0.65, occupancy + 0.15). The floor instead asks a
+                    # falsifiable question: how many active cores are needed to retain
+                    # this tier's required share of the throughput the workload is
+                    # estimated to be achieving now?
+                    my $threads_per_core_peak = (defined $smt_for_vcpu && $smt_for_vcpu > 0)
+                        ? ($runnable_density * $smt_for_vcpu) : undef;
+                    my $retention_eff = $TIER_THROUGHPUT_RETENTION{$rvcpu_tier_num} // 0.85;
+                    my ($yield_floor_cores, $yield_floor_reason) =
+                        _yield_aware_active_core_floor($pure_p99w1_physc, $threads_per_core_peak, $retention_eff);
+
+                    if (defined $yield_floor_cores) {
+                        $p99w1_adjusted = $yield_floor_cores;
+                    }
+                    $debug_info{'rVCPU_YieldFloorCores'}     = defined($yield_floor_cores) ? sprintf("%.2f", $yield_floor_cores) : 'N/A';
+                    $debug_info{'rVCPU_YieldRetentionUsed'}  = sprintf("%.2f", $retention_eff);
+                    $debug_info{'rVCPU_YieldFloorReason'}    = $yield_floor_reason // 'N/A';
+
+                    # Retained for comparison only - see $VCPU_PEAK_CRED_DISCOUNT_ENABLED.
+                    if ($VCPU_PEAK_CRED_DISCOUNT_ENABLED) {
+                        my $credibility = $runnable_density + $VCPU_PEAK_CRED_BIAS;
+                        $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
+                        $credibility = 1.00 if ($credibility > 1.00);
+                        $p99w1_adjusted = $pure_p99w1_physc * $credibility;
+                    }
+                } else {
+                    $debug_info{'rVCPU_RunnableDensitySource'} = 'N/A (no paired NormRunQ percentile available)';
                 }
 
-                # Peak floor: PAE/AAE-driven headroom, tier-scaled.
-                # Base is 1.00 (VCPUs must at minimum cover peak cores).
-                # Headroom above that is proportional to empirical above-entitlement evidence,
-                # amplified by tier policy. This avoids the multiplicative compounding of
-                # base × dynamic_mult × tier that inflated recommendations for stressed tier-1 LPARs.
-                my $pae_raw = (defined $debug_info{'PhysC_Daily_PAE'} && looks_like_number($debug_info{'PhysC_Daily_PAE'})) ? ($debug_info{'PhysC_Daily_PAE'} + 0) : 0.0;
-                my $aae_raw = (defined $debug_info{'PhysC_Daily_AAE'} && looks_like_number($debug_info{'PhysC_Daily_AAE'})) ? ($debug_info{'PhysC_Daily_AAE'} + 0) : 0.0;
+                # Peak-sourced burst evidence. These previously read the PROFILE-LOCAL
+                # PAE/AAE, which describe how often THIS PROFILE's smoothed series
+                # crossed the entitlement line - a property of the lens, not of the
+                # partition. The same VM reads PAE 1.0000 through its peak profile and
+                # 0.0000 through G3, so the VP headroom this drives varied by profile
+                # for reasons unconnected to the workload. Burst behaviour belongs to
+                # the partition; only the peak profile witnesses it.
+                my $pae_raw = (defined $debug_info{'PhysC_Peak_PAE'} && looks_like_number($debug_info{'PhysC_Peak_PAE'})) ? ($debug_info{'PhysC_Peak_PAE'} + 0) : 0.0;
+                my $aae_raw = (defined $debug_info{'PhysC_Peak_AAE'} && looks_like_number($debug_info{'PhysC_Peak_AAE'})) ? ($debug_info{'PhysC_Peak_AAE'} + 0) : 0.0;
 
                 # Each component contributes up to +15% of peak when its threshold is reached.
                 # PAE: proportion of days above entitlement (chronic burst indicator)
@@ -5930,16 +6838,16 @@ sub calculate_runq_modified_physc
             # ================================================================
             # LAYER 5a: Micro-partition RunQ Envelope Override
             # ================================================================
-            # When rENT_P < threshold and RunQ strongly exceeds PhysC (cred_ratio > threshold),
+            # When rENT_P < threshold and RunQ strongly exceeds PhysC (runnable_density > threshold),
             # and the RunQ-derived VP requirement exceeds the envelope max,
             # expand the envelope to accommodate the RunQ evidence.
             # This addresses scheduling disadvantage in tiny partitions.
             # ================================================================
-            my $runq_peak_cores_for_override = undef;
+            my $runq_width_cores_for_override = undef;
 
             # Calculate RunQ-derived core requirement for comparison
             if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0) {
-                $runq_peak_cores_for_override = $runq_hi_threads / $smt_for_vcpu;
+                $runq_width_cores_for_override = $runq_hi_threads / $smt_for_vcpu;
             }
 
             # Check DBW/XRQ anomaly state (do not apply override if pathological)
@@ -5952,14 +6860,14 @@ sub calculate_runq_modified_physc
                 (defined $debug_info{'IsWorkloadPressure'} && $debug_info{'IsWorkloadPressure'} eq "True");
 
             if (   defined $rENT_P && $rENT_P > 0 && $rENT_P < $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH
-                && defined $cred_ratio && $cred_ratio > $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH
+                && defined $runnable_density && $runnable_density > $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH
                 && defined $rvcpu_raw && defined $rvcpu_max && $rvcpu_raw > $rvcpu_max
                 && !$is_dbw_anomaly && !$is_xrq_anomaly
                 && $has_pressure_for_override
-                && defined $runq_peak_cores_for_override) {
+                && defined $runq_width_cores_for_override) {
 
                 $runq_envelope_override = 1;
-                $runq_envelope_basis = $runq_peak_cores_for_override;
+                $runq_envelope_basis = $runq_width_cores_for_override;
 
                 # Extend env_max to permit the RunQ-derived VP requirement
                 my $extended_max = $rvcpu_raw;
@@ -5991,7 +6899,7 @@ sub calculate_runq_modified_physc
                 # Uncertainty indicators
                 my $has_growth = (defined $growth_adj_numeric && $growth_adj_numeric > 0.25);
                 my $has_pressure = ($p99w1_overall_vm_has_abs_runq_pressure || $p99w1_overall_vm_has_norm_runq_pressure);
-                my $has_low_corroboration = (defined $cred_ratio && $cred_ratio < 0.70);
+                my $has_low_corroboration = (defined $runnable_density && $runnable_density < 0.70);
 
                 # Count risk triggers
                 my $risk_count = 0;
@@ -6080,7 +6988,7 @@ sub calculate_runq_modified_physc
                 my @triggers;
                 push @triggers, sprintf("GrowthAdj +%.2f", $growth_adj_numeric) if $has_growth;
                 push @triggers, "Pressure" if $has_pressure;
-                push @triggers, sprintf("LowCorroboration %.2f", $cred_ratio) if $has_low_corroboration;
+                push @triggers, sprintf("LowCorroboration %.2f", $runnable_density) if $has_low_corroboration;
                 my $trigger_str = join(", ", @triggers);
                 my $risk_label = ($risk_count >= 2) ? "HighRisk" : "Standard";
 
@@ -6134,9 +7042,9 @@ sub calculate_runq_modified_physc
             P99W1Floor     => $p99w1_floor_vcpu,
             P99W1FactorEff => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
             P99W1Mult      => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
-            P99W1CredRatio => sprintf("%.3f", $cred_ratio),
-            P99W1CredCorr  => sprintf("%.2f", $runq_cred_corr),
-            P99W1CredRatioSuffix => $runq_cred_corr_suffix,
+            P99W1RunnableDensity => sprintf("%.3f", $runnable_density),
+            P99W1OccupancyIntervalCorr  => sprintf("%.2f", $runq_cred_corr),
+            P99W1RunnableDensitySuffix => $runq_cred_corr_suffix,
             P99W1AdjPeak   => (defined $p99w1_adjusted ? sprintf("%.2f", $p99w1_adjusted) : undef),
             P99W1RawPeak   => (defined $pure_p99w1_physc ? sprintf("%.2f", $pure_p99w1_physc) : undef),
             RunQEnvelopeOverride => $runq_envelope_override ? "Yes" : "No",
@@ -6161,15 +7069,15 @@ sub calculate_runq_modified_physc
         $debug_info{'rVCPU_P99W1Floor'}     = defined($p99w1_floor_vcpu) ? $p99w1_floor_vcpu : 'N/A';
         $debug_info{'rVCPU_P99W1FactorEff'} = defined($p99w1_factor_eff) ? sprintf("%.3f",$p99w1_factor_eff) : 'N/A';
         $debug_info{'rVCPU_P99W1Mult'}      = defined($p99w1_mult) ? sprintf("%.3f",$p99w1_mult) : 'N/A';
-        $debug_info{'rVCPU_P99W1CredRatio'} = defined($cred_ratio) ? sprintf("%.3f", $cred_ratio) : 'N/A';
+        $debug_info{'rVCPU_P99W1RunnableDensity'} = defined($runnable_density) ? sprintf("%.3f", $runnable_density) : 'N/A';
         $debug_info{'rVCPU_P99W1AdjPeak'}   = defined($p99w1_adjusted) ? sprintf("%.2f", $p99w1_adjusted) : "N/A";
         $debug_info{'rVCPU_P99W1RawPeak'}   = defined($pure_p99w1_physc) ? sprintf("%.2f", $pure_p99w1_physc) : "N/A";
         $debug_info{'rVCPU_RunQHiThreads'}  = defined($runq_hi_threads) ? sprintf("%.2f",$runq_hi_threads) : 'N/A';
         $debug_info{'rVCPU_RunQWidthDivisor'}     = defined($runq_width_divisor) ? sprintf("%.2f", $runq_width_divisor) : 'N/A';
         $debug_info{'rVCPU_RunQWidthDivisorBase'} = sprintf("%.2f", $runq_width_divisor_base);
         $debug_info{'rVCPU_RunQIntervalMinutes'}  = defined($runq_interval_minutes_snapped) ? $runq_interval_minutes_snapped : 'N/A';
-        $debug_info{'rVCPU_P99W1CredCorr'}        = sprintf("%.2f", $runq_cred_corr);
-        $debug_info{'rVCPU_P99W1CredRatioSuffix'} = $runq_cred_corr_suffix;
+        $debug_info{'rVCPU_P99W1OccupancyIntervalCorr'}        = sprintf("%.2f", $runq_cred_corr);
+        $debug_info{'rVCPU_P99W1RunnableDensitySuffix'} = $runq_cred_corr_suffix;
         $debug_info{'rVCPU_Final'}          = defined($rvcpu_final) ? $rvcpu_final : 'N/A';
         $debug_info{'rVCPU_RunQEnvelopeOverride'} = $runq_envelope_override ? "Yes" : "No";
         $debug_info{'rVCPU_RunQEnvelopeBasis'}    = defined $runq_envelope_basis ? sprintf("%.3f", $runq_envelope_basis) : 'N/A';
@@ -8507,8 +9415,21 @@ sub _write_standard_csv_report {
 
         $vm_map_ref->{Configuration} //= {};
         $vm_map_ref->{Configuration}{vm_name} //= $vm_name;
-        ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str) =
-            generate_sizing_hint($vm_map_ref, undef, $adaptive_runq_saturation_thresh);
+        # Reuse the hints generated during the sizing phase. Re-deriving them
+        # here re-ran the classification against ProfileValues that the RunQ
+        # modifiers had already adjusted, so the CSV Hint column could disagree
+        # with the hint that actually governed source resolution (e.g. Hint
+        # drifting B2 -> G2 at write time). Regenerate only if the sizing phase
+        # did not populate the map for this VM.
+        if (defined $vm_map_ref->{Hinting}{AutoTier}) {
+            $hint_type_tier      = $vm_map_ref->{Hinting}{AutoTier};
+            $hint_pattern_shape  = $vm_map_ref->{Hinting}{Pattern} // '';
+            $pressure_bool       = $vm_map_ref->{Hinting}{Pressure} // 0;
+            $pressure_detail_str = $vm_map_ref->{Hinting}{PressureDetail} // 'N/A';
+        } else {
+            ($hint_type_tier, $hint_pattern_shape, $pressure_bool, $pressure_detail_str) =
+                generate_sizing_hint($vm_map_ref, undef, $adaptive_runq_saturation_thresh);
+        }
 
         ## Deterministic fallback chain for profile selection for growth and for the RunQ modifier columns
 
@@ -8642,7 +9563,7 @@ sub _write_standard_csv_report {
                     my $p99w1_floor_vcpu = undef;
                     my $p99w1_factor_eff = undef;
                     my $p99w1_mult = undef;
-                    my $cred_ratio = 1.00;
+                    my $runnable_density = 1.00;
                     my $p99w1_adjusted;
                     my $runq_cred_corr = 1.00;
                     my $runq_cred_corr_suffix = '';
@@ -8763,31 +9684,45 @@ sub _write_standard_csv_report {
 
                         # RunQ credibility adjustment
                         $p99w1_adjusted = $p99w1_cores;
-                        $cred_ratio = 1.00;
+                        $runnable_density = 1.00;
                         # Credibility uses a tail-to-tail comparison: P99W1 PhysC vs AbsRunQ_P99W1.
                         # Prefer the peak-helper-aligned W1 RunQ tail for credibility, so we
                         # compare like-for-like: P99W1 PhysC vs AbsRunQ_P99W1 (window=1).
-                        my $runq_p99w1_for_cred =
-                            $vm_map_ref->{RunQMetrics}{AbsRunQ_P99W1} //
-                            $vm_map_ref->{RunQMetrics}{AbsRunQ_P99};
+                        # Paired runnable density (Stage 2) - see _resolve_peak_runnable_density.
+                        my ($paired_density) = _resolve_peak_runnable_density($vm_map_ref);
+                        if (defined $paired_density) {
+                            $runnable_density = $paired_density * $runq_cred_corr;
 
-                        if (defined $runq_p99w1_for_cred && $runq_p99w1_for_cred > 0 && defined $smt_used && $smt_used > 0) {
-                            my $runq_peak_cores_raw = $runq_p99w1_for_cred / $smt_used;
-                            my $runq_peak_cores = $runq_peak_cores_raw * $runq_cred_corr;
-                            $cred_ratio = $runq_peak_cores / $p99w1_cores;
-                            my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
-                            $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
-                            $credibility = 1.00 if ($credibility > 1.00);
-                            $p99w1_adjusted = $p99w1_cores * $credibility;
+                            # Yield-aware active-core floor (Stage 3). Mirrors the primary
+                            # path in calculate_runq_modified_physc: the withdrawn occupancy
+                            # discount is replaced by the smallest active-core count that
+                            # retains this tier's required share of the throughput the
+                            # workload is estimated to be achieving at its observed peak.
+                            my $threads_per_core_peak = (defined $smt_used && $smt_used > 0)
+                                ? ($runnable_density * $smt_used) : undef;
+                            my ($yield_floor_cores) = _yield_aware_active_core_floor(
+                                $p99w1_cores,
+                                $threads_per_core_peak,
+                                ($TIER_THROUGHPUT_RETENTION{$rvcpu_tier_num} // 0.85)
+                            );
+                            $p99w1_adjusted = $yield_floor_cores if (defined $yield_floor_cores);
+
+                            # Retained for comparison only - see $VCPU_PEAK_CRED_DISCOUNT_ENABLED.
+                            if ($VCPU_PEAK_CRED_DISCOUNT_ENABLED) {
+                                my $credibility = $runnable_density + $VCPU_PEAK_CRED_BIAS;
+                                $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
+                                $credibility = 1.00 if ($credibility > 1.00);
+                                $p99w1_adjusted = $p99w1_cores * $credibility;
+                            }
                         }
 
                         my $pae_raw = 0.0;
                         my $aae_raw = 0.0;
                         my $calc_debug_info_ref = $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname} // {};
-                        $pae_raw = (defined $calc_debug_info_ref->{'PhysC_Daily_PAE'} && looks_like_number($calc_debug_info_ref->{'PhysC_Daily_PAE'}))
-                                 ? ($calc_debug_info_ref->{'PhysC_Daily_PAE'} + 0) : 0.0;
-                        $aae_raw = (defined $calc_debug_info_ref->{'PhysC_Daily_AAE'} && looks_like_number($calc_debug_info_ref->{'PhysC_Daily_AAE'}))
-                                 ? ($calc_debug_info_ref->{'PhysC_Daily_AAE'} + 0) : 0.0;
+                        $pae_raw = (defined $calc_debug_info_ref->{'PhysC_Peak_PAE'} && looks_like_number($calc_debug_info_ref->{'PhysC_Peak_PAE'}))
+                                 ? ($calc_debug_info_ref->{'PhysC_Peak_PAE'} + 0) : 0.0;
+                        $aae_raw = (defined $calc_debug_info_ref->{'PhysC_Peak_AAE'} && looks_like_number($calc_debug_info_ref->{'PhysC_Peak_AAE'}))
+                                 ? ($calc_debug_info_ref->{'PhysC_Peak_AAE'} + 0) : 0.0;
 
                         my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
                         my $aae_component = ($aae_raw > 0) ? (($aae_raw < 0.10 ? $aae_raw : 0.10) / 0.10) * 0.15 : 0.0;
@@ -8838,9 +9773,9 @@ sub _write_standard_csv_report {
                         P99W1Floor        => $p99w1_floor_vcpu,
                         P99W1FactorEff    => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
                         P99W1Mult         => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
-                        P99W1CredRatio    => sprintf("%.3f", $cred_ratio),
-                        P99W1CredCorr   => sprintf("%.2f", $runq_cred_corr),
-                        P99W1CredRatioSuffix => $runq_cred_corr_suffix,
+                        P99W1RunnableDensity    => sprintf("%.3f", $runnable_density),
+                        P99W1OccupancyIntervalCorr   => sprintf("%.2f", $runq_cred_corr),
+                        P99W1RunnableDensitySuffix => $runq_cred_corr_suffix,
                         P99W1AdjPeak      => sprintf("%.2f", $p99w1_adjusted),
                         P99W1RawPeak      => sprintf("%.2f", $p99w1_cores),
                         # Micro-partition override: not computed in CSV fallback path
@@ -8865,11 +9800,11 @@ sub _write_standard_csv_report {
                     $di->{'rVCPU_P99W1Floor'}       = defined $p99w1_floor_vcpu ? $p99w1_floor_vcpu : "N/A";
                     $di->{'rVCPU_P99W1FactorEff'}   = defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : "N/A";
                     $di->{'rVCPU_P99W1Mult'}        = defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : "N/A";
-                    $di->{'rVCPU_P99W1CredRatio'}   = defined($cred_ratio) ? sprintf("%.3f", $cred_ratio) : 'N/A';
+                    $di->{'rVCPU_P99W1RunnableDensity'}   = defined($runnable_density) ? sprintf("%.3f", $runnable_density) : 'N/A';
                     $di->{'rVCPU_P99W1AdjPeak'}     = defined($p99w1_adjusted) ? sprintf("%.2f", $p99w1_adjusted) : "N/A";
                     $di->{'rVCPU_P99W1RawPeak'}     = defined($p99w1_cores)    ? sprintf("%.2f", $p99w1_cores)    : "N/A";
-                    $di->{'rVCPU_P99W1CredCorr'}        = sprintf("%.2f", $runq_cred_corr);
-                    $di->{'rVCPU_P99W1CredRatioSuffix'} = $runq_cred_corr_suffix;
+                    $di->{'rVCPU_P99W1OccupancyIntervalCorr'}        = sprintf("%.2f", $runq_cred_corr);
+                    $di->{'rVCPU_P99W1RunnableDensitySuffix'} = $runq_cred_corr_suffix;
                     $di->{'rVCPU_Final'}            = defined $rvcpu_final ? $rvcpu_final : "N/A";
                 }
 
@@ -15099,6 +16034,21 @@ sub build_transform_manifest {
         if (defined $rq_norm_str) {
             my @norm_percs = grep { looks_like_number($_) } split /[,\s]+/, $rq_norm_str;
             push @norm_percs, (25, 50, 75, 90);
+            # Align the NormRunQ percentile set with the profile's own PhysC
+            # percentile, mirroring the AbsRunQ list below. NormRunQ is the PAIRED
+            # runnable-density estimator - nfit forms runq/(physc*smt) per sample
+            # before smoothing and percentiling - so a profile-aligned percentile
+            # lets consumers read occupancy at the same tail as the PhysC value
+            # they are assessing, rather than dividing two independently derived
+            # percentiles that need not share a timestamp.
+            #
+            # PERFORMANCE: nfit sorts each series once and indexes the sorted array
+            # per requested percentile, so an extra percentile on an EXISTING
+            # transform is O(1). No new transform, packed array, rolling-average
+            # state or sort pass is introduced. Deliberately NOT gated on
+            # runq_perc_behavior_mode: the occupancy diagnostic needs the aligned
+            # tail regardless of how AbsRunQ pressure percentiles are selected.
+            push @norm_percs, $p_perc if (defined $p_perc && looks_like_number($p_perc));
             my %seen; @norm_percs = grep { !$seen{$_}++ } @norm_percs;
 
             if (@norm_percs) {
@@ -15706,19 +16656,40 @@ sub build_assimilation_map {
             $vm_map->{CoreResults}{PeakValue} = max(@peak_values) if @peak_values;
         }
 
-        # --- Block 3: Populate RunQMetrics (Comprehensive) ---
-        # This loop iterates through ALL profiles to find and collate every RunQ
-        # metric calculated by the nfit engine into a single, unified block.
-        $vm_map->{RunQMetrics}{SourceProfile} = $MANDATORY_PEAK_PROFILE_FOR_HINT; # P-99W1 remains the default source
+        # --- Block 3: Populate RunQMetrics (Unified + Per-Profile) ---
+        # Two structures are populated here:
+        #   1. RunQMetrics          - the legacy unified block. Collation remains
+        #      first-wins per key in profile configuration order, which in
+        #      practice means the peak profile supplies the common keys
+        #      (P50/P90). It is retained unchanged for consumers that
+        #      deliberately require the 24x7 peak-window view (flat-lining
+        #      detection, global hint pressure assessment).
+        #   2. RunQMetricsByProfile - per-profile RunQ percentile blocks, keyed
+        #      by profile name. Each block reflects the profile's own time
+        #      filter (-online / -batch / 24x7) and RunQ smoothing window, so
+        #      the modifier logic can judge each profile on the queueing
+        #      behaviour of its own analysis window.
+        # The previously declared (but never populated) %per_profile_runq_metrics
+        # global is wired here as well, so the seasonal execution paths share
+        # the same provenance.
+        $vm_map->{RunQMetrics}{SourceProfile} = $MANDATORY_PEAK_PROFILE_FOR_HINT; # P-99W1 remains the default unified source
         foreach my $profile (@$profiles_aref) {
             my $p_name = $profile->{name};
             my $runq_norm_metrics = _safe_dig($representative_state, 'metrics', 'runq', 'normalized', $p_name) || {};
             my $runq_abs_metrics  = _safe_dig($representative_state, 'metrics', 'runq', 'absolute', $p_name) || {};
             foreach my $key (keys %$runq_norm_metrics) {
                 $vm_map->{RunQMetrics}{"NormRunQ_$key"} //= $runq_norm_metrics->{$key};
+                $vm_map->{RunQMetricsByProfile}{$p_name}{"NormRunQ_$key"} = $runq_norm_metrics->{$key};
             }
             foreach my $key (keys %$runq_abs_metrics) {
                 $vm_map->{RunQMetrics}{"AbsRunQ_$key"} //= $runq_abs_metrics->{$key};
+                $vm_map->{RunQMetricsByProfile}{$p_name}{"AbsRunQ_$key"} = $runq_abs_metrics->{$key};
+            }
+            # Record provenance inside each per-profile block and mirror the
+            # block into the shared global for the seasonal paths.
+            if (exists $vm_map->{RunQMetricsByProfile}{$p_name}) {
+                $vm_map->{RunQMetricsByProfile}{$p_name}{SourceProfile} = $p_name;
+                $per_profile_runq_metrics{$vm_name}{$p_name} = $vm_map->{RunQMetricsByProfile}{$p_name};
             }
         }
 
@@ -18535,13 +19506,10 @@ sub _execute_multiplicative_seasonal {
         $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
         $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
 
-        # Prepare for RunQ Modifiers
+        # Prepare for RunQ Modifiers (tier-resolved source, Phase 2)
         my $user_tier = $vm_tier_overrides{$vm_name} // "";
-        my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
-        my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
-        $pattern_char //= 'G';
-        my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-        my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+        my ($runq_source_profile_name, $runq_source_label) =
+            _resolve_runq_source_profile($user_tier, $hint_type_tier, $profiles_aref);
 
         foreach my $profile (@$profiles_aref) {
             my $p_name = $profile->{name};
@@ -18577,7 +19545,7 @@ sub _execute_multiplicative_seasonal {
             my $p99w1_floor_vcpu = undef;
             my $p99w1_factor_eff = undef;
             my $p99w1_mult = undef;
-            my $cred_ratio = 1.00;
+            my $runnable_density = 1.00;
             my $p99w1_adjusted;
             my $p99w1_cores;
 
@@ -18677,31 +19645,49 @@ sub _execute_multiplicative_seasonal {
                 if (defined $p99w1_cores && looks_like_number($p99w1_cores) && $p99w1_cores > 0) {
                     # RunQ credibility adjustment
                     $p99w1_adjusted = $p99w1_cores;
-                    $cred_ratio = 1.00;
+                    $runnable_density = 1.00;
 
                     # Credibility uses a tail-to-tail comparison: P99W1 PhysC vs AbsRunQ_P99W1.
                     # Prefer the peak-helper-aligned W1 RunQ tail for credibility, so we
                     # compare like-for-like: P99W1 PhysC vs AbsRunQ_P99W1 (window=1).
-                    my $runq_p99w1_for_cred =
-                        $vm_map_ref->{RunQMetrics}{AbsRunQ_P99W1} //
-                        $vm_map_ref->{RunQMetrics}{AbsRunQ_P99};
+                    # Paired runnable density (Stage 2) - see _resolve_peak_runnable_density.
+                    # This path has never applied the interval correction; that
+                    # inconsistency is preserved deliberately rather than changed
+                    # under an estimator patch.
+                    my ($paired_density) = _resolve_peak_runnable_density($vm_map_ref);
+                    if (defined $paired_density) {
+                        $runnable_density = $paired_density;
 
-                    if (defined $runq_p99w1_for_cred && $runq_p99w1_for_cred > 0 && defined $smt_used && $smt_used > 0) {
-                        my $runq_peak_cores = $runq_p99w1_for_cred / $smt_used;
-                        $cred_ratio = $runq_peak_cores / $p99w1_cores;
-                        my $credibility = $cred_ratio + $VCPU_PEAK_CRED_BIAS;
-                        $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
-                        $credibility = 1.00 if ($credibility > 1.00);
-                        $p99w1_adjusted = $p99w1_cores * $credibility;
+                        # Yield-aware active-core floor (Stage 3). Mirrors the primary
+                        # path in calculate_runq_modified_physc. This path applies no
+                        # interval correction to the occupancy - a pre-existing
+                        # divergence from the other two sites, preserved deliberately
+                        # rather than changed under a yield patch.
+                        my $threads_per_core_peak = (defined $smt_used && $smt_used > 0)
+                            ? ($runnable_density * $smt_used) : undef;
+                        my ($yield_floor_cores) = _yield_aware_active_core_floor(
+                            $p99w1_cores,
+                            $threads_per_core_peak,
+                            ($TIER_THROUGHPUT_RETENTION{$rvcpu_tier_num} // 0.85)
+                        );
+                        $p99w1_adjusted = $yield_floor_cores if (defined $yield_floor_cores);
+
+                        # Retained for comparison only - see $VCPU_PEAK_CRED_DISCOUNT_ENABLED.
+                        if ($VCPU_PEAK_CRED_DISCOUNT_ENABLED) {
+                            my $credibility = $runnable_density + $VCPU_PEAK_CRED_BIAS;
+                            $credibility = $VCPU_PEAK_CRED_MIN if ($credibility < $VCPU_PEAK_CRED_MIN);
+                            $credibility = 1.00 if ($credibility > 1.00);
+                            $p99w1_adjusted = $p99w1_cores * $credibility;
+                        }
                     }
 
                     my $pae_raw = 0.0;
                     my $aae_raw = 0.0;
                     if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
-                        $pae_raw = (defined $debug_info_ref->{'PhysC_Daily_PAE'} && looks_like_number($debug_info_ref->{'PhysC_Daily_PAE'}))
-                                 ? ($debug_info_ref->{'PhysC_Daily_PAE'} + 0) : 0.0;
-                        $aae_raw = (defined $debug_info_ref->{'PhysC_Daily_AAE'} && looks_like_number($debug_info_ref->{'PhysC_Daily_AAE'}))
-                                 ? ($debug_info_ref->{'PhysC_Daily_AAE'} + 0) : 0.0;
+                        $pae_raw = (defined $debug_info_ref->{'PhysC_Peak_PAE'} && looks_like_number($debug_info_ref->{'PhysC_Peak_PAE'}))
+                                 ? ($debug_info_ref->{'PhysC_Peak_PAE'} + 0) : 0.0;
+                        $aae_raw = (defined $debug_info_ref->{'PhysC_Peak_AAE'} && looks_like_number($debug_info_ref->{'PhysC_Peak_AAE'}))
+                                 ? ($debug_info_ref->{'PhysC_Peak_AAE'} + 0) : 0.0;
                     }
 
                     my $pae_component = ($pae_raw > 0) ? (($pae_raw < 0.30 ? $pae_raw : 0.30) / 0.30) * 0.15 : 0.0;
@@ -18749,9 +19735,9 @@ sub _execute_multiplicative_seasonal {
                 P99W1Floor     => $p99w1_floor_vcpu,
                 P99W1FactorEff => (defined $p99w1_factor_eff ? sprintf("%.3f", $p99w1_factor_eff) : undef),
                 P99W1Mult      => (defined $p99w1_mult ? sprintf("%.3f", $p99w1_mult) : undef),
-                P99W1CredRatio => sprintf("%.3f", $cred_ratio),
-                P99W1CredCorr        => $debug_info_ref->{'rVCPU_P99W1CredCorr'},
-                P99W1CredRatioSuffix => $debug_info_ref->{'rVCPU_P99W1CredRatioSuffix'},
+                P99W1RunnableDensity => sprintf("%.3f", $runnable_density),
+                P99W1OccupancyIntervalCorr        => $debug_info_ref->{'rVCPU_P99W1OccupancyIntervalCorr'},
+                P99W1RunnableDensitySuffix => $debug_info_ref->{'rVCPU_P99W1RunnableDensitySuffix'},
                 P99W1AdjPeak   => (defined $p99w1_adjusted ? sprintf("%.2f", $p99w1_adjusted) : undef),
                 P99W1RawPeak   => (defined $p99w1_cores    ? sprintf("%.2f", $p99w1_cores)    : undef),
                 # Micro-partition override: not computed in seasonal path
@@ -18772,7 +19758,7 @@ sub _execute_multiplicative_seasonal {
                 $debug_info_ref->{'rVCPU_P99W1Floor'} = defined($p99w1_floor_vcpu) ? $p99w1_floor_vcpu : "N/A";
                 $debug_info_ref->{'rVCPU_P99W1FactorEff'} = defined($p99w1_factor_eff) ? sprintf("%.3f",$p99w1_factor_eff) : "N/A";
                 $debug_info_ref->{'rVCPU_P99W1Mult'} = defined($p99w1_mult) ? sprintf("%.3f",$p99w1_mult) : "N/A";
-                $debug_info_ref->{'rVCPU_P99W1CredRatio'} = defined($cred_ratio) ? sprintf("%.3f", $cred_ratio) : 'N/A';
+                $debug_info_ref->{'rVCPU_P99W1RunnableDensity'} = defined($runnable_density) ? sprintf("%.3f", $runnable_density) : 'N/A';
                 $debug_info_ref->{'rVCPU_P99W1AdjPeak'}   = defined($p99w1_adjusted) ? sprintf("%.2f", $p99w1_adjusted) : "N/A";
                 $debug_info_ref->{'rVCPU_P99W1RawPeak'}   = defined($p99w1_cores)    ? sprintf("%.2f", $p99w1_cores)    : "N/A";
                 $debug_info_ref->{'rVCPU_Final'} = defined($rvcpu_final) ? $rvcpu_final : "N/A";
@@ -18782,7 +19768,7 @@ sub _execute_multiplicative_seasonal {
                 $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
                 $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
                 $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
-                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_label;
             }
         }
     }
@@ -19122,13 +20108,17 @@ sub _execute_recency_decay {
         $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
         $vm_map_ref->{Hinting}{FinalTierForVM} = $vm_tier_overrides{$vm_name} // $hint_type_tier;
 
-        # --- Determine Source Profile for Standardised Modifiers ---
+        # --- Determine Source Profiles for Standardised Modifiers ---
         my $user_tier = $vm_tier_overrides{$vm_name} // "";
         my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
         my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
         $pattern_char //= 'G';
+        # Growth standardisation remains anchored to the stable tier-3 profile.
         my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-        my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+        my $growth_source_profile = $pat_map{$pattern_char} // 'G3-95W15';
+        # RunQ modifier source is tier-resolved (Phase 2).
+        my ($runq_source_profile_name, $runq_source_label) =
+            _resolve_runq_source_profile($user_tier, $hint_type_tier, $profiles_aref);
 
         # --- Pre-calculate CSVModifiers using the Source Profile ---
         # This must happen BEFORE the profile loop so all profiles can use RunQ_Potential.
@@ -19150,14 +20140,13 @@ sub _execute_recency_decay {
             $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref_src->{'FinalAdditive'};
             $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref_src->{'RunQ_Strategic'};
             $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref_src->{'RunQ_Potential'};
-            $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+            $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_label;
         }
 
-        # --- Set Standardised Growth Metadata for Logging ---
-        my $standard_growth_adj = $vm_map_ref->{Growth}{adjustments}{$runq_source_profile_name} // 0;
+        my $standard_growth_adj = $vm_map_ref->{Growth}{adjustments}{$growth_source_profile} // 0;
         $vm_map_ref->{Growth}{StandardAdjustment} = {
             Value  => $standard_growth_adj,
-            Source => $runq_source_profile_name
+            Source => $growth_source_profile
         };
 
         # --- Apply Standardised Modifiers to All Profiles ---
@@ -19542,11 +20531,8 @@ sub _execute_predictive_peak {
         $tier_override_for_csv{$vm_name}       = $vm_tier_overrides{$vm_name} // "";
 
         my $user_tier = $vm_tier_overrides{$vm_name} // "";
-        my $pattern_source = ($user_tier ne "") ? $user_tier : $hint_type_tier;
-        my ($pattern_char) = ($pattern_source =~ /^([A-Z])/);
-        $pattern_char //= 'G';
-        my %pat_map = ('O'=>'O3-95W15', 'B'=>'B3-95W15', 'G'=>'G3-95W15', 'P'=>'G3-95W15');
-        my $runq_source_profile_name = $pat_map{$pattern_char} // 'G3-95W15';
+        my ($runq_source_profile_name, $runq_source_label) =
+            _resolve_runq_source_profile($user_tier, $hint_type_tier, $profiles_aref);
 
         foreach my $profile (@$profiles_aref) {
             my $p_name = $profile->{name};
@@ -19577,7 +20563,7 @@ sub _execute_predictive_peak {
                 $vm_map_ref->{CSVModifiers}{RunQ_Tactical}  = $debug_info_ref->{'FinalAdditive'};
                 $vm_map_ref->{CSVModifiers}{RunQ_Strategic} = $debug_info_ref->{'RunQ_Strategic'};
                 $vm_map_ref->{CSVModifiers}{RunQ_Potential} = $debug_info_ref->{'RunQ_Potential'};
-                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_profile_name;
+                $vm_map_ref->{CSVModifiers}{RunQ_Source}    = $runq_source_label;
             }
         }
 
