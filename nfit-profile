@@ -3788,6 +3788,7 @@ sub log_profile_rationale
     # untouched - see nFit - Interim VP Right-Sizing Implementation Strategy.
     if (defined $re->{EntBounded} && looks_like_number($re->{EntBounded})) {
         my $eb_needs_change = ($re->{EntBoundedNeedsCoordinatedChange}) ? 1 : 0;
+        my $eb_evidence_env = ($re->{EntBoundedEvidenceAboveEnvelope}) ? 1 : 0;
         my $eb_stale_note = ($re->{CurrentEntStale}) ? ' [current entitlement unavailable - fell back to VP_Min]' : '';
         printf {$fh} "  - Entitlement-bounded VCPUs (rVCPU_EntBounded)       : %s virtual processors%s\n",
             $re->{EntBounded}, $eb_stale_note;
@@ -3795,12 +3796,36 @@ sub log_profile_rationale
         printf {$fh} "                           entitlement enters as a lower bound (ceil of current Ent), so RunQ or yield\n";
         printf {$fh} "                           evidence may still size this above current entitlement; it is not a cap.\n";
         printf {$fh} "    Governed by          : %s.\n", ($re->{EntBoundedGovernedBy} // $na);
-        if ($eb_needs_change) {
-            printf {$fh} "    Vs strategic rVCPU   : rVCPU (%s) is lower - the strategic end-state needs a coordinated entitlement\n";
-            printf {$fh} "                           reduction first. rVCPU_EntBounded (%s) is the safe interim without it.\n",
-                ($rvcpu_final_log // $na), $re->{EntBounded};
-        } else {
+
+        # Explain EntBounded relative to the strategic rVCPU. Three distinct
+        # situations, each with a different planner action:
+        #   (a) equal            - nothing to coordinate.
+        #   (b) needs_change     - the current-entitlement floor holds EntBounded
+        #                          above rVCPU, so a coordinated entitlement
+        #                          reduction is genuinely required to reach rVCPU.
+        #   (c) evidence-above   - dispatch/peak evidence holds EntBounded above
+        #                          rVCPU; when it also exceeds the 2:1 VP envelope
+        #                          this is an envelope-policy conflict, NOT an
+        #                          entitlement constraint, and reducing entitlement
+        #                          would not change it.
+        my $eb_n = (looks_like_number($re->{EntBounded})) ? ($re->{EntBounded} + 0) : undef;
+        my $rv_n = (defined $rvcpu_final_log && looks_like_number($rvcpu_final_log)) ? ($rvcpu_final_log + 0) : undef;
+        if (defined $eb_n && defined $rv_n && $eb_n == $rv_n) {
             printf {$fh} "    Vs strategic rVCPU   : equal to rVCPU - the strategic target is already reachable with entitlement untouched.\n";
+        } elsif ($eb_needs_change) {
+            printf {$fh} "    Vs strategic rVCPU   : rVCPU (%s) is lower - the strategic end-state needs a coordinated entitlement\n",
+                ($rvcpu_final_log // $na);
+            printf {$fh} "                           reduction first. rVCPU_EntBounded (%s) is the safe interim without it.\n",
+                $re->{EntBounded};
+        } else {
+            printf {$fh} "    Vs strategic rVCPU   : rVCPU_EntBounded (%s) exceeds rVCPU (%s) on dispatch/peak evidence, not current\n",
+                $re->{EntBounded}, ($rvcpu_final_log // $na);
+            if ($eb_evidence_env) {
+                printf {$fh} "                           entitlement - the 2:1 VP envelope caps the strategic figure below this\n";
+                printf {$fh} "                           evidence, so no entitlement change is needed to reach rVCPU (see 'Governed by').\n";
+            } else {
+                printf {$fh} "                           entitlement, so no entitlement change is needed to reach rVCPU (see 'Governed by').\n";
+            }
         }
     }
 
@@ -4790,6 +4815,7 @@ sub _resolve_runq_source_profile {
 # In (hashref):
 #   rvcpu_raw            - RunQ dispatch-sized VP count (may be undef)
 #   rvcpu_min            - envelope minimum VPs (may be undef)
+#   rvcpu_max            - envelope maximum VPs / 2:1 policy ceiling (may be undef)
 #   rvcpu_final          - coordinated rVCPU (may be undef)
 #   p99w1_floor_vcpu     - peak-derived VP floor (may be undef)
 #   rvcpu_tier_num       - tier number (1..4) driving the step fraction
@@ -4799,7 +4825,7 @@ sub _resolve_runq_source_profile {
 #
 # Out (hashref):
 #   entbounded, entbounded_governed, entbounded_needs_coordinated_change,
-#   tactical, tactical_note
+#   entbounded_evidence_above_envelope, tactical, tactical_note
 # ---------------------------------------------------------------------------
 sub _compute_entbounded_and_tactical
 {
@@ -4811,6 +4837,7 @@ sub _compute_entbounded_and_tactical
     # drift during centralisation).
     my $rvcpu_raw            = $terms->{rvcpu_raw};
     my $rvcpu_min            = $terms->{rvcpu_min};
+    my $rvcpu_max            = $terms->{rvcpu_max};
     my $rvcpu_final          = $terms->{rvcpu_final};
     my $p99w1_floor_vcpu     = $terms->{p99w1_floor_vcpu};
     my $rvcpu_tier_num       = $terms->{rvcpu_tier_num};
@@ -4836,10 +4863,30 @@ sub _compute_entbounded_and_tactical
         $entbounded_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
     }
 
-    # TRUE when the coordinated rVCPU is lower than EntBounded: reaching the
-    # coordinated figure needs entitlement to actually move first, not just VPs.
+    # Distinguish WHY rVCPU_EntBounded can exceed the coordinated rVCPU. The two
+    # causes carry very different planner actions, so they are reported as
+    # separate flags rather than collapsed into "EntBounded > rVCPU".
+    #
+    #   needs_coordinated_change - the CURRENT-ENTITLEMENT floor sits above the
+    #     strategic rVCPU, so reaching rVCPU genuinely requires a coordinated
+    #     entitlement reduction first. Tested specifically against the entitlement
+    #     floor (ceil of current Ent), not against EntBounded as a whole. Gated on
+    #     !stale: when current entitlement is unavailable the floor is a VP_Min
+    #     fallback, not an entitlement figure, so no entitlement change can be
+    #     asserted (and by construction VP_Min <= rVCPU, so this cannot fire then).
+    #
+    #   evidence_above_envelope - raw RunQ or the peak floor exceeds the 2:1 VP
+    #     envelope ceiling (rVCPU_Max), i.e. dispatch/peak evidence wants more than
+    #     policy allows. This is an envelope-policy conflict, NOT an entitlement
+    #     constraint; reducing entitlement would not change it.
     my $entbounded_needs_coordinated_change =
-        (defined $rvcpu_final && $rvcpu_entbounded > $rvcpu_final) ? 1 : 0;
+        (!$current_ent_stale && defined $vp_current_ent_floor && defined $rvcpu_final
+            && $vp_current_ent_floor > $rvcpu_final) ? 1 : 0;
+
+    my $entbounded_evidence_above_envelope =
+        (defined $rvcpu_max
+            && ( (defined $rvcpu_raw        && $rvcpu_raw        > $rvcpu_max)
+              || (defined $p99w1_floor_vcpu && $p99w1_floor_vcpu > $rvcpu_max) )) ? 1 : 0;
 
     # ================================================================
     # Task 4: Tier-aware rate limiting on VP reduction (rVCPU_Tactical)
@@ -4884,6 +4931,7 @@ sub _compute_entbounded_and_tactical
         entbounded                          => $rvcpu_entbounded,
         entbounded_governed                 => $entbounded_governed,
         entbounded_needs_coordinated_change => $entbounded_needs_coordinated_change,
+        entbounded_evidence_above_envelope  => $entbounded_evidence_above_envelope,
         tactical                            => $rvcpu_tactical,
         tactical_note                       => $tactical_note,
     };
@@ -6693,6 +6741,7 @@ sub calculate_runq_modified_physc
         my $rvcpu_ebt = _compute_entbounded_and_tactical({
             rvcpu_raw            => $rvcpu_raw,
             rvcpu_min            => $rvcpu_min,
+            rvcpu_max            => $rvcpu_max,
             rvcpu_final          => $rvcpu_final,
             p99w1_floor_vcpu     => $p99w1_floor_vcpu,
             rvcpu_tier_num       => $rvcpu_tier_num,
@@ -6703,6 +6752,7 @@ sub calculate_runq_modified_physc
         my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
         my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
         my $entbounded_needs_coordinated_change = $rvcpu_ebt->{entbounded_needs_coordinated_change};
+        my $entbounded_evidence_above_envelope  = $rvcpu_ebt->{entbounded_evidence_above_envelope};
         my $rvcpu_tactical                      = $rvcpu_ebt->{tactical};
         my $tactical_note                       = $rvcpu_ebt->{tactical_note};
 
@@ -6742,6 +6792,7 @@ sub calculate_runq_modified_physc
             EntBounded                    => $rvcpu_entbounded,
             EntBoundedGovernedBy          => $entbounded_governed,
             EntBoundedNeedsCoordinatedChange => $entbounded_needs_coordinated_change,
+            EntBoundedEvidenceAboveEnvelope  => $entbounded_evidence_above_envelope,
             CurrentEntCores               => (defined $current_ent_numeric ? sprintf("%.2f", $current_ent_numeric) : undef),
             CurrentEntStale               => $current_ent_stale,
             Tactical                      => $rvcpu_tactical,
@@ -6782,6 +6833,7 @@ sub calculate_runq_modified_physc
         $debug_info{'rVCPU_EntBounded'}           = defined($rvcpu_entbounded) ? $rvcpu_entbounded : 'N/A';
         $debug_info{'rVCPU_EntBoundedGovernedBy'} = $entbounded_governed // 'N/A';
         $debug_info{'rVCPU_EntBoundedNeedsCoordinatedChange'} = $entbounded_needs_coordinated_change ? 1 : 0;
+        $debug_info{'rVCPU_EntBoundedEvidenceAboveEnvelope'} = $entbounded_evidence_above_envelope ? 1 : 0;
         $debug_info{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
         $debug_info{'rVCPU_Tactical'}             = defined($rvcpu_tactical) ? $rvcpu_tactical : 'N/A';
         $debug_info{'rVCPU_TacticalNote'}         = $tactical_note // 'N/A';
@@ -9521,6 +9573,7 @@ sub _write_standard_csv_report {
                     my $rvcpu_ebt = _compute_entbounded_and_tactical({
                         rvcpu_raw            => $rvcpu_raw,
                         rvcpu_min            => $rvcpu_min,
+                        rvcpu_max            => $rvcpu_max,
                         rvcpu_final          => $rvcpu_final,
                         p99w1_floor_vcpu     => $p99w1_floor_vcpu,
                         rvcpu_tier_num       => $rvcpu_tier_num,
@@ -9531,6 +9584,7 @@ sub _write_standard_csv_report {
                     my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
                     my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
                     my $entbounded_needs_coordinated_change = $rvcpu_ebt->{entbounded_needs_coordinated_change};
+                    my $entbounded_evidence_above_envelope  = $rvcpu_ebt->{entbounded_evidence_above_envelope};
                     my $rvcpu_tactical                      = $rvcpu_ebt->{tactical};
                     my $tactical_note                       = $rvcpu_ebt->{tactical_note};
 
@@ -9570,6 +9624,7 @@ sub _write_standard_csv_report {
                         EntBounded                    => $rvcpu_entbounded,
                         EntBoundedGovernedBy          => $entbounded_governed,
                         EntBoundedNeedsCoordinatedChange => $entbounded_needs_coordinated_change,
+                        EntBoundedEvidenceAboveEnvelope  => $entbounded_evidence_above_envelope,
                         CurrentEntCores               => (defined $current_ent_numeric ? sprintf("%.2f", $current_ent_numeric) : undef),
                         CurrentEntStale               => $current_ent_stale,
                         Tactical                      => $rvcpu_tactical,
@@ -9601,6 +9656,7 @@ sub _write_standard_csv_report {
                     $di->{'rVCPU_EntBounded'}           = defined($rvcpu_entbounded) ? $rvcpu_entbounded : "N/A";
                     $di->{'rVCPU_EntBoundedGovernedBy'} = $entbounded_governed // "N/A";
                     $di->{'rVCPU_EntBoundedNeedsCoordinatedChange'} = $entbounded_needs_coordinated_change ? 1 : 0;
+                    $di->{'rVCPU_EntBoundedEvidenceAboveEnvelope'} = $entbounded_evidence_above_envelope ? 1 : 0;
                     $di->{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
                     $di->{'rVCPU_Tactical'}           = defined($rvcpu_tactical) ? $rvcpu_tactical : "N/A";
                     $di->{'rVCPU_TacticalNote'}       = $tactical_note // "N/A";
@@ -19552,6 +19608,7 @@ sub _execute_multiplicative_seasonal {
             my $rvcpu_ebt = _compute_entbounded_and_tactical({
                 rvcpu_raw            => $rvcpu_raw,
                 rvcpu_min            => $rvcpu_min,
+                rvcpu_max            => $rvcpu_max,
                 rvcpu_final          => $rvcpu_final,
                 p99w1_floor_vcpu     => $p99w1_floor_vcpu,
                 rvcpu_tier_num       => $rvcpu_tier_num,
@@ -19562,6 +19619,7 @@ sub _execute_multiplicative_seasonal {
             my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
             my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
             my $entbounded_needs_coordinated_change = $rvcpu_ebt->{entbounded_needs_coordinated_change};
+            my $entbounded_evidence_above_envelope  = $rvcpu_ebt->{entbounded_evidence_above_envelope};
             my $rvcpu_tactical                      = $rvcpu_ebt->{tactical};
             my $tactical_note                       = $rvcpu_ebt->{tactical_note};
 
@@ -19600,6 +19658,7 @@ sub _execute_multiplicative_seasonal {
                 EntBounded                    => $rvcpu_entbounded,
                 EntBoundedGovernedBy          => $entbounded_governed,
                 EntBoundedNeedsCoordinatedChange => $entbounded_needs_coordinated_change,
+                EntBoundedEvidenceAboveEnvelope  => $entbounded_evidence_above_envelope,
                 CurrentEntCores               => (defined $current_ent_numeric ? sprintf("%.2f", $current_ent_numeric) : undef),
                 CurrentEntStale               => $current_ent_stale,
                 Tactical                      => $rvcpu_tactical,
@@ -19625,6 +19684,7 @@ sub _execute_multiplicative_seasonal {
                 $debug_info_ref->{'rVCPU_EntBounded'}           = defined($rvcpu_entbounded) ? $rvcpu_entbounded : "N/A";
                 $debug_info_ref->{'rVCPU_EntBoundedGovernedBy'} = $entbounded_governed // "N/A";
                 $debug_info_ref->{'rVCPU_EntBoundedNeedsCoordinatedChange'} = $entbounded_needs_coordinated_change ? 1 : 0;
+                $debug_info_ref->{'rVCPU_EntBoundedEvidenceAboveEnvelope'} = $entbounded_evidence_above_envelope ? 1 : 0;
                 $debug_info_ref->{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
                 $debug_info_ref->{'rVCPU_Tactical'}             = defined($rvcpu_tactical) ? $rvcpu_tactical : "N/A";
                 $debug_info_ref->{'rVCPU_TacticalNote'}         = $tactical_note // "N/A";
