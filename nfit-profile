@@ -4944,6 +4944,171 @@ sub _compute_entbounded_and_tactical
 # Returns the adjusted PhysC value and a hash of debug information for logging.
 # --- calculate_runq_modified_physc (refactor: decoupled C & D, no early-returns, adds RunQ_Strategic) ---
 #
+# --- _strategic_rvcpu_envelope --------------------------------------------
+# Pure, side-effect-free strategic-rVCPU kernel (authoritative path only).
+#
+# Given a trial planning entitlement and the rENT-INDEPENDENT evidence
+# (RunQ dispatch size and peak-floor value, both computed once by the caller),
+# derive the VP envelope and the clamped/overridden strategic rVCPU. This is
+# the exact envelope -> micro-partition -> clamp -> peak-floor application ->
+# Layer-5a override sequence previously inlined in calculate_runq_modified_physc;
+# it is lifted verbatim so the A1 proposal-relative convergence loop can
+# re-derive the strategic pair for successive trial entitlements without side
+# effects. Diagnostics are RETURNED, not written, so repeated calls are safe;
+# the caller mirrors them into %debug_info once.
+#
+# Scope (constraint 1): the authoritative engine is the only caller. The
+# seasonal and CSV-fallback paths keep their own inline logic and their known
+# divergences - this kernel must NOT be wired into them.
+#
+# In (hashref): rent_p, rent_for_envelope, rvcpu_raw, p99w1_floor_vcpu,
+#   runnable_density, runq_hi_threads, smt, max_cpu, runq_potential,
+#   is_runq_pressure, is_workload_pressure
+# Out (hashref): rvcpu_min, rvcpu_max, rvcpu_final, orig_rvcpu_min,
+#   orig_rvcpu_max, runq_envelope_override, runq_envelope_basis,
+#   micro_expansion_note (undef unless expansion occurred)
+# ---------------------------------------------------------------------------
+sub _strategic_rvcpu_envelope
+{
+    my ($in) = @_;
+    $in = {} unless (defined $in && ref($in) eq 'HASH');
+
+    # Bind inputs to the names the lifted logic uses (verbatim move).
+    my $rENT_P                   = $in->{rent_p};
+    my $rENT_P_for_envelope      = $in->{rent_for_envelope};
+    my $rvcpu_raw                = $in->{rvcpu_raw};
+    my $p99w1_floor_vcpu         = $in->{p99w1_floor_vcpu};
+    my $runnable_density         = $in->{runnable_density};
+    my $runq_hi_threads          = $in->{runq_hi_threads};
+    my $smt_for_vcpu             = $in->{smt};
+    my $max_cpu_for_lpar_numeric = $in->{max_cpu};
+    my $runq_potential           = $in->{runq_potential};
+    my $is_runq_pressure         = $in->{is_runq_pressure};
+    my $is_workload_pressure     = $in->{is_workload_pressure};
+
+    my ($rvcpu_min, $rvcpu_max, $rvcpu_final, $orig_rvcpu_min, $orig_rvcpu_max);
+    my $runq_envelope_override = 0;
+    my $runq_envelope_basis    = undef;
+    my $micro_expansion_note;
+
+            # Vendor envelope from rENT_P_for_envelope (planning entitlement, pre-MaxCPU-sanity).
+            # This ensures the VP envelope reflects workload demand, not current environment limits.
+            my $min_v = $rENT_P_for_envelope * $VCPU_RATIO_MIN;
+            my $max_v = $rENT_P_for_envelope * $VCPU_RATIO_MAX;
+            $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
+            $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
+
+            # Enforce minimum VP floor (evenisation removed - odd VP counts now permitted)
+            if (defined $rvcpu_min) {
+                $rvcpu_min = 1 if ($rvcpu_min < 1);
+            }
+            if (defined $rvcpu_max) {
+                $rvcpu_max = 1 if ($rvcpu_max < 1);
+                $rvcpu_max = $rvcpu_min if (defined $rvcpu_min && $rvcpu_max < $rvcpu_min);
+            }
+
+            # Micro-partition envelope expansion (evidence-gated).
+            # For rENT_P < 1.0 with env_max = 1, expand to floor of 2 when RunQ demands it.
+            # This ensures micro-partitions are not locked to a single VP when dispatch
+            # evidence shows concurrency demand. The gate (rvcpu_raw > rvcpu_max) prevents
+            # unnecessary expansion for genuinely low-concurrency workloads.
+            if (defined $rENT_P_for_envelope
+                && $rENT_P_for_envelope > 0
+                && $rENT_P_for_envelope < $VCPU_MICRO_PARTITION_THRESHOLD
+                && defined $rvcpu_max
+                && $rvcpu_max < $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR
+                && defined $rvcpu_raw
+                && $rvcpu_raw > $rvcpu_max) {
+                my $original_env_max = $rvcpu_max;
+                $rvcpu_max = $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR;
+                # Respect MaxCPU as absolute ceiling
+                if (defined $max_cpu_for_lpar_numeric && $max_cpu_for_lpar_numeric > 0 && $rvcpu_max > $max_cpu_for_lpar_numeric) {
+                    $rvcpu_max = int($max_cpu_for_lpar_numeric);
+                }
+                if ($rvcpu_max > $original_env_max) {
+                    $micro_expansion_note = sprintf(
+                        "Envelope max expanded %d -> %d (micro-partition floor; rENT_P=%.2f, RunQ demand=%d VPs > ratio max=%d)",
+                        $original_env_max, $rvcpu_max, $rENT_P_for_envelope, $rvcpu_raw, $original_env_max);
+                }
+            }
+
+            # Track original envelope for rationale (before any override)
+            ($orig_rvcpu_min, $orig_rvcpu_max) = ($rvcpu_min, $rvcpu_max);
+
+            # Clamp
+            $rvcpu_final = $rvcpu_raw;
+            $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
+            $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
+
+            # Low-entitlement sanity rules
+            $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
+            if (defined $rENT_P && $rENT_P >= 0.5 && $rENT_P < 1.0) {
+                $rvcpu_final = $VCPU_MIN_FOR_ENT_GE_0_5_LT_1 if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_FOR_ENT_GE_0_5_LT_1);
+            }
+                if (defined $p99w1_floor_vcpu && defined $rvcpu_final && $p99w1_floor_vcpu > $rvcpu_final) {
+                    $rvcpu_final = $p99w1_floor_vcpu;
+                    $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && defined $rvcpu_final && $rvcpu_final > $rvcpu_max);
+                }
+            # Enforce minimum (evenisation removed)
+            $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
+
+            # ================================================================
+            # LAYER 5a: Micro-partition RunQ Envelope Override
+            # ================================================================
+            # When rENT_P < threshold and RunQ strongly exceeds PhysC (runnable_density > threshold),
+            # and the RunQ-derived VP requirement exceeds the envelope max,
+            # expand the envelope to accommodate the RunQ evidence.
+            # This addresses scheduling disadvantage in tiny partitions.
+            # ================================================================
+            my $runq_width_cores_for_override = undef;
+
+            # Calculate RunQ-derived core requirement for comparison
+            if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0) {
+                $runq_width_cores_for_override = $runq_hi_threads / $smt_for_vcpu;
+            }
+
+            # Check DBW/XRQ anomaly state (do not apply override if pathological)
+            my $is_dbw_anomaly = (defined $runq_potential && $runq_potential =~ /ANOMALY.*DBW/i);
+            my $is_xrq_anomaly = (defined $runq_potential && $runq_potential =~ /ANOMALY.*XRQ/i);
+
+            # Check pressure flags - use per-profile detection (not overall flags which can miss cases)
+            my $has_pressure_for_override =
+                (defined $is_runq_pressure && $is_runq_pressure eq "True") ||
+                (defined $is_workload_pressure && $is_workload_pressure eq "True");
+
+            if (   defined $rENT_P && $rENT_P > 0 && $rENT_P < $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH
+                && defined $runnable_density && $runnable_density > $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH
+                && defined $rvcpu_raw && defined $rvcpu_max && $rvcpu_raw > $rvcpu_max
+                && !$is_dbw_anomaly && !$is_xrq_anomaly
+                && $has_pressure_for_override
+                && defined $runq_width_cores_for_override) {
+
+                $runq_envelope_override = 1;
+                $runq_envelope_basis = $runq_width_cores_for_override;
+
+                # Extend env_max to permit the RunQ-derived VP requirement
+                my $extended_max = $rvcpu_raw;
+                $extended_max = $MICRO_PARTITION_RUNQ_MAX_VP_CAP if ($extended_max > $MICRO_PARTITION_RUNQ_MAX_VP_CAP);
+                $rvcpu_max = $extended_max;
+
+                # Re-apply clamp with new envelope
+                $rvcpu_final = $rvcpu_raw;
+                $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
+                $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
+            }
+
+    return {
+        rvcpu_min              => $rvcpu_min,
+        rvcpu_max              => $rvcpu_max,
+        rvcpu_final            => $rvcpu_final,
+        orig_rvcpu_min         => $orig_rvcpu_min,
+        orig_rvcpu_max         => $orig_rvcpu_max,
+        runq_envelope_override => $runq_envelope_override,
+        runq_envelope_basis    => $runq_envelope_basis,
+        micro_expansion_note   => $micro_expansion_note,
+    };
+}
+
 sub calculate_runq_modified_physc
 {
     my ($vm_name, $vm_map_ref, $profile_ref, $pressure_flags_href, $adaptive_thresholds_href) = @_;
@@ -6341,61 +6506,13 @@ sub calculate_runq_modified_physc
             $rvcpu_raw = int($required_cores);
             $rvcpu_raw++ if ($required_cores > $rvcpu_raw); # ceil
 
-            # Vendor envelope from rENT_P_for_envelope (planning entitlement, pre-MaxCPU-sanity).
-            # This ensures the VP envelope reflects workload demand, not current environment limits.
-            my $min_v = $rENT_P_for_envelope * $VCPU_RATIO_MIN;
-            my $max_v = $rENT_P_for_envelope * $VCPU_RATIO_MAX;
-            $rvcpu_min = int($min_v); $rvcpu_min++ if ($min_v > $rvcpu_min);
-            $rvcpu_max = int($max_v); $rvcpu_max++ if ($max_v > $rvcpu_max);
-
-            # Enforce minimum VP floor (evenisation removed - odd VP counts now permitted)
-            if (defined $rvcpu_min) {
-                $rvcpu_min = 1 if ($rvcpu_min < 1);
-            }
-            if (defined $rvcpu_max) {
-                $rvcpu_max = 1 if ($rvcpu_max < 1);
-                $rvcpu_max = $rvcpu_min if (defined $rvcpu_min && $rvcpu_max < $rvcpu_min);
-            }
-
-            # Micro-partition envelope expansion (evidence-gated).
-            # For rENT_P < 1.0 with env_max = 1, expand to floor of 2 when RunQ demands it.
-            # This ensures micro-partitions are not locked to a single VP when dispatch
-            # evidence shows concurrency demand. The gate (rvcpu_raw > rvcpu_max) prevents
-            # unnecessary expansion for genuinely low-concurrency workloads.
-            if (defined $rENT_P_for_envelope
-                && $rENT_P_for_envelope > 0
-                && $rENT_P_for_envelope < $VCPU_MICRO_PARTITION_THRESHOLD
-                && defined $rvcpu_max
-                && $rvcpu_max < $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR
-                && defined $rvcpu_raw
-                && $rvcpu_raw > $rvcpu_max) {
-                my $original_env_max = $rvcpu_max;
-                $rvcpu_max = $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR;
-                # Respect MaxCPU as absolute ceiling
-                if (defined $max_cpu_for_lpar_numeric && $max_cpu_for_lpar_numeric > 0 && $rvcpu_max > $max_cpu_for_lpar_numeric) {
-                    $rvcpu_max = int($max_cpu_for_lpar_numeric);
-                }
-                if ($rvcpu_max > $original_env_max) {
-                    $debug_info{'MicroPartitionEnvExpansion'} = sprintf(
-                        "Envelope max expanded %d -> %d (micro-partition floor; rENT_P=%.2f, RunQ demand=%d VPs > ratio max=%d)",
-                        $original_env_max, $rvcpu_max, $rENT_P_for_envelope, $rvcpu_raw, $original_env_max);
-                }
-            }
-
-            # Track original envelope for rationale (before any override)
-            ($orig_rvcpu_min, $orig_rvcpu_max) = ($rvcpu_min, $rvcpu_max);
-
-            # Clamp
-            $rvcpu_final = $rvcpu_raw;
-            $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
-            $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
-
-            # Low-entitlement sanity rules
-            $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
-            if (defined $rENT_P && $rENT_P >= 0.5 && $rENT_P < 1.0) {
-                $rvcpu_final = $VCPU_MIN_FOR_ENT_GE_0_5_LT_1 if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_FOR_ENT_GE_0_5_LT_1);
-            }
-
+            # ------------------------------------------------------------------
+            # Peak-aware floor VALUE (rENT-independent). Hoisted above the
+            # strategic envelope/clamp below so the A1 convergence loop can
+            # re-derive the envelope for a trial planning rENT without
+            # recomputing this. Sets $p99w1_floor_vcpu / $p99w1_factor_eff /
+            # $p99w1_mult / $runnable_density.
+            # ------------------------------------------------------------------
             # Peak-aware floor from P-99W1 (mandatory helper profile)
             if (defined $pure_p99w1_physc && looks_like_number($pure_p99w1_physc) && $pure_p99w1_physc > 0) {
                 # RunQ runnable-density assessment of the P99W1 peak.
@@ -6499,60 +6616,37 @@ sub calculate_runq_modified_physc
                 if (defined $p99w1_floor_vcpu) {
                     $p99w1_floor_vcpu = 1 if ($p99w1_floor_vcpu < 1);
                 }
-
-                if (defined $p99w1_floor_vcpu && defined $rvcpu_final && $p99w1_floor_vcpu > $rvcpu_final) {
-                    $rvcpu_final = $p99w1_floor_vcpu;
-                    $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && defined $rvcpu_final && $rvcpu_final > $rvcpu_max);
-                }
             }
 
-            # Enforce minimum (evenisation removed)
-            $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
-
-            # ================================================================
-            # LAYER 5a: Micro-partition RunQ Envelope Override
-            # ================================================================
-            # When rENT_P < threshold and RunQ strongly exceeds PhysC (runnable_density > threshold),
-            # and the RunQ-derived VP requirement exceeds the envelope max,
-            # expand the envelope to accommodate the RunQ evidence.
-            # This addresses scheduling disadvantage in tiny partitions.
-            # ================================================================
-            my $runq_width_cores_for_override = undef;
-
-            # Calculate RunQ-derived core requirement for comparison
-            if (defined $runq_hi_threads && defined $smt_for_vcpu && $smt_for_vcpu > 0) {
-                $runq_width_cores_for_override = $runq_hi_threads / $smt_for_vcpu;
-            }
-
-            # Check DBW/XRQ anomaly state (do not apply override if pathological)
-            my $is_dbw_anomaly = (defined $debug_info{'RunQ_Potential'} && $debug_info{'RunQ_Potential'} =~ /ANOMALY.*DBW/i);
-            my $is_xrq_anomaly = (defined $debug_info{'RunQ_Potential'} && $debug_info{'RunQ_Potential'} =~ /ANOMALY.*XRQ/i);
-
-            # Check pressure flags - use per-profile detection (not overall flags which can miss cases)
-            my $has_pressure_for_override =
-                (defined $debug_info{'IsRunQPressure'} && $debug_info{'IsRunQPressure'} eq "True") ||
-                (defined $debug_info{'IsWorkloadPressure'} && $debug_info{'IsWorkloadPressure'} eq "True");
-
-            if (   defined $rENT_P && $rENT_P > 0 && $rENT_P < $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH
-                && defined $runnable_density && $runnable_density > $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH
-                && defined $rvcpu_raw && defined $rvcpu_max && $rvcpu_raw > $rvcpu_max
-                && !$is_dbw_anomaly && !$is_xrq_anomaly
-                && $has_pressure_for_override
-                && defined $runq_width_cores_for_override) {
-
-                $runq_envelope_override = 1;
-                $runq_envelope_basis = $runq_width_cores_for_override;
-
-                # Extend env_max to permit the RunQ-derived VP requirement
-                my $extended_max = $rvcpu_raw;
-                $extended_max = $MICRO_PARTITION_RUNQ_MAX_VP_CAP if ($extended_max > $MICRO_PARTITION_RUNQ_MAX_VP_CAP);
-                $rvcpu_max = $extended_max;
-
-                # Re-apply clamp with new envelope
-                $rvcpu_final = $rvcpu_raw;
-                $rvcpu_final = $rvcpu_min if (defined $rvcpu_min && $rvcpu_final < $rvcpu_min);
-                $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
-            }
+            # ------------------------------------------------------------------
+            # Strategic rVCPU envelope + clamp + Layer-5a override (A0 kernel).
+            # Side-effect-free: given the trial planning rENT and the
+            # rENT-independent evidence above, returns the envelope and the
+            # clamped/overridden strategic rVCPU. Diagnostics are returned and
+            # mirrored into %debug_info here. Authoritative path only.
+            # ------------------------------------------------------------------
+            my $strat = _strategic_rvcpu_envelope({
+                rent_p               => $rENT_P,
+                rent_for_envelope    => $rENT_P_for_envelope,
+                rvcpu_raw            => $rvcpu_raw,
+                p99w1_floor_vcpu     => $p99w1_floor_vcpu,
+                runnable_density     => $runnable_density,
+                runq_hi_threads      => $runq_hi_threads,
+                smt                  => $smt_for_vcpu,
+                max_cpu              => $max_cpu_for_lpar_numeric,
+                runq_potential       => $debug_info{'RunQ_Potential'},
+                is_runq_pressure     => $debug_info{'IsRunQPressure'},
+                is_workload_pressure => $debug_info{'IsWorkloadPressure'},
+            });
+            $rvcpu_min              = $strat->{rvcpu_min};
+            $rvcpu_max              = $strat->{rvcpu_max};
+            $rvcpu_final            = $strat->{rvcpu_final};
+            $orig_rvcpu_min         = $strat->{orig_rvcpu_min};
+            $orig_rvcpu_max         = $strat->{orig_rvcpu_max};
+            $runq_envelope_override = $strat->{runq_envelope_override};
+            $runq_envelope_basis    = $strat->{runq_envelope_basis};
+            $debug_info{'MicroPartitionEnvExpansion'} = $strat->{micro_expansion_note}
+                if (defined $strat->{micro_expansion_note});
 
             # ================================================================
             # LAYER 5: Conditional Dispatch Reserve (Dynamic Scaling)
