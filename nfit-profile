@@ -4753,6 +4753,131 @@ sub _resolve_runq_source_profile {
     return ($name, sprintf("%s (%s)", $name, $provenance));
 }
 
+# --- _compute_entbounded_and_tactical -------------------------------------
+# Centralised decision logic for the two entitlement-relative rVCPU outputs:
+#   * rVCPU_EntBounded (Task 3) - the target implementable now with current
+#     entitlement held as a lower bound; also its governing-term string and
+#     its needs-coordinated-change flag.
+#   * rVCPU_Tactical   (Task 4) - the tier-aware, rate-limited step for the
+#     current cycle; also its explanatory note.
+#
+# This block was previously triplicated verbatim across
+# calculate_runq_modified_physc(), _execute_multiplicative_seasonal() and the
+# _write_standard_csv_report() fallback recompute. The three copies were
+# byte-identical apart from comments and the sourcing of the current VP count,
+# so they are collapsed here with no behavioural change (Task 6, narrow scope:
+# the entitlement-safe and rate-limited tail only; the upstream envelope,
+# peak-floor and reserve chain deliberately stays per-site because it is NOT
+# identical across the three).
+#
+# Scope boundary: this routine performs decision logic only. It never sources
+# or recomputes an input. Each caller resolves its own envelope terms, current
+# entitlement and current VP count, and keeps its own persistence, CSV row
+# assembly and debug_info mirror. Callers that do not compute a given term
+# pass undef, exactly as the in-line code did.
+#
+# In (hashref):
+#   rvcpu_raw            - RunQ dispatch-sized VP count (may be undef)
+#   rvcpu_min            - envelope minimum VPs (may be undef)
+#   rvcpu_final          - coordinated rVCPU (may be undef)
+#   p99w1_floor_vcpu     - peak-derived VP floor (may be undef)
+#   rvcpu_tier_num       - tier number (1..4) driving the step fraction
+#   vp_current_ent_floor - ceil(current entitlement), or VP_Min when stale
+#   current_ent_stale    - 1 when current entitlement was unavailable/stale
+#   current_vp_numeric   - current VP count, or undef when unavailable
+#
+# Out (hashref):
+#   entbounded, entbounded_governed, entbounded_needs_coordinated_change,
+#   tactical, tactical_note
+# ---------------------------------------------------------------------------
+sub _compute_entbounded_and_tactical
+{
+    my ($terms) = @_;
+    $terms = {} unless (defined $terms && ref($terms) eq 'HASH');
+
+    # Bind resolved inputs to the same names the original in-line code used, so
+    # the decision logic below is a verbatim move (guards against transcription
+    # drift during centralisation).
+    my $rvcpu_raw            = $terms->{rvcpu_raw};
+    my $rvcpu_min            = $terms->{rvcpu_min};
+    my $rvcpu_final          = $terms->{rvcpu_final};
+    my $p99w1_floor_vcpu     = $terms->{p99w1_floor_vcpu};
+    my $rvcpu_tier_num       = $terms->{rvcpu_tier_num};
+    my $vp_current_ent_floor = $terms->{vp_current_ent_floor};
+    my $current_ent_stale    = $terms->{current_ent_stale};
+    my $current_vp_numeric   = $terms->{current_vp_numeric};
+
+    # max() includes $rvcpu_final (the coordinated rVCPU) so rVCPU_EntBounded
+    # >= rVCPU holds by construction in every case, including upsize scenarios
+    # where current entitlement is below recommended.
+    my $rvcpu_entbounded = max(grep { defined $_ } ($vp_current_ent_floor, $rvcpu_raw, $p99w1_floor_vcpu, $rvcpu_final));
+
+    my $entbounded_governed;
+    if (defined $vp_current_ent_floor && $rvcpu_entbounded == $vp_current_ent_floor) {
+        $entbounded_governed = $current_ent_stale
+            ? sprintf("Minimum VPs from rENT_P (%s) [current entitlement unavailable]", $rvcpu_min // 'N/A')
+            : sprintf("Current entitlement floor (%d)", $vp_current_ent_floor);
+    } elsif (defined $p99w1_floor_vcpu && $rvcpu_entbounded == $p99w1_floor_vcpu) {
+        $entbounded_governed = sprintf("Peak floor (%d)", $p99w1_floor_vcpu);
+    } elsif (defined $rvcpu_raw && $rvcpu_entbounded == $rvcpu_raw) {
+        $entbounded_governed = sprintf("RunQ dispatch sizing (%d)", $rvcpu_raw);
+    } else {
+        $entbounded_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
+    }
+
+    # TRUE when the coordinated rVCPU is lower than EntBounded: reaching the
+    # coordinated figure needs entitlement to actually move first, not just VPs.
+    my $entbounded_needs_coordinated_change =
+        (defined $rvcpu_final && $rvcpu_entbounded > $rvcpu_final) ? 1 : 0;
+
+    # ================================================================
+    # Task 4: Tier-aware rate limiting on VP reduction (rVCPU_Tactical)
+    # ================================================================
+    # Steps CURRENT VPs toward rVCPU_EntBounded, limited per cycle by tier
+    # appetite (strictest for P/tier-1, most permissive for tiers 3-4).
+    # Never steps below the strategic target (EntBounded) and never steps
+    # up - upward moves follow entitlement, not this rate limiter.
+    my $rvcpu_tactical;
+    my $tactical_note;
+    if (!defined $current_vp_numeric) {
+        # Watch for: current VP count unavailable. No safe step can be computed
+        # without a starting point - hold at EntBounded (the most conservative,
+        # already-validated figure) rather than inventing a step.
+        $rvcpu_tactical = $rvcpu_entbounded;
+        $tactical_note = "current VP count unavailable - held at rVCPU_EntBounded";
+    } elsif ($rvcpu_entbounded >= $current_vp_numeric) {
+        # No reduction due (or an upsize scenario). Upward moves follow
+        # entitlement, not this rate limiter, so hold at current VPs.
+        $rvcpu_tactical = $current_vp_numeric;
+        $tactical_note = "no reduction due; upward moves follow entitlement";
+    } else {
+        my $step_fraction = $VCPU_TIER_STAGE1_STEP_FRACTION{$rvcpu_tier_num} // $VCPU_TIER_STAGE1_STEP_FRACTION{3};
+        my $reduction_needed = $current_vp_numeric - $rvcpu_entbounded;
+        my $max_step = $step_fraction * $current_vp_numeric;
+        $max_step = $VCPU_TIER_STAGE1_STEP_MIN_VP if ($max_step < $VCPU_TIER_STAGE1_STEP_MIN_VP);
+        my $step = ($reduction_needed < $max_step) ? $reduction_needed : $max_step;
+
+        my $rvcpu_tactical_raw = $current_vp_numeric - $step;
+        $rvcpu_tactical = int($rvcpu_tactical_raw);
+        $rvcpu_tactical++ if ($rvcpu_tactical_raw > $rvcpu_tactical); # ceil: never remove more than budgeted
+
+        # Never step below the strategic target. Guaranteed by construction
+        # above (step <= reduction_needed); re-asserted as a hard clamp.
+        $rvcpu_tactical = $rvcpu_entbounded if ($rvcpu_tactical < $rvcpu_entbounded);
+
+        $tactical_note = sprintf("stepped %.2f of %.2f VPs needed (tier %s cap %.0f%%)",
+            $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
+    }
+
+    return {
+        entbounded                          => $rvcpu_entbounded,
+        entbounded_governed                 => $entbounded_governed,
+        entbounded_needs_coordinated_change => $entbounded_needs_coordinated_change,
+        tactical                            => $rvcpu_tactical,
+        tactical_note                       => $tactical_note,
+    };
+}
+
 # --- calculate_runq_modified_physc (with enhanced efficiency logic and detailed debug output) ---
 # Calculates the final PhysC value for a profile after applying efficiency factors
 # and RunQ-driven additive CPU adjustments.
@@ -6545,70 +6670,30 @@ sub calculate_runq_modified_physc
             $vp_current_ent_floor++ if ($current_ent_numeric > $vp_current_ent_floor); # ceil
         }
 
-        # max() includes $rvcpu_final (the coordinated rVCPU) so rVCPU_EntBounded
-        # >= rVCPU holds by construction in every case, including upsize scenarios
-        # where current entitlement is below recommended.
-        my $rvcpu_entbounded = max(grep { defined $_ } ($vp_current_ent_floor, $rvcpu_raw, $p99w1_floor_vcpu, $rvcpu_final));
-
-        my $entbounded_governed;
-        if (defined $vp_current_ent_floor && $rvcpu_entbounded == $vp_current_ent_floor) {
-            $entbounded_governed = $current_ent_stale
-                ? sprintf("Minimum VPs from rENT_P (%s) [current entitlement unavailable]", $rvcpu_min // 'N/A')
-                : sprintf("Current entitlement floor (%d)", $vp_current_ent_floor);
-        } elsif (defined $p99w1_floor_vcpu && $rvcpu_entbounded == $p99w1_floor_vcpu) {
-            $entbounded_governed = sprintf("Peak floor (%d)", $p99w1_floor_vcpu);
-        } elsif (defined $rvcpu_raw && $rvcpu_entbounded == $rvcpu_raw) {
-            $entbounded_governed = sprintf("RunQ dispatch sizing (%d)", $rvcpu_raw);
-        } else {
-            $entbounded_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
-        }
-
-        # TRUE when the coordinated rVCPU is lower than EntBounded: reaching the
-        # coordinated figure needs entitlement to actually move first, not just VPs.
-        my $entbounded_needs_coordinated_change =
-            (defined $rvcpu_final && $rvcpu_entbounded > $rvcpu_final) ? 1 : 0;
-
-        # ================================================================
-        # Task 4: Tier-aware rate limiting on VP reduction (rVCPU_Tactical)
-        # ================================================================
-        # Steps CURRENT VPs toward rVCPU_EntBounded, limited per cycle by tier
-        # appetite (strictest for P/tier-1, most permissive for tiers 3-4).
-        # Never steps below the strategic target (EntBounded) and never steps
-        # up - upward moves follow entitlement, not this rate limiter.
+        # Current VP count for the rate limiter (Task 4). Sourced here, on this
+        # path, and reused for persistence below; passed into the centralised
+        # decision helper rather than recomputed inside it.
         my $current_vp_numeric = (defined $vcpu_for_lpar_numeric && looks_like_number($vcpu_for_lpar_numeric) && $vcpu_for_lpar_numeric > 0)
                                 ? ($vcpu_for_lpar_numeric + 0) : undef;
 
-        my $rvcpu_tactical;
-        my $tactical_note;
-        if (!defined $current_vp_numeric) {
-            # Watch for: current VP count unavailable. No safe step can be computed
-            # without a starting point - hold at EntBounded (the most conservative,
-            # already-validated figure) rather than inventing a step.
-            $rvcpu_tactical = $rvcpu_entbounded;
-            $tactical_note = "current VP count unavailable - held at rVCPU_EntBounded";
-        } elsif ($rvcpu_entbounded >= $current_vp_numeric) {
-            # No reduction due (or an upsize scenario). Upward moves follow
-            # entitlement, not this rate limiter, so hold at current VPs.
-            $rvcpu_tactical = $current_vp_numeric;
-            $tactical_note = "no reduction due; upward moves follow entitlement";
-        } else {
-            my $step_fraction = $VCPU_TIER_STAGE1_STEP_FRACTION{$rvcpu_tier_num} // $VCPU_TIER_STAGE1_STEP_FRACTION{3};
-            my $reduction_needed = $current_vp_numeric - $rvcpu_entbounded;
-            my $max_step = $step_fraction * $current_vp_numeric;
-            $max_step = $VCPU_TIER_STAGE1_STEP_MIN_VP if ($max_step < $VCPU_TIER_STAGE1_STEP_MIN_VP);
-            my $step = ($reduction_needed < $max_step) ? $reduction_needed : $max_step;
-
-            my $rvcpu_tactical_raw = $current_vp_numeric - $step;
-            $rvcpu_tactical = int($rvcpu_tactical_raw);
-            $rvcpu_tactical++ if ($rvcpu_tactical_raw > $rvcpu_tactical); # ceil: never remove more than budgeted
-
-            # Never step below the strategic target. Guaranteed by construction
-            # above (step <= reduction_needed); re-asserted as a hard clamp.
-            $rvcpu_tactical = $rvcpu_entbounded if ($rvcpu_tactical < $rvcpu_entbounded);
-
-            $tactical_note = sprintf("stepped %.2f of %.2f VPs needed (tier %s cap %.0f%%)",
-                $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
-        }
+        # Task 3 (rVCPU_EntBounded) + Task 4 (rVCPU_Tactical): centralised so the
+        # entitlement-safe and rate-limited tail cannot drift across the three
+        # rVCPU paths. Envelope terms above are passed in unchanged.
+        my $rvcpu_ebt = _compute_entbounded_and_tactical({
+            rvcpu_raw            => $rvcpu_raw,
+            rvcpu_min            => $rvcpu_min,
+            rvcpu_final          => $rvcpu_final,
+            p99w1_floor_vcpu     => $p99w1_floor_vcpu,
+            rvcpu_tier_num       => $rvcpu_tier_num,
+            vp_current_ent_floor => $vp_current_ent_floor,
+            current_ent_stale    => $current_ent_stale,
+            current_vp_numeric   => $current_vp_numeric,
+        });
+        my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
+        my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
+        my $entbounded_needs_coordinated_change = $rvcpu_ebt->{entbounded_needs_coordinated_change};
+        my $rvcpu_tactical                      = $rvcpu_ebt->{tactical};
+        my $tactical_note                       = $rvcpu_ebt->{tactical_note};
 
         # Persist for CSV and rationale consumers
         $vm_map_ref->{CoreResults}{Profile_rVCPU}{$profile_name} = defined($rvcpu_final) ? $rvcpu_final : '';
@@ -9402,59 +9487,34 @@ sub _write_standard_csv_report {
                         $vp_current_ent_floor++ if ($current_ent_numeric > $vp_current_ent_floor); # ceil
                     }
 
-                    my $rvcpu_entbounded = max(grep { defined $_ } ($vp_current_ent_floor, $rvcpu_raw, $p99w1_floor_vcpu, $rvcpu_final));
-
-                    my $entbounded_governed;
-                    if (defined $vp_current_ent_floor && $rvcpu_entbounded == $vp_current_ent_floor) {
-                        $entbounded_governed = $current_ent_stale
-                            ? sprintf("Minimum VPs from rENT_P (%s) [current entitlement unavailable]", $rvcpu_min // 'N/A')
-                            : sprintf("Current entitlement floor (%d)", $vp_current_ent_floor);
-                    } elsif (defined $p99w1_floor_vcpu && $rvcpu_entbounded == $p99w1_floor_vcpu) {
-                        $entbounded_governed = sprintf("Peak floor (%d)", $p99w1_floor_vcpu);
-                    } elsif (defined $rvcpu_raw && $rvcpu_entbounded == $rvcpu_raw) {
-                        $entbounded_governed = sprintf("RunQ dispatch sizing (%d)", $rvcpu_raw);
-                    } else {
-                        $entbounded_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
-                    }
-
-                    my $entbounded_needs_coordinated_change =
-                        (defined $rvcpu_final && $rvcpu_entbounded > $rvcpu_final) ? 1 : 0;
-
                     # ================================================================
                     # Task 4: Tier-aware rate limiting on VP reduction (CSV fallback path)
                     # ================================================================
+                    # Current VP count for the rate limiter. Sourced here, on this
+                    # path, and reused for persistence below; passed into the
+                    # centralised decision helper rather than recomputed inside it.
                     my $current_vp_numeric = (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus}) && $cfg->{virtual_cpus} > 0)
                                             ? ($cfg->{virtual_cpus} + 0) : undef;
 
-                    my $rvcpu_tactical;
-                    my $tactical_note;
-                    if (!defined $current_vp_numeric) {
-                        # Watch for: current VP count unavailable. Hold at EntBounded rather
-                        # than inventing a step.
-                        $rvcpu_tactical = $rvcpu_entbounded;
-                        $tactical_note = "current VP count unavailable - held at rVCPU_EntBounded";
-                    } elsif ($rvcpu_entbounded >= $current_vp_numeric) {
-                        # No reduction due (or an upsize scenario). Upward moves follow
-                        # entitlement, not this rate limiter, so hold at current VPs.
-                        $rvcpu_tactical = $current_vp_numeric;
-                        $tactical_note = "no reduction due; upward moves follow entitlement";
-                    } else {
-                        my $step_fraction = $VCPU_TIER_STAGE1_STEP_FRACTION{$rvcpu_tier_num} // $VCPU_TIER_STAGE1_STEP_FRACTION{3};
-                        my $reduction_needed = $current_vp_numeric - $rvcpu_entbounded;
-                        my $max_step = $step_fraction * $current_vp_numeric;
-                        $max_step = $VCPU_TIER_STAGE1_STEP_MIN_VP if ($max_step < $VCPU_TIER_STAGE1_STEP_MIN_VP);
-                        my $step = ($reduction_needed < $max_step) ? $reduction_needed : $max_step;
-
-                        my $rvcpu_tactical_raw = $current_vp_numeric - $step;
-                        $rvcpu_tactical = int($rvcpu_tactical_raw);
-                        $rvcpu_tactical++ if ($rvcpu_tactical_raw > $rvcpu_tactical); # ceil: never remove more than budgeted
-
-                        # Never step below the strategic target (re-asserted as a hard clamp).
-                        $rvcpu_tactical = $rvcpu_entbounded if ($rvcpu_tactical < $rvcpu_entbounded);
-
-                        $tactical_note = sprintf("stepped %.2f of %.2f VPs needed (tier %s cap %.0f%%)",
-                            $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
-                    }
+                    # Task 3 (rVCPU_EntBounded) + Task 4 (rVCPU_Tactical): centralised
+                    # so the entitlement-safe and rate-limited tail cannot drift across
+                    # the three rVCPU paths. This fallback path's envelope terms above
+                    # are passed in unchanged.
+                    my $rvcpu_ebt = _compute_entbounded_and_tactical({
+                        rvcpu_raw            => $rvcpu_raw,
+                        rvcpu_min            => $rvcpu_min,
+                        rvcpu_final          => $rvcpu_final,
+                        p99w1_floor_vcpu     => $p99w1_floor_vcpu,
+                        rvcpu_tier_num       => $rvcpu_tier_num,
+                        vp_current_ent_floor => $vp_current_ent_floor,
+                        current_ent_stale    => $current_ent_stale,
+                        current_vp_numeric   => $current_vp_numeric,
+                    });
+                    my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
+                    my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
+                    my $entbounded_needs_coordinated_change = $rvcpu_ebt->{entbounded_needs_coordinated_change};
+                    my $rvcpu_tactical                      = $rvcpu_ebt->{tactical};
+                    my $tactical_note                       = $rvcpu_ebt->{tactical_note};
 
                     # Persist rVCPU + explain so rationale can print an audit trail
                     $vm_map_ref->{CoreResults}{Profile_rVCPU}{$pname} = $rvcpu_final;
@@ -19455,61 +19515,37 @@ sub _execute_multiplicative_seasonal {
                 $vp_current_ent_floor++ if ($current_ent_numeric > $vp_current_ent_floor); # ceil
             }
 
-            my $rvcpu_entbounded = max(grep { defined $_ } ($vp_current_ent_floor, $rvcpu_raw, $p99w1_floor_vcpu, $rvcpu_final));
-
-            my $entbounded_governed;
-            if (defined $vp_current_ent_floor && $rvcpu_entbounded == $vp_current_ent_floor) {
-                $entbounded_governed = $current_ent_stale
-                    ? sprintf("Minimum VPs from rENT_P (%s) [current entitlement unavailable]", $rvcpu_min // 'N/A')
-                    : sprintf("Current entitlement floor (%d)", $vp_current_ent_floor);
-            } elsif (defined $p99w1_floor_vcpu && $rvcpu_entbounded == $p99w1_floor_vcpu) {
-                $entbounded_governed = sprintf("Peak floor (%d)", $p99w1_floor_vcpu);
-            } elsif (defined $rvcpu_raw && $rvcpu_entbounded == $rvcpu_raw) {
-                $entbounded_governed = sprintf("RunQ dispatch sizing (%d)", $rvcpu_raw);
-            } else {
-                $entbounded_governed = sprintf("Coordinated rVCPU (%d)", $rvcpu_final // 0);
-            }
-
-            my $entbounded_needs_coordinated_change =
-                (defined $rvcpu_final && $rvcpu_entbounded > $rvcpu_final) ? 1 : 0;
-
             # ================================================================
             # Task 4: Tier-aware rate limiting on VP reduction (seasonal path)
             # ================================================================
+            # Current VP count for the rate limiter. Sourced here, on this path,
+            # and reused for persistence below; passed into the centralised
+            # decision helper rather than recomputed inside it.
             my $current_vp_numeric = (defined $vm_map_ref->{Configuration}{virtual_cpus}
                                        && looks_like_number($vm_map_ref->{Configuration}{virtual_cpus})
                                        && $vm_map_ref->{Configuration}{virtual_cpus} > 0)
                                     ? ($vm_map_ref->{Configuration}{virtual_cpus} + 0) : undef;
 
-            my $rvcpu_tactical;
-            my $tactical_note;
-            if (!defined $current_vp_numeric) {
-                # Watch for: current VP count unavailable. Hold at EntBounded rather
-                # than inventing a step.
-                $rvcpu_tactical = $rvcpu_entbounded;
-                $tactical_note = "current VP count unavailable - held at rVCPU_EntBounded";
-            } elsif ($rvcpu_entbounded >= $current_vp_numeric) {
-                # No reduction due (or an upsize scenario). Upward moves follow
-                # entitlement, not this rate limiter, so hold at current VPs.
-                $rvcpu_tactical = $current_vp_numeric;
-                $tactical_note = "no reduction due; upward moves follow entitlement";
-            } else {
-                my $step_fraction = $VCPU_TIER_STAGE1_STEP_FRACTION{$rvcpu_tier_num} // $VCPU_TIER_STAGE1_STEP_FRACTION{3};
-                my $reduction_needed = $current_vp_numeric - $rvcpu_entbounded;
-                my $max_step = $step_fraction * $current_vp_numeric;
-                $max_step = $VCPU_TIER_STAGE1_STEP_MIN_VP if ($max_step < $VCPU_TIER_STAGE1_STEP_MIN_VP);
-                my $step = ($reduction_needed < $max_step) ? $reduction_needed : $max_step;
-
-                my $rvcpu_tactical_raw = $current_vp_numeric - $step;
-                $rvcpu_tactical = int($rvcpu_tactical_raw);
-                $rvcpu_tactical++ if ($rvcpu_tactical_raw > $rvcpu_tactical); # ceil: never remove more than budgeted
-
-                # Never step below the strategic target (re-asserted as a hard clamp).
-                $rvcpu_tactical = $rvcpu_entbounded if ($rvcpu_tactical < $rvcpu_entbounded);
-
-                $tactical_note = sprintf("stepped %.2f of %.2f VPs needed (tier %s cap %.0f%%)",
-                    $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
-            }
+            # Task 3 (rVCPU_EntBounded) + Task 4 (rVCPU_Tactical): centralised so
+            # the entitlement-safe and rate-limited tail cannot drift across the
+            # three rVCPU paths. The seasonal envelope terms above are passed in
+            # unchanged (the seasonal path still recomputes rVCPU from its own
+            # baseline without the full modifier chain; only this tail is shared).
+            my $rvcpu_ebt = _compute_entbounded_and_tactical({
+                rvcpu_raw            => $rvcpu_raw,
+                rvcpu_min            => $rvcpu_min,
+                rvcpu_final          => $rvcpu_final,
+                p99w1_floor_vcpu     => $p99w1_floor_vcpu,
+                rvcpu_tier_num       => $rvcpu_tier_num,
+                vp_current_ent_floor => $vp_current_ent_floor,
+                current_ent_stale    => $current_ent_stale,
+                current_vp_numeric   => $current_vp_numeric,
+            });
+            my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
+            my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
+            my $entbounded_needs_coordinated_change = $rvcpu_ebt->{entbounded_needs_coordinated_change};
+            my $rvcpu_tactical                      = $rvcpu_ebt->{tactical};
+            my $tactical_note                       = $rvcpu_ebt->{tactical_note};
 
             $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : "";
             $vm_map_ref->{CoreResults}{Profile_rVCPU_EntBounded}{$p_name} = $rvcpu_entbounded;
