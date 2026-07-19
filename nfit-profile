@@ -314,11 +314,25 @@ my $SMT_YIELD_CURVE_SOURCE  = 'configured-policy';
 my %SMT_YIELD_CURVE = ( 1 => 1.00, 2 => 1.45, 4 => 1.90, 8 => 2.35 );
 my @SMT_YIELD_POINTS;   # lazily built, sorted [k, y] - see _smt_yield
 
-# Fraction of estimated current throughput that must survive consolidation onto
-# fewer active cores. Keyed on $rvcpu_tier_num to match the existing rVCPU tier
-# convention (%VCPU_TIER_HEADROOM_FACTORS); tier 'P' collapses to 1 there.
-# Back-test candidates.
-my %TIER_THROUGHPUT_RETENTION = ( 1 => 0.95, 2 => 0.90, 3 => 0.85, 4 => 0.80 );
+# Fraction of estimated credible-peak throughput that must survive consolidation
+# onto fewer active cores. Unlike the other numeric rVCPU controls, P is an
+# explicit policy rung here: mission-critical workloads permit no intentional
+# peak-throughput compression. The numbered tiers use the initial conservative
+# ladder from the Tier-Aware CPU and VCPU Right-Sizing Policy Contract.
+#
+# These are configured POLICY assumptions and back-test candidates, not IBM
+# constants. Changing them changes the binding yield-aware VP floor and must be
+# versioned and estate-tested. The previous 0.95/0.90/0.85/0.80 ladder remains
+# recorded in history; it was considered too aggressive before PhysB and
+# outcome-based calibration because 80% throughput retention can translate into
+# materially more than a 20% reduction in active-core width after SMT packing.
+my %TIER_THROUGHPUT_RETENTION = (
+    'P' => 1.00,  # Mission-critical: preserve the complete credible peak
+     1  => 0.98,  # Performance-critical: near-complete peak protection
+     2  => 0.95,  # Business-important: high retention with healthy burst scope
+     3  => 0.92,  # Standard production: modest peak compression
+     4  => 0.90,  # Economy-led: stronger consolidation, still pressure-aware
+);
 
 # Micro-partition RunQ envelope override.
 # When a tiny partition (rENT < threshold) has strong RunQ evidence (runnable_density > threshold)
@@ -341,8 +355,10 @@ my %VCPU_TIER_HEADROOM_FACTORS = (
 
 # Task 4: Tier-aware rate limiting on VP reduction (rVCPU_Tactical).
 # Fraction of CURRENT VPs that may be removed in a single cycle, keyed on
-# $rvcpu_tier_num (tier 'P' collapses to 1, matching %TIER_THROUGHPUT_RETENTION
-# and %VCPU_TIER_HEADROOM_FACTORS above).
+# $rvcpu_tier_num. Tier 'P' continues to share the tier-1 tactical step and
+# RunQ-width headroom factor for this interim phase; only peak-throughput
+# retention now resolves P independently. Tactical-rate calibration is a
+# separate policy decision and is intentionally unchanged by this patch.
 #
 # This is the FOURTH place tier appetite appears in the rVCPU chain. It is
 # legitimate here because it governs CHANGE RATE, not sizing - a different
@@ -4734,6 +4750,52 @@ sub _yield_aware_active_core_floor {
 }
 
 # ==============================================================================
+# SUBROUTINE: _resolve_tier_throughput_retention
+# PURPOSE:    Resolve the configured credible-peak throughput-retention policy.
+#             P is deliberately distinct from numeric tier 1 for this control;
+#             the existing numeric tier remains valid for RunQ width and tactical
+#             rate limiting. Centralising this small resolution step prevents the
+#             authoritative, CSV-fallback and seasonal paths from drifting.
+# ARGUMENTS:  1. $tier_label  Final/profile tier label (P, O1, G3, B4, or a
+#                             profile name beginning with one of those labels)
+#             2. $tier_num    Existing numeric fallback (1..4)
+# RETURNS:    ($retention, $policy_key)
+# ==============================================================================
+sub _resolve_tier_throughput_retention {
+    my ($tier_label, $tier_num) = @_;
+
+    my $label = defined($tier_label) ? "$tier_label" : '';
+    $label =~ s/-.*$//;
+    $label = uc($label);
+
+    if ($label eq 'P') {
+        my $retention = $TIER_THROUGHPUT_RETENTION{'P'};
+        $retention = 1.00 unless (defined $retention && looks_like_number($retention));
+        $retention = 1.00 if ($retention > 1.00);
+        $retention = 0.01 if ($retention <= 0);
+        return ($retention + 0, 'P');
+    }
+
+    if ($label =~ /(\d)$/) {
+        $tier_num = $1;
+    }
+    $tier_num = 3
+        unless (defined $tier_num && looks_like_number($tier_num)
+                && $tier_num >= 1 && $tier_num <= 4);
+    $tier_num = int($tier_num);
+
+    my $retention = $TIER_THROUGHPUT_RETENTION{$tier_num};
+    $retention = $TIER_THROUGHPUT_RETENTION{3}
+        unless (defined $retention && looks_like_number($retention));
+    $retention = 0.92
+        unless (defined $retention && looks_like_number($retention));
+    $retention = 1.00 if ($retention > 1.00);
+    $retention = 0.01 if ($retention <= 0);
+
+    return ($retention + 0, "tier-$tier_num");
+}
+
+# ==============================================================================
 # SUBROUTINE: _resolve_peak_runnable_density
 # PURPOSE:    Return the PAIRED runnable-density estimate for the P99W1 peak:
 #             runnable threads per consumed thread slot, formed per sample by
@@ -6669,7 +6731,8 @@ sub calculate_runq_modified_physc
                     # estimated to be achieving now?
                     my $threads_per_core_peak = (defined $smt_for_vcpu && $smt_for_vcpu > 0)
                         ? ($runnable_density * $smt_for_vcpu) : undef;
-                    my $retention_eff = $TIER_THROUGHPUT_RETENTION{$rvcpu_tier_num} // 0.85;
+                    my ($retention_eff, $retention_policy_key) =
+                        _resolve_tier_throughput_retention($final_tier, $rvcpu_tier_num);
                     my ($yield_floor_cores, $yield_floor_reason) =
                         _yield_aware_active_core_floor($pure_p99w1_physc, $threads_per_core_peak, $retention_eff);
 
@@ -6678,6 +6741,7 @@ sub calculate_runq_modified_physc
                     }
                     $debug_info{'rVCPU_YieldFloorCores'}     = defined($yield_floor_cores) ? sprintf("%.2f", $yield_floor_cores) : 'N/A';
                     $debug_info{'rVCPU_YieldRetentionUsed'}  = sprintf("%.2f", $retention_eff);
+                    $debug_info{'rVCPU_YieldRetentionPolicy'} = $retention_policy_key;
                     $debug_info{'rVCPU_YieldFloorReason'}    = $yield_floor_reason // 'N/A';
 
                     # Retained for comparison only - see $VCPU_PEAK_CRED_DISCOUNT_ENABLED.
@@ -9875,10 +9939,12 @@ sub _write_standard_csv_report {
                             # workload is estimated to be achieving at its observed peak.
                             my $threads_per_core_peak = (defined $smt_used && $smt_used > 0)
                                 ? ($runnable_density * $smt_used) : undef;
+                            my ($retention_eff) =
+                                _resolve_tier_throughput_retention($csv_tier_str, $rvcpu_tier_num);
                             my ($yield_floor_cores) = _yield_aware_active_core_floor(
                                 $p99w1_cores,
                                 $threads_per_core_peak,
-                                ($TIER_THROUGHPUT_RETENTION{$rvcpu_tier_num} // 0.85)
+                                $retention_eff
                             );
                             $p99w1_adjusted = $yield_floor_cores if (defined $yield_floor_cores);
 
@@ -19944,10 +20010,12 @@ sub _execute_multiplicative_seasonal {
                         # rather than changed under a yield patch.
                         my $threads_per_core_peak = (defined $smt_used && $smt_used > 0)
                             ? ($runnable_density * $smt_used) : undef;
+                        my ($retention_eff) =
+                            _resolve_tier_throughput_retention($ms_tier_str, $rvcpu_tier_num);
                         my ($yield_floor_cores) = _yield_aware_active_core_floor(
                             $p99w1_cores,
                             $threads_per_core_peak,
-                            ($TIER_THROUGHPUT_RETENTION{$rvcpu_tier_num} // 0.85)
+                            $retention_eff
                         );
                         $p99w1_adjusted = $yield_floor_cores if (defined $yield_floor_cores);
 
