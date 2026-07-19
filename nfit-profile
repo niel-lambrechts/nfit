@@ -41,7 +41,7 @@ my $VERSION = '8.26.199.0';
 # Tier-aware CPU/VCPU right-sizing policy contract implemented by the
 # recommendation and rationale paths below. This identifies the semantic
 # policy; it is deliberately independent of the executable release version.
-my $RIGHTSIZING_POLICY_CONTRACT_VERSION = '0.2';
+my $RIGHTSIZING_POLICY_CONTRACT_VERSION = '0.2.1';
 
 # --- Seasonal Engine Version (Phase 4: Idempotency) ---
 # Bump this constant whenever anchoring semantics, fingerprint logic, or
@@ -2995,6 +2995,18 @@ sub log_profile_rationale
             ($policy_audit_for_log->{YieldCurveName} // 'N/A'),
             ($policy_audit_for_log->{YieldCurveVersion} // 'N/A'),
             ($policy_audit_for_log->{YieldCurveSource} // 'N/A');
+        printf {$fh} "Configured Pool Size                                   : %s cores\n",
+            ($policy_audit_for_log->{PoolSize} // 'N/A');
+        printf {$fh} "Measured Available Pool Capacity                       : %s cores\n",
+            ($policy_audit_for_log->{AvailablePoolCapacity} // 'N/A');
+        printf {$fh} "Pool Availability Status                              : %s\n",
+            ($policy_audit_for_log->{PoolAvailabilityStatus} // 'N/A');
+        printf {$fh} "Strategic Reachability                                 : %s cores (%s%s)\n",
+            ($policy_audit_for_log->{ProposedReachable} // 'N/A'),
+            ($policy_audit_for_log->{ProposedReachabilityBasis} // 'N/A'),
+            ($policy_audit_for_log->{ProposedReachableIsProxy} ? '; advisory proxy' : '');
+        printf {$fh} "Pool Evidence Note                                     : %s\n",
+            ($policy_audit_for_log->{PoolEvidenceNote} // 'N/A');
     }
     print {$fh} "----------------------------------------------------------------------\n";
     if ($model_type eq 'recency_decay') {
@@ -4988,13 +5000,83 @@ sub _resolve_tier_throughput_retention {
 }
 
 # ==============================================================================
+# SUBROUTINE: _resolve_pool_evidence
+# PURPOSE:    Keep configured pool geometry distinct from measured spare-pool
+#             availability. No availability telemetry is staged today, so the
+#             normal uncapped result is an explicitly-labelled advisory proxy:
+#             min(proposed VPs, configured pool size) when the pool ceiling is
+#             known, otherwise proposed VPs. This helper is audit-only in A2.6;
+#             it does not replace the existing sizing or invariant arithmetic.
+# ARGUMENTS:  hashref containing proposed_vcpu, proposed_entitlement,
+#             pool_size, available_pool_capacity and is_capped.
+# RETURNS:    hashref of distinct pool/reachability audit fields.
+# ==============================================================================
+sub _resolve_pool_evidence {
+    my ($terms) = @_;
+    $terms = {} unless (defined $terms && ref($terms) eq 'HASH');
+
+    my $vp = (defined $terms->{proposed_vcpu}
+              && looks_like_number($terms->{proposed_vcpu})
+              && $terms->{proposed_vcpu} > 0)
+           ? ($terms->{proposed_vcpu} + 0) : undef;
+    my $ent = (defined $terms->{proposed_entitlement}
+               && looks_like_number($terms->{proposed_entitlement})
+               && $terms->{proposed_entitlement} > 0)
+            ? ($terms->{proposed_entitlement} + 0) : undef;
+    my $pool_size = (defined $terms->{pool_size}
+                     && looks_like_number($terms->{pool_size})
+                     && $terms->{pool_size} > 0)
+                  ? ($terms->{pool_size} + 0) : undef;
+    my $available = (defined $terms->{available_pool_capacity}
+                     && looks_like_number($terms->{available_pool_capacity})
+                     && $terms->{available_pool_capacity} >= 0)
+                  ? ($terms->{available_pool_capacity} + 0) : undef;
+    my $is_capped = $terms->{is_capped} ? 1 : 0;
+
+    my ($status, $reachable, $basis, $note);
+    if ($is_capped) {
+        $status    = 'NOT_APPLICABLE';
+        $reachable = $ent;
+        $basis     = 'ENTITLEMENT';
+        $note      = 'capped LPAR: reachable capacity is the proposed entitlement';
+    } elsif (defined $available) {
+        $status    = 'MEASURED';
+        $reachable = defined($vp) ? min($vp, $available) : $available;
+        $basis     = 'MEASURED_AVAILABLE_POOL';
+        $note      = 'measured available pool capacity limits proposed VP reachability';
+    } elsif (defined $pool_size) {
+        $status    = 'UNKNOWN';
+        $reachable = defined($vp) ? min($vp, $pool_size) : $pool_size;
+        $basis     = 'CONFIGURED_POOL_CEILING_PROXY';
+        $note      = 'configured pool size is an architectural ceiling, not measured spare capacity';
+    } else {
+        $status    = 'UNKNOWN';
+        $reachable = $vp;
+        $basis     = 'PROPOSED_VCPU_PROXY';
+        $note      = 'pool size and spare-capacity telemetry unavailable; proposed VPs used as advisory proxy';
+    }
+
+    return {
+        PoolSize                  => defined($pool_size) ? sprintf('%.2f', $pool_size) : 'N/A',
+        AvailablePoolCapacity     => defined($available) ? sprintf('%.2f', $available) : 'N/A',
+        PoolAvailabilityStatus    => $status,
+        ProposedReachable         => defined($reachable) ? sprintf('%.2f', $reachable) : 'N/A',
+        ProposedReachabilityBasis => $basis,
+        ProposedReachableIsProxy  => (!$is_capped && !defined($available)) ? 1 : 0,
+        PoolEvidenceNote          => $note,
+    };
+}
+
+# ==============================================================================
 # SUBROUTINE: _build_rvcpu_policy_audit
 # PURPOSE:    Build calculation provenance and policy metadata for an rVCPU
 #             recommendation without participating in sizing. All execution
 #             paths persist this same shape so a planner can distinguish the
 #             authoritative, seasonal and CSV-fallback calculations.
 # ARGUMENTS:  hashref containing tier_label, tier_num, path,
-#             convergence_mode and overwrote_authoritative.
+#             convergence_mode, overwrote_authoritative, proposed_vcpu,
+#             proposed_entitlement, pool_size, optional
+#             available_pool_capacity, and is_capped.
 # RETURNS:    hashref suitable for Profile_rVCPU_Explain.
 # ==============================================================================
 sub _build_rvcpu_policy_audit {
@@ -5007,8 +5089,16 @@ sub _build_rvcpu_policy_audit {
     my ($dispatch_budget, $dispatch_policy) = _resolve_dispatch_budget($tier_label);
     my ($retention, $retention_policy) =
         _resolve_tier_throughput_retention($tier_label, $tier_num);
+    my $pool_evidence = _resolve_pool_evidence({
+        proposed_vcpu          => $terms->{proposed_vcpu},
+        proposed_entitlement   => $terms->{proposed_entitlement},
+        pool_size              => $terms->{pool_size},
+        available_pool_capacity => $terms->{available_pool_capacity},
+        is_capped              => $terms->{is_capped},
+    });
 
     return {
+        %{$pool_evidence},
         PolicyContractVersion      => $RIGHTSIZING_POLICY_CONTRACT_VERSION,
         RecommendationPath         => $terms->{path} // 'UNKNOWN',
         StrategicConvergenceMode   => $terms->{convergence_mode} // 'UNKNOWN',
@@ -8038,6 +8128,10 @@ sub calculate_runq_modified_physc
             path                    => 'AUTHORITATIVE',
             convergence_mode        => 'FULL',
             overwrote_authoritative => 0,
+            proposed_vcpu           => $rvcpu_final,
+            proposed_entitlement    => $rENT_P_for_envelope,
+            pool_size               => $pool_cpu_for_lpar_numeric,
+            is_capped               => $is_capped_lpar,
         });
 
         # Persist for CSV and rationale consumers
@@ -11029,6 +11123,10 @@ sub _write_standard_csv_report {
                         path                    => 'CSV_FALLBACK',
                         convergence_mode        => 'DIAGNOSTIC_ONLY',
                         overwrote_authoritative => 0,
+                        proposed_vcpu           => $rvcpu_final,
+                        proposed_entitlement    => $rENT_P,
+                        pool_size               => $fb_safety_pool,
+                        is_capped               => $fb_safety_capped,
                     });
 
                     # Persist rVCPU + explain so rationale can print an audit trail
@@ -11827,6 +11925,19 @@ sub log_multiplicative_seasonal_rationale
                     ($policy_audit->{YieldCurveName} // 'N/A'),
                     ($policy_audit->{YieldCurveVersion} // 'N/A'),
                     ($policy_audit->{YieldCurveSource} // 'N/A');
+                printf {$fh} "%-${label_width}s   : %s cores\n",
+                    "Configured Pool Size", ($policy_audit->{PoolSize} // 'N/A');
+                printf {$fh} "%-${label_width}s   : %s cores\n",
+                    "Measured Available Pool Capacity", ($policy_audit->{AvailablePoolCapacity} // 'N/A');
+                printf {$fh} "%-${label_width}s   : %s\n",
+                    "Pool Availability Status", ($policy_audit->{PoolAvailabilityStatus} // 'N/A');
+                printf {$fh} "%-${label_width}s   : %s cores (%s%s)\n",
+                    "Strategic Reachability",
+                    ($policy_audit->{ProposedReachable} // 'N/A'),
+                    ($policy_audit->{ProposedReachabilityBasis} // 'N/A'),
+                    ($policy_audit->{ProposedReachableIsProxy} ? '; advisory proxy' : '');
+                printf {$fh} "%-${label_width}s   : %s\n",
+                    "Pool Evidence Note", ($policy_audit->{PoolEvidenceNote} // 'N/A');
             }
             print {$fh} "----------------------------------------------------------------------\n";
             print {$fh} "  CPU Forecasting Model: Multiplicative Seasonal Forecast ($apply_seasonality_event)\n\n";
@@ -21264,6 +21375,10 @@ sub _execute_multiplicative_seasonal {
                 path                    => 'SEASONAL',
                 convergence_mode        => 'DIAGNOSTIC_ONLY',
                 overwrote_authoritative => 1,
+                proposed_vcpu           => $rvcpu_final,
+                proposed_entitlement    => $rENT_P,
+                pool_size               => $seas_safety_pool,
+                is_capped               => $seas_safety_capped,
             });
 
             $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : "";
