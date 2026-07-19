@@ -3683,7 +3683,19 @@ sub log_profile_rationale
             printf {$fh} "      Basis                                           : %s\n", $calc_debug_info_ref->{'BudgetFloorReason'};
             printf {$fh} "      Applied                                         : %s\n", ($calc_debug_info_ref->{'BudgetFloorApplied'} // 'No');
         }
-        printf {$fh} "  - Recommendation before Max Sanity Check             : %s cores\n",
+        if (defined $calc_debug_info_ref->{'GuaranteeConvergencePlannerVisible'}
+            && $calc_debug_info_ref->{'GuaranteeConvergencePlannerVisible'} eq 'Yes'
+            && defined $calc_debug_info_ref->{'GuaranteeConvergence'}
+            && $calc_debug_info_ref->{'GuaranteeConvergence'} ne '') {
+            printf {$fh} "  - Proposal-relative guarantee convergence            : %s\n",
+                $calc_debug_info_ref->{'GuaranteeConvergence'};
+        }
+        if (defined $calc_debug_info_ref->{'GuaranteeInvariantHolds'}
+            && $calc_debug_info_ref->{'GuaranteeInvariantHolds'} eq 'No') {
+            printf {$fh} "  - GUARANTEE INVARIANT FAILURE                        : %s\n",
+                ($calc_debug_info_ref->{'GuaranteeInvariant'} // 'No detail available');
+        }
+        printf {$fh} "  - Recommendation before Max Sanity Check             : %s cores\n", ($calc_debug_info_ref->{'PreMaxCpuCapRec'} // $na);
         printf {$fh} "  - LPAR MaxCPU (from VM config)                       : %s cores\n", $lpar_max_cpu_display_A_log_sec;
         printf {$fh} "  - Entitlement (for forecast multiplier)              : %s cores\n", $entitlement_display_A_log_sec;
         printf {$fh} "  - Forecast Multiplier Used                           : %s\n", ($calc_debug_info_ref->{'ForecastMultiplier'} // $na);
@@ -4523,6 +4535,100 @@ sub _resolve_dispatch_budget {
     my ($num) = ($final_tier =~ /(\d)$/);
     $num = 3 unless (defined $num && $num >= 1 && $num <= 4);
     return ($DISPATCH_BUDGET_BY_TIER{'G' . $num}, "fallback: tier-$num rung");
+}
+
+# ==============================================================================
+# SUBROUTINE: _ceil_to_granule
+# PURPOSE:    Round a core value UP to the nearest implementable entitlement
+#             granule. Used by the proposal-relative guarantee-floor convergence
+#             so a raised planning entitlement is expressible at the configured
+#             granularity - never whole-core rounding, which would over-provision
+#             (e.g. a 14.54-core floor must not become 15.00).
+# ARGUMENTS:  1. $value    core value to round up
+#             2. $granule  entitlement granule (e.g. $DEFAULT_ROUND_INCREMENT)
+# RETURNS:    $value rounded up to the granule (or $value unchanged if inputs
+#             are unusable)
+# ==============================================================================
+sub _ceil_to_granule {
+    my ($value, $granule) = @_;
+    return $value unless (defined $value && looks_like_number($value));
+    return $value unless (defined $granule && looks_like_number($granule) && $granule > 0);
+    my $units = $value / $granule;
+    my $c = int($units);
+    $c++ if ($units > $c + 1e-12);
+    return $c * $granule;
+}
+
+# ==============================================================================
+# SUBROUTINE: _assert_budget_invariant
+# PURPOSE:    Soft (non-fatal) check of the tier guarantee-floor invariant on a
+#             FINALISED strategic pair. The invariant is the same algebra the
+#             floor enforces, evaluated against the pair actually recommended:
+#
+#                 Demand - Ent  <=  Budget x (Reachable - Ent) + eps
+#
+#             Production surfaces any failure as a rationale/debug flag, never a
+#             batch abort. Reusable so it can be invoked after EVERY path that
+#             overwrites the final strategic rENT/rVCPU (authoritative and
+#             seasonal), keeping the guarantee honest wherever the pair is set.
+# ARGUMENTS:  1. $demand     observed peak PhysC (P-99W1)
+#             2. $ent        finalised strategic (planning) entitlement
+#             3. $reachable  proposed reachability: min(proposed VP, pool)
+#                            uncapped, or entitlement when capped
+#             4. $is_capped
+#             5. $budget     tier dispatch budget
+#             6. $tier_label for the message
+# RETURNS:    ($holds, $message)  - $holds is 1/0, or undef when the
+#             invariant cannot be evaluated from the available inputs
+# ==============================================================================
+sub _assert_budget_invariant {
+    my ($demand, $ent, $reachable, $is_capped, $budget, $tier_label) = @_;
+    $tier_label = 'unknown' unless (defined $tier_label && length $tier_label);
+
+    return (undef, "not evaluated: inputs unavailable")
+        unless (defined $demand && looks_like_number($demand)
+             && defined $ent    && looks_like_number($ent)
+             && defined $budget && looks_like_number($budget)
+             && defined $is_capped);
+
+    if ($is_capped) {
+        # Capped: reachable == entitlement, band is zero, guarantee must cover
+        # the whole peak.
+        my $ok = ($ent + $FLOAT_EPSILON >= $demand) ? 1 : 0;
+        return ($ok, sprintf("capped LPAR: guarantee %.4f %s observed peak %.4f",
+            $ent, $ok ? '>=' : '<', $demand));
+    }
+
+    return (undef, "not evaluated: reachable capacity unavailable")
+        unless (defined $reachable && looks_like_number($reachable));
+
+    if ($reachable < $ent - $FLOAT_EPSILON) {
+        return (0, sprintf(
+            "INVALID CONFIGURATION: proposed reachable %.2f is less than entitlement %.4f",
+            $reachable, $ent));
+    }
+
+    if ($demand > $reachable + $FLOAT_EPSILON) {
+        # A budget of 1.00 permits use of the whole reachable band; it does not
+        # make demand beyond that band physically reachable.
+        return (0, sprintf(
+            "INFEASIBLE: observed peak %.2f exceeds proposed reachable %.2f; additional VPs/pool required",
+            $demand, $reachable));
+    }
+
+    return (1, sprintf("tier '%s' budget 1.00: full reachable non-guaranteed band reliance permitted", $tier_label))
+        if ($budget >= 1.0 - $FLOAT_EPSILON);
+
+    my $lhs = $demand - $ent;
+    my $rhs = $budget * ($reachable - $ent);
+    my $ok  = ($lhs <= $rhs + 1e-6) ? 1 : 0;
+    my $pen = 0;
+    if ($demand > $ent && $reachable - $ent > $FLOAT_EPSILON) {
+        $pen = (($demand - $ent) / ($reachable - $ent)) * 100;
+    }
+    return ($ok, sprintf(
+        "tier '%s' budget %.0f%%: pool reliance %.1f%% of non-guaranteed band (peak %.2f, guarantee %.4f, reachable %.2f) - %s",
+        $tier_label, $budget * 100, $pen, $demand, $ent, $reachable, $ok ? 'within budget' : 'EXCEEDS budget'));
 }
 
 # ==============================================================================
@@ -6618,12 +6724,149 @@ sub calculate_runq_modified_physc
                 }
             }
 
+            # ==================================================================
+            # A1: Proposal-relative guarantee-floor convergence (strategic pair)
+            # ==================================================================
+            # The tier guarantee floor must be evaluated against the reachability
+            # the PROPOSED strategic pair delivers - min(proposed rVCPU, pool)
+            # when uncapped, or the proposed entitlement when capped - not the
+            # current configured VPs. Because the strategic rVCPU depends on the
+            # planning entitlement (envelope) and the floor depends on that rVCPU
+            # (reachability), the pair is solved by a bounded, monotone-raising
+            # fixed-point iteration over the PLANNING entitlement only. The
+            # rENT-independent evidence ($rvcpu_raw, $p99w1_floor_vcpu,
+            # $runnable_density) is already computed above, so the A0 kernel is
+            # re-evaluated for each trial with no side effects. EntBounded and
+            # Tactical are NOT part of this loop; they run once, afterwards.
+            #
+            # The seed is the current-reachability floor already applied upstream,
+            # so a partition whose proposed reachability equals its current
+            # reachability - and any partition where the budget does not bite -
+            # converges immediately with no change (no regression). The loop only
+            # ever RAISES the planning entitlement: the direction the previous
+            # ordering under-protected when VPs are cut, since downsizing shrinks
+            # reachability and thus raises the required guarantee.
+            my ($conv_current_reach, $conv_pre_rent, $conv_pre_rvcpu,
+                $conv_iters, $conv_stop, $conv_applied, $conv_maxcpu_blocks);
+            $conv_current_reach = $reachable_cores;
+            $conv_pre_rent      = $rENT_P_for_envelope;
+            {
+                my $pre = _strategic_rvcpu_envelope({
+                    rent_p               => $rENT_P,
+                    rent_for_envelope    => $conv_pre_rent,
+                    rvcpu_raw            => $rvcpu_raw,
+                    p99w1_floor_vcpu     => $p99w1_floor_vcpu,
+                    runnable_density     => $runnable_density,
+                    runq_hi_threads      => $runq_hi_threads,
+                    smt                  => $smt_for_vcpu,
+                    max_cpu              => $max_cpu_for_lpar_numeric,
+                    runq_potential       => $debug_info{'RunQ_Potential'},
+                    is_runq_pressure     => $debug_info{'IsRunQPressure'},
+                    is_workload_pressure => $debug_info{'IsWorkloadPressure'},
+                });
+                $conv_pre_rvcpu = $pre->{rvcpu_final};
+            }
+
+            # The convergence result must be expressible at the same increment
+            # requested for nfit's entitlement output. A bare -r/-u has no
+            # explicit increment and therefore retains the 0.05 default.
+            my $ent_granule = (defined $DEFAULT_ROUND_INCREMENT
+                                && looks_like_number($DEFAULT_ROUND_INCREMENT)
+                                && $DEFAULT_ROUND_INCREMENT > 0)
+                              ? ($DEFAULT_ROUND_INCREMENT + 0) : 0.05;
+            if (defined $round_arg && looks_like_number($round_arg) && $round_arg > 0) {
+                $ent_granule = $round_arg + 0;
+            } elsif (defined $roundup_arg && looks_like_number($roundup_arg) && $roundup_arg > 0) {
+                $ent_granule = $roundup_arg + 0;
+            }
+            $debug_info{'GuaranteeEntitlementGranule'} = sprintf("%.4f", $ent_granule);
+            my $conv_trial = $rENT_P_for_envelope;
+            my $CONV_MAX_ITERS = 8;   # conservative; the iteration is monotone and typically settles in <=3
+            $conv_iters = 0;
+            $conv_stop  = 'converged';
+            my ($conv_floor, $conv_floor_reason, $conv_proposed_reach);
+
+            while (defined $conv_trial) {
+                $conv_iters++;
+                my $s = _strategic_rvcpu_envelope({
+                    rent_p               => $conv_trial,
+                    rent_for_envelope    => $conv_trial,
+                    rvcpu_raw            => $rvcpu_raw,
+                    p99w1_floor_vcpu     => $p99w1_floor_vcpu,
+                    runnable_density     => $runnable_density,
+                    runq_hi_threads      => $runq_hi_threads,
+                    smt                  => $smt_for_vcpu,
+                    max_cpu              => $max_cpu_for_lpar_numeric,
+                    runq_potential       => $debug_info{'RunQ_Potential'},
+                    is_runq_pressure     => $debug_info{'IsRunQPressure'},
+                    is_workload_pressure => $debug_info{'IsWorkloadPressure'},
+                });
+                my $rv_trial = $s->{rvcpu_final};
+
+                # Proposed reachability from THIS trial's strategic pair.
+                if ($is_capped_lpar) {
+                    $conv_proposed_reach = $conv_trial;                       # capped: reachable == entitlement
+                } elsif (defined $pool_cpu_for_lpar_numeric && looks_like_number($pool_cpu_for_lpar_numeric) && $pool_cpu_for_lpar_numeric > 0) {
+                    $conv_proposed_reach = (defined $rv_trial && $rv_trial < $pool_cpu_for_lpar_numeric)
+                                         ? $rv_trial : $pool_cpu_for_lpar_numeric;   # uncapped: min(proposed VP, pool)
+                } else {
+                    $conv_proposed_reach = $rv_trial;                         # pool size unknown: reachable == proposed VP
+                }
+
+                ($conv_floor, $conv_floor_reason) = _tier_guarantee_floor(
+                    $pure_p99w1_physc, $conv_proposed_reach, $is_capped_lpar, $dispatch_budget, $final_tier);
+
+                last unless (defined $conv_floor && $conv_floor > $conv_trial + $FLOAT_EPSILON);
+
+                my $raised = _ceil_to_granule($conv_floor, $ent_granule);
+                if (!defined $raised || $raised <= $conv_trial + $FLOAT_EPSILON) {
+                    $conv_stop = 'no progress at granule';
+                    last;
+                }
+                $conv_trial = $raised;
+                if ($conv_iters >= $CONV_MAX_ITERS) { $conv_stop = 'iteration cap'; last; }
+            }
+
+            # Commit the converged PLANNING entitlement (monotone: raise only).
+            # Re-derive the OPERATIONAL entitlement from the existing MaxCPU cap;
+            # convergence itself operates on planning values only.
+            $conv_applied       = 0;
+            $conv_maxcpu_blocks = 0;
+            if (defined $conv_trial && $conv_trial > $rENT_P_for_envelope + $FLOAT_EPSILON) {
+                $rENT_P_for_envelope = $conv_trial;
+                $rENT_P_planning     = $conv_trial;
+                my $op = $conv_trial;
+                if (defined $effective_max_cpu_cap_val && $op > $effective_max_cpu_cap_val) {
+                    $op = $effective_max_cpu_cap_val;
+                    $conv_maxcpu_blocks = 1;
+                }
+                $rENT_P            = $op;
+                $runq_modified_rec = $op;
+                $conv_applied      = 1;
+                $debug_info{'rENT_P_Planning'}    = sprintf("%.4f", $rENT_P_planning);
+                $debug_info{'FinalAdjustedPhysC'} = sprintf("%.4f", $runq_modified_rec);
+                $debug_info{'CappedByMaxCPU'}     = $conv_maxcpu_blocks ? "True" : $debug_info{'CappedByMaxCPU'};
+                $debug_info{'BudgetFloorCores'}   = defined($conv_floor) ? sprintf("%.4f", $conv_floor) : $debug_info{'BudgetFloorCores'};
+                $debug_info{'BudgetFloorReason'}  = $conv_floor_reason // $debug_info{'BudgetFloorReason'};
+                $debug_info{'PreMaxCpuCapRec'}    = sprintf("%.4f", $rENT_P_for_envelope);
+            }
+
+            # Convergence may change the relationship between the planning and
+            # operational recommendations. Refresh the lexical source consumed
+            # later by Profile_rVCPU_Explain and its debug mirror.
+            $envelope_exceeds_operational =
+                (defined $rENT_P_for_envelope
+                 && defined $rENT_P
+                 && $rENT_P_for_envelope > $rENT_P + 0.005) ? 1 : 0;
+
             # ------------------------------------------------------------------
             # Strategic rVCPU envelope + clamp + Layer-5a override (A0 kernel).
             # Side-effect-free: given the trial planning rENT and the
             # rENT-independent evidence above, returns the envelope and the
             # clamped/overridden strategic rVCPU. Diagnostics are returned and
             # mirrored into %debug_info here. Authoritative path only.
+            # Runs once more with the CONVERGED planning entitlement to produce
+            # the final strategic pair.
             # ------------------------------------------------------------------
             my $strat = _strategic_rvcpu_envelope({
                 rent_p               => $rENT_P,
@@ -6647,6 +6890,66 @@ sub calculate_runq_modified_physc
             $runq_envelope_basis    = $strat->{runq_envelope_basis};
             $debug_info{'MicroPartitionEnvExpansion'} = $strat->{micro_expansion_note}
                 if (defined $strat->{micro_expansion_note});
+
+            # ------------------------------------------------------------------
+            # A1: final proposed reachability, soft budget invariant, rationale.
+            # The invariant is a rationale/debug flag, never a batch abort.
+            # ------------------------------------------------------------------
+            my $conv_final_reach;
+            if ($is_capped_lpar) {
+                $conv_final_reach = $rENT_P_for_envelope;
+            } elsif (defined $pool_cpu_for_lpar_numeric && looks_like_number($pool_cpu_for_lpar_numeric) && $pool_cpu_for_lpar_numeric > 0) {
+                $conv_final_reach = (defined $rvcpu_final && $rvcpu_final < $pool_cpu_for_lpar_numeric)
+                                  ? $rvcpu_final : $pool_cpu_for_lpar_numeric;
+            } else {
+                $conv_final_reach = $rvcpu_final;
+            }
+            my $conv_pool_bound = (!$is_capped_lpar
+                && defined $pool_cpu_for_lpar_numeric && $pool_cpu_for_lpar_numeric > 0
+                && defined $rvcpu_final && $rvcpu_final > $pool_cpu_for_lpar_numeric) ? 1 : 0;
+
+            my ($conv_inv_ok, $conv_inv_msg) = _assert_budget_invariant(
+                $pure_p99w1_physc, $rENT_P_for_envelope, $conv_final_reach,
+                $is_capped_lpar, $dispatch_budget, $final_tier);
+            $debug_info{'GuaranteeInvariantHolds'} = !defined($conv_inv_ok) ? 'N/A'
+                                                   : ($conv_inv_ok ? 'Yes' : 'No');
+            $debug_info{'GuaranteeInvariant'}      = $conv_inv_msg;
+
+            my @conv_impl_blocks;
+            push @conv_impl_blocks, sprintf("MaxCPU cap %.2f cores", $effective_max_cpu_cap_val)
+                if ($conv_maxcpu_blocks && defined $effective_max_cpu_cap_val);
+            push @conv_impl_blocks, sprintf("pool %.2f < proposed %s VPs", $pool_cpu_for_lpar_numeric, (defined $rvcpu_final ? $rvcpu_final : '?'))
+                if ($conv_pool_bound);
+            push @conv_impl_blocks, sprintf(
+                "proposed rVCPU %d exceeds current MaxCPU ceiling %.2f",
+                $rvcpu_final, $max_cpu_for_lpar_numeric)
+                if (defined $rvcpu_final
+                    && defined $max_cpu_for_lpar_numeric
+                    && $max_cpu_for_lpar_numeric > 0
+                    && $rvcpu_final > $max_cpu_for_lpar_numeric + $FLOAT_EPSILON);
+
+            $debug_info{'GuaranteeConvergence'} = sprintf(
+                "current reachability %.2f -> proposed reachability %.2f; pre-convergence (Ent %.4f, rVCPU %s) -> converged (Ent %.4f, rVCPU %s); %d iteration(s) (%s); %s%s",
+                (defined $conv_current_reach ? $conv_current_reach : 0),
+                (defined $conv_final_reach   ? $conv_final_reach   : 0),
+                (defined $conv_pre_rent      ? $conv_pre_rent      : 0),
+                (defined $conv_pre_rvcpu     ? $conv_pre_rvcpu     : 'N/A'),
+                $rENT_P_for_envelope,
+                (defined $rvcpu_final        ? $rvcpu_final        : 'N/A'),
+                (defined $conv_iters         ? $conv_iters         : 0),
+                (defined $conv_stop          ? $conv_stop          : 'n/a'),
+                ($conv_applied ? 'guarantee raised the planning entitlement'
+                               : 'no raise required (budget satisfied at seed)'),
+                (@conv_impl_blocks ? ('; implementation/reachability constrained by ' . join(', ', @conv_impl_blocks)) : '')
+            );
+            $debug_info{'GuaranteeConvergencePlannerVisible'} =
+                ($conv_applied
+                 || (defined $conv_inv_ok && !$conv_inv_ok)
+                 || @conv_impl_blocks) ? 'Yes' : 'No';
+            $debug_info{'BudgetFloorApplied'} = $conv_applied
+                ? sprintf("Yes (proposal-relative): planning Ent -> %.4f cores at proposed reachability %.2f",
+                          $rENT_P_for_envelope, (defined $conv_final_reach ? $conv_final_reach : 0))
+                : $debug_info{'BudgetFloorApplied'};
 
             # ================================================================
             # LAYER 5: Conditional Dispatch Reserve (Dynamic Scaling)
@@ -9633,6 +9936,40 @@ sub _write_standard_csv_report {
 
                     $rvcpu_out = $rvcpu_final;
                     $max_rvcpu_seen = $rvcpu_final if (!defined $max_rvcpu_seen || $rvcpu_final > $max_rvcpu_seen);
+
+                    # ------------------------------------------------------------
+                    # Constraint 4: soft budget-invariant check on the CSV-fallback
+                    # strategic pair. This path reuses pre-computed values and does
+                    # NOT run the floor convergence, so this is a diagnostic flag
+                    # only (never a batch abort). Tier is re-derived from the
+                    # profile name to stay self-contained.
+                    # ------------------------------------------------------------
+                    {
+                        my $fb_tier = $pname; $fb_tier =~ s/-.*//;
+                        my $fb_capped = (defined $cfg->{is_capped} && $cfg->{is_capped}) ? 1 : 0;
+                        my $fb_pool   = (defined $cfg->{pool_cpu} && looks_like_number($cfg->{pool_cpu}))
+                                      ? ($cfg->{pool_cpu} + 0) : undef;
+                        my $fb_demand = (defined $core->{ProfileValues}{$MANDATORY_PEAK_PROFILE_FOR_HINT}
+                                          && looks_like_number($core->{ProfileValues}{$MANDATORY_PEAK_PROFILE_FOR_HINT}))
+                                      ? ($core->{ProfileValues}{$MANDATORY_PEAK_PROFILE_FOR_HINT} + 0) : undef;
+                        my $fb_reach;
+                        if ($fb_capped) {
+                            $fb_reach = $rENT_P;
+                        } elsif (defined $fb_pool && $fb_pool > 0) {
+                            $fb_reach = (defined $rvcpu_final && $rvcpu_final < $fb_pool) ? $rvcpu_final : $fb_pool;
+                        } else {
+                            $fb_reach = $rvcpu_final;
+                        }
+                        my ($fb_budget) = _resolve_dispatch_budget($fb_tier);
+                        my ($fb_ok, $fb_msg) = _assert_budget_invariant(
+                            $fb_demand, $rENT_P, $fb_reach, $fb_capped, $fb_budget, $fb_tier);
+                        my $fb_dbg = $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname};
+                        if (defined $fb_dbg && ref($fb_dbg) eq 'HASH') {
+                            $fb_dbg->{'GuaranteeInvariantHolds'} = !defined($fb_ok) ? 'N/A'
+                                                                  : ($fb_ok ? 'Yes' : 'No');
+                            $fb_dbg->{'GuaranteeInvariant'}      = $fb_msg;
+                        }
+                    }
 
                     # ================================================================
                     # Task 3: Stage-1-safe VP recommendation (CSV fallback path)
@@ -19658,6 +19995,37 @@ sub _execute_multiplicative_seasonal {
 
                 # Enforce minimum (evenisation removed)
                 $rvcpu_final = $VCPU_MIN_ABS if (defined $rvcpu_final && $rvcpu_final < $VCPU_MIN_ABS);
+            }
+
+            # ------------------------------------------------------------------
+            # Constraint 4: soft budget-invariant check on the seasonal strategic
+            # pair. The seasonal path recomputes rVCPU from its own baseline and
+            # does NOT run the proposal-relative floor convergence, so this is a
+            # diagnostic flag only (never a batch abort) that surfaces when the
+            # seasonal pair leans on the pool beyond the tier's dispatch budget.
+            # Reachability is proposal-relative: min(proposed VP, pool) uncapped,
+            # or the entitlement when capped.
+            # ------------------------------------------------------------------
+            {
+                my $seas_capped = (defined $vm_map_ref->{Configuration}{is_capped} && $vm_map_ref->{Configuration}{is_capped}) ? 1 : 0;
+                my $seas_pool   = (defined $vm_map_ref->{Configuration}{pool_cpu} && looks_like_number($vm_map_ref->{Configuration}{pool_cpu}))
+                                ? ($vm_map_ref->{Configuration}{pool_cpu} + 0) : undef;
+                my $seas_reach;
+                if ($seas_capped) {
+                    $seas_reach = $rENT_P;
+                } elsif (defined $seas_pool && $seas_pool > 0) {
+                    $seas_reach = (defined $rvcpu_final && $rvcpu_final < $seas_pool) ? $rvcpu_final : $seas_pool;
+                } else {
+                    $seas_reach = $rvcpu_final;
+                }
+                my ($seas_budget) = _resolve_dispatch_budget($ms_tier_str);
+                my ($seas_ok, $seas_msg) = _assert_budget_invariant(
+                    $p99w1_cores, $rENT_P, $seas_reach, $seas_capped, $seas_budget, $ms_tier_str);
+                if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
+                    $debug_info_ref->{'GuaranteeInvariantHolds'} = !defined($seas_ok) ? 'N/A'
+                                                                 : ($seas_ok ? 'Yes' : 'No');
+                    $debug_info_ref->{'GuaranteeInvariant'}      = $seas_msg;
+                }
             }
 
             # ================================================================
