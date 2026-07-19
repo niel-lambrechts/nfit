@@ -41,7 +41,7 @@ my $VERSION = '8.26.199.0';
 # Tier-aware CPU/VCPU right-sizing policy contract implemented by the
 # recommendation and rationale paths below. This identifies the semantic
 # policy; it is deliberately independent of the executable release version.
-my $RIGHTSIZING_POLICY_CONTRACT_VERSION = '0.2.1';
+my $RIGHTSIZING_POLICY_CONTRACT_VERSION = '0.2.2';
 
 # --- Seasonal Engine Version (Phase 4: Idempotency) ---
 # Bump this constant whenever anchoring semantics, fingerprint logic, or
@@ -4029,6 +4029,14 @@ sub log_profile_rationale
             printf {$fh} "    Current reachable capacity                         : %.2f cores\n",
                 $re->{ReductionCurrentReachable};
         }
+        printf {$fh} "    Current reachability basis                         : %s\n",
+            ($re->{ReductionCurrentReachabilityBasis} // $na);
+        printf {$fh} "    Pool availability status                           : %s\n",
+            ($re->{ReductionPoolAvailabilityStatus} // $na);
+        printf {$fh} "    Downward action depends on unmeasured pool         : %s\n",
+            ($re->{ReductionDependsOnUnmeasuredPool} ? 'Yes - CAUTION required' : 'No');
+        printf {$fh} "    Strategic guarantee prerequisite                   : %s\n",
+            ($re->{StrategicInvariantStatus} // $na);
         if (defined $re->{ReductionPeakReachRatio} && looks_like_number($re->{ReductionPeakReachRatio})) {
             printf {$fh} "    Credible peak / current reachable                  : %.1f%%\n",
                 $re->{ReductionPeakReachRatio} * 100;
@@ -5506,14 +5514,22 @@ sub _classify_vcpu_reduction_safety
                             && $terms->{guarantee_demand} > 0)
                          ? ($terms->{guarantee_demand} + 0) : undef;
 
-    my $current_reachable;
-    if ($is_capped) {
-        $current_reachable = $current_ent;
-    } elsif (defined $current_vp && defined $pool_cpu) {
-        $current_reachable = ($current_vp < $pool_cpu) ? $current_vp : $pool_cpu;
-    } else {
-        $current_reachable = $current_vp;
-    }
+    # Resolve pool state through the same semantic layer used by the strategic
+    # audit. Current callers have configured pool geometry but no measured
+    # spare-capacity telemetry, so uncapped status is normally UNKNOWN while
+    # current reach remains the existing conservative min(VP, PoolSize) proxy.
+    my $pool_evidence = _resolve_pool_evidence({
+        proposed_vcpu           => $current_vp,
+        proposed_entitlement    => $current_ent,
+        pool_size               => $pool_cpu,
+        available_pool_capacity => $terms->{available_pool_capacity},
+        is_capped               => $is_capped,
+    });
+    my $pool_availability_status = $pool_evidence->{PoolAvailabilityStatus} // 'UNKNOWN';
+    my $current_reachable = (defined $pool_evidence->{ProposedReachable}
+                             && looks_like_number($pool_evidence->{ProposedReachable}))
+                          ? ($pool_evidence->{ProposedReachable} + 0) : undef;
+    my $current_reachability_basis = $pool_evidence->{ProposedReachabilityBasis} // 'N/A';
 
     my (@block, @caution);
     my $add_unique = sub {
@@ -5544,7 +5560,8 @@ sub _classify_vcpu_reduction_safety
     if (($evidence->{'HotThreadWLDampeningApplied'} // 'False') eq 'True') {
         $add_unique->(\@block, 'hot-thread/pathological workload signal is active');
     }
-    if (($evidence->{'GuaranteeInvariantHolds'} // 'N/A') eq 'No') {
+    my $strategic_invariant_status = $evidence->{'GuaranteeInvariantHolds'} // 'N/A';
+    if ($strategic_invariant_status eq 'No') {
         $add_unique->(\@block, 'strategic guarantee invariant failed');
     }
 
@@ -5592,6 +5609,17 @@ sub _classify_vcpu_reduction_safety
         $add_unique->(\@caution, 'shared-pool capacity unavailable; current reach assumes configured VPs');
     }
 
+    # This flag becomes actionable only after the shared decision helper has
+    # established that a genuinely downward Tactical step exists. A workload
+    # whose applicable demand is already covered by entitlement does not depend
+    # on pool grace for this policy test.
+    my $depends_on_unmeasured_pool =
+        (!$is_capped
+         && $pool_availability_status ne 'MEASURED'
+         && defined $guarantee_demand
+         && defined $current_ent
+         && $guarantee_demand > $current_ent + $FLOAT_EPSILON) ? 1 : 0;
+
     my $state = @block ? 'BLOCK' : (@caution ? 'CAUTION' : 'CLEAR');
     my @reasons = @block ? @block : @caution;
     @reasons = ('no blocking or caution evidence detected') unless (@reasons);
@@ -5601,6 +5629,10 @@ sub _classify_vcpu_reduction_safety
         reasons           => join('; ', @reasons),
         current_reachable => $current_reachable,
         peak_reach_ratio  => $reach_ratio,
+        pool_availability_status     => $pool_availability_status,
+        current_reachability_basis   => $current_reachability_basis,
+        depends_on_unmeasured_pool   => $depends_on_unmeasured_pool,
+        strategic_invariant_status   => $strategic_invariant_status,
     };
 }
 
@@ -5643,11 +5675,12 @@ sub _classify_vcpu_reduction_safety
 #   current_entitlement  - unchanged entitlement for the tactical pair
 #   guarantee_demand     - tier-applicable demand witness
 #   is_capped, pool_cpu, dispatch_budget, tier_label - immediate invariant inputs
+#   reduction_safety also carries strategic-invariant and pool-evidence status
 #
 # Out (hashref):
 #   entbounded, entbounded_governed, entbounded_needs_coordinated_change,
 #   entbounded_evidence_above_envelope, tactical, tactical_note,
-#   reduction_safety_state/reasons,
+#   reduction_safety_state/reasons, pool-dependence and strategic status,
 #   immediate_invariant_holds/message/reachable
 # ---------------------------------------------------------------------------
 sub _compute_entbounded_and_tactical
@@ -5673,6 +5706,13 @@ sub _compute_entbounded_and_tactical
                              ? $terms->{reduction_safety} : {};
     my $safety_state         = $reduction_safety->{state} // 'CAUTION';
     my $safety_reasons       = $reduction_safety->{reasons} // 'reduction-safety evidence unavailable';
+    my $append_safety_reason = sub {
+        my ($reason) = @_;
+        return unless (defined $reason && $reason ne '');
+        return if ($safety_reasons =~ /(?:^|; )\Q$reason\E(?:; |$)/);
+        $safety_reasons .= '; ' unless ($safety_reasons eq '');
+        $safety_reasons .= $reason;
+    };
 
     # max() includes $rvcpu_final (the coordinated rVCPU) so rVCPU_EntBounded
     # >= rVCPU holds by construction in every case, including upsize scenarios
@@ -5772,6 +5812,33 @@ sub _compute_entbounded_and_tactical
     my $tactical_pre_safety = $rvcpu_tactical;
     my ($immediate_ok, $immediate_msg, $immediate_reachable, $immediate_candidate);
 
+    # A2.7: qualify only a genuinely downward action. Unknown pool availability
+    # is material when applicable demand exceeds the unchanged entitlement: the
+    # proposed pair relies on some non-guaranteed capacity whose future presence
+    # has not been measured. That is CAUTION, not BLOCK. Independently, a
+    # downward action requires a positively-proven strategic invariant; No/N/A
+    # is fail-closed. The immediate invariant is still evaluated below against
+    # the actual post-CAUTION candidate and must also be positively proven.
+    my $is_downward_candidate =
+        (defined $current_vp_numeric
+         && defined $rvcpu_tactical
+         && $rvcpu_tactical < $current_vp_numeric) ? 1 : 0;
+    if ($is_downward_candidate) {
+        if ($reduction_safety->{depends_on_unmeasured_pool}) {
+            my $pool_reason = sprintf(
+                'downward action depends on non-guaranteed capacity while pool availability is %s',
+                ($reduction_safety->{pool_availability_status} // 'UNKNOWN'));
+            $append_safety_reason->($pool_reason);
+            $safety_state = 'CAUTION' if ($safety_state eq 'CLEAR');
+        }
+
+        my $strategic_status = $reduction_safety->{strategic_invariant_status} // 'N/A';
+        if ($strategic_status ne 'Yes') {
+            $append_safety_reason->("strategic guarantee invariant not positively proven ($strategic_status)");
+            $safety_state = 'BLOCK';
+        }
+    }
+
     if (!defined $current_vp_numeric) {
         # Preserve the established numeric fallback, but make it unambiguously
         # non-actionable: a BLOCK cannot literally hold an unknown VP count.
@@ -5857,6 +5924,11 @@ sub _compute_entbounded_and_tactical
         reduction_safety_reasons            => $safety_reasons,
         reduction_current_reachable         => $reduction_safety->{current_reachable},
         reduction_peak_reach_ratio          => $reduction_safety->{peak_reach_ratio},
+        reduction_pool_availability_status  => $reduction_safety->{pool_availability_status},
+        reduction_current_reachability_basis => $reduction_safety->{current_reachability_basis},
+        reduction_depends_on_unmeasured_pool =>
+            ($is_downward_candidate && $reduction_safety->{depends_on_unmeasured_pool}) ? 1 : 0,
+        strategic_invariant_status          => $reduction_safety->{strategic_invariant_status} // 'N/A',
         immediate_candidate                 => $immediate_candidate,
         immediate_invariant_holds           => $immediate_ok,
         immediate_invariant                 => $immediate_msg,
@@ -8188,6 +8260,10 @@ sub calculate_runq_modified_physc
             ReductionSafetyReasons        => $rvcpu_ebt->{reduction_safety_reasons},
             ReductionCurrentReachable     => $rvcpu_ebt->{reduction_current_reachable},
             ReductionPeakReachRatio       => $rvcpu_ebt->{reduction_peak_reach_ratio},
+            ReductionPoolAvailabilityStatus => $rvcpu_ebt->{reduction_pool_availability_status},
+            ReductionCurrentReachabilityBasis => $rvcpu_ebt->{reduction_current_reachability_basis},
+            ReductionDependsOnUnmeasuredPool => $rvcpu_ebt->{reduction_depends_on_unmeasured_pool},
+            StrategicInvariantStatus      => $rvcpu_ebt->{strategic_invariant_status},
             ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
             ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
             ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
@@ -8241,6 +8317,14 @@ sub calculate_runq_modified_physc
             ? sprintf('%.2f', $rvcpu_ebt->{reduction_current_reachable}) : 'N/A';
         $debug_info{'rVCPU_ReductionPeakReachRatio'} = defined($rvcpu_ebt->{reduction_peak_reach_ratio})
             ? sprintf('%.3f', $rvcpu_ebt->{reduction_peak_reach_ratio}) : 'N/A';
+        $debug_info{'rVCPU_ReductionPoolAvailabilityStatus'} =
+            $rvcpu_ebt->{reduction_pool_availability_status} // 'N/A';
+        $debug_info{'rVCPU_ReductionCurrentReachabilityBasis'} =
+            $rvcpu_ebt->{reduction_current_reachability_basis} // 'N/A';
+        $debug_info{'rVCPU_ReductionDependsOnUnmeasuredPool'} =
+            $rvcpu_ebt->{reduction_depends_on_unmeasured_pool} ? 1 : 0;
+        $debug_info{'rVCPU_StrategicInvariantStatus'} =
+            $rvcpu_ebt->{strategic_invariant_status} // 'N/A';
         $debug_info{'rVCPU_ImmediateCandidate'} = defined($rvcpu_ebt->{immediate_candidate}) ? $rvcpu_ebt->{immediate_candidate} : 'N/A';
         $debug_info{'rVCPU_ImmediateInvariantHolds'} = !defined($rvcpu_ebt->{immediate_invariant_holds}) ? 'N/A'
             : ($rvcpu_ebt->{immediate_invariant_holds} ? 'Yes' : 'No');
@@ -11183,6 +11267,10 @@ sub _write_standard_csv_report {
                         ReductionSafetyReasons        => $rvcpu_ebt->{reduction_safety_reasons},
                         ReductionCurrentReachable     => $rvcpu_ebt->{reduction_current_reachable},
                         ReductionPeakReachRatio       => $rvcpu_ebt->{reduction_peak_reach_ratio},
+                        ReductionPoolAvailabilityStatus => $rvcpu_ebt->{reduction_pool_availability_status},
+                        ReductionCurrentReachabilityBasis => $rvcpu_ebt->{reduction_current_reachability_basis},
+                        ReductionDependsOnUnmeasuredPool => $rvcpu_ebt->{reduction_depends_on_unmeasured_pool},
+                        StrategicInvariantStatus      => $rvcpu_ebt->{strategic_invariant_status},
                         ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
                         ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
                         ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
@@ -11236,6 +11324,14 @@ sub _write_standard_csv_report {
                         ? sprintf('%.2f', $rvcpu_ebt->{reduction_current_reachable}) : 'N/A';
                     $di->{'rVCPU_ReductionPeakReachRatio'} = defined($rvcpu_ebt->{reduction_peak_reach_ratio})
                         ? sprintf('%.3f', $rvcpu_ebt->{reduction_peak_reach_ratio}) : 'N/A';
+                    $di->{'rVCPU_ReductionPoolAvailabilityStatus'} =
+                        $rvcpu_ebt->{reduction_pool_availability_status} // 'N/A';
+                    $di->{'rVCPU_ReductionCurrentReachabilityBasis'} =
+                        $rvcpu_ebt->{reduction_current_reachability_basis} // 'N/A';
+                    $di->{'rVCPU_ReductionDependsOnUnmeasuredPool'} =
+                        $rvcpu_ebt->{reduction_depends_on_unmeasured_pool} ? 1 : 0;
+                    $di->{'rVCPU_StrategicInvariantStatus'} =
+                        $rvcpu_ebt->{strategic_invariant_status} // 'N/A';
                     $di->{'rVCPU_ImmediateCandidate'} = defined($rvcpu_ebt->{immediate_candidate}) ? $rvcpu_ebt->{immediate_candidate} : 'N/A';
                     $di->{'rVCPU_ImmediateInvariantHolds'} = !defined($rvcpu_ebt->{immediate_invariant_holds}) ? 'N/A'
                         : ($rvcpu_ebt->{immediate_invariant_holds} ? 'Yes' : 'No');
@@ -21434,6 +21530,10 @@ sub _execute_multiplicative_seasonal {
                 ReductionSafetyReasons        => $rvcpu_ebt->{reduction_safety_reasons},
                 ReductionCurrentReachable     => $rvcpu_ebt->{reduction_current_reachable},
                 ReductionPeakReachRatio       => $rvcpu_ebt->{reduction_peak_reach_ratio},
+                ReductionPoolAvailabilityStatus => $rvcpu_ebt->{reduction_pool_availability_status},
+                ReductionCurrentReachabilityBasis => $rvcpu_ebt->{reduction_current_reachability_basis},
+                ReductionDependsOnUnmeasuredPool => $rvcpu_ebt->{reduction_depends_on_unmeasured_pool},
+                StrategicInvariantStatus      => $rvcpu_ebt->{strategic_invariant_status},
                 ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
                 ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
                 ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
@@ -21481,6 +21581,14 @@ sub _execute_multiplicative_seasonal {
                     ? sprintf('%.2f', $rvcpu_ebt->{reduction_current_reachable}) : 'N/A';
                 $debug_info_ref->{'rVCPU_ReductionPeakReachRatio'} = defined($rvcpu_ebt->{reduction_peak_reach_ratio})
                     ? sprintf('%.3f', $rvcpu_ebt->{reduction_peak_reach_ratio}) : 'N/A';
+                $debug_info_ref->{'rVCPU_ReductionPoolAvailabilityStatus'} =
+                    $rvcpu_ebt->{reduction_pool_availability_status} // 'N/A';
+                $debug_info_ref->{'rVCPU_ReductionCurrentReachabilityBasis'} =
+                    $rvcpu_ebt->{reduction_current_reachability_basis} // 'N/A';
+                $debug_info_ref->{'rVCPU_ReductionDependsOnUnmeasuredPool'} =
+                    $rvcpu_ebt->{reduction_depends_on_unmeasured_pool} ? 1 : 0;
+                $debug_info_ref->{'rVCPU_StrategicInvariantStatus'} =
+                    $rvcpu_ebt->{strategic_invariant_status} // 'N/A';
                 $debug_info_ref->{'rVCPU_ImmediateCandidate'} = defined($rvcpu_ebt->{immediate_candidate}) ? $rvcpu_ebt->{immediate_candidate} : 'N/A';
                 $debug_info_ref->{'rVCPU_ImmediateInvariantHolds'} = !defined($rvcpu_ebt->{immediate_invariant_holds}) ? 'N/A'
                     : ($rvcpu_ebt->{immediate_invariant_holds} ? 'Yes' : 'No');
