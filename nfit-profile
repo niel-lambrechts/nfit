@@ -378,6 +378,17 @@ my %VCPU_TIER_STAGE1_STEP_FRACTION = (
 );
 my $VCPU_TIER_STAGE1_STEP_MIN_VP = 1;  # Floor so small partitions can still move
 
+# A2.2: tactical VP-reduction safety policy. These thresholds classify the
+# evidence; they do not alter strategic rVCPU or rVCPU_EntBounded. CLEAR uses
+# the ordinary tier step, CAUTION permits at most one VP this cycle, and BLOCK
+# holds the configured VP count. They are explicit back-test candidates rather
+# than IBM limits and must be reviewed as estate evidence accumulates.
+my $VCPU_REDUCTION_CAUTION_REACH_RATIO = 0.70;
+my $VCPU_REDUCTION_BLOCK_REACH_RATIO   = 0.90;
+my $VCPU_REDUCTION_CAUTION_PEAK_PAE    = 0.30;
+my $VCPU_REDUCTION_CAUTION_PEAK_AAE    = 0.10;
+my $VCPU_REDUCTION_CAUTION_MAX_STEP_VP = 1;
+
 my $ENTITLEMENT_BURST_ALLOWANCE_FACTOR = 0.25;          # Allow uncapped VMs to burst 25% over their entitlement before pressure is assessed
 my $BURST_ALLOWANCE_MIN_FACTOR = 0.0;
 my $BURST_ALLOWANCE_MAX_FACTOR = 0.5;                   # Clamp at 50%
@@ -3879,6 +3890,42 @@ sub log_profile_rationale
         printf {$fh} "    %s.\n", ($re->{TacticalNote} // $na);
     }
 
+    # A2.2: make the action state and the invariant for the candidate
+    # implementation pair planner-visible. Strategic targets remain visible
+    # above even when Tactical is slowed or held.
+    if (defined $re->{ReductionSafetyState}) {
+        printf {$fh} "  - VP reduction-safety state                          : %s\n",
+            $re->{ReductionSafetyState};
+        printf {$fh} "    Evidence                                            : %s\n",
+            ($re->{ReductionSafetyReasons} // $na);
+        if (defined $re->{ReductionCurrentReachable} && looks_like_number($re->{ReductionCurrentReachable})) {
+            printf {$fh} "    Current reachable capacity                         : %.2f cores\n",
+                $re->{ReductionCurrentReachable};
+        }
+        if (defined $re->{ReductionPeakReachRatio} && looks_like_number($re->{ReductionPeakReachRatio})) {
+            printf {$fh} "    Credible peak / current reachable                  : %.1f%%\n",
+                $re->{ReductionPeakReachRatio} * 100;
+        }
+        if (defined $re->{TacticalPreSafety} && looks_like_number($re->{TacticalPreSafety})
+            && defined $re->{Tactical} && looks_like_number($re->{Tactical})
+            && $re->{TacticalPreSafety} != $re->{Tactical}) {
+            printf {$fh} "    Rate-limited candidate before safety state         : %s VPs\n",
+                $re->{TacticalPreSafety};
+        }
+
+        my $imm_holds = !defined($re->{ImmediateInvariantHolds}) ? 'N/A'
+                      : ($re->{ImmediateInvariantHolds} ? 'Yes' : 'No');
+        printf {$fh} "  - Immediate tactical-pair guarantee check            : %s\n", $imm_holds;
+        printf {$fh} "    Candidate / reachable                              : %s VPs / %s cores\n",
+            (defined $re->{ImmediateCandidate} ? $re->{ImmediateCandidate} : $na),
+            (defined $re->{ImmediateReachable} ? sprintf('%.2f', $re->{ImmediateReachable}) : $na);
+        printf {$fh} "    Basis                                               : %s\n",
+            ($re->{ImmediateInvariant} // $na);
+        if (defined $re->{ImmediateInvariantHolds} && !$re->{ImmediateInvariantHolds}) {
+            printf {$fh} "    IMMEDIATE-PAIR INVARIANT FAILURE: Tactical held at current VPs.\n";
+        }
+    }
+
     # Practical audit trail: explain each width constraint in a capacity-planner-friendly way
     # (kept concise; detailed engineer-level fields remain in the "Detail:" line below).
     my $smt_used = (defined $cfg->{smt} && looks_like_number($cfg->{smt})) ? ($cfg->{smt} + 0) : undef;
@@ -5026,6 +5073,136 @@ sub _resolve_runq_source_profile {
     return ($name, sprintf("%s (%s)", $name, $provenance));
 }
 
+# --- _classify_vcpu_reduction_safety -------------------------------------
+# Classify the evidence for a VP-only reduction under the CURRENT
+# configuration. This is deliberately separate from strategic sizing:
+# rVCPU/rVCPU_EntBounded remain visible even when the actionable Tactical
+# recommendation is slowed or held.
+#
+# Inputs are already-resolved values plus the profile debug hash. The current
+# reachable capacity is entitlement for capped LPARs, otherwise min(current
+# VPs, pool) when pool size is known, or current VPs with a CAUTION marker when
+# pool evidence is unavailable.
+# ---------------------------------------------------------------------------
+sub _classify_vcpu_reduction_safety
+{
+    my ($terms) = @_;
+    $terms = {} unless (defined $terms && ref($terms) eq 'HASH');
+    my $evidence = (defined $terms->{evidence} && ref($terms->{evidence}) eq 'HASH')
+                 ? $terms->{evidence} : {};
+
+    my $current_vp  = (defined $terms->{current_vp} && looks_like_number($terms->{current_vp})
+                       && $terms->{current_vp} > 0) ? ($terms->{current_vp} + 0) : undef;
+    my $current_ent = (defined $terms->{current_entitlement} && looks_like_number($terms->{current_entitlement})
+                       && $terms->{current_entitlement} > 0) ? ($terms->{current_entitlement} + 0) : undef;
+    my $pool_cpu    = (defined $terms->{pool_cpu} && looks_like_number($terms->{pool_cpu})
+                       && $terms->{pool_cpu} > 0) ? ($terms->{pool_cpu} + 0) : undef;
+    my $is_capped   = $terms->{is_capped} ? 1 : 0;
+    my $peak_physc  = (defined $terms->{peak_physc} && looks_like_number($terms->{peak_physc})
+                       && $terms->{peak_physc} > 0) ? ($terms->{peak_physc} + 0) : undef;
+    my $guarantee_demand = (defined $terms->{guarantee_demand}
+                            && looks_like_number($terms->{guarantee_demand})
+                            && $terms->{guarantee_demand} > 0)
+                         ? ($terms->{guarantee_demand} + 0) : undef;
+
+    my $current_reachable;
+    if ($is_capped) {
+        $current_reachable = $current_ent;
+    } elsif (defined $current_vp && defined $pool_cpu) {
+        $current_reachable = ($current_vp < $pool_cpu) ? $current_vp : $pool_cpu;
+    } else {
+        $current_reachable = $current_vp;
+    }
+
+    my (@block, @caution);
+    my $add_unique = sub {
+        my ($list, $reason) = @_;
+        return unless (defined $reason && length $reason);
+        push @$list, $reason unless (grep { $_ eq $reason } @$list);
+    };
+
+    $add_unique->(\@block, 'current VP count unavailable') unless (defined $current_vp);
+    $add_unique->(\@block, 'current entitlement unavailable or stale') unless (defined $current_ent);
+
+    for my $flag (qw(CPUFlatlining CPUFlatliningPartialSevere CPUFlatliningPartial)) {
+        if (($evidence->{$flag} // 'No') eq 'Yes') {
+            $add_unique->(\@block, "capacity-censoring/pathology signal: $flag");
+        }
+    }
+    if (($evidence->{'CPUCapLimited'} // 'No') eq 'Yes') {
+        $add_unique->(\@block, 'capacity is consistently close to the configured CPU ceiling');
+    }
+    if (($evidence->{'IsRunQPressure'} // 'False') eq 'True'
+        || ($evidence->{'IsWorkloadPressure'} // 'False') eq 'True') {
+        $add_unique->(\@block, 'material RunQ/workload pressure is present');
+    }
+    if (defined $evidence->{'RunQ_Potential'}
+        && $evidence->{'RunQ_Potential'} =~ /ANOMALY\s*\((?:DBW|XRQ)\)/i) {
+        $add_unique->(\@block, "RunQ pathology: $evidence->{'RunQ_Potential'}");
+    }
+    if (($evidence->{'HotThreadWLDampeningApplied'} // 'False') eq 'True') {
+        $add_unique->(\@block, 'hot-thread/pathological workload signal is active');
+    }
+    if (($evidence->{'GuaranteeInvariantHolds'} // 'N/A') eq 'No') {
+        $add_unique->(\@block, 'strategic guarantee invariant failed');
+    }
+
+    my $reach_ratio;
+    if (defined $peak_physc && defined $current_reachable && $current_reachable > 0) {
+        $reach_ratio = $peak_physc / $current_reachable;
+        if ($reach_ratio >= $VCPU_REDUCTION_BLOCK_REACH_RATIO - $FLOAT_EPSILON) {
+            $add_unique->(\@block, sprintf(
+                'credible peak is %.0f%% of current reachable capacity (BLOCK at %.0f%%)',
+                $reach_ratio * 100, $VCPU_REDUCTION_BLOCK_REACH_RATIO * 100));
+        } elsif ($reach_ratio >= $VCPU_REDUCTION_CAUTION_REACH_RATIO - $FLOAT_EPSILON) {
+            $add_unique->(\@caution, sprintf(
+                'credible peak is %.0f%% of current reachable capacity (CAUTION at %.0f%%)',
+                $reach_ratio * 100, $VCPU_REDUCTION_CAUTION_REACH_RATIO * 100));
+        }
+    } elsif (!defined $peak_physc) {
+        $add_unique->(\@caution, 'credible peak evidence unavailable');
+    }
+
+    if (defined $guarantee_demand && defined $current_reachable
+        && $guarantee_demand > $current_reachable + $FLOAT_EPSILON) {
+        $add_unique->(\@block, sprintf(
+            'applicable demand %.2f exceeds current reachable capacity %.2f',
+            $guarantee_demand, $current_reachable));
+    }
+
+    my $growth = (defined $evidence->{'GrowthAdjUsed'} && looks_like_number($evidence->{'GrowthAdjUsed'}))
+               ? ($evidence->{'GrowthAdjUsed'} + 0) : 0;
+    if ($growth >= $MIN_MEANINGFUL_ADJUSTMENT_CORES - $FLOAT_EPSILON) {
+        $add_unique->(\@caution, sprintf('positive growth adjustment %.2f cores', $growth));
+    }
+
+    my $peak_pae = (defined $evidence->{'PhysC_Peak_PAE'} && looks_like_number($evidence->{'PhysC_Peak_PAE'}))
+                 ? ($evidence->{'PhysC_Peak_PAE'} + 0) : undef;
+    my $peak_aae = (defined $evidence->{'PhysC_Peak_AAE'} && looks_like_number($evidence->{'PhysC_Peak_AAE'}))
+                 ? ($evidence->{'PhysC_Peak_AAE'} + 0) : undef;
+    if ((defined $peak_pae && $peak_pae >= $VCPU_REDUCTION_CAUTION_PEAK_PAE - $FLOAT_EPSILON)
+        || (defined $peak_aae && $peak_aae >= $VCPU_REDUCTION_CAUTION_PEAK_AAE - $FLOAT_EPSILON)) {
+        $add_unique->(\@caution, sprintf(
+            'material served-burst evidence (peak PAE %s, AAE %s)',
+            defined($peak_pae) ? sprintf('%.2f', $peak_pae) : 'N/A',
+            defined($peak_aae) ? sprintf('%.2f', $peak_aae) : 'N/A'));
+    }
+    if (!$is_capped && !defined $pool_cpu) {
+        $add_unique->(\@caution, 'shared-pool capacity unavailable; current reach assumes configured VPs');
+    }
+
+    my $state = @block ? 'BLOCK' : (@caution ? 'CAUTION' : 'CLEAR');
+    my @reasons = @block ? @block : @caution;
+    @reasons = ('no blocking or caution evidence detected') unless (@reasons);
+
+    return {
+        state             => $state,
+        reasons           => join('; ', @reasons),
+        current_reachable => $current_reachable,
+        peak_reach_ratio  => $reach_ratio,
+    };
+}
+
 # --- _compute_entbounded_and_tactical -------------------------------------
 # Centralised decision logic for the two entitlement-relative rVCPU outputs:
 #   * rVCPU_EntBounded (Task 3) - the target implementable now with current
@@ -5059,10 +5236,16 @@ sub _resolve_runq_source_profile {
 #   vp_current_ent_floor - ceil(current entitlement), or VP_Min when stale
 #   current_ent_stale    - 1 when current entitlement was unavailable/stale
 #   current_vp_numeric   - current VP count, or undef when unavailable
+#   reduction_safety     - result from _classify_vcpu_reduction_safety()
+#   current_entitlement  - unchanged entitlement for the tactical pair
+#   guarantee_demand     - tier-applicable demand witness
+#   is_capped, pool_cpu, dispatch_budget, tier_label - immediate invariant inputs
 #
 # Out (hashref):
 #   entbounded, entbounded_governed, entbounded_needs_coordinated_change,
-#   entbounded_evidence_above_envelope, tactical, tactical_note
+#   entbounded_evidence_above_envelope, tactical, tactical_note,
+#   reduction_safety_state/reasons,
+#   immediate_invariant_holds/message/reachable
 # ---------------------------------------------------------------------------
 sub _compute_entbounded_and_tactical
 {
@@ -5081,6 +5264,11 @@ sub _compute_entbounded_and_tactical
     my $vp_current_ent_floor = $terms->{vp_current_ent_floor};
     my $current_ent_stale    = $terms->{current_ent_stale};
     my $current_vp_numeric   = $terms->{current_vp_numeric};
+    my $reduction_safety     = (defined $terms->{reduction_safety}
+                                && ref($terms->{reduction_safety}) eq 'HASH')
+                             ? $terms->{reduction_safety} : {};
+    my $safety_state         = $reduction_safety->{state} // 'CAUTION';
+    my $safety_reasons       = $reduction_safety->{reasons} // 'reduction-safety evidence unavailable';
 
     # max() includes $rvcpu_final (the coordinated rVCPU) so rVCPU_EntBounded
     # >= rVCPU holds by construction in every case, including upsize scenarios
@@ -5164,6 +5352,84 @@ sub _compute_entbounded_and_tactical
             $step, $reduction_needed, $rvcpu_tier_num, $step_fraction * 100);
     }
 
+    # A2.2: pressure/evidence state governs only the actionable reduction.
+    # Strategic rVCPU and EntBounded above remain untouched and visible.
+    my $tactical_pre_safety = $rvcpu_tactical;
+    my ($immediate_ok, $immediate_msg, $immediate_reachable, $immediate_candidate);
+
+    if (!defined $current_vp_numeric) {
+        # Preserve the established numeric fallback, but make it unambiguously
+        # non-actionable: a BLOCK cannot literally hold an unknown VP count.
+        $safety_state = 'BLOCK';
+        $safety_reasons .= '; ' unless ($safety_reasons eq '');
+        $safety_reasons .= 'cannot hold or validate a tactical pair without current VPs'
+            unless ($safety_reasons =~ /without current VPs/);
+        $tactical_note = sprintf(
+            'BLOCK: current VP count unavailable; retained rVCPU_EntBounded (%s) for visibility only - do not implement',
+            defined($rvcpu_entbounded) ? $rvcpu_entbounded : 'N/A');
+        $immediate_msg = 'not evaluated: current VP count unavailable';
+    } elsif (defined $rvcpu_tactical && $rvcpu_tactical < $current_vp_numeric) {
+        if ($safety_state eq 'BLOCK') {
+            $immediate_candidate = $rvcpu_tactical;
+            $rvcpu_tactical = $current_vp_numeric;
+            $tactical_note = sprintf(
+                'BLOCK: candidate %s VPs held at current %s VPs (%s)',
+                $immediate_candidate, $current_vp_numeric, $safety_reasons);
+            $immediate_msg = 'not evaluated: reduction held by pre-existing BLOCK evidence';
+        } else {
+            if ($safety_state eq 'CAUTION') {
+                my $caution_floor = $current_vp_numeric - $VCPU_REDUCTION_CAUTION_MAX_STEP_VP;
+                $caution_floor = $rvcpu_entbounded if ($caution_floor < $rvcpu_entbounded);
+                if ($rvcpu_tactical < $caution_floor) {
+                    $rvcpu_tactical = $caution_floor;
+                }
+                $tactical_note = sprintf(
+                    'CAUTION: limited to %d VP this cycle (%s)',
+                    $VCPU_REDUCTION_CAUTION_MAX_STEP_VP, $safety_reasons);
+            }
+
+            # Validate the pair the planner would actually implement: current
+            # entitlement held, candidate Tactical VPs supplying reachability.
+            $immediate_candidate = $rvcpu_tactical;
+            my $current_ent = (defined $terms->{current_entitlement}
+                               && looks_like_number($terms->{current_entitlement})
+                               && $terms->{current_entitlement} > 0)
+                            ? ($terms->{current_entitlement} + 0) : undef;
+            my $pool_cpu = (defined $terms->{pool_cpu} && looks_like_number($terms->{pool_cpu})
+                            && $terms->{pool_cpu} > 0) ? ($terms->{pool_cpu} + 0) : undef;
+            my $is_capped = $terms->{is_capped} ? 1 : 0;
+            if ($is_capped) {
+                $immediate_reachable = $current_ent;
+            } elsif (defined $pool_cpu) {
+                $immediate_reachable = ($rvcpu_tactical < $pool_cpu) ? $rvcpu_tactical : $pool_cpu;
+            } else {
+                $immediate_reachable = $rvcpu_tactical;
+            }
+
+            ($immediate_ok, $immediate_msg) = _assert_budget_invariant(
+                $terms->{guarantee_demand}, $current_ent, $immediate_reachable,
+                $is_capped, $terms->{dispatch_budget}, $terms->{tier_label});
+
+            if (!defined $immediate_ok || !$immediate_ok) {
+                my $candidate = $rvcpu_tactical;
+                $safety_state = 'BLOCK';
+                my $why = defined($immediate_msg) ? $immediate_msg : 'invariant unavailable';
+                $safety_reasons .= '; ' unless ($safety_reasons eq '');
+                $safety_reasons .= "immediate tactical pair failed: $why";
+                $rvcpu_tactical = $current_vp_numeric;
+                $tactical_note = sprintf(
+                    'BLOCK: candidate %s VPs failed the immediate guarantee check; held at current %s VPs (%s)',
+                    $candidate, $current_vp_numeric, $why);
+            } else {
+                $tactical_note .= sprintf(
+                    '; immediate pair validated at reachable %.2f cores', $immediate_reachable);
+            }
+        }
+    } else {
+        $immediate_msg = 'not evaluated: no downward tactical action proposed';
+        $tactical_note .= sprintf('; reduction-safety state %s (%s)', $safety_state, $safety_reasons);
+    }
+
     return {
         entbounded                          => $rvcpu_entbounded,
         entbounded_governed                 => $entbounded_governed,
@@ -5171,6 +5437,15 @@ sub _compute_entbounded_and_tactical
         entbounded_evidence_above_envelope  => $entbounded_evidence_above_envelope,
         tactical                            => $rvcpu_tactical,
         tactical_note                       => $tactical_note,
+        tactical_pre_safety                 => $tactical_pre_safety,
+        reduction_safety_state              => $safety_state,
+        reduction_safety_reasons            => $safety_reasons,
+        reduction_current_reachable         => $reduction_safety->{current_reachable},
+        reduction_peak_reach_ratio          => $reduction_safety->{peak_reach_ratio},
+        immediate_candidate                 => $immediate_candidate,
+        immediate_invariant_holds           => $immediate_ok,
+        immediate_invariant                 => $immediate_msg,
+        immediate_reachable                 => $immediate_reachable,
     };
 }
 
@@ -7341,6 +7616,19 @@ sub calculate_runq_modified_physc
         # decision helper rather than recomputed inside it.
         my $current_vp_numeric = (defined $vcpu_for_lpar_numeric && looks_like_number($vcpu_for_lpar_numeric) && $vcpu_for_lpar_numeric > 0)
                                 ? ($vcpu_for_lpar_numeric + 0) : undef;
+        my $tactical_guarantee_demand = (defined $debug_info{'GuaranteeDemand'}
+                                         && looks_like_number($debug_info{'GuaranteeDemand'}))
+                                      ? ($debug_info{'GuaranteeDemand'} + 0) : undef;
+
+        my $reduction_safety = _classify_vcpu_reduction_safety({
+            evidence            => \%debug_info,
+            current_vp          => $current_vp_numeric,
+            current_entitlement => $current_ent_numeric,
+            pool_cpu            => $pool_cpu_for_lpar_numeric,
+            is_capped           => $is_capped_lpar,
+            peak_physc          => $pure_p99w1_physc,
+            guarantee_demand    => $tactical_guarantee_demand,
+        });
 
         # Task 3 (rVCPU_EntBounded) + Task 4 (rVCPU_Tactical): centralised so the
         # entitlement-safe and rate-limited tail cannot drift across the three
@@ -7355,6 +7643,13 @@ sub calculate_runq_modified_physc
             vp_current_ent_floor => $vp_current_ent_floor,
             current_ent_stale    => $current_ent_stale,
             current_vp_numeric   => $current_vp_numeric,
+            reduction_safety     => $reduction_safety,
+            current_entitlement  => $current_ent_numeric,
+            guarantee_demand     => $tactical_guarantee_demand,
+            is_capped            => $is_capped_lpar,
+            pool_cpu             => $pool_cpu_for_lpar_numeric,
+            dispatch_budget      => $dispatch_budget,
+            tier_label           => $final_tier,
         });
         my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
         my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
@@ -7404,6 +7699,15 @@ sub calculate_runq_modified_physc
             CurrentEntStale               => $current_ent_stale,
             Tactical                      => $rvcpu_tactical,
             TacticalNote                  => $tactical_note,
+            TacticalPreSafety             => $rvcpu_ebt->{tactical_pre_safety},
+            ReductionSafetyState          => $rvcpu_ebt->{reduction_safety_state},
+            ReductionSafetyReasons        => $rvcpu_ebt->{reduction_safety_reasons},
+            ReductionCurrentReachable     => $rvcpu_ebt->{reduction_current_reachable},
+            ReductionPeakReachRatio       => $rvcpu_ebt->{reduction_peak_reach_ratio},
+            ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
+            ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
+            ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
+            ImmediateReachable            => $rvcpu_ebt->{immediate_reachable},
             CurrentVPs                    => $current_vp_numeric,
         };
 
@@ -7444,6 +7748,19 @@ sub calculate_runq_modified_physc
         $debug_info{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
         $debug_info{'rVCPU_Tactical'}             = defined($rvcpu_tactical) ? $rvcpu_tactical : 'N/A';
         $debug_info{'rVCPU_TacticalNote'}         = $tactical_note // 'N/A';
+        $debug_info{'rVCPU_TacticalPreSafety'}    = defined($rvcpu_ebt->{tactical_pre_safety}) ? $rvcpu_ebt->{tactical_pre_safety} : 'N/A';
+        $debug_info{'rVCPU_ReductionSafetyState'} = $rvcpu_ebt->{reduction_safety_state} // 'N/A';
+        $debug_info{'rVCPU_ReductionSafetyReasons'} = $rvcpu_ebt->{reduction_safety_reasons} // 'N/A';
+        $debug_info{'rVCPU_ReductionCurrentReachable'} = defined($rvcpu_ebt->{reduction_current_reachable})
+            ? sprintf('%.2f', $rvcpu_ebt->{reduction_current_reachable}) : 'N/A';
+        $debug_info{'rVCPU_ReductionPeakReachRatio'} = defined($rvcpu_ebt->{reduction_peak_reach_ratio})
+            ? sprintf('%.3f', $rvcpu_ebt->{reduction_peak_reach_ratio}) : 'N/A';
+        $debug_info{'rVCPU_ImmediateCandidate'} = defined($rvcpu_ebt->{immediate_candidate}) ? $rvcpu_ebt->{immediate_candidate} : 'N/A';
+        $debug_info{'rVCPU_ImmediateInvariantHolds'} = !defined($rvcpu_ebt->{immediate_invariant_holds}) ? 'N/A'
+            : ($rvcpu_ebt->{immediate_invariant_holds} ? 'Yes' : 'No');
+        $debug_info{'rVCPU_ImmediateInvariant'} = $rvcpu_ebt->{immediate_invariant} // 'N/A';
+        $debug_info{'rVCPU_ImmediateReachable'} = defined($rvcpu_ebt->{immediate_reachable})
+            ? sprintf('%.2f', $rvcpu_ebt->{immediate_reachable}) : 'N/A';
         $debug_info{'rVCPU_CurrentVPs'}           = defined($current_vp_numeric) ? $current_vp_numeric : 'N/A';
     };
 
@@ -10231,6 +10548,25 @@ sub _write_standard_csv_report {
                     my $current_vp_numeric = (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus}) && $cfg->{virtual_cpus} > 0)
                                             ? ($cfg->{virtual_cpus} + 0) : undef;
 
+                    my $fb_safety_tier = $pname; $fb_safety_tier =~ s/-.*//;
+                    my $fb_safety_capped = (defined $cfg->{is_capped} && $cfg->{is_capped}) ? 1 : 0;
+                    my $fb_safety_pool = (defined $cfg->{pool_cpu} && looks_like_number($cfg->{pool_cpu})
+                                          && $cfg->{pool_cpu} > 0) ? ($cfg->{pool_cpu} + 0) : undef;
+                    my ($fb_safety_budget) = _resolve_dispatch_budget($fb_safety_tier);
+                    my $fb_safety_debug = $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$pname} // {};
+                    my $fb_safety_demand = (defined $fb_safety_debug->{'GuaranteeDemand'}
+                                            && looks_like_number($fb_safety_debug->{'GuaranteeDemand'}))
+                                         ? ($fb_safety_debug->{'GuaranteeDemand'} + 0) : undef;
+                    my $reduction_safety = _classify_vcpu_reduction_safety({
+                        evidence            => $fb_safety_debug,
+                        current_vp          => $current_vp_numeric,
+                        current_entitlement => $current_ent_numeric,
+                        pool_cpu            => $fb_safety_pool,
+                        is_capped           => $fb_safety_capped,
+                        peak_physc          => $p99w1_cores,
+                        guarantee_demand    => $fb_safety_demand,
+                    });
+
                     # Task 3 (rVCPU_EntBounded) + Task 4 (rVCPU_Tactical): centralised
                     # so the entitlement-safe and rate-limited tail cannot drift across
                     # the three rVCPU paths. This fallback path's envelope terms above
@@ -10245,6 +10581,13 @@ sub _write_standard_csv_report {
                         vp_current_ent_floor => $vp_current_ent_floor,
                         current_ent_stale    => $current_ent_stale,
                         current_vp_numeric   => $current_vp_numeric,
+                        reduction_safety     => $reduction_safety,
+                        current_entitlement  => $current_ent_numeric,
+                        guarantee_demand     => $fb_safety_demand,
+                        is_capped            => $fb_safety_capped,
+                        pool_cpu             => $fb_safety_pool,
+                        dispatch_budget      => $fb_safety_budget,
+                        tier_label           => $fb_safety_tier,
                     });
                     my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
                     my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
@@ -10294,6 +10637,15 @@ sub _write_standard_csv_report {
                         CurrentEntStale               => $current_ent_stale,
                         Tactical                      => $rvcpu_tactical,
                         TacticalNote                  => $tactical_note,
+                        TacticalPreSafety             => $rvcpu_ebt->{tactical_pre_safety},
+                        ReductionSafetyState          => $rvcpu_ebt->{reduction_safety_state},
+                        ReductionSafetyReasons        => $rvcpu_ebt->{reduction_safety_reasons},
+                        ReductionCurrentReachable     => $rvcpu_ebt->{reduction_current_reachable},
+                        ReductionPeakReachRatio       => $rvcpu_ebt->{reduction_peak_reach_ratio},
+                        ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
+                        ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
+                        ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
+                        ImmediateReachable            => $rvcpu_ebt->{immediate_reachable},
                         CurrentVPs                    => $current_vp_numeric,
                     };
 
@@ -10325,6 +10677,19 @@ sub _write_standard_csv_report {
                     $di->{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
                     $di->{'rVCPU_Tactical'}           = defined($rvcpu_tactical) ? $rvcpu_tactical : "N/A";
                     $di->{'rVCPU_TacticalNote'}       = $tactical_note // "N/A";
+                    $di->{'rVCPU_TacticalPreSafety'}  = defined($rvcpu_ebt->{tactical_pre_safety}) ? $rvcpu_ebt->{tactical_pre_safety} : 'N/A';
+                    $di->{'rVCPU_ReductionSafetyState'} = $rvcpu_ebt->{reduction_safety_state} // 'N/A';
+                    $di->{'rVCPU_ReductionSafetyReasons'} = $rvcpu_ebt->{reduction_safety_reasons} // 'N/A';
+                    $di->{'rVCPU_ReductionCurrentReachable'} = defined($rvcpu_ebt->{reduction_current_reachable})
+                        ? sprintf('%.2f', $rvcpu_ebt->{reduction_current_reachable}) : 'N/A';
+                    $di->{'rVCPU_ReductionPeakReachRatio'} = defined($rvcpu_ebt->{reduction_peak_reach_ratio})
+                        ? sprintf('%.3f', $rvcpu_ebt->{reduction_peak_reach_ratio}) : 'N/A';
+                    $di->{'rVCPU_ImmediateCandidate'} = defined($rvcpu_ebt->{immediate_candidate}) ? $rvcpu_ebt->{immediate_candidate} : 'N/A';
+                    $di->{'rVCPU_ImmediateInvariantHolds'} = !defined($rvcpu_ebt->{immediate_invariant_holds}) ? 'N/A'
+                        : ($rvcpu_ebt->{immediate_invariant_holds} ? 'Yes' : 'No');
+                    $di->{'rVCPU_ImmediateInvariant'} = $rvcpu_ebt->{immediate_invariant} // 'N/A';
+                    $di->{'rVCPU_ImmediateReachable'} = defined($rvcpu_ebt->{immediate_reachable})
+                        ? sprintf('%.2f', $rvcpu_ebt->{immediate_reachable}) : 'N/A';
                     $di->{'rVCPU_CurrentVPs'}         = defined($current_vp_numeric) ? $current_vp_numeric : "N/A";
                 }
 
@@ -20320,6 +20685,28 @@ sub _execute_multiplicative_seasonal {
                                        && $vm_map_ref->{Configuration}{virtual_cpus} > 0)
                                     ? ($vm_map_ref->{Configuration}{virtual_cpus} + 0) : undef;
 
+            my $seas_safety_capped = (defined $vm_map_ref->{Configuration}{is_capped}
+                                       && $vm_map_ref->{Configuration}{is_capped}) ? 1 : 0;
+            my $seas_safety_pool = (defined $vm_map_ref->{Configuration}{pool_cpu}
+                                    && looks_like_number($vm_map_ref->{Configuration}{pool_cpu})
+                                    && $vm_map_ref->{Configuration}{pool_cpu} > 0)
+                                 ? ($vm_map_ref->{Configuration}{pool_cpu} + 0) : undef;
+            my ($seas_safety_budget) = _resolve_dispatch_budget($ms_tier_str);
+            my $seas_safety_debug = (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH')
+                                  ? $debug_info_ref : {};
+            my $seas_safety_demand = (defined $seas_safety_debug->{'GuaranteeDemand'}
+                                      && looks_like_number($seas_safety_debug->{'GuaranteeDemand'}))
+                                   ? ($seas_safety_debug->{'GuaranteeDemand'} + 0) : undef;
+            my $reduction_safety = _classify_vcpu_reduction_safety({
+                evidence            => $seas_safety_debug,
+                current_vp          => $current_vp_numeric,
+                current_entitlement => $current_ent_numeric,
+                pool_cpu            => $seas_safety_pool,
+                is_capped           => $seas_safety_capped,
+                peak_physc          => $p99w1_cores,
+                guarantee_demand    => $seas_safety_demand,
+            });
+
             # Task 3 (rVCPU_EntBounded) + Task 4 (rVCPU_Tactical): centralised so
             # the entitlement-safe and rate-limited tail cannot drift across the
             # three rVCPU paths. The seasonal envelope terms above are passed in
@@ -20335,6 +20722,13 @@ sub _execute_multiplicative_seasonal {
                 vp_current_ent_floor => $vp_current_ent_floor,
                 current_ent_stale    => $current_ent_stale,
                 current_vp_numeric   => $current_vp_numeric,
+                reduction_safety     => $reduction_safety,
+                current_entitlement  => $current_ent_numeric,
+                guarantee_demand     => $seas_safety_demand,
+                is_capped            => $seas_safety_capped,
+                pool_cpu             => $seas_safety_pool,
+                dispatch_budget      => $seas_safety_budget,
+                tier_label           => $ms_tier_str,
             });
             my $rvcpu_entbounded                    = $rvcpu_ebt->{entbounded};
             my $entbounded_governed                 = $rvcpu_ebt->{entbounded_governed};
@@ -20383,6 +20777,15 @@ sub _execute_multiplicative_seasonal {
                 CurrentEntStale               => $current_ent_stale,
                 Tactical                      => $rvcpu_tactical,
                 TacticalNote                  => $tactical_note,
+                TacticalPreSafety             => $rvcpu_ebt->{tactical_pre_safety},
+                ReductionSafetyState          => $rvcpu_ebt->{reduction_safety_state},
+                ReductionSafetyReasons        => $rvcpu_ebt->{reduction_safety_reasons},
+                ReductionCurrentReachable     => $rvcpu_ebt->{reduction_current_reachable},
+                ReductionPeakReachRatio       => $rvcpu_ebt->{reduction_peak_reach_ratio},
+                ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
+                ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
+                ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
+                ImmediateReachable            => $rvcpu_ebt->{immediate_reachable},
                 CurrentVPs                    => $current_vp_numeric,
             };
             if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
@@ -20408,6 +20811,19 @@ sub _execute_multiplicative_seasonal {
                 $debug_info_ref->{'rVCPU_CurrentEntStale'}      = $current_ent_stale ? 1 : 0;
                 $debug_info_ref->{'rVCPU_Tactical'}             = defined($rvcpu_tactical) ? $rvcpu_tactical : "N/A";
                 $debug_info_ref->{'rVCPU_TacticalNote'}         = $tactical_note // "N/A";
+                $debug_info_ref->{'rVCPU_TacticalPreSafety'}    = defined($rvcpu_ebt->{tactical_pre_safety}) ? $rvcpu_ebt->{tactical_pre_safety} : 'N/A';
+                $debug_info_ref->{'rVCPU_ReductionSafetyState'} = $rvcpu_ebt->{reduction_safety_state} // 'N/A';
+                $debug_info_ref->{'rVCPU_ReductionSafetyReasons'} = $rvcpu_ebt->{reduction_safety_reasons} // 'N/A';
+                $debug_info_ref->{'rVCPU_ReductionCurrentReachable'} = defined($rvcpu_ebt->{reduction_current_reachable})
+                    ? sprintf('%.2f', $rvcpu_ebt->{reduction_current_reachable}) : 'N/A';
+                $debug_info_ref->{'rVCPU_ReductionPeakReachRatio'} = defined($rvcpu_ebt->{reduction_peak_reach_ratio})
+                    ? sprintf('%.3f', $rvcpu_ebt->{reduction_peak_reach_ratio}) : 'N/A';
+                $debug_info_ref->{'rVCPU_ImmediateCandidate'} = defined($rvcpu_ebt->{immediate_candidate}) ? $rvcpu_ebt->{immediate_candidate} : 'N/A';
+                $debug_info_ref->{'rVCPU_ImmediateInvariantHolds'} = !defined($rvcpu_ebt->{immediate_invariant_holds}) ? 'N/A'
+                    : ($rvcpu_ebt->{immediate_invariant_holds} ? 'Yes' : 'No');
+                $debug_info_ref->{'rVCPU_ImmediateInvariant'} = $rvcpu_ebt->{immediate_invariant} // 'N/A';
+                $debug_info_ref->{'rVCPU_ImmediateReachable'} = defined($rvcpu_ebt->{immediate_reachable})
+                    ? sprintf('%.2f', $rvcpu_ebt->{immediate_reachable}) : 'N/A';
                 $debug_info_ref->{'rVCPU_CurrentVPs'}           = defined($current_vp_numeric) ? $current_vp_numeric : "N/A";
             }
 
