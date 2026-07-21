@@ -202,7 +202,9 @@ my $VCPU_ROUND_UP_TO_EVEN = 0;                           # RETIRED: rVCPU evenis
 # For rENT_P < 1.0, the 2:1 VP:ENT ratio can yield env_max = 1 (for rENT_P < 0.50),
 # which provides zero dispatch headroom. A single VP cannot service any workload
 # concurrency. This floor ensures micro-partitions can reach at least 2 VPs when
-# RunQ evidence demonstrates demand exceeding the ratio-derived envelope.
+# completed, rENT-independent width evidence (RunQ, yield/peak, or configured
+# burst) demonstrates demand exceeding the ratio-derived envelope. Entitlement
+# must not be raised merely to make the ratio envelope admit that evidence.
 my $VCPU_MICRO_PARTITION_THRESHOLD     = 1.0;   # rENT_P < this qualifies as micro-partition
 my $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR = 2;     # Minimum env_max when expansion triggered
 
@@ -6008,18 +6010,41 @@ sub _strategic_rvcpu_envelope
                 $rvcpu_max = $rvcpu_min if (defined $rvcpu_min && $rvcpu_max < $rvcpu_min);
             }
 
-            # Micro-partition envelope expansion (evidence-gated).
-            # For rENT_P < 1.0 with env_max = 1, expand to floor of 2 when RunQ demands it.
-            # This ensures micro-partitions are not locked to a single VP when dispatch
-            # evidence shows concurrency demand. The gate (rvcpu_raw > rvcpu_max) prevents
-            # unnecessary expansion for genuinely low-concurrency workloads.
+            # Micro-partition envelope expansion (completed-evidence gated).
+            #
+            # The former gate considered rVCPU_raw (RunQ width) only. A completed
+            # yield/peak floor of 2 could therefore be clamped back to env_max=1
+            # at a sub-0.5 entitlement. A1 then saw Demand > Reachable and raised
+            # entitlement to 1.00 solely to make the 2:1 envelope admit the two
+            # VPs. On the next iteration reachability was 2 and the guarantee
+            # floor vanished, but monotone convergence could not undo the
+            # provisional entitlement raise (the observed G3 > G2 inversion).
+            #
+            # All three values below are rENT-independent width witnesses. Let
+            # any of them open the existing two-VP micro envelope. This does not
+            # create a new envelope policy; it makes the existing exception
+            # listen to the completed evidence that the final kernel already
+            # claims to floor against.
+            my $micro_width_evidence_vp = $rvcpu_raw;
+            my $micro_width_evidence_source = 'RunQ dispatch';
+            for my $candidate (
+                [ $p99w1_floor_vcpu,            'yield/peak' ],
+                [ $configured_burst_floor_vcpu, 'configured burst' ],
+            ) {
+                next unless (defined $candidate->[0]);
+                if (!defined $micro_width_evidence_vp
+                    || $candidate->[0] > $micro_width_evidence_vp) {
+                    $micro_width_evidence_vp = $candidate->[0];
+                    $micro_width_evidence_source = $candidate->[1];
+                }
+            }
             if (defined $rENT_P_for_envelope
                 && $rENT_P_for_envelope > 0
                 && $rENT_P_for_envelope < $VCPU_MICRO_PARTITION_THRESHOLD
                 && defined $rvcpu_max
                 && $rvcpu_max < $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR
-                && defined $rvcpu_raw
-                && $rvcpu_raw > $rvcpu_max) {
+                && defined $micro_width_evidence_vp
+                && $micro_width_evidence_vp > $rvcpu_max) {
                 my $original_env_max = $rvcpu_max;
                 $rvcpu_max = $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR;
                 # Respect MaxCPU as absolute ceiling
@@ -6028,8 +6053,9 @@ sub _strategic_rvcpu_envelope
                 }
                 if ($rvcpu_max > $original_env_max) {
                     $micro_expansion_note = sprintf(
-                        "Envelope max expanded %d -> %d (micro-partition floor; rENT_P=%.2f, RunQ demand=%d VPs > ratio max=%d)",
-                        $original_env_max, $rvcpu_max, $rENT_P_for_envelope, $rvcpu_raw, $original_env_max);
+                        "Envelope max expanded %d -> %d (micro-partition floor; rENT_P=%.2f, %s evidence=%d VPs > ratio max=%d)",
+                        $original_env_max, $rvcpu_max, $rENT_P_for_envelope,
+                        $micro_width_evidence_source, $micro_width_evidence_vp, $original_env_max);
                 }
             }
 
@@ -7826,6 +7852,31 @@ sub calculate_runq_modified_physc
                     $conv_proposed_reach = $rv_trial;                         # pool size unknown: reachable == proposed VP
                 }
 
+                # For an uncapped proposal, Demand > Reachable is a width or
+                # configuration infeasibility, not an entitlement floor. The
+                # guarantee helper deliberately returns a reach-pinned numeric
+                # floor for diagnostics in this state. Feeding that value into
+                # this monotone loop, however, can raise entitlement until the
+                # ratio envelope widens and then retain the provisional raise
+                # after the final proposal-relative floor has disappeared.
+                # Completed RunQ/yield/burst evidence has already had the chance
+                # to open the strategic envelope above. If demand is still
+                # unreachable, stop and let the final invariant fail closed (and
+                # Tactical hold) rather than manufacturing guaranteed demand.
+                if (!$is_capped_lpar
+                    && defined $guarantee_demand
+                    && looks_like_number($guarantee_demand)
+                    && defined $conv_proposed_reach
+                    && looks_like_number($conv_proposed_reach)
+                    && $guarantee_demand > $conv_proposed_reach + $FLOAT_EPSILON) {
+                    $conv_floor = undef;
+                    $conv_floor_reason = sprintf(
+                        "INFEASIBLE WIDTH: applicable demand %.2f cores exceeds proposed reachable capacity %.2f; entitlement was not raised because the uncapped proposal requires more reachable width, pool capacity or MaxCPU",
+                        $guarantee_demand, $conv_proposed_reach);
+                    $conv_stop = 'infeasible proposed width';
+                    last;
+                }
+
                 ($conv_floor, $conv_floor_reason) = _tier_guarantee_floor(
                     $guarantee_demand, $conv_proposed_reach, $is_capped_lpar, $dispatch_budget, $final_tier);
 
@@ -7960,7 +8011,9 @@ sub calculate_runq_modified_physc
                 (defined $conv_iters         ? $conv_iters         : 0),
                 (defined $conv_stop          ? $conv_stop          : 'n/a'),
                 ($conv_applied ? 'guarantee raised the planning entitlement'
-                               : 'no raise required (budget satisfied at seed)'),
+                 : ($conv_stop eq 'infeasible proposed width'
+                    ? 'no entitlement raise applied; the uncapped proposal requires additional reachable width'
+                    : 'no raise required (budget satisfied at seed)')),
                 (@conv_impl_blocks ? ('; implementation/reachability constrained by ' . join(', ', @conv_impl_blocks)) : '')
             );
             $debug_info{'GuaranteeConvergencePlannerVisible'} =
@@ -10925,7 +10978,9 @@ sub _write_standard_csv_report {
                     }
 
                     # Micro-partition envelope expansion (evidence-gated).
-                    # For rENT_P < 1.0 with env_max = 1, expand to floor of 2 when RunQ demands it.
+                    # At this point the fallback has only RunQ width available;
+                    # completed yield evidence is allowed to open the same
+                    # two-VP envelope immediately after it is calculated below.
                     if (defined $rENT_P
                         && $rENT_P > 0
                         && $rENT_P < $VCPU_MICRO_PARTITION_THRESHOLD
@@ -11037,6 +11092,25 @@ sub _write_standard_csv_report {
                             $p99w1_floor_vcpu = 1 if ($p99w1_floor_vcpu < 1);
                         }
 
+                        # Align the dormant CSV fallback with the authoritative
+                        # kernel: a completed yield/peak floor may open the
+                        # existing two-VP micro envelope. Without this, a profile
+                        # recomputed only at CSV time could silently reinstate the
+                        # same one-VP quantisation that A2.9 removes upstream.
+                        if (defined $rENT_P
+                            && $rENT_P > 0
+                            && $rENT_P < $VCPU_MICRO_PARTITION_THRESHOLD
+                            && defined $rvcpu_max
+                            && $rvcpu_max < $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR
+                            && defined $p99w1_floor_vcpu
+                            && $p99w1_floor_vcpu > $rvcpu_max) {
+                            $rvcpu_max = $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR;
+                            my $lpar_max_cpu = $cfg->{max_cpu} // 0;
+                            if ($lpar_max_cpu > 0 && $rvcpu_max > $lpar_max_cpu) {
+                                $rvcpu_max = int($lpar_max_cpu);
+                            }
+                        }
+
                         if ($p99w1_floor_vcpu > $rvcpu_final) {
                             $rvcpu_final = $p99w1_floor_vcpu;
                             $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
@@ -11068,6 +11142,19 @@ sub _write_standard_csv_report {
                     });
                     $configured_burst_floor_vcpu = $configured_burst_floor->{active}
                                                    ? $configured_burst_floor->{floor} : undef;
+                    if (defined $rENT_P
+                        && $rENT_P > 0
+                        && $rENT_P < $VCPU_MICRO_PARTITION_THRESHOLD
+                        && defined $rvcpu_max
+                        && $rvcpu_max < $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR
+                        && defined $configured_burst_floor_vcpu
+                        && $configured_burst_floor_vcpu > $rvcpu_max) {
+                        $rvcpu_max = $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR;
+                        my $lpar_max_cpu = $cfg->{max_cpu} // 0;
+                        if ($lpar_max_cpu > 0 && $rvcpu_max > $lpar_max_cpu) {
+                            $rvcpu_max = int($lpar_max_cpu);
+                        }
+                    }
                     if (defined $configured_burst_floor_vcpu
                         && $configured_burst_floor_vcpu > $rvcpu_final) {
                         $rvcpu_final = $configured_burst_floor_vcpu;
@@ -21414,6 +21501,25 @@ sub _execute_multiplicative_seasonal {
                         $p99w1_floor_vcpu = 1 if ($p99w1_floor_vcpu < 1);
                     }
 
+                    # Seasonal recomputation keeps its established estimator
+                    # inputs, but must honour the same completed yield/peak
+                    # evidence at the one-to-two-VP micro-envelope boundary.
+                    # This is deliberately limited to the existing floor of 2;
+                    # it does not centralise or otherwise alter the seasonal path.
+                    if (defined $rENT_P
+                        && $rENT_P > 0
+                        && $rENT_P < $VCPU_MICRO_PARTITION_THRESHOLD
+                        && defined $rvcpu_max
+                        && $rvcpu_max < $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR
+                        && defined $p99w1_floor_vcpu
+                        && $p99w1_floor_vcpu > $rvcpu_max) {
+                        $rvcpu_max = $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR;
+                        my $lpar_max_cpu = $vm_map_ref->{Configuration}{max_cpu} // 0;
+                        if ($lpar_max_cpu > 0 && $rvcpu_max > $lpar_max_cpu) {
+                            $rvcpu_max = int($lpar_max_cpu);
+                        }
+                    }
+
                     if ($p99w1_floor_vcpu > $rvcpu_final) {
                         $rvcpu_final = $p99w1_floor_vcpu;
                         $rvcpu_final = $rvcpu_max if (defined $rvcpu_max && $rvcpu_final > $rvcpu_max);
@@ -21442,6 +21548,19 @@ sub _execute_multiplicative_seasonal {
                 });
                 $configured_burst_floor_vcpu = $configured_burst_floor->{active}
                                                ? $configured_burst_floor->{floor} : undef;
+                if (defined $rENT_P
+                    && $rENT_P > 0
+                    && $rENT_P < $VCPU_MICRO_PARTITION_THRESHOLD
+                    && defined $rvcpu_max
+                    && $rvcpu_max < $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR
+                    && defined $configured_burst_floor_vcpu
+                    && $configured_burst_floor_vcpu > $rvcpu_max) {
+                    $rvcpu_max = $VCPU_MICRO_PARTITION_ENV_MAX_FLOOR;
+                    my $lpar_max_cpu = $vm_map_ref->{Configuration}{max_cpu} // 0;
+                    if ($lpar_max_cpu > 0 && $rvcpu_max > $lpar_max_cpu) {
+                        $rvcpu_max = int($lpar_max_cpu);
+                    }
+                }
                 if (defined $configured_burst_floor_vcpu
                     && $configured_burst_floor_vcpu > $rvcpu_final) {
                     $rvcpu_final = $configured_burst_floor_vcpu;
