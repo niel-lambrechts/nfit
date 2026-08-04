@@ -3053,6 +3053,23 @@ sub log_profile_rationale
             ($policy_audit_for_log->{ProposedReachableIsProxy} ? '; advisory proxy' : '');
         printf {$fh} "Pool Evidence Note                                     : %s\n",
             ($policy_audit_for_log->{PoolEvidenceNote} // 'N/A');
+        {
+            my $pr_assess = $policy_audit_for_log->{PoolRelianceAssessment} // 'NOT_APPLICABLE';
+            my $pr_class  = $policy_audit_for_log->{PoolRelianceClass} // 'NOT_APPLICABLE';
+            my $pr_pct    = $policy_audit_for_log->{PoolReliancePct};
+            my $pr_budget = $policy_audit_for_log->{PoolRelianceBudgetPct};
+            printf {$fh} "Event-Time Pool Reliance                               : %s (class: %s)\n",
+                $pr_assess, $pr_class;
+            if (defined $pr_pct && looks_like_number($pr_pct)
+                && defined $pr_budget && looks_like_number($pr_budget)) {
+                printf {$fh} "  Applicable / proposed ent / reachable (cores)        : %s / %s / %s\n",
+                    ($policy_audit_for_log->{PoolRelianceApplicableDemand} // 'N/A'),
+                    ($policy_audit_for_log->{PoolRelianceProposedEntitlement} // 'N/A'),
+                    ($policy_audit_for_log->{PoolRelianceReachable} // 'N/A');
+                printf {$fh} "  Pool reliance vs tier budget                         : %.0f%% vs %.0f%%\n",
+                    $pr_pct * 100, $pr_budget * 100;
+            }
+        }
     }
     print {$fh} "----------------------------------------------------------------------\n";
     if ($model_type eq 'recency_decay') {
@@ -5139,6 +5156,105 @@ sub _resolve_pool_evidence {
 }
 
 # ==============================================================================
+# SUBROUTINE: _assess_pool_reliance
+# PURPOSE:    Side-effect-free assessment of how far a proposed entitlement/VP
+#             pair leans on non-guaranteed (shared-pool) capacity, expressed
+#             against the tier's dispatch budget. Diagnostic only: it never
+#             sizes, clamps or converges anything. Mirrors the guarantee-floor
+#             algebra in _tier_guarantee_floor - pool reliance is the demand
+#             above entitlement measured against the non-guaranteed band
+#             (reachable minus entitlement), and must stay within the tier
+#             budget fraction.
+# CLASS:      NONE                - applicable demand already covered by guarantee
+#             TRANSIENT_EVENT     - baseline covered; only a retained peak/burst leans
+#             STRUCTURAL_BASELINE - ordinary planning demand itself leans on the pool
+#             NOT_APPLICABLE      - capped LPAR, or inputs unavailable
+# ARGUMENTS:  hashref: applicable_demand, base_planning_demand,
+#             proposed_entitlement, reachable, is_capped, dispatch_budget
+# RETURNS:    hashref of PoolReliance* fields (stringified/steady for the audit)
+# ==============================================================================
+sub _assess_pool_reliance {
+    my ($t) = @_;
+    $t = {} unless (defined $t && ref($t) eq 'HASH');
+
+    my $num = sub {
+        my ($v) = @_;
+        return (defined $v && looks_like_number($v)) ? ($v + 0) : undef;
+    };
+
+    my %out = (
+        PoolRelianceApplicableDemand    => 'N/A',
+        PoolRelianceProposedEntitlement => 'N/A',
+        PoolRelianceReachable           => 'N/A',
+        PoolReliancePct                 => 'N/A',
+        PoolRelianceBudgetPct           => 'N/A',
+        PoolRelianceAssessment          => 'NOT_APPLICABLE',
+        PoolRelianceClass               => 'NOT_APPLICABLE',
+    );
+
+    my $demand    = $num->($t->{applicable_demand});
+    my $base      = $num->($t->{base_planning_demand});
+    my $ent       = $num->($t->{proposed_entitlement});
+    my $reach     = $num->($t->{reachable});
+    my $budget    = $num->($t->{dispatch_budget});
+    my $is_capped = $t->{is_capped} ? 1 : 0;
+
+    # Without a resolved budget there is no policy test to make.
+    return { %out } unless (defined $budget && $budget >= 0);
+    $out{PoolRelianceBudgetPct} = sprintf('%.2f', $budget);
+
+    return { %out } unless (defined $demand && defined $ent);
+    $out{PoolRelianceApplicableDemand}    = sprintf('%.2f', $demand);
+    $out{PoolRelianceProposedEntitlement} = sprintf('%.2f', $ent);
+
+    # Capped LPAR: no non-guaranteed band exists, so pool reliance is not a
+    # meaningful concept (the guarantee floor collapses to Ent >= Demand).
+    if ($is_capped) {
+        $out{PoolRelianceReachable}  = sprintf('%.2f', $ent);
+        $out{PoolReliancePct}        = '0.00';
+        $out{PoolRelianceAssessment} = 'NOT_APPLICABLE';
+        $out{PoolRelianceClass}      = 'NONE';
+        return { %out };
+    }
+
+    return { %out } unless (defined $reach);
+    $out{PoolRelianceReachable} = sprintf('%.2f', $reach);
+
+    my $reliance_cores = $demand - $ent;
+    $reliance_cores = 0 if ($reliance_cores < 0);
+
+    # No lean at all: applicable demand is inside the guarantee.
+    if ($reliance_cores <= $FLOAT_EPSILON) {
+        $out{PoolReliancePct}        = '0.00';
+        $out{PoolRelianceAssessment} = 'WITHIN_ALLOWANCE';
+        $out{PoolRelianceClass}      = 'NONE';
+        return { %out };
+    }
+
+    # A lean exists; classify it as transient (only a retained peak/burst leans)
+    # or structural (ordinary planning demand itself exceeds entitlement).
+    my $structural = (defined $base && $base > $ent + $FLOAT_EPSILON) ? 1 : 0;
+    $out{PoolRelianceClass} = $structural ? 'STRUCTURAL_BASELINE' : 'TRANSIENT_EVENT';
+
+    # Infeasible width: applicable demand exceeds reachable capacity entirely,
+    # so no entitlement can bring reliance within band (mirrors _tier_guarantee_floor).
+    if ($demand > $reach + $FLOAT_EPSILON) {
+        $out{PoolReliancePct}        = 'N/A';
+        $out{PoolRelianceAssessment} = 'INFEASIBLE_WIDTH';
+        return { %out };
+    }
+
+    # demand > ent and demand <= reach => band strictly positive.
+    my $band_cores = $reach - $ent;
+    my $frac = $reliance_cores / $band_cores;
+    $out{PoolReliancePct}        = sprintf('%.2f', $frac);
+    $out{PoolRelianceAssessment} =
+        ($frac <= $budget + $FLOAT_EPSILON) ? 'WITHIN_ALLOWANCE' : 'EXCEEDS_ALLOWANCE';
+
+    return { %out };
+}
+
+# ==============================================================================
 # SUBROUTINE: _build_rvcpu_policy_audit
 # PURPOSE:    Build calculation provenance and policy metadata for an rVCPU
 #             recommendation without participating in sizing. All execution
@@ -5168,8 +5284,18 @@ sub _build_rvcpu_policy_audit {
         is_capped              => $terms->{is_capped},
     });
 
+    my $pool_reliance = _assess_pool_reliance({
+        applicable_demand    => $terms->{applicable_demand},
+        base_planning_demand => $terms->{base_planning_demand},
+        proposed_entitlement => $terms->{proposed_entitlement},
+        reachable            => $pool_evidence->{ProposedReachable},
+        is_capped            => $terms->{is_capped},
+        dispatch_budget      => $dispatch_budget,
+    });
+
     return {
         %{$pool_evidence},
+        %{$pool_reliance},
         PolicyContractVersion      => $RIGHTSIZING_POLICY_CONTRACT_VERSION,
         RecommendationPath         => $terms->{path} // 'UNKNOWN',
         StrategicConvergenceMode   => $terms->{convergence_mode} // 'UNKNOWN',
@@ -8385,6 +8511,8 @@ sub calculate_runq_modified_physc
             proposed_entitlement    => $rENT_P_for_envelope,
             pool_size               => $pool_cpu_for_lpar_numeric,
             is_capped               => $is_capped_lpar,
+            applicable_demand       => $debug_info{'GuaranteeDemand'},
+            base_planning_demand    => $debug_info{'BasePlanningDemand'},
         });
 
         # Persist for CSV and rationale consumers
@@ -11449,6 +11577,12 @@ sub _write_standard_csv_report {
                     my $entbounded_evidence_above_envelope  = $rvcpu_ebt->{entbounded_evidence_above_envelope};
                     my $rvcpu_tactical                      = $rvcpu_ebt->{tactical};
                     my $tactical_note                       = $rvcpu_ebt->{tactical_note};
+                    my $fb_pool_dbg = {};
+                    {
+                        my $fb_pdi = $vm_map_ref->{CoreResults}{ProfileDebugInfo};
+                        $fb_pool_dbg = $fb_pdi->{$pname}
+                            if (ref $fb_pdi eq 'HASH' && ref $fb_pdi->{$pname} eq 'HASH');
+                    }
                     my $rvcpu_policy_audit = _build_rvcpu_policy_audit({
                         tier_label              => $fb_safety_tier,
                         tier_num                => $rvcpu_tier_num,
@@ -11459,6 +11593,8 @@ sub _write_standard_csv_report {
                         proposed_entitlement    => $rENT_P,
                         pool_size               => $fb_safety_pool,
                         is_capped               => $fb_safety_capped,
+                        applicable_demand       => $fb_pool_dbg->{'GuaranteeDemand'},
+                        base_planning_demand    => $fb_pool_dbg->{'BasePlanningDemand'},
                     });
 
                     # Persist rVCPU + explain so rationale can print an audit trail
@@ -21865,6 +22001,8 @@ sub _execute_multiplicative_seasonal {
                 proposed_entitlement    => $rENT_P,
                 pool_size               => $seas_safety_pool,
                 is_capped               => $seas_safety_capped,
+                applicable_demand       => $debug_info_ref->{'GuaranteeDemand'},
+                base_planning_demand    => $debug_info_ref->{'BasePlanningDemand'},
             });
 
             $vm_map_ref->{CoreResults}{Profile_rVCPU}{$p_name} = defined($rvcpu_final) ? $rvcpu_final : "";
