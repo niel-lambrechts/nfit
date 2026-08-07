@@ -47,7 +47,7 @@ This guide will help you get the `nFit Suite` up and running quickly.
 
 * **Clone the repository:**
     ```bash
-    git clone <your_github_repository_url_here> nmon-fit
+    git clone https://github.com/niel-lambrechts/nfit nmon-fit
     cd nmon-fit
     ```
 * **Make Scripts Executable:**
