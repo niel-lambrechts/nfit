@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : golden
+# AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
+# PURPOSE  : Regression baseline ("golden master") harness for nFit.
+#
+#            capture : run nfit-profile (and through it the nfit engine) for each
+#                      selected staged system and run profile, in an isolated
+#                      scratch tree, and store canonicalised outputs plus a frozen
+#                      copy of the executables and configuration that produced
+#                      them.
+#            compare : re-run the same systems and profiles with the current
+#                      source tree against the same staged data and report every
+#                      difference from the stored baseline.
+#            list    : show stored baselines.
+#
+# ISOLATION: Staged data is never written. Each run uses a scratch tree:
+#              <scratch>/nfit, nfit-profile, etc/nfit.* (copies; connection
+#                                                   files such as influxdb.conf
+#                                                   are never copied)
+#              <scratch>/stage/<serial>/           (symlinks to the real
+#                                                   .nfit.cache.data/.states/
+#                                                   .manifest/.nfit_stage_id)
+#              <scratch>/output/, history/         (empty; outputs land here)
+#            so the L2 results cache, cache index, engine debug files, CSV and
+#            rationale outputs and any history lookups stay inside the scratch
+#            tree. History-dependent paths (--update-history, seasonal) are out
+#            of scope for this version.
+#
+# DETERMINISM: --enddate is pinned at capture (default: last complete month end
+#            of the staged data's capture date) and recorded; decay runs also
+#            pin --analysis-reference-date. Each run executes twice in the same
+#            scratch tree (uncached, then L2-cached); both must agree.
+#            Only these declared volatile tokens are normalised:
+#              - "Date/Time Generated : <timestamp>"
+#              - "completed at: <timestamp>"
+#              - "Total execution time: <n>s"
+#              - the scratch-tree path
+#            Numerical content is never normalised.
+#
+# PRIVACY  : All output is piped through dev/nfit-redact (fail-closed). Stored
+#            baselines live under .private/golden/<name>/ (gitignored).
+#
+# USAGE    : dev/golden capture <name> [--stage-dir DIR] [--systems all|S1,S2]
+#                                      [--runs forensic,decay-states,windowed]
+#                                      [--enddate YYYY-MM-DD]
+#            dev/golden compare <name> [--stage-dir DIR] [--frozen]
+#            dev/golden list
+#
+# REQUIRES : Python 3.8+ (standard library only), perl with JSON (or the
+#            .claude/perl5 development shims, used automatically when present).
+# ==============================================================================
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+GOLDEN_ROOT = REPO / '.private' / 'golden'
+STAGE_FILES = ('.nfit.cache.data', '.nfit.cache.states', '.nfit.cache.manifest', '.nfit_stage_id')
+EXECUTABLES = ('nfit', 'nfit-profile')
+
+# Run definitions mirror scripts/run-nfit-staged-batch.sh, minus the legacy
+# display-only --config and with the end-date clamp replaced by a pinned date.
+RUNS = {
+    'forensic':     ['--runq-perc-behavior=match'],
+    'decay-states': ['--runq-perc-behavior=match', '--decay-over-states'],
+    'windowed':     ['--runq-perc-behavior=match', '--enable-windowed-decay'],
+}
+DECAY_RUNS = {'decay-states', 'windowed'}
+
+VOLATILE = [
+    (re.compile(r'(Date/Time Generated\s*:\s*).*'), r'\1<TIMESTAMP>'),
+    (re.compile(r'(completed at:\s*).*'), r'\1<TIMESTAMP>'),
+    (re.compile(r'(Total execution time:\s*)[0-9.]+s'), r'\1<DURATION>'),
+]
+
+
+# ------------------------------------------------------------------------------
+# Output through the privacy filter
+# ------------------------------------------------------------------------------
+class RedactedOut:
+    """All harness output goes through dev/nfit-redact; fail-closed."""
+
+    def __init__(self, data_root: Path = None):
+        cmd = [str(REPO / 'dev' / 'nfit-redact'),
+               '--secret-file', str(REPO / '.private' / 'redact.secret')]
+        if data_root is not None:
+            cmd += ['--extra-root', str(data_root)]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, text=True, encoding='utf-8')
+
+    def say(self, msg=''):
+        self.proc.stdin.write(msg + '\n')
+
+    def close(self):
+        self.proc.stdin.close()
+        rc = self.proc.wait()
+        if rc == 2:
+            sys.stderr.write('golden: privacy filter refused output (empty vocabulary). '
+                             'Is the data root reachable?\n')
+        return rc
+
+
+# ------------------------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------------------------
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open('rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def git_identity(src: Path) -> dict:
+    def run(*cmd):
+        r = subprocess.run(['git', '-C', str(src)] + list(cmd), capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+    status = run('status', '--porcelain', '--', *EXECUTABLES) or ''
+    return {'commit': run('rev-parse', 'HEAD'), 'executables_dirty': bool(status)}
+
+
+def data_identity(sysdir: Path) -> dict:
+    ident = {}
+    for name in ('.nfit.cache.data', '.nfit.cache.states'):
+        p = sysdir / name
+        st = p.stat()
+        ident[name] = {'size': st.st_size, 'mtime_ns': st.st_mtime_ns}
+    return ident
+
+
+def discover_systems(stage_dir: Path, selector: str) -> list:
+    found = sorted(p.name for p in stage_dir.iterdir()
+                   if p.is_dir() and (p / '.nfit.cache.data').is_file()
+                   and (p / '.nfit.cache.states').is_file())
+    if selector in (None, '', 'all'):
+        return found
+    wanted = [s.strip() for s in selector.split(',') if s.strip()]
+    missing = [s for s in wanted if s not in found]
+    if missing:
+        raise LookupError(','.join(missing))
+    return wanted
+
+
+def last_complete_month_end(today: dt.date) -> dt.date:
+    return today.replace(day=1) - dt.timedelta(days=1)
+
+
+def perl_env() -> dict:
+    env = dict(os.environ)
+    shim = REPO / '.claude' / 'perl5'
+    probe = subprocess.run(['perl', '-MJSON', '-e1'], capture_output=True)
+    if probe.returncode != 0 and shim.is_dir():
+        env['PERL5LIB'] = str(shim) + (os.pathsep + env['PERL5LIB'] if env.get('PERL5LIB') else '')
+    return env
+
+
+def copy_nfit_config(src: Path, dst: Path) -> None:
+    """Copy only nFit configuration files (nfit.*). Connection files such as
+    influxdb.conf are never copied into scratch trees or frozen baselines."""
+    dst.mkdir(parents=True, exist_ok=True)
+    for f in sorted(src.iterdir()):
+        if f.is_file() and f.name.startswith('nfit.'):
+            shutil.copy2(f, dst / f.name)
+
+
+def build_tree(scratch: Path, exe_src: Path, etc_src: Path, sysdir: Path) -> Path:
+    """Create an isolated scratch tree; returns the scratch system directory."""
+    for exe in EXECUTABLES:
+        shutil.copy2(exe_src / exe, scratch / exe)
+    copy_nfit_config(etc_src, scratch / 'etc')
+    (scratch / 'output').mkdir()
+    (scratch / 'history').mkdir()
+    sdir = scratch / 'stage' / sysdir.name
+    sdir.mkdir(parents=True)
+    for name in STAGE_FILES:
+        if (sysdir / name).exists():
+            os.symlink(sysdir.resolve() / name, sdir / name)
+    return sdir
+
+
+def canonical_text(text: str, scratch: Path) -> str:
+    text = text.replace(str(scratch), '<TREE>')
+    out = []
+    for line in text.splitlines(keepends=True):
+        for rx, repl in VOLATILE:
+            line = rx.sub(repl, line)
+        out.append(line)
+    return ''.join(out)
+
+
+def run_profile(scratch: Path, sdir: Path, run: str, enddate: str, env: dict):
+    args = [str(scratch / 'nfit-profile')] + RUNS[run] + ['--enddate', enddate, '--nmondir', str(sdir)]
+    if run in DECAY_RUNS:
+        args += ['--analysis-reference-date', enddate]
+    r = subprocess.run(args, cwd=str(scratch), env=env, capture_output=True, text=True)
+    outputs = sorted((scratch / 'output').glob('*'))
+    collected = {}
+    for p in outputs:
+        kind = 'csv' if p.suffix == '.csv' else ('log' if p.suffix == '.log' else p.suffix.lstrip('.'))
+        collected[kind] = canonical_text(p.read_text(encoding='utf-8', errors='replace'), scratch)
+        p.unlink()
+    return r.returncode, r.stderr, collected
+
+
+def execute(system: str, sysdir: Path, run: str, enddate: str, exe_src: Path, etc_src: Path, env: dict):
+    """Run uncached then cached in one scratch tree; return canonical outputs."""
+    with tempfile.TemporaryDirectory(prefix='nfit-golden-') as tmp:
+        scratch = Path(tmp)
+        sdir = build_tree(scratch, exe_src, etc_src, sysdir)
+        rc1, err1, first = run_profile(scratch, sdir, run, enddate, env)
+        if rc1 != 0:
+            return {'error': f'uncached run failed rc={rc1}', 'stderr_tail': err1[-2000:]}
+        rc2, err2, second = run_profile(scratch, sdir, run, enddate, env)
+        if rc2 != 0:
+            return {'error': f'cached run failed rc={rc2}', 'stderr_tail': err2[-2000:]}
+        if first != second:
+            return {'error': 'uncached and cached runs disagree', 'outputs': first, 'cached': second}
+        return {'outputs': first}
+
+
+def diff_lines(a: str, b: str, limit: int = 20) -> list:
+    import difflib
+    d = list(difflib.unified_diff(a.splitlines(), b.splitlines(), 'baseline', 'current', lineterm='', n=0))
+    return d[:limit] + ([f'... ({len(d) - limit} more diff lines)'] if len(d) > limit else [])
+
+
+# ------------------------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------------------------
+def cmd_capture(a, out: RedactedOut) -> int:
+    stage_dir = Path(a.stage_dir).resolve()
+    dest = GOLDEN_ROOT / a.name
+    if dest.exists():
+        out.say(f'golden: baseline "{a.name}" already exists; choose another name.')
+        return 2
+    try:
+        systems = discover_systems(stage_dir, a.systems)
+    except LookupError as exc:
+        out.say(f'golden: system(s) not found in stage: {exc}')
+        return 2
+    runs = [r.strip() for r in a.runs.split(',')]
+    for r in runs:
+        if r not in RUNS:
+            out.say(f'golden: unknown run "{r}" (choose from {",".join(RUNS)})')
+            return 2
+    enddate = a.enddate or last_complete_month_end(dt.date.today()).isoformat()
+
+    frozen = dest / 'frozen'
+    frozen.mkdir(parents=True)
+    for exe in EXECUTABLES:
+        shutil.copy2(REPO / exe, frozen / exe)
+    copy_nfit_config(REPO / 'etc', frozen / 'etc')
+    env = perl_env()
+
+    meta = {
+        'name': a.name, 'created': dt.datetime.now().isoformat(timespec='seconds'),
+        'stage_dir': str(stage_dir), 'enddate': enddate, 'runs': runs,
+        'source': git_identity(REPO),
+        'executables_sha256': {e: sha256_file(REPO / e) for e in EXECUTABLES},
+        'systems': {},
+    }
+    out.say(f'Capturing baseline "{a.name}": {len(systems)} system(s), runs {",".join(runs)}, enddate {enddate}')
+    out.say(f'  stage dir (resolved): {stage_dir}')
+    failures = 0
+    for system in systems:
+        sysdir = stage_dir / system
+        meta['systems'][system] = {'data_identity': data_identity(sysdir), 'runs': {}}
+        for run in runs:
+            res = execute(system, sysdir, run, enddate, frozen, frozen / 'etc', env)
+            rdir = dest / 'results' / system / run
+            rdir.mkdir(parents=True)
+            if 'error' in res:
+                failures += 1
+                (rdir / 'ERROR.txt').write_text(res['error'] + '\n' + res.get('stderr_tail', ''))
+                out.say(f'  {system} {run:<13} FAILED: {res["error"]}')
+                continue
+            digests = {}
+            for kind, text in res['outputs'].items():
+                (rdir / f'{run}.{kind}').write_text(text, encoding='utf-8')
+                digests[kind] = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            meta['systems'][system]['runs'][run] = digests
+            out.say(f'  {system} {run:<13} ok ({", ".join(sorted(digests))}; cached run agrees)')
+    (dest / 'meta.json').write_text(json.dumps(meta, indent=2, sort_keys=True))
+    out.say(f'Baseline stored under .private/golden/{a.name} ({failures} failure(s)).')
+    return 1 if failures else 0
+
+
+def cmd_compare(a, out: RedactedOut) -> int:
+    dest = GOLDEN_ROOT / a.name
+    meta_path = dest / 'meta.json'
+    if not meta_path.is_file():
+        out.say(f'golden: no baseline named "{a.name}".')
+        return 2
+    meta = json.loads(meta_path.read_text())
+    stage_dir = Path(a.stage_dir or meta['stage_dir']).resolve()
+    exe_src = dest / 'frozen' if a.frozen else REPO
+    env = perl_env()
+    out.say(f'Comparing against baseline "{a.name}" (source: {"frozen copy" if a.frozen else "current tree"}, '
+            f'enddate {meta["enddate"]})')
+    differences = 0
+    for system, sysmeta in sorted(meta['systems'].items()):
+        sysdir = stage_dir / system
+        if not sysdir.is_dir():
+            out.say(f'  {system}: staged data not found; skipped')
+            differences += 1
+            continue
+        if data_identity(sysdir) != sysmeta['data_identity']:
+            out.say(f'  {system}: WARNING staged data changed since capture; differences may be data, not code')
+        for run, digests in sorted(sysmeta['runs'].items()):
+            res = execute(system, sysdir, run, meta['enddate'], exe_src, exe_src / 'etc', env)
+            if 'error' in res:
+                differences += 1
+                out.say(f'  {system} {run:<13} FAILED: {res["error"]}')
+                continue
+            changed = []
+            for kind in sorted(set(digests) | set(res['outputs'])):
+                cur = res['outputs'].get(kind)
+                if cur is None or hashlib.sha256(cur.encode('utf-8')).hexdigest() != digests.get(kind):
+                    changed.append(kind)
+            if not changed:
+                out.say(f'  {system} {run:<13} identical')
+                continue
+            differences += 1
+            out.say(f'  {system} {run:<13} DIFFERS in {", ".join(changed)}')
+            for kind in changed:
+                base_file = dest / 'results' / system / run / f'{run}.{kind}'
+                base = base_file.read_text(encoding='utf-8') if base_file.exists() else ''
+                for line in diff_lines(base, res['outputs'].get(kind, '')):
+                    out.say('      ' + line)
+    out.say(f'Summary: {differences} system/run combination(s) differ.')
+    return 1 if differences else 0
+
+
+def cmd_list(a, out: RedactedOut) -> int:
+    if not GOLDEN_ROOT.is_dir():
+        out.say('No baselines.')
+        return 0
+    for d in sorted(GOLDEN_ROOT.iterdir()):
+        m = d / 'meta.json'
+        if m.is_file():
+            meta = json.loads(m.read_text())
+            out.say(f'{meta["name"]}: created {meta["created"]}, {len(meta["systems"])} system(s), '
+                    f'runs {",".join(meta["runs"])}, enddate {meta["enddate"]}, '
+                    f'commit {(meta["source"]["commit"] or "?")[:7]}'
+                    f'{" (dirty)" if meta["source"]["executables_dirty"] else ""}')
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description='nFit golden-master regression harness')
+    sub = ap.add_subparsers(dest='cmd', required=True)
+    c = sub.add_parser('capture')
+    c.add_argument('name')
+    c.add_argument('--stage-dir', default=str(REPO / 'stage'))
+    c.add_argument('--systems', default='all')
+    c.add_argument('--runs', default='forensic,decay-states,windowed')
+    c.add_argument('--enddate', default=None)
+    k = sub.add_parser('compare')
+    k.add_argument('name')
+    k.add_argument('--stage-dir', default=None)
+    k.add_argument('--frozen', action='store_true', help='Re-run the frozen executables (reproducibility check)')
+    sub.add_parser('list')
+    a = ap.parse_args()
+
+    # The privacy filter learns identifiers from the data root in use as well
+    # as from the repository's own (possibly linked) data directories.
+    stage_arg = getattr(a, 'stage_dir', None)
+    if a.cmd == 'compare' and stage_arg is None:
+        m = GOLDEN_ROOT / a.name / 'meta.json'
+        stage_arg = json.loads(m.read_text())['stage_dir'] if m.is_file() else None
+    data_root = Path(stage_arg).resolve().parent if stage_arg else None
+    out = RedactedOut(data_root)
+    try:
+        rc = {'capture': cmd_capture, 'compare': cmd_compare, 'list': cmd_list}[a.cmd](a, out)
+    finally:
+        rrc = out.close()
+    return rc if rrc == 0 else 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
