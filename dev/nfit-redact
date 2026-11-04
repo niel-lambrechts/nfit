@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : nfit-redact
+# AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
+# PURPOSE  : Privacy filter for nFit developer output. Replaces VM names,
+#            managed-system serials, managed-system names, IPv4 addresses and
+#            fully qualified host names with stable, keyed pseudonyms, so that
+#            command output, logs, CSV and JSON can be shared for review
+#            (including with AI assistants) without disclosing estate identity.
+#
+#            The vocabulary of confidential terms is built locally, on every
+#            run, from the data and configuration that hold them:
+#              - directory names under stage/, history/, backups/ and output/
+#              - VM keys and serial_number values in stage/*/.nfit.cache.states
+#              - section names in etc/nfit.vms.cfg
+#              - section names and string values in etc/nfit.mgsys.cfg
+#              - (optional, slow) distinct VMName values in stage/*/.nfit.cache.data
+#            The vocabulary itself is never printed.
+#
+#            Pseudonyms are HMAC-SHA256(secret, lower(term)) truncated to six
+#            hex digits and prefixed by category (vm_, sys_, ip_, host_). The
+#            same term therefore maps to the same pseudonym across runs, which
+#            allows results to be correlated without revealing names. The
+#            secret lives outside version control (see --secret-file).
+#
+#            FAIL-CLOSED: if no vocabulary can be built, nothing is emitted and
+#            the exit status is 2 (override with --allow-empty).
+#
+# USAGE    : <command> 2>&1 | dev/nfit-redact
+#            dev/nfit-redact [options] FILE ...         (redact files to STDOUT)
+#            dev/nfit-redact --audit FILE|DIR ...       (count hits only; no content)
+#            dev/nfit-redact --stats                    (vocabulary sizes only)
+#
+# OPTIONS  : --root DIR          nFit application root (default: parent of dev/)
+#            --secret-file PATH  HMAC secret (default: $NFIT_REDACT_SECRET_FILE,
+#                                else <root>/.private/redact.secret; created
+#                                with mode 0600 on first use)
+#            --scan-l1           Also harvest VMName values from the L1 caches
+#            --allow-empty       Permit operation with an empty vocabulary
+#
+# REQUIRES : Python 3.8+ (standard library only)
+# ==============================================================================
+
+import argparse
+import configparser
+import hashlib
+import hmac
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+# Terms shorter than this are not treated as confidential vocabulary: they are
+# too likely to collide with ordinary words, column names or numbers.
+MIN_TERM_LENGTH = 3
+
+# Ordinary words that may appear as section names or values in configuration
+# files but which are not identifying. Matching is case-insensitive.
+STOP_TERMS = {
+    'default', 'defaults', 'global', 'none', 'true', 'false', 'yes', 'no',
+    'prod', 'production', 'test', 'dev', 'uat', 'tier', 'name', 'pool',
+    'shared', 'dedicated', 'capped', 'uncapped', 'aix', 'linux', 'vios',
+}
+
+# Data directories whose immediate child directory names are confidential
+# (managed-system serials or names).
+DATA_DIRS = ('stage', 'history', 'backups', 'output')
+
+# Character class used to define term boundaries. A confidential term only
+# matches when it is not embedded in a longer identifier.
+_WORD = r'A-Za-z0-9_'
+
+# IPv4 address (dotted quad, each octet 0-255). Not preceded by a letter, so
+# version strings such as v9.26.219.0 are left intact.
+IPV4_RE = re.compile(
+    r'(?<![0-9A-Za-z_.])(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?![0-9A-Za-z_]|\.\d)'
+)
+
+# Fully qualified host names: at least two dots and a recognised network
+# suffix. Deliberately narrow so that file names such as nfit.cache.states or
+# nfit-profile.pl are never mistaken for host names.
+FQDN_RE = re.compile(
+    r'(?<![' + _WORD + r'.-])'
+    r'(?:[A-Za-z0-9_-]+\.){2,}'
+    r'(?:com|net|org|local|lan|corp|internal|intra|int|io|za|uk)'
+    r'(?![' + _WORD + r'-])',
+    re.IGNORECASE,
+)
+
+# IBM machine serial as presented by firmware/HMC metadata, e.g. IBM,02 followed by seven characters.
+IBM_SERIAL_RE = re.compile(r'IBM,0?[0-9A-Z]{7,8}\b')
+
+
+# ------------------------------------------------------------------------------
+# Secret handling
+# ------------------------------------------------------------------------------
+def load_or_create_secret(path: Path) -> bytes:
+    """Return the HMAC secret, creating it (0600) on first use."""
+    if path.exists():
+        data = path.read_text(encoding='utf-8').strip()
+        if len(data) < 32:
+            raise SystemExit(f"nfit-redact: secret file is too short: {path}")
+        return data.encode('utf-8')
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    secret = os.urandom(32).hex()
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        fh.write(secret + '\n')
+    return secret.encode('utf-8')
+
+
+# ------------------------------------------------------------------------------
+# Vocabulary construction
+# ------------------------------------------------------------------------------
+def _accept(term) -> bool:
+    """True when a candidate string should be treated as confidential."""
+    if term is None:
+        return False
+    term = str(term).strip()
+    if len(term) < MIN_TERM_LENGTH:
+        return False
+    if term.lower() in STOP_TERMS:
+        return False
+    # Pure numbers (entitlements, counts, epochs) are not identifiers.
+    if re.fullmatch(r'[0-9.]+', term):
+        return False
+    return True
+
+
+def _add(vocab: dict, term, category: str) -> None:
+    """Record a term; a VM classification never downgrades a system term."""
+    if not _accept(term):
+        return
+    term = str(term).strip()
+    vocab.setdefault(term, category)
+
+
+def build_vocabulary(root: Path, scan_l1: bool) -> dict:
+    """Build {term: category} from local data and configuration."""
+    vocab = {}
+
+    # 1. Managed-system directory names under the data directories.
+    for name in DATA_DIRS:
+        base = root / name
+        if not base.is_dir():
+            continue
+        for child in base.iterdir():
+            if child.is_dir() and not child.name.startswith('.'):
+                _add(vocab, child.name, 'sys')
+
+    # 2. VM keys and serial numbers from each configuration-state cache.
+    stage = root / 'stage'
+    if stage.is_dir():
+        for states_file in stage.glob('*/.nfit.cache.states'):
+            try:
+                states = json.loads(states_file.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                continue
+            if not isinstance(states, dict):
+                continue
+            for vm_name, timeline in states.items():
+                _add(vocab, vm_name, 'vm')
+                if isinstance(timeline, list):
+                    for state in timeline:
+                        meta = state.get('metadata', {}) if isinstance(state, dict) else {}
+                        if isinstance(meta, dict):
+                            _add(vocab, meta.get('serial_number'), 'sys')
+
+    # 3. VM section names in the VM tier configuration.
+    vms_cfg = root / 'etc' / 'nfit.vms.cfg'
+    if vms_cfg.is_file():
+        for line in vms_cfg.read_text(encoding='utf-8', errors='replace').splitlines():
+            m = re.match(r'\s*\[([^\]]+)\]\s*$', line)
+            if m:
+                _add(vocab, m.group(1), 'vm')
+
+    # 4. Managed-system configuration: section names and non-numeric values.
+    mgsys_cfg = root / 'etc' / 'nfit.mgsys.cfg'
+    if mgsys_cfg.is_file():
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            parser.read(mgsys_cfg, encoding='utf-8')
+            for section in parser.sections():
+                _add(vocab, section, 'sys')
+                for _key, value in parser.items(section):
+                    for token in re.split(r'[\s,;]+', value or ''):
+                        _add(vocab, token.strip('"\''), 'sys')
+        except configparser.Error:
+            pass
+
+    # 5. Optional: distinct VM names from the L1 caches (reads whole files).
+    if scan_l1 and stage.is_dir():
+        for data_file in stage.glob('*/.nfit.cache.data'):
+            try:
+                with data_file.open('r', encoding='utf-8', errors='replace') as fh:
+                    fh.readline()  # header
+                    for line in fh:
+                        parts = line.split(',', 2)
+                        if len(parts) >= 2:
+                            _add(vocab, parts[1], 'vm')
+            except OSError:
+                continue
+
+    return vocab
+
+
+# ------------------------------------------------------------------------------
+# Redaction engine
+# ------------------------------------------------------------------------------
+class Redactor:
+    def __init__(self, vocab: dict, secret: bytes):
+        self.secret = secret
+        # Case-insensitive lookup: the pseudonym is keyed on the lower-cased
+        # term so that VM1 and vm1 map to the same identity.
+        self.category = {t.lower(): c for t, c in vocab.items()}
+        terms = sorted(vocab.keys(), key=len, reverse=True)
+        self.vocab_re = None
+        if terms:
+            alternation = '|'.join(re.escape(t) for t in terms)
+            self.vocab_re = re.compile(
+                r'(?<![' + _WORD + r'])(?:' + alternation + r')(?![' + _WORD + r'])',
+                re.IGNORECASE,
+            )
+        self.hits = 0
+
+    def pseudonym(self, term: str, category: str) -> str:
+        digest = hmac.new(self.secret, term.lower().encode('utf-8'), hashlib.sha256).hexdigest()
+        return f"{category}_{digest[:6]}"
+
+    def _vocab_sub(self, m) -> str:
+        self.hits += 1
+        term = m.group(0)
+        return self.pseudonym(term, self.category.get(term.lower(), 'vm'))
+
+    def _cat_sub(self, category):
+        def _sub(m):
+            self.hits += 1
+            return self.pseudonym(m.group(0), category)
+        return _sub
+
+    def _fqdn_sub(self, m) -> str:
+        # Pseudonymise the host label and the domain separately, so that a VM
+        # name inside an FQDN keeps the same vm_ pseudonym it has elsewhere.
+        self.hits += 1
+        first, _, domain = m.group(0).partition('.')
+        first_p = self.pseudonym(first, self.category.get(first.lower(), 'host'))
+        return f"{first_p}.{self.pseudonym(domain, 'dom')}"
+
+    def redact(self, text: str) -> str:
+        # Order matters: FQDNs first (host and domain handled together), then
+        # the vocabulary, then the remaining structural patterns.
+        text = FQDN_RE.sub(self._fqdn_sub, text)
+        if self.vocab_re is not None:
+            text = self.vocab_re.sub(self._vocab_sub, text)
+        text = IBM_SERIAL_RE.sub(self._cat_sub('sys'), text)
+        text = IPV4_RE.sub(self._cat_sub('ip'), text)
+        return text
+
+
+# ------------------------------------------------------------------------------
+# Command-line interface
+# ------------------------------------------------------------------------------
+def _iter_audit_files(paths):
+    for p in paths:
+        p = Path(p)
+        if p.is_dir():
+            for f in sorted(p.rglob('*')):
+                if f.is_file():
+                    yield f
+        elif p.is_file():
+            yield p
+
+
+def main() -> int:
+    script_root = Path(__file__).resolve().parent.parent
+    ap = argparse.ArgumentParser(description='Pseudonymise confidential identifiers in nFit output.')
+    ap.add_argument('files', nargs='*', help='Files to redact (default: STDIN)')
+    ap.add_argument('--root', default=str(script_root), help='nFit application root')
+    ap.add_argument('--secret-file', default=None, help='HMAC secret file')
+    ap.add_argument('--scan-l1', action='store_true', help='Harvest VM names from L1 caches (slow)')
+    ap.add_argument('--allow-empty', action='store_true', help='Permit an empty vocabulary')
+    ap.add_argument('--audit', action='store_true', help='Report hit counts per file; print no content')
+    ap.add_argument('--stats', action='store_true', help='Report vocabulary sizes only')
+    args = ap.parse_args()
+
+    root = Path(args.root).resolve()
+    secret_path = Path(
+        args.secret_file
+        or os.environ.get('NFIT_REDACT_SECRET_FILE')
+        or (root / '.private' / 'redact.secret')
+    )
+
+    vocab = build_vocabulary(root, args.scan_l1)
+    if not vocab and not args.allow_empty:
+        print('nfit-redact: empty vocabulary - refusing to emit output (fail-closed).', file=sys.stderr)
+        return 2
+
+    if args.stats:
+        counts = {}
+        for cat in vocab.values():
+            counts[cat] = counts.get(cat, 0) + 1
+        print(json.dumps({'vocabulary_terms': len(vocab), 'by_category': counts}, sort_keys=True))
+        return 0
+
+    redactor = Redactor(vocab, load_or_create_secret(secret_path))
+
+    if args.audit:
+        total = 0
+        for f in _iter_audit_files(args.files or ['.']):
+            try:
+                text = f.read_text(encoding='utf-8', errors='replace')
+            except OSError:
+                continue
+            before = redactor.hits
+            redactor.redact(text)
+            n = redactor.hits - before
+            total += n
+            if n:
+                # Only a count and the (itself redacted) path are shown.
+                saved = redactor.hits
+                shown = redactor.redact(str(f))
+                redactor.hits = saved
+                print(f"{n:6d}  {shown}")
+        print(f"total hits: {total}")
+        return 1 if total else 0
+
+    out = sys.stdout
+    if args.files:
+        for name in args.files:
+            with open(name, 'r', encoding='utf-8', errors='replace') as fh:
+                for line in fh:
+                    out.write(redactor.redact(line))
+    else:
+        for line in sys.stdin:
+            out.write(redactor.redact(line))
+    out.flush()
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
