@@ -46,6 +46,10 @@
 #                                      [--enddate YYYY-MM-DD]
 #            dev/golden compare <name> [--stage-dir DIR] [--frozen]
 #            dev/golden list
+#            dev/golden determinism [--stage-dir DIR] --systems S [--runs R]
+#                                   [--enddate YYYY-MM-DD]
+#            Systems may be given by real name or by the sys_xxxxxx pseudonym
+#            that the redacted output shows.
 #
 # REQUIRES : Python 3.8+ (standard library only), perl with JSON (or the
 #            .claude/perl5 development shims, used automatically when present).
@@ -137,13 +141,44 @@ def data_identity(sysdir: Path) -> dict:
     return ident
 
 
+def pseudonym(term: str):
+    """sys_xxxxxx pseudonym exactly as dev/nfit-redact computes it, or None."""
+    import hmac
+    secret_file = REPO / '.private' / 'redact.secret'
+    if not secret_file.is_file():
+        return None
+    secret = secret_file.read_text(encoding='utf-8').strip().encode('utf-8')
+    return 'sys_' + hmac.new(secret, term.lower().encode('utf-8'), hashlib.sha256).hexdigest()[:6]
+
+
+def stderr_tail(text: str, lines: int = 8) -> list:
+    parts = [p.strip() for p in re.split(r'[\r\n]+', text or '') if p.strip()]
+    return parts[-lines:]
+
+
+def report_difference(out, label_a: str, a: dict, label_b: str, b: dict, limit: int = 12) -> None:
+    for kind in sorted(set(a) | set(b)):
+        if a.get(kind) != b.get(kind):
+            out.say(f'      {kind}: {label_a} vs {label_b} differ')
+            for line in diff_lines(a.get(kind, ''), b.get(kind, ''), limit):
+                out.say('        ' + line)
+
+
+def report_failure(out, res: dict) -> None:
+    for line in stderr_tail(res.get('stderr_tail', '')):
+        out.say('      stderr: ' + line)
+    if 'cached' in res:
+        report_difference(out, 'uncached', res['outputs'], 'cached', res['cached'])
+
+
 def discover_systems(stage_dir: Path, selector: str) -> list:
     found = sorted(p.name for p in stage_dir.iterdir()
                    if p.is_dir() and (p / '.nfit.cache.data').is_file()
                    and (p / '.nfit.cache.states').is_file())
     if selector in (None, '', 'all'):
         return found
-    wanted = [s.strip() for s in selector.split(',') if s.strip()]
+    by_alias = {pseudonym(f): f for f in found}
+    wanted = [by_alias.get(s.strip(), s.strip()) for s in selector.split(',') if s.strip()]
     missing = [s for s in wanted if s not in found]
     if missing:
         raise LookupError(','.join(missing))
@@ -211,17 +246,20 @@ def run_profile(scratch: Path, sdir: Path, run: str, enddate: str, env: dict):
     return r.returncode, r.stderr, collected
 
 
-def execute(system: str, sysdir: Path, run: str, enddate: str, exe_src: Path, etc_src: Path, env: dict):
+def execute(system: str, sysdir: Path, run: str, enddate: str, exe_src: Path, etc_src: Path, env: dict,
+            repeat: bool = True):
     """Run uncached then cached in one scratch tree; return canonical outputs."""
     with tempfile.TemporaryDirectory(prefix='nfit-golden-') as tmp:
         scratch = Path(tmp)
         sdir = build_tree(scratch, exe_src, etc_src, sysdir)
         rc1, err1, first = run_profile(scratch, sdir, run, enddate, env)
         if rc1 != 0:
-            return {'error': f'uncached run failed rc={rc1}', 'stderr_tail': err1[-2000:]}
+            return {'error': f'uncached run failed rc={rc1}', 'stderr_tail': err1[-4000:]}
+        if not repeat:
+            return {'outputs': first}
         rc2, err2, second = run_profile(scratch, sdir, run, enddate, env)
         if rc2 != 0:
-            return {'error': f'cached run failed rc={rc2}', 'stderr_tail': err2[-2000:]}
+            return {'error': f'cached run failed rc={rc2}', 'stderr_tail': err2[-4000:], 'outputs': first}
         if first != second:
             return {'error': 'uncached and cached runs disagree', 'outputs': first, 'cached': second}
         return {'outputs': first}
@@ -281,7 +319,12 @@ def cmd_capture(a, out: RedactedOut) -> int:
             if 'error' in res:
                 failures += 1
                 (rdir / 'ERROR.txt').write_text(res['error'] + '\n' + res.get('stderr_tail', ''))
+                for label in ('outputs', 'cached'):
+                    for kind, text in res.get(label, {}).items():
+                        prefix = 'uncached' if label == 'outputs' else 'cached'
+                        (rdir / f'{prefix}.{kind}').write_text(text, encoding='utf-8')
                 out.say(f'  {system} {run:<13} FAILED: {res["error"]}')
+                report_failure(out, res)
                 continue
             digests = {}
             for kind, text in res['outputs'].items():
@@ -340,6 +383,58 @@ def cmd_compare(a, out: RedactedOut) -> int:
     return 1 if differences else 0
 
 
+def cmd_determinism(a, out: RedactedOut) -> int:
+    """Separate run-to-run nondeterminism from results-cache effects.
+
+    For each system and run: two fresh scratch trees (A, B), a repeat in tree A
+    (served by the L2 results cache), and two fresh trees with Perl hash
+    randomisation fixed (C, D). Nothing is stored."""
+    stage_dir = Path(a.stage_dir).resolve()
+    try:
+        systems = discover_systems(stage_dir, a.systems)
+    except LookupError as exc:
+        out.say(f'golden: system(s) not found in stage: {exc}')
+        return 2
+    enddate = a.enddate or last_complete_month_end(dt.date.today()).isoformat()
+    base_env = perl_env()
+    seeded_env = dict(base_env, PERL_HASH_SEED='0', PERL_PERTURB_KEYS='0')
+    worst = 0
+    for system in systems:
+        sysdir = stage_dir / system
+        for run in [r.strip() for r in a.runs.split(',')]:
+            out.say(f'  {system} {run}')
+            a1 = execute(system, sysdir, run, enddate, REPO, REPO / 'etc', base_env)   # fresh + cached
+            b = execute(system, sysdir, run, enddate, REPO, REPO / 'etc', base_env, repeat=False)
+            c = execute(system, sysdir, run, enddate, REPO, REPO / 'etc', seeded_env, repeat=False)
+            d = execute(system, sysdir, run, enddate, REPO, REPO / 'etc', seeded_env, repeat=False)
+            fresh_a = a1.get('outputs', {})
+            # A successful repeat returns only the shared output; a disagreeing
+            # repeat returns both; a failed first run returns neither.
+            if 'cached' in a1:
+                cached_a = a1['cached']
+            elif 'error' not in a1:
+                cached_a = fresh_a
+            else:
+                cached_a = {}
+            checks = [
+                ('fresh A vs fresh B (random hash order)', fresh_a, b.get('outputs', {})),
+                ('fresh A vs cached A', fresh_a, cached_a),
+                ('fresh C vs fresh D (PERL_HASH_SEED=0)', c.get('outputs', {}), d.get('outputs', {})),
+            ]
+            for res, label in ((a1, 'A'), (b, 'B'), (c, 'C'), (d, 'D')):
+                if 'error' in res and 'cached' not in res:
+                    out.say(f'    run {label}: {res["error"]}')
+                    for line in stderr_tail(res.get('stderr_tail', '')):
+                        out.say('      stderr: ' + line)
+            for label, x, y in checks:
+                same = bool(x) and x == y
+                out.say(f'    {label:<42} {"identical" if same else "DIFFER"}')
+                if not same:
+                    worst = 1
+                    report_difference(out, 'first', x, 'second', y, limit=8)
+    return worst
+
+
 def cmd_list(a, out: RedactedOut) -> int:
     if not GOLDEN_ROOT.is_dir():
         out.say('No baselines.')
@@ -369,6 +464,11 @@ def main() -> int:
     k.add_argument('--stage-dir', default=None)
     k.add_argument('--frozen', action='store_true', help='Re-run the frozen executables (reproducibility check)')
     sub.add_parser('list')
+    d = sub.add_parser('determinism')
+    d.add_argument('--stage-dir', default=str(REPO / 'stage'))
+    d.add_argument('--systems', required=True)
+    d.add_argument('--runs', default='forensic')
+    d.add_argument('--enddate', default=None)
     a = ap.parse_args()
 
     # The privacy filter learns identifiers from the data root in use as well
@@ -380,7 +480,8 @@ def main() -> int:
     data_root = Path(stage_arg).resolve().parent if stage_arg else None
     out = RedactedOut(data_root)
     try:
-        rc = {'capture': cmd_capture, 'compare': cmd_compare, 'list': cmd_list}[a.cmd](a, out)
+        rc = {'capture': cmd_capture, 'compare': cmd_compare, 'list': cmd_list,
+              'determinism': cmd_determinism}[a.cmd](a, out)
     finally:
         rrc = out.close()
     return rc if rrc == 0 else 2
