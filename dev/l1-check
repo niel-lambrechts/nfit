@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : l1-check
+# AUTHOR   : Niël Lambrechts (https://github.com/niel-lambrechts)
+# PURPOSE  : Read-only validator for staged nFit L1 caches: the main data file,
+#            the configuration-state file, the manifest and, when one is
+#            published, the processor-pool evidence sidecar. Used as the gate
+#            for each system of a research capture, and on any cache whose
+#            integrity is in doubt (for example after an interrupted run).
+#
+#            Checks (FAIL unless marked WARN):
+#              manifest  build status, data window, schema version and columns
+#              data      header against the schema; per row: cell count, UTC
+#                        second timestamp, VM name present, numeric cells,
+#                        no negative values; timestamp order (VM byte order
+#                        within a timestamp WARN); data_end not earlier than the
+#                        last row with PhysC (WARN);
+#                        schema 2: data_revision, quality_rows and
+#                        quality_nonempty recomputed from the file
+#              states    JSON object; every VM in the data has states;
+#                        schema 2: states_revision recomputed
+#              pool      when pool_file is declared: gzip stream intact, header
+#                        equals pool_columns, cell count, integer ns times inside
+#                        pool_window_ns, series IDs and hosts match the series
+#                        file, counts and revisions recomputed; status and file
+#                        consistent
+#              leftovers interrupted-run work files (WARN)
+#
+#            Output never contains VM or host names, serials or cell values:
+#            systems are shown by keyed pseudonym (as dev/nfit-redact computes
+#            it, when its secret is available) or by position, and problems by
+#            row number and column name.
+#
+# USAGE    : dev/l1-check [--pseudonym-secret FILE] [--max-examples N] DIR ...
+#            DIR is one system's cache directory or a stage root holding them.
+# EXIT     : 0 all systems pass (warnings allowed), 1 a check failed, 2 usage.
+# REQUIRES : Python 3.8+ (standard library only); the stager alongside, from
+#            which the column contracts are read.
+# ==============================================================================
+import argparse
+import gzip
+import hashlib
+import hmac
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import sys
+import zlib
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+TS_RE = re.compile(r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')
+NUMERIC_RE = re.compile(r'-?(\d+(\.\d*)?|\.\d+)([eE][-+]?\d+)?')
+DATA, STATES, MANIFEST = '.nfit.cache.data', '.nfit.cache.states', '.nfit.cache.manifest'
+
+
+def load_stager(path):
+    loader = importlib.machinery.SourceFileLoader('nfit_stager_contract', str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for block in iter(lambda: fh.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def read_manifest(path):
+    meta = {}
+    with open(path, encoding='utf-8') as fh:
+        for line in fh:
+            if ':' in line:
+                k, _, v = line.partition(':')
+                meta[k.strip()] = v.strip()
+    return meta
+
+
+def parse_counts(text):
+    out = {}
+    for part in (text or '').split(';'):
+        if '=' in part:
+            k, _, v = part.partition('=')
+            out[k.strip()] = v.strip()
+    return out
+
+
+class Report:
+    def __init__(self, label, max_examples):
+        self.label, self.max_examples = label, max_examples
+        self.fails, self.warns, self.info = [], [], []
+        self._examples = {}
+
+    def fail(self, check, detail):
+        self.fails.append((check, detail))
+
+    def warn(self, check, detail):
+        self.warns.append((check, detail))
+
+    def note(self, detail):
+        self.info.append(detail)
+
+    def example(self, check, detail):
+        """Counted problem with up to max_examples row-level details."""
+        bucket = self._examples.setdefault(check, [0, []])
+        bucket[0] += 1
+        if len(bucket[1]) < self.max_examples:
+            bucket[1].append(detail)
+
+    def flush_examples(self, severity='fail'):
+        for check, (n, examples) in self._examples.items():
+            (self.fail if severity == 'fail' else self.warn)(check, f"{n} occurrence(s); e.g. {'; '.join(examples)}")
+        self._examples = {}
+
+    def print(self):
+        status = 'FAIL' if self.fails else ('WARN' if self.warns else 'OK')
+        print(f"{self.label}: {status}")
+        for d in self.info:
+            print(f"    {d}")
+        for check, d in self.fails:
+            print(f"    FAIL {check}: {d}")
+        for check, d in self.warns:
+            print(f"    WARN {check}: {d}")
+        return not self.fails
+
+
+def check_data(d, meta, schema, st, rep):
+    """Validates the main file; returns (vms, first_ts, last_physc_ts, digest)."""
+    cols_required = list(st.L1_REQUIRED_COLUMNS)
+    with open(d / DATA, 'rb') as fh:
+        header_raw = fh.readline()
+        h = hashlib.sha256(header_raw)
+        header = header_raw.decode('utf-8', 'replace').rstrip('\r\n')
+        cols = header.split(',')
+        if schema == 1:
+            mapped = ['VMName' if c == 'VM_Name' else c for c in cols]
+            if mapped != cols_required:
+                rep.fail('header', f"schema 1 needs {','.join(cols_required)}; found {len(cols)} column(s)")
+                return set(), None, None, None
+        else:
+            if header != meta.get('data_columns'):
+                rep.fail('header', 'header differs from the manifest data_columns')
+                return set(), None, None, None
+            if cols[:4] != cols_required or len(set(cols)) != len(cols):
+                rep.fail('header', 'required columns misplaced or a column repeated')
+                return set(), None, None, None
+            if tuple(cols) != st.l1_columns_for_schema(2):
+                rep.warn('header', "columns differ from this stager's schema 2")
+        n = len(cols)
+        rows = 0
+        nonempty = [0] * n
+        vms = set()
+        first_ts = last_physc_ts = prev_ts = prev_key = None
+        same_second_keys = vm_order_breaks = 0
+        for lineno, raw in enumerate(fh, start=2):
+            h.update(raw)
+            rows += 1
+            try:
+                line = raw.decode('utf-8').rstrip('\r\n')
+            except UnicodeDecodeError:
+                rep.example('encoding', f'row {lineno}')
+                continue
+            cells = line.split(',')
+            if len(cells) != n:
+                rep.example('cell count', f'row {lineno} has {len(cells)} of {n}')
+                continue
+            ts, vm = cells[0], cells[1]
+            if not TS_RE.fullmatch(ts):
+                rep.example('timestamp', f'row {lineno}')
+                continue
+            if not vm:
+                rep.example('VM name', f'row {lineno} empty')
+            for i in range(2, n):
+                c = cells[i]
+                if not c:
+                    continue
+                nonempty[i] += 1
+                if not NUMERIC_RE.fullmatch(c):
+                    rep.example('numeric', f'row {lineno} column {cols[i]}')
+                elif float(c) < 0:
+                    rep.example('negative value', f'row {lineno} column {cols[i]}')
+            if prev_ts is not None and ts < prev_ts:
+                rep.example('timestamp order', f'row {lineno}')
+            key = ts + ',' + vm
+            if prev_key is not None and ts == prev_ts:
+                if key == prev_key:
+                    same_second_keys += 1
+                elif key < prev_key:
+                    vm_order_breaks += 1
+            prev_ts, prev_key = ts, key
+            first_ts = first_ts or ts
+            if cells[2] and NUMERIC_RE.fullmatch(cells[2]):
+                last_physc_ts = ts
+            vms.add(vm)
+    rep.flush_examples()
+    rep.note(f"schema {schema}; {rows:,} rows; {len(vms)} VM(s); {first_ts} .. {last_physc_ts}")
+    if same_second_keys:
+        rep.note(f"{same_second_keys} row(s) repeat the previous (timestamp, VM) key (several samples in one second)")
+    if vm_order_breaks:
+        rep.warn('VM order', f"{vm_order_breaks} row(s) out of byte order within a timestamp "
+                             "(caches sorted under a collating locale before the merge fix)")
+    # data_end is the staging run's end across all systems in the run, so it may
+    # be later than this system's last row; earlier would contradict the file.
+    if meta.get('data_end') and last_physc_ts and meta['data_end'][:19] < last_physc_ts:
+        rep.warn('data_end', 'manifest data_end is earlier than the last row with PhysC')
+    if meta.get('data_start') and first_ts and first_ts[:10] < meta['data_start'][:10]:
+        rep.warn('data_start', 'rows precede the manifest data_start')
+    if schema == 2:
+        if meta.get('data_revision') != 'sha256:' + h.hexdigest():
+            rep.fail('data_revision', 'does not match the data file')
+        if meta.get('quality_rows') != str(rows):
+            rep.fail('quality_rows', 'does not match the row count')
+        declared = parse_counts(meta.get('quality_nonempty'))
+        computed = {cols[i]: str(nonempty[i]) for i in range(2, n)}
+        if declared != computed:
+            rep.fail('quality_nonempty', 'does not match the non-empty counts')
+    return vms, first_ts, last_physc_ts, h.hexdigest()
+
+
+def check_states(d, meta, schema, vms, rep):
+    path = d / STATES
+    if not path.is_file():
+        rep.fail('states', 'file missing')
+        return
+    try:
+        with open(path, encoding='utf-8') as fh:
+            states = json.load(fh)
+    except (OSError, ValueError) as exc:
+        rep.fail('states', f'not valid JSON ({type(exc).__name__})')
+        return
+    if not isinstance(states, dict) or not all(isinstance(v, list) for v in states.values()):
+        rep.fail('states', 'not an object of per-VM state lists')
+        return
+    missing = len(vms - set(states))
+    if missing:
+        rep.fail('states', f'{missing} VM(s) in the data have no states')
+    if schema == 2 and meta.get('states_revision') != 'sha256:' + sha256_file(path):
+        rep.fail('states_revision', 'does not match the states file')
+
+
+def gzip_member_count(path):
+    """Members of a gzip file, read in blocks; raises EOFError on a damaged or
+    truncated stream."""
+    members = 0
+    d = None
+    pending = b''
+    with open(path, 'rb') as fh:
+        while True:
+            block = pending or fh.read(1 << 20)
+            pending = b''
+            if not block:
+                break
+            if d is None:
+                d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            d.decompress(block, 1 << 20)
+            while d.unconsumed_tail:
+                d.decompress(d.unconsumed_tail, 1 << 20)
+            if d.eof:
+                members += 1
+                pending = d.unused_data
+                d = None
+    if d is not None:
+        raise EOFError('truncated gzip member')
+    return members
+
+
+def check_pool(d, meta, st, rep):
+    status = meta.get('pool_capture_status')
+    if status is None:
+        return
+    allowed = ('not_requested', 'unsupported', 'complete', 'partial', 'failed')
+    if status not in allowed:
+        rep.fail('pool status', 'unknown pool_capture_status')
+        return
+    declared_file = meta.get('pool_file')
+    if not declared_file:
+        if status in ('complete', 'partial'):
+            rep.fail('pool status', f'{status} without a declared pool_file')
+        else:
+            rep.note(f"pool capture {status}; no pool file")
+        if (d / st.POOL_OBSERVATIONS_FILE).exists():
+            rep.warn('pool file', 'a pool file exists that the manifest does not declare')
+        return
+    if status not in ('complete', 'partial'):
+        rep.fail('pool status', f'pool_file declared with status {status}')
+    path = d / declared_file
+    series_path = d / meta.get('pool_series_file', st.POOL_SERIES_FILE)
+    if not path.is_file() or not series_path.is_file():
+        rep.fail('pool file', 'declared pool or series file missing')
+        return
+    if meta.get('pool_revision') != 'sha256:' + sha256_file(path):
+        rep.fail('pool_revision', 'does not match the pool file')
+    if meta.get('pool_series_revision') != 'sha256:' + sha256_file(series_path):
+        rep.fail('pool_series_revision', 'does not match the series file')
+    try:
+        members = gzip_member_count(path)
+    except (EOFError, zlib.error, OSError) as exc:
+        rep.fail('pool gzip', f'stream damaged ({type(exc).__name__})')
+        return
+    try:
+        with open(series_path, encoding='utf-8') as fh:
+            series = json.load(fh)
+    except ValueError:
+        rep.fail('pool series', 'series file is not valid JSON')
+        return
+    m = re.fullmatch(r'\[(\d+), (\d+)\)', meta.get('pool_window_ns', ''))
+    if not m:
+        rep.fail('pool window', 'pool_window_ns missing or malformed')
+        return
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if meta.get('pool_columns') != ','.join(st.POOL_COLUMNS):
+        rep.warn('pool columns', "pool_columns differ from this stager's layout")
+    rows = 0
+    seen_series, hosts, pools = set(), set(), set()
+    nonempty = {}
+    with gzip.open(path, 'rt', encoding='utf-8') as fh:
+        header = fh.readline().rstrip('\n')
+        if header != meta.get('pool_columns'):
+            rep.fail('pool header', 'header differs from the manifest pool_columns')
+            return
+        cols = header.split(',')
+        n = len(cols)
+        nonempty = dict.fromkeys(cols[3:], 0)
+        for lineno, line in enumerate(fh, start=2):
+            rows += 1
+            cells = line.rstrip('\n').split(',')
+            if len(cells) != n:
+                rep.example('pool cell count', f'row {lineno} has {len(cells)} of {n}')
+                continue
+            t, host, sid = cells[0], cells[1], cells[2]
+            if not t.isdigit():
+                rep.example('pool time', f'row {lineno} not integer nanoseconds')
+            elif not lo <= int(t) < hi:
+                rep.example('pool window', f'row {lineno} outside pool_window_ns')
+            tags = series.get(sid)
+            if tags is None:
+                rep.example('pool series', f'row {lineno} series_id not in the series file')
+            elif tags.get('host') != host:
+                rep.example('pool series', f'row {lineno} host differs from its series tags')
+            for i in range(3, n):
+                c = cells[i]
+                if not c:
+                    continue
+                nonempty[cols[i]] += 1
+                if not NUMERIC_RE.fullmatch(c):
+                    rep.example('pool numeric', f'row {lineno} column {cols[i]}')
+            seen_series.add(sid)
+            hosts.add(host)
+            if cells[3]:
+                pools.add(cells[3])
+    rep.flush_examples()
+    expect = {'pool_rows': str(rows), 'pool_series': str(len(seen_series)), 'pool_reporters': str(len(hosts))}
+    for key, value in expect.items():
+        if meta.get(key) != value:
+            rep.fail(key, 'does not match the pool file')
+    if parse_counts(meta.get('pool_nonempty')) != {k: str(v) for k, v in nonempty.items()}:
+        rep.fail('pool_nonempty', 'does not match the pool file')
+    declared_pools = {p.strip() for p in meta.get('pool_ids', '').split(',') if p.strip() and p.strip() != '-'}
+    if declared_pools != pools:
+        rep.fail('pool_ids', 'do not match the pool file')
+    if set(series) != seen_series:
+        rep.warn('pool series', 'series file lists IDs that have no rows')
+    rep.note(f"pool capture {status}; {rows:,} observations, {len(hosts)} reporter(s), "
+             f"{len(pools)} pool(s), {members} gzip member(s)")
+
+
+def check_system(d, st, rep):
+    mpath = d / MANIFEST
+    if not mpath.is_file():
+        rep.fail('manifest', 'missing')
+        return
+    meta = read_manifest(mpath)
+    if meta.get('cache_build_status') != 'success':
+        rep.fail('manifest', 'cache_build_status is not success')
+    for key in ('data_start', 'data_end'):
+        if not meta.get(key):
+            rep.fail('manifest', f'{key} missing')
+    try:
+        schema = int(meta.get('data_schema_version') or 1)
+    except ValueError:
+        rep.fail('manifest', 'data_schema_version is not an integer')
+        return
+    if schema not in (1, 2):
+        rep.fail('manifest', f'unsupported data_schema_version {schema}')
+        return
+    if not (d / DATA).is_file():
+        rep.fail('data', 'file missing')
+        return
+    vms, _, _, _ = check_data(d, meta, schema, st, rep)
+    check_states(d, meta, schema, vms, rep)
+    check_pool(d, meta, st, rep)
+    leftovers = sorted(p.name for p in d.iterdir() if p.name.endswith(('.work', '.tmp')))
+    if leftovers:
+        rep.warn('leftovers', f"interrupted-run file(s): {', '.join(leftovers)}")
+
+
+def find_systems(paths):
+    out = []
+    for p in paths:
+        p = Path(p)
+        if (p / DATA).exists() or (p / MANIFEST).exists():
+            out.append(p)
+        elif p.is_dir():
+            out.extend(sorted(c for c in p.iterdir() if c.is_dir() and ((c / DATA).exists() or (c / MANIFEST).exists())))
+    return out
+
+
+def load_secret(explicit):
+    for path in (explicit, os.environ.get('NFIT_REDACT_SECRET_FILE'), str(REPO / '.private' / 'redact.secret')):
+        if path and os.path.isfile(path):
+            with open(path, encoding='utf-8') as fh:
+                data = fh.read().strip()
+            if len(data) >= 32:
+                return data.encode('utf-8')
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Validate staged nFit L1 caches (read-only).')
+    ap.add_argument('dirs', nargs='+', metavar='DIR', help="a system's cache directory or a stage root")
+    ap.add_argument('--pseudonym-secret', metavar='FILE', help='HMAC secret for labels (default: as dev/nfit-redact)')
+    ap.add_argument('--max-examples', type=int, default=3, help='row-level examples per problem (default: 3)')
+    ap.add_argument('--stager', default=str(REPO / 'nfit-stage-influxdb'), help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    st = load_stager(args.stager)
+    systems = find_systems(args.dirs)
+    if not systems:
+        print('l1-check: no cache directories found.', file=sys.stderr)
+        return 2
+    secret = load_secret(args.pseudonym_secret)
+    ok = True
+    for i, d in enumerate(systems, start=1):
+        label = ('sys_' + hmac.new(secret, d.name.lower().encode('utf-8'), hashlib.sha256).hexdigest()[:6]
+                 if secret else f'system {i}')
+        rep = Report(label, max(0, args.max_examples))
+        check_system(d, st, rep)
+        ok = rep.print() and ok
+    return 0 if ok else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
