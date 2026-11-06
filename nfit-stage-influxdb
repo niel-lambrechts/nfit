@@ -7,6 +7,7 @@ from an InfluxDB database and build a local cache for the nFit toolkit.
 """
 
 import argparse
+import calendar
 import configparser
 import os
 import sys
@@ -41,6 +42,294 @@ CONFIG_FIELD_MAP = {
     'pool_id': 'pool_id', 'proc_type': 'processorModel', 'proc_version': 'processorFamily',
     'proc_clock': 'processorMHz'
 }
+
+# --- Performance acquisition (InfluxQL v1) ---
+# Each entry: (metric key, measurement, field). Fields are read by name from
+# every returned point; nothing is inferred from column order.
+PERF_SOURCES = (
+    ('physc', 'cpu_util', 'physical_consumed'),
+    ('runq',  'kernel',   'run_queue'),
+)
+NS_PER_SECOND       = 1_000_000_000
+DEFAULT_CHUNK_SIZE  = 10000   # points per line of a chunked InfluxDB response
+DEFAULT_SLICE_HOURS = 24      # length of each half-open acquisition slice
+SLICE_ATTEMPTS      = 3       # attempts per slice before the run fails
+SLICE_RETRY_DELAY_S = 2       # seconds before the first retry; doubles each time
+
+
+class IncompleteResponseError(Exception):
+    """A chunked InfluxQL response ended before its final chunk."""
+
+
+class InfluxQueryError(Exception):
+    """InfluxDB reported an error for a query; retrying cannot help."""
+
+
+def utc_date_to_ns(date_str, hh_mm_ss='00:00:00'):
+    """Exact integer nanoseconds since the epoch for a UTC date and time."""
+    t = time.strptime(f'{date_str} {hh_mm_ss}', '%Y-%m-%d %H:%M:%S')
+    return calendar.timegm(t) * NS_PER_SECOND
+
+
+def build_time_slices(start_ns, end_exclusive_ns, slice_ns):
+    """Half-open slices [s, e) that cover [start_ns, end_exclusive_ns) exactly,
+    with no gap and no overlap."""
+    if slice_ns <= 0:
+        raise ValueError('slice length must be positive')
+    slices = []
+    s = start_ns
+    while s < end_exclusive_ns:
+        e = min(s + slice_ns, end_exclusive_ns)
+        slices.append((s, e))
+        s = e
+    return slices
+
+
+def ns_to_legacy_timestamp(ns):
+    """'YYYY-MM-DD HH:MM:SS' (UTC) with the sub-second part discarded, exactly
+    as the former parse-then-strftime path produced it."""
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ns // NS_PER_SECOND))
+
+
+def ns_to_utc_datetime(ns):
+    """Timezone-aware UTC datetime truncated to the second. Every consumer of
+    the acquisition minimum and maximum uses second resolution (strftime or
+    int(timestamp())), so truncation preserves their results."""
+    return datetime.fromtimestamp(ns // NS_PER_SECOND, tz=timezone.utc)
+
+
+def _msgpack_ext_hook(code, data):
+    """InfluxDB MessagePack extension 5 is a timestamp: big-endian unsigned
+    seconds then nanoseconds. Decode it to exact integer nanoseconds. Only a
+    query without epoch= produces it; epoch=ns returns plain integers."""
+    import msgpack
+    import struct
+    if code == 5:
+        seconds, nanos = struct.unpack('>QI', data)
+        return seconds * NS_PER_SECOND + nanos
+    return msgpack.ExtType(code, data)
+
+
+def _open_query_stream(client, params):
+    """
+    Issues a GET /query through the client's own session, URL, credentials,
+    headers, proxies, TLS and timeout settings, and returns the unread
+    streaming response.
+
+    InfluxDBClient.request() cannot be used: for a MessagePack response it reads
+    and unpacks the whole body before returning, even with stream=True, and
+    fails on a chunked body of concatenated objects. Forcing JSON instead is
+    not equivalent, because the server's JSON encoder writes whole-number
+    floats as integers (1.0 as 1), whereas MessagePack keeps the field type
+    that the legacy client.query() path wrote to the cache.
+    """
+    from influxdb.exceptions import InfluxDBClientError, InfluxDBServerError
+
+    try:
+        session, baseurl, headers = client._session, client._baseurl, dict(client._headers)
+        username, password = client._username, client._password
+        proxies, verify, timeout = client._proxies, client._verify_ssl, client._timeout
+    except AttributeError as exc:
+        raise RuntimeError(f'unsupported influxdb client version: {exc}') from exc
+
+    auth = None if 'Authorization' in headers else (username, password)
+    if auth is not None and None in auth:
+        auth = None
+    response = session.request(method='GET', url=f'{baseurl}/query', auth=auth,
+                               params=params, stream=True, headers=headers,
+                               proxies=proxies, verify=verify, timeout=timeout)
+    if response.status_code == 200:
+        return response
+    try:
+        body = response.content
+    finally:
+        response.close()
+    if 500 <= response.status_code < 600:
+        raise InfluxDBServerError(body)
+    raise InfluxDBClientError(body, response.status_code)
+
+
+def _iter_response_chunks(response):
+    """Yields each decoded chunk object of a chunked /query response, in the
+    encoding the server chose: concatenated MessagePack objects, or one JSON
+    object per line. Raises IncompleteResponseError on a truncated object."""
+    content_type = (response.headers.get('Content-Type') or '').split(';')[0].strip()
+    if content_type == 'application/x-msgpack':
+        import msgpack
+        unpacker = msgpack.Unpacker(raw=False, ext_hook=_msgpack_ext_hook)
+        fed = 0
+        for block in response.iter_content(chunk_size=65536):
+            if not block:
+                continue
+            unpacker.feed(block)
+            fed += len(block)
+            for chunk in unpacker:
+                yield chunk
+        if hasattr(unpacker, 'tell') and unpacker.tell() != fed:
+            raise IncompleteResponseError(
+                f'truncated chunk: {fed - unpacker.tell()} byte(s) left undecoded')
+        return
+    for raw in response.iter_lines():
+        if not raw:
+            continue
+        try:
+            yield json.loads(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+        except ValueError as exc:
+            raise IncompleteResponseError(f'truncated chunk: {exc}') from exc
+
+
+def iter_influxql_points(client, database, query, chunk_size):
+    """
+    Streams one InfluxQL v1 SELECT as (tags, point) pairs. Timestamps are exact
+    integer nanoseconds (epoch=ns) and fields are addressed by name.
+
+    The HTTP response is chunked and decoded incrementally, so memory is bounded
+    by the chunk size rather than the result size. The client's default Accept
+    header (MessagePack for the v1 client) is kept, so field values keep the
+    types the legacy acquisition wrote; a JSON response is also accepted.
+    Completion is verified: every chunk but the last carries "partial": true, so
+    a stream that ends on a partial chunk, delivers no chunk at all, or breaks
+    off mid-transfer raises IncompleteResponseError. An error reported in any
+    chunk raises InfluxQueryError.
+    """
+    import requests  # dependency of the influxdb client package
+
+    params = {'q': query, 'db': database, 'epoch': 'ns',
+              'chunked': 'true', 'chunk_size': int(chunk_size)}
+    response = _open_query_stream(client, params)
+    saw_chunk = False
+    last_partial = False
+    try:
+        for chunk in _iter_response_chunks(response):
+            saw_chunk = True
+            if 'error' in chunk:
+                raise InfluxQueryError(chunk['error'])
+            results = chunk.get('results', [])
+            last_partial = any(r.get('partial') for r in results)
+            for result in results:
+                if 'error' in result:
+                    raise InfluxQueryError(result['error'])
+                for series in result.get('series', []):
+                    tags = series.get('tags') or {}
+                    columns = series.get('columns', [])
+                    for values in series.get('values', []):
+                        yield tags, dict(zip(columns, values))
+    except requests.exceptions.RequestException as exc:
+        raise IncompleteResponseError(f'response interrupted: {exc}') from exc
+    finally:
+        response.close()
+    if not saw_chunk:
+        raise IncompleteResponseError('no chunk received')
+    if last_partial:
+        raise IncompleteResponseError('stream ended on a partial chunk')
+
+
+class AcquisitionStats:
+    """Per-metric acquisition counters, reported after each metric."""
+
+    def __init__(self):
+        self.rows = 0
+        self.null_values = 0
+        self.no_host = 0
+        self.exact_duplicates = 0       # same host, same nanosecond
+        self.same_second = 0            # same host and second, different nanosecond
+        self.out_of_order = 0           # earlier than the previous point of its host
+        self.slice_retries = 0
+        self.vms = set()
+        self.min_ns = None
+        self.max_ns = None
+
+    def merge(self, other):
+        for name in ('rows', 'null_values', 'no_host', 'exact_duplicates',
+                     'same_second', 'out_of_order', 'slice_retries'):
+            setattr(self, name, getattr(self, name) + getattr(other, name))
+        self.vms |= other.vms
+        for ns in (other.min_ns, other.max_ns):
+            if ns is None:
+                continue
+            self.min_ns = ns if self.min_ns is None else min(self.min_ns, ns)
+            self.max_ns = ns if self.max_ns is None else max(self.max_ns, ns)
+
+    def anomalies(self):
+        return {k: v for k, v in (('null values skipped', self.null_values),
+                                  ('series without host', self.no_host),
+                                  ('exact duplicate timestamps', self.exact_duplicates),
+                                  ('same-second timestamps', self.same_second),
+                                  ('out-of-order points', self.out_of_order),
+                                  ('slice retries', self.slice_retries)) if v}
+
+
+def acquire_metric_to_file(client, database, measurement, field, entity_filter,
+                           slices, chunk_size, out_fh, verbose=False):
+    """
+    Acquires one field across half-open time slices and appends rows to out_fh
+    in the legacy temporary-file format (timestamp,vm_name,value).
+
+    A slice whose response is interrupted is rolled back (the file is truncated
+    to the slice's starting offset) and queried again, up to SLICE_ATTEMPTS
+    times. Rows are written exactly as before: values via str(), timestamps at
+    second resolution, duplicates retained (they are counted, not removed).
+    """
+    import requests
+    from influxdb.exceptions import InfluxDBServerError
+
+    # Transient failures: interrupted or truncated transfers, connection
+    # errors and HTTP 5xx. Query errors (InfluxQueryError, HTTP 4xx) are
+    # deterministic and fail immediately.
+    retryable = (IncompleteResponseError, requests.exceptions.RequestException, InfluxDBServerError)
+
+    total = AcquisitionStats()
+    for slice_start, slice_end in slices:
+        query = (f'SELECT "{field}" FROM "{measurement}" WHERE {entity_filter} '
+                 f'AND time >= {slice_start} AND time < {slice_end} GROUP BY "host"')
+        attempt = 0
+        while True:
+            attempt += 1
+            out_fh.flush()
+            mark = out_fh.tell()
+            part = AcquisitionStats()
+            last_ns_by_host = {}
+            try:
+                for tags, point in iter_influxql_points(client, database, query, chunk_size):
+                    vm_name = tags.get('host')
+                    if not vm_name:
+                        part.no_host += 1
+                        continue
+                    part.vms.add(vm_name)
+                    value = point.get(field)
+                    if value is None:
+                        part.null_values += 1
+                        continue
+                    ts_ns = int(point['time'])
+                    previous = last_ns_by_host.get(vm_name)
+                    if previous is not None:
+                        if ts_ns == previous:
+                            part.exact_duplicates += 1
+                        elif ts_ns < previous:
+                            part.out_of_order += 1
+                        elif ts_ns // NS_PER_SECOND == previous // NS_PER_SECOND:
+                            part.same_second += 1
+                    last_ns_by_host[vm_name] = ts_ns
+                    part.min_ns = ts_ns if part.min_ns is None else min(part.min_ns, ts_ns)
+                    part.max_ns = ts_ns if part.max_ns is None else max(part.max_ns, ts_ns)
+                    out_fh.write(f"{ns_to_legacy_timestamp(ts_ns)},{vm_name},{value}\n")
+                    part.rows += 1
+                break
+            except retryable as exc:
+                out_fh.seek(mark)
+                out_fh.truncate()
+                if attempt >= SLICE_ATTEMPTS:
+                    raise RuntimeError(
+                        f'{measurement}.{field}: slice [{slice_start}, {slice_end}) failed after '
+                        f'{attempt} attempts: {exc}') from exc
+                delay = SLICE_RETRY_DELAY_S * (2 ** (attempt - 1))
+                print(f"\n    WARNING: {measurement}.{field} slice [{slice_start}, {slice_end}) "
+                      f"attempt {attempt} failed ({exc}); retrying in {delay}s.", file=sys.stderr)
+                total.slice_retries += 1
+                time.sleep(delay)
+        total.merge(part)
+    return total
+
 
 # --- Helper Functions ---
 class FcntlLock:
@@ -122,10 +411,16 @@ def parse_utc_string(ts_str):
             continue
     raise ValueError(f"Unsupported datetime format: {ts_str}")
 
-def stream_performance_data_optimized(client, db_version, entity_filter, time_filter_v1, tmp_dir, args):
+def stream_performance_data_optimized(client, database, entity_filter, slices, tmp_dir, args, stats_out=None):
     """
     Streams performance data to temp files, tracks min/max timestamps, and
     uses an external sort to create a master file.
+
+    Acquisition is chunked InfluxQL v1 over half-open time slices with exact
+    nanosecond timestamps and named fields (acquire_metric_to_file). The
+    temporary files, sort and merge are unchanged, so the master file is
+    identical to the former single-query acquisition. Per-metric counters are
+    stored in stats_out when a dict is supplied.
     """
     print("\n## Phase 1: Performance Data Staging")
     temp_files = {}
@@ -133,13 +428,9 @@ def stream_performance_data_optimized(client, db_version, entity_filter, time_fi
     min_ts, max_ts = None, None
     discovered_vms = set()
 
+    chunk_size = getattr(args, 'chunk_size', DEFAULT_CHUNK_SIZE)
     try:
-        perf_query_templates = {
-            'physc': 'SELECT "physical_consumed" FROM "cpu_util" WHERE {filter} AND {time_filter} GROUP BY "host"',
-            'runq':  'SELECT "run_queue" FROM "kernel" WHERE {filter} AND {time_filter} GROUP BY "host"',
-        }
-
-        for metric in ['physc', 'runq']:
+        for metric, measurement, field in PERF_SOURCES:
             print(f"- Streaming performance metrics ({metric})...", end="", flush=True)
             start_metric_time = time.time()
 
@@ -149,38 +440,29 @@ def stream_performance_data_optimized(client, db_version, entity_filter, time_fi
             if args.verbose:
                 print(f"\n    Created temp file for {metric}: {temp_file.name}")
 
-            query = perf_query_templates[metric].format(filter=entity_filter, time_filter=time_filter_v1)
-            results = execute_query(client, query, db_version, args.verbose)
-
+            # The header line is part of the legacy temporary-file contract that
+            # the external sort and merge below depend on; keep it unchanged.
             temp_file.write("timestamp,vm_name,value\n")
 
-            for series in results.items():
-                # Ensure the series is valid and has a host tag.
-                if not (series and series[0] and isinstance(series[0][1], dict) and series[0][1].get('host')):
-                    if args.verbose: print("  [DEBUG] Skipping a series with no host tag in performance data.")
+            stats = acquire_metric_to_file(client, database, measurement, field, entity_filter,
+                                           slices, chunk_size, temp_file, args.verbose)
+            discovered_vms |= stats.vms
+            for ns in (stats.min_ns, stats.max_ns):
+                if ns is None:
                     continue
-                vm_name = series[0][1]['host']
-
-                # FINAL POLISH: Reject entries with an empty host tag.
-                if not vm_name:
-                    if args.verbose: print("  [DEBUG] Skipping performance data series with an empty host tag.")
-                    continue
-
-                discovered_vms.add(vm_name)
-
-                for point in series[1]:
-                    field_name = next(iter(k for k in point if k != 'time'), None)
-                    if field_name and point.get(field_name) is not None:
-                        current_ts_obj = parse_utc_string(point['time'])
-                        # Track the overall min/max timestamps during the stream.
-                        min_ts = min(min_ts, current_ts_obj) if min_ts else current_ts_obj
-                        max_ts = max(max_ts, current_ts_obj) if max_ts else current_ts_obj
-                        ts = current_ts_obj.strftime('%Y-%m-%d %H:%M:%S')
-                        temp_file.write(f"{ts},{vm_name},{point.get(field_name)}\n")
+                current_ts_obj = ns_to_utc_datetime(ns)
+                min_ts = min(min_ts, current_ts_obj) if min_ts else current_ts_obj
+                max_ts = max(max_ts, current_ts_obj) if max_ts else current_ts_obj
+            if stats_out is not None:
+                stats_out[metric] = stats
 
             temp_file.close()
             duration_metric = time.time() - start_metric_time
             print(f" [DONE: {format_duration(duration_metric)}]")
+            anomalies = stats.anomalies()
+            if anomalies or args.verbose:
+                detail = ', '.join(f'{v} {k}' for k, v in anomalies.items()) or 'no anomalies'
+                print(f"    {stats.rows} rows over {len(slices)} slice(s); {detail}.")
 
         print("- Sorting and merging all performance data into master cache...", end="", flush=True)
         start_sort_time = time.time()
@@ -688,7 +970,14 @@ def main():
         help="Emit a warning when the total cache span after appending exceeds this many days (0 = unlimited, default: 180).")
     parser.add_argument("--show-cache-info", action="store_true", dest="show_cache_info",
         help="Print the cached data window for each discovered serial and exit without querying InfluxDB.")
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, dest="chunk_size",
+        help=f"Points per line of the chunked InfluxDB response (default: {DEFAULT_CHUNK_SIZE}).")
+    parser.add_argument("--slice-hours", type=int, default=DEFAULT_SLICE_HOURS, dest="slice_hours",
+        help=f"Length of each half-open acquisition time slice in hours (default: {DEFAULT_SLICE_HOURS}).\n"
+             "An interrupted slice is rolled back and retried without repeating completed slices.")
     args = parser.parse_args()
+    if args.chunk_size < 1 or args.slice_hours < 1:
+        parser.error("--chunk-size and --slice-hours must be positive.")
 
     # --- Initial Setup & Timing ---
     script_start_time = time.time()
@@ -784,7 +1073,11 @@ def main():
         endd_for_query   = args.endd
 
     config_path = os.path.join(script_root, 'etc', 'influxdb.conf')
-    client, db_version, _ = get_db_client(config_path)
+    client, db_version, db_config = get_db_client(config_path)
+    if db_version != 1:
+        print("Error: only InfluxDB 1.x with InfluxQL over the v1 API is supported for acquisition "
+              "(VERSION = 1 in etc/influxdb.conf). The Flux/v2 path is not implemented.", file=sys.stderr)
+        sys.exit(1)
 
     os.makedirs(cache_dir, exist_ok=True)
     os.makedirs(tmp_dir, exist_ok=True)
@@ -813,21 +1106,21 @@ def main():
                 vm_list = [s.strip() for s in args.vms.split(',')] if args.vms else [line.strip() for line in open(args.vmfile) if line.strip()]
                 entity_filter = "(" + " OR ".join([f"host = '{vm}'" for vm in vm_list]) + ")"
 
-           # Convert date strings to nanosecond epoch timestamps for the InfluxDB v1 query
-            start_dt = datetime.strptime(f'{startd_for_query}T00:00:00Z', '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-            end_dt = datetime.strptime(f'{endd_for_query}T23:59:59Z', '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-
-            start_ns = int(start_dt.timestamp() * 1_000_000_000)
-            end_ns = int(end_dt.timestamp() * 1_000_000_000)
-
-            time_filter_v1 = f"time >= {start_ns} AND time <= {end_ns}"
+            # Half-open acquisition window in exact integer nanoseconds. Its coverage
+            # is identical to the former inclusive filter
+            # (time >= start 00:00:00 AND time <= end 23:59:59):
+            # [start 00:00:00, end 23:59:59 + 1 ns), split into half-open slices.
+            start_ns         = utc_date_to_ns(startd_for_query)
+            end_exclusive_ns = utc_date_to_ns(endd_for_query, '23:59:59') + 1
+            perf_slices      = build_time_slices(start_ns, end_exclusive_ns,
+                                                 args.slice_hours * 3600 * NS_PER_SECOND)
 
             if args.verbose:
-                print(f"\n[DEBUG] Generated InfluxDB v1 time filter: {time_filter_v1}\n")
-
+                print(f"\n[DEBUG] Acquisition window [{start_ns}, {end_exclusive_ns}) ns in "
+                      f"{len(perf_slices)} slice(s) of up to {args.slice_hours}h; chunk size {args.chunk_size}.\n")
 
             master_temp_filename, discovered_vms, min_ts, max_ts = stream_performance_data_optimized(
-                client, db_version, entity_filter, time_filter_v1, tmp_dir, args
+                client, db_config['DATABASE'], entity_filter, perf_slices, tmp_dir, args
             )
 
             if not discovered_vms:
