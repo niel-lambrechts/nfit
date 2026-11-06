@@ -50,6 +50,19 @@ PERF_SOURCES = (
     ('physc', 'cpu_util', 'physical_consumed'),
     ('runq',  'kernel',   'run_queue'),
 )
+# L1 schema 2 (opt-in with --l1-schema 2): optional CPU columns appended after
+# the four required columns. They are selected in the same cpu_util query as
+# PhysC, so each value stays on the line of the CPU sample it belongs to
+# through the temporary file, the sort and the merge. The header is stable:
+# an unavailable field leaves its cells blank and is recorded in the manifest.
+L1_REQUIRED_COLUMNS = ('Timestamp', 'VMName', 'PhysC', 'RunQ')
+L1_OPTIONAL_CPU_COLUMNS = (
+    # (column, cpu_util field, unit recorded in the manifest)
+    ('PhysB',   'physical_busy', 'cores'),
+    ('FreqPct', 'freq_pct',      'percent (collector freq_pct)'),
+)
+L1_COLUMN_SOURCES = {'PhysC': ('cpu_util.physical_consumed', 'cores'),
+                     'RunQ':  ('kernel.run_queue', 'run queue length')}
 NS_PER_SECOND       = 1_000_000_000
 DEFAULT_CHUNK_SIZE  = 10000   # points per line of a chunked InfluxDB response
 DEFAULT_SLICE_HOURS = 24      # length of each half-open acquisition slice
@@ -240,13 +253,14 @@ class AcquisitionStats:
         self.same_second = 0            # same host and second, different nanosecond
         self.out_of_order = 0           # earlier than the previous point of its host
         self.slice_retries = 0
+        self.optional_without_primary = 0   # optional values on points lacking the row's field
         self.vms = set()
         self.min_ns = None
         self.max_ns = None
 
     def merge(self, other):
         for name in ('rows', 'null_values', 'no_host', 'exact_duplicates',
-                     'same_second', 'out_of_order', 'slice_retries'):
+                     'same_second', 'out_of_order', 'slice_retries', 'optional_without_primary'):
             setattr(self, name, getattr(self, name) + getattr(other, name))
         self.vms |= other.vms
         for ns in (other.min_ns, other.max_ns):
@@ -261,14 +275,23 @@ class AcquisitionStats:
                                   ('exact duplicate timestamps', self.exact_duplicates),
                                   ('same-second timestamps', self.same_second),
                                   ('out-of-order points', self.out_of_order),
-                                  ('slice retries', self.slice_retries)) if v}
+                                  ('slice retries', self.slice_retries),
+                                  ('optional values on points without the row field',
+                                   self.optional_without_primary)) if v}
 
 
 def acquire_metric_to_file(client, database, measurement, field, entity_filter,
-                           slices, chunk_size, out_fh, verbose=False):
+                           slices, chunk_size, out_fh, verbose=False, extra_fields=()):
     """
     Acquires one field across half-open time slices and appends rows to out_fh
     in the temporary-file format (timestamp,vm_name,value; no header line).
+
+    extra_fields (schema 2) are further fields of the same points, written as
+    additional cells after the value: timestamp,vm_name,value,extra1,... An
+    entry of None is a declared but unavailable field: its cell is blank and
+    it is not selected. A row is written only when `field` itself has a value,
+    exactly as without extra fields; extra values on points without it are
+    counted, never written on their own and never turned into zero.
 
     A slice whose response is interrupted is rolled back (the file is truncated
     to the slice's starting offset) and queried again, up to SLICE_ATTEMPTS
@@ -285,7 +308,8 @@ def acquire_metric_to_file(client, database, measurement, field, entity_filter,
 
     total = AcquisitionStats()
     for slice_start, slice_end in slices:
-        query = (f'SELECT "{field}" FROM "{measurement}" WHERE {entity_filter} '
+        selected = ''.join(f', "{x}"' for x in extra_fields if x)
+        query = (f'SELECT "{field}"{selected} FROM "{measurement}" WHERE {entity_filter} '
                  f'AND time >= {slice_start} AND time < {slice_end} GROUP BY "host"')
         attempt = 0
         while True:
@@ -304,6 +328,8 @@ def acquire_metric_to_file(client, database, measurement, field, entity_filter,
                     value = point.get(field)
                     if value is None:
                         part.null_values += 1
+                        if any(x and point.get(x) is not None for x in extra_fields):
+                            part.optional_without_primary += 1
                         continue
                     ts_ns = int(point['time'])
                     previous = last_ns_by_host.get(vm_name)
@@ -317,7 +343,9 @@ def acquire_metric_to_file(client, database, measurement, field, entity_filter,
                     last_ns_by_host[vm_name] = ts_ns
                     part.min_ns = ts_ns if part.min_ns is None else min(part.min_ns, ts_ns)
                     part.max_ns = ts_ns if part.max_ns is None else max(part.max_ns, ts_ns)
-                    out_fh.write(f"{ns_to_legacy_timestamp(ts_ns)},{vm_name},{value}\n")
+                    extras = ''.join(',' + ('' if not x or point.get(x) is None else str(point[x]))
+                                     for x in extra_fields)
+                    out_fh.write(f"{ns_to_legacy_timestamp(ts_ns)},{vm_name},{value}{extras}\n")
                     part.rows += 1
                 break
             except retryable as exc:
@@ -416,7 +444,8 @@ def parse_utc_string(ts_str):
             continue
     raise ValueError(f"Unsupported datetime format: {ts_str}")
 
-def stream_performance_data_optimized(client, database, entity_filter, slices, tmp_dir, args, stats_out=None):
+def stream_performance_data_optimized(client, database, entity_filter, slices, tmp_dir, args, stats_out=None,
+                                      cpu_optional=()):
     """
     Streams performance data to temp files, tracks min/max timestamps, and
     uses an external sort to create a master file.
@@ -424,8 +453,12 @@ def stream_performance_data_optimized(client, database, entity_filter, slices, t
     Acquisition is chunked InfluxQL v1 over half-open time slices with exact
     nanosecond timestamps and named fields (acquire_metric_to_file). Temporary
     files hold data rows only and are sorted in byte order, the order the
-    merge compares keys in. Per-metric counters are stored in stats_out when a
-    dict is supplied.
+    merge compares keys in. Per-metric counters, and the merge's counters under
+    'merge', are stored in stats_out when a dict is supplied.
+
+    cpu_optional (schema 2) is a sequence of (column, field or None): fields
+    acquired with PhysC in the same query and written as columns after RunQ.
+    Empty (the default) gives the four-column schema-1 master file.
     """
     print("\n## Phase 1: Performance Data Staging")
     temp_files = {}
@@ -450,8 +483,10 @@ def stream_performance_data_optimized(client, database, entity_filter, slices, t
             # skipped the earliest sample of each metric and emitted the header as
             # a final data row.
 
+            extra_fields = [f for _, f in cpu_optional] if metric == 'physc' else ()
             stats = acquire_metric_to_file(client, database, measurement, field, entity_filter,
-                                           slices, chunk_size, temp_file, args.verbose)
+                                           slices, chunk_size, temp_file, args.verbose,
+                                           extra_fields=extra_fields)
             discovered_vms |= stats.vms
             for ns in (stats.min_ns, stats.max_ns):
                 if ns is None:
@@ -475,9 +510,16 @@ def stream_performance_data_optimized(client, database, entity_filter, slices, t
         master_temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, dir=tmp_dir, suffix='.master.csv', encoding='utf-8')
         master_temp_filename = master_temp_file.name
         master_temp_file.close()
-        create_sorted_master_file(temp_files, master_temp_filename)
+        merge_stats = create_sorted_master_file(temp_files, master_temp_filename,
+                                                [c for c, _ in cpu_optional])
         duration_sort = time.time() - start_sort_time
         print(f" [DONE: {format_duration(duration_sort)}]")
+        if merge_stats['ambiguous_keys']:
+            print(f"    {merge_stats['ambiguous_keys']} (timestamp, VM) key(s) hold more than one sample at "
+                  f"second resolution ({merge_stats['ambiguous_extra_rows']} extra row(s)); "
+                  f"their PhysC/RunQ pairing is positional, not exact.")
+        if stats_out is not None:
+            stats_out['merge'] = merge_stats
 
         print(f"- Discovered {len(discovered_vms)} VMs with performance data in the target time window.")
         return master_temp_filename, discovered_vms, min_ts, max_ts
@@ -489,8 +531,9 @@ def stream_performance_data_optimized(client, database, entity_filter, slices, t
         for temp_file in temp_files.values():
             if os.path.exists(temp_file): os.remove(temp_file)
 
-def create_sorted_master_file(temp_files, master_temp_filename):
-    """Orchestrates creating a sorted master file by sorting and joining."""
+def create_sorted_master_file(temp_files, master_temp_filename, optional_columns=()):
+    """Orchestrates creating a sorted master file by sorting and joining.
+    Returns the merge counters of join_sorted_files."""
     sorted_files = {}
     try:
         for metric, temp_file in temp_files.items():
@@ -505,41 +548,78 @@ def create_sorted_master_file(temp_files, master_temp_filename):
             with open(sorted_file, 'w', encoding='utf-8') as outfile:
                 subprocess.run(sort_cmd, stdout=outfile, check=True, env=sort_env)
             sorted_files[metric] = sorted_file
-        join_sorted_files(sorted_files, master_temp_filename)
+        return join_sorted_files(sorted_files, master_temp_filename, optional_columns)
     finally:
         for sorted_file in sorted_files.values():
             if os.path.exists(sorted_file): os.remove(sorted_file)
 
-def join_sorted_files(sorted_files, master_temp_filename):
-    """Performs a memory-efficient merge-join of multiple sorted CSV files."""
+def join_sorted_files(sorted_files, master_temp_filename, optional_columns=()):
+    """
+    Performs a memory-efficient merge-join of multiple sorted CSV files.
+
+    optional_columns (schema 2) names the cells that follow the value on each
+    PhysC line; they are written after RunQ, blank on rows without a PhysC
+    line. Rows sharing one (timestamp, VM) key (several samples in one second)
+    are paired positionally, as before; they are counted as ambiguous.
+    Returns {'rows', 'ambiguous_keys', 'ambiguous_extra_rows'}.
+    """
+    n_opt = len(optional_columns)
+    blank_opt = ',' * n_opt
     file_handles = {}
     current_rows = {}
+    counts = {'rows': 0, 'ambiguous_keys': 0, 'ambiguous_extra_rows': 0}
+
+    def parse(metric, line):
+        parts = line.strip().split(',')
+        if len(parts) < 3:
+            return None
+        row = {'key': f"{parts[0]},{parts[1]}", 'value': parts[2]}
+        if metric == 'physc' and n_opt:
+            cells = parts[3:3 + n_opt]
+            row['optional'] = ',' + ','.join(cells + [''] * (n_opt - len(cells)))
+        return row
+
     try:
         for metric, sorted_file in sorted_files.items():
             file_handles[metric] = open(sorted_file, 'r', encoding='utf-8')
             line = file_handles[metric].readline()
             if line:
-                parts = line.strip().split(',')
-                if len(parts) >= 3:
-                    current_rows[metric] = {'key': f"{parts[0]},{parts[1]}", 'value': parts[2]}
+                row = parse(metric, line)
+                if row:
+                    current_rows[metric] = row
+        header = ','.join(L1_REQUIRED_COLUMNS + tuple(optional_columns))
+        previous_key = None
         with open(master_temp_filename, 'w', encoding='utf-8') as master_file:
-            master_file.write("Timestamp,VMName,PhysC,RunQ\n")
+            master_file.write(header + "\n")
             while current_rows:
                 min_key = min(current_rows.values(), key=lambda x: x['key'])['key']
                 timestamp, vm_name = min_key.split(',', 1)
                 values = {metric: row_data['value'] for metric, row_data in current_rows.items() if row_data['key'] == min_key}
-                master_file.write(f"{timestamp},{vm_name},{values.get('physc', '')},{values.get('runq', '')}\n")
+                optional = ''
+                if n_opt:
+                    physc_row = current_rows.get('physc')
+                    optional = physc_row['optional'] if physc_row and physc_row['key'] == min_key else blank_opt
+                master_file.write(f"{timestamp},{vm_name},{values.get('physc', '')},{values.get('runq', '')}{optional}\n")
+                counts['rows'] += 1
+                if min_key == previous_key:
+                    counts['ambiguous_extra_rows'] += 1
+                    if counts.get('_last_ambiguous') != min_key:
+                        counts['ambiguous_keys'] += 1
+                        counts['_last_ambiguous'] = min_key
+                previous_key = min_key
                 for metric in list(current_rows.keys()):
                     if current_rows.get(metric) and current_rows[metric]['key'] == min_key:
                         line = file_handles[metric].readline()
                         if line:
-                            parts = line.strip().split(',')
-                            if len(parts) >= 3: current_rows[metric] = {'key': f"{parts[0]},{parts[1]}", 'value': parts[2]}
+                            row = parse(metric, line)
+                            if row: current_rows[metric] = row
                             else: del current_rows[metric]
                         else:
                             del current_rows[metric]
     finally:
         for handle in file_handles.values(): handle.close()
+    counts.pop('_last_ambiguous', None)
+    return counts
 
 def get_config_events_by_measurement(client, db_version, fields, measurement, entity_filter, start_date, end_date, verbose=False):
     """
@@ -2032,6 +2112,131 @@ def run_probe_mode(args, script_root, cache_dir):
     return 0
 
 
+# --- L1 schema 2 helpers -------------------------------------------------------
+def l1_columns_for_schema(schema):
+    """Exact L1 header for a schema version."""
+    if schema == 2:
+        return L1_REQUIRED_COLUMNS + tuple(c for c, _, _ in L1_OPTIONAL_CPU_COLUMNS)
+    return L1_REQUIRED_COLUMNS
+
+
+def resolve_cpu_optional_columns(client):
+    """
+    Decides, from SHOW FIELD KEYS, which schema-2 optional CPU fields are
+    selected. Returns ([(column, field or None), ...], {column: availability}).
+    A field is selected only when the server reports it with numeric types
+    only; otherwise the column stays in the header with blank cells. Field
+    presence is not coverage: per-row availability is counted in the manifest.
+    """
+    fields = discover_schema(client, ['cpu_util'])['cpu_util']['fields']
+    selected, availability = [], {}
+    for column, field, _ in L1_OPTIONAL_CPU_COLUMNS:
+        types_seen = fields.get(field)
+        if not types_seen:
+            selected.append((column, None))
+            availability[column] = 'absent from schema'
+        elif set(types_seen) - {'float', 'integer'}:
+            selected.append((column, None))
+            availability[column] = f"not selected: type {'/'.join(types_seen)}"
+        else:
+            selected.append((column, field))
+            availability[column] = 'present in schema'
+    return selected, availability
+
+
+def append_layout_conflicts(cache_dir, serials, schema):
+    """
+    Reasons why appending with the requested schema would mix layouts in an
+    existing cache, one per conflicting serial. A schema-1 append accepts any
+    existing four-column cache (including legacy header spellings); a
+    schema-2 append requires an existing schema-2 cache with the same columns.
+    """
+    want = l1_columns_for_schema(schema)
+    problems = []
+    for serial in sorted(serials):
+        serial_dir = os.path.join(cache_dir, serial)
+        data_path = os.path.join(serial_dir, '.nfit.cache.data')
+        if not os.path.isfile(data_path):
+            continue
+        with open(data_path, encoding='utf-8') as fh:
+            header = tuple(fh.readline().strip().split(','))
+        manifest = read_cache_manifest(os.path.join(serial_dir, '.nfit.cache.manifest'))
+        try:
+            have = int(manifest.get('data_schema_version') or 1)
+        except ValueError:
+            have = None
+        declared = manifest.get('data_columns')
+        if schema == 1:
+            ok = have == 1 and len(header) == len(L1_REQUIRED_COLUMNS)
+        else:
+            ok = have == 2 and header == want and declared == ','.join(want)
+        if not ok:
+            problems.append(f"{serial}: existing cache is schema {have if have is not None else 'unknown'} "
+                            f"with columns {','.join(header)}; requested schema {schema} "
+                            f"({','.join(want)})")
+    return problems
+
+
+def l1_schema2_manifest_lines(data_path, states_path, availability, acq_stats, window_ns, args):
+    """
+    Schema-2 manifest entries, computed from the files as written (after any
+    append): exact header, revisions as content hashes, column provenance,
+    availability and per-column non-empty counts. data_revision and
+    states_revision are the keys nfit reads for its results-cache identity.
+    Acquisition counters cover the whole staging run, all systems together.
+    """
+    import hashlib
+    columns = l1_columns_for_schema(2)
+    data_hash = hashlib.sha256()
+    rows = 0
+    nonempty = [0] * len(columns)
+    with open(data_path, 'rb') as fh:
+        header = fh.readline()
+        data_hash.update(header)
+        if header.decode('utf-8').strip() != ','.join(columns):
+            raise RuntimeError(f'{data_path}: header does not match schema 2')
+        for line in fh:
+            data_hash.update(line)
+            rows += 1
+            cells = line.rstrip(b'\r\n').split(b',')
+            for i in range(2, min(len(cells), len(columns))):
+                if cells[i]:
+                    nonempty[i] += 1
+    states_hash = hashlib.sha256()
+    with open(states_path, 'rb') as fh:
+        for block in iter(lambda: fh.read(1 << 20), b''):
+            states_hash.update(block)
+    sources = dict(L1_COLUMN_SOURCES)
+    sources.update({c: (f'cpu_util.{f}', unit) for c, f, unit in L1_OPTIONAL_CPU_COLUMNS})
+
+    def counts(stats):
+        if stats is None:
+            return 'unavailable'
+        return (f"rows={stats.rows}; null_values={stats.null_values}; exact_duplicates={stats.exact_duplicates}; "
+                f"same_second={stats.same_second}; out_of_order={stats.out_of_order}; "
+                f"slice_retries={stats.slice_retries}; optional_values_without_physc={stats.optional_without_primary}")
+    merge = acq_stats.get('merge', {})
+    return [
+        "data_schema_version: 2",
+        f"data_columns: {','.join(columns)}",
+        f"data_revision: sha256:{data_hash.hexdigest()}",
+        f"states_revision: sha256:{states_hash.hexdigest()}",
+        "column_sources: " + '; '.join(f"{c}={sources[c][0]}" for c in columns[2:]),
+        "column_units: " + '; '.join(f"{c}={sources[c][1]}" for c in columns[2:]),
+        "column_availability: " + '; '.join(f"{c}={availability.get(c, 'unknown')}"
+                                             for c, _, _ in L1_OPTIONAL_CPU_COLUMNS),
+        f"quality_rows: {rows}",
+        "quality_nonempty: " + '; '.join(f"{columns[i]}={nonempty[i]}" for i in range(2, len(columns))),
+        f"last_run_window_ns: [{window_ns[0]}, {window_ns[1]})",
+        f"last_run_acquisition: slice_hours={args.slice_hours}; chunk_size={args.chunk_size}",
+        "last_run_counts_scope: all systems acquired in the staging run",
+        f"last_run_physc_counts: {counts(acq_stats.get('physc'))}",
+        f"last_run_runq_counts: {counts(acq_stats.get('runq'))}",
+        f"last_run_ambiguous_second_keys: {merge.get('ambiguous_keys', 'unavailable')} "
+        f"(extra rows {merge.get('ambiguous_extra_rows', 'unavailable')}; paired positionally)",
+    ]
+
+
 def main():
     """Main function for the nfit-stage-influxdb script."""
     # --- Argument Parsing ---
@@ -2059,6 +2264,10 @@ def main():
         help="Print the cached data window for each discovered serial and exit without querying InfluxDB.")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, dest="chunk_size",
         help=f"Points per line of the chunked InfluxDB response (default: {DEFAULT_CHUNK_SIZE}).")
+    parser.add_argument("--l1-schema", type=int, choices=(1, 2), default=1, dest="l1_schema",
+        help="L1 cache layout (default: 1). 1: Timestamp,VMName,PhysC,RunQ.\n"
+             "2: adds PhysB and FreqPct, acquired with PhysC in one cpu_util query; blank\n"
+             "cells where unavailable. --append requires the existing cache's layout.")
     parser.add_argument("--slice-hours", type=int, default=DEFAULT_SLICE_HOURS, dest="slice_hours",
         help=f"Length of each half-open acquisition time slice in hours (default: {DEFAULT_SLICE_HOURS}).\n"
              "An interrupted slice is rolled back and retried without repeating completed slices.")
@@ -2098,7 +2307,8 @@ def main():
             ("--startd", args.startd), ("--endd", args.endd), ("--days", args.days),
             ("--append", args.append), ("--cleanup", args.cleanup),
             ("--preserve-results", args.preserve_results), ("--config", args.config),
-            ("--show-cache-info", args.show_cache_info)) if used]
+            ("--show-cache-info", args.show_cache_info),
+            ("--l1-schema", args.l1_schema != 1)) if used]
         if staging_only:
             parser.error(f"{', '.join(staging_only)} cannot be combined with probe modes.")
         if not args.reanalyse and not args.probe_out:
@@ -2199,6 +2409,15 @@ def main():
             print(f"Cache is already up to date (earliest data_end: {earliest_end}). Nothing to append.")
             sys.exit(0)
 
+        # Refuse before any query: appending must never mix L1 layouts.
+        conflicts = append_layout_conflicts(cache_dir, known.keys(), args.l1_schema)
+        if conflicts:
+            print("ERROR: --append would mix L1 layouts; nothing was changed:", file=sys.stderr)
+            for reason in conflicts:
+                print(f"  - {reason}", file=sys.stderr)
+            print("Append with the cache's own --l1-schema, or restage with --cleanup.", file=sys.stderr)
+            sys.exit(1)
+
         print(f"Append mode: querying InfluxDB from {startd_for_query} to {endd_for_query}.")
 
     else:
@@ -2252,8 +2471,15 @@ def main():
                 print(f"\n[DEBUG] Acquisition window [{start_ns}, {end_exclusive_ns}) ns in "
                       f"{len(perf_slices)} slice(s) of up to {args.slice_hours}h; chunk size {args.chunk_size}.\n")
 
+            cpu_optional, cpu_availability, acq_stats = (), {}, {}
+            if args.l1_schema == 2:
+                cpu_optional, cpu_availability = resolve_cpu_optional_columns(client)
+                print("L1 schema 2 optional columns: "
+                      + ', '.join(f"{c} ({a})" for c, a in cpu_availability.items()))
+
             master_temp_filename, discovered_vms, min_ts, max_ts = stream_performance_data_optimized(
-                client, db_config['DATABASE'], entity_filter, perf_slices, tmp_dir, args
+                client, db_config['DATABASE'], entity_filter, perf_slices, tmp_dir, args,
+                stats_out=acq_stats, cpu_optional=cpu_optional
             )
 
             if not discovered_vms:
@@ -2516,6 +2742,11 @@ def main():
                     except ValueError:
                         pass
 
+                schema2_lines = []
+                if args.l1_schema == 2:
+                    schema2_lines = l1_schema2_manifest_lines(
+                        cache_data_path, cache_states_path, cpu_availability, acq_stats,
+                        (start_ns, end_exclusive_ns), args)
                 with open(os.path.join(serial_cache_dir, '.nfit.cache.manifest'), 'w') as f:
                     f.write(
                         f"cache_build_status: success\n"
@@ -2524,6 +2755,8 @@ def main():
                         f"data_end: {manifest_data_end}\n"
                         f"staged_by: nfit-stage-influxdb.py v{VERSION}\n"
                     )
+                    for manifest_line in schema2_lines:
+                        f.write(manifest_line + "\n")
 
                 with open(os.path.join(serial_cache_dir, '.nfit_stage_id'), 'w') as f:
                     f.write(f"Created by nfit-stage-influxdb.py v{VERSION} for system {serial}\n")
