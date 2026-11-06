@@ -268,7 +268,7 @@ def acquire_metric_to_file(client, database, measurement, field, entity_filter,
                            slices, chunk_size, out_fh, verbose=False):
     """
     Acquires one field across half-open time slices and appends rows to out_fh
-    in the legacy temporary-file format (timestamp,vm_name,value).
+    in the temporary-file format (timestamp,vm_name,value; no header line).
 
     A slice whose response is interrupted is rolled back (the file is truncated
     to the slice's starting offset) and queried again, up to SLICE_ATTEMPTS
@@ -422,10 +422,10 @@ def stream_performance_data_optimized(client, database, entity_filter, slices, t
     uses an external sort to create a master file.
 
     Acquisition is chunked InfluxQL v1 over half-open time slices with exact
-    nanosecond timestamps and named fields (acquire_metric_to_file). The
-    temporary files, sort and merge are unchanged, so the master file is
-    identical to the former single-query acquisition. Per-metric counters are
-    stored in stats_out when a dict is supplied.
+    nanosecond timestamps and named fields (acquire_metric_to_file). Temporary
+    files hold data rows only and are sorted in byte order, the order the
+    merge compares keys in. Per-metric counters are stored in stats_out when a
+    dict is supplied.
     """
     print("\n## Phase 1: Performance Data Staging")
     temp_files = {}
@@ -445,9 +445,10 @@ def stream_performance_data_optimized(client, database, entity_filter, slices, t
             if args.verbose:
                 print(f"\n    Created temp file for {metric}: {temp_file.name}")
 
-            # The header line is part of the legacy temporary-file contract that
-            # the external sort and merge below depend on; keep it unchanged.
-            temp_file.write("timestamp,vm_name,value\n")
+            # Temporary files carry data rows only. A header line used to be
+            # written here; the sort placed it after every data row, so the merge
+            # skipped the earliest sample of each metric and emitted the header as
+            # a final data row.
 
             stats = acquire_metric_to_file(client, database, measurement, field, entity_filter,
                                            slices, chunk_size, temp_file, args.verbose)
@@ -496,8 +497,13 @@ def create_sorted_master_file(temp_files, master_temp_filename):
             sorted_file = f"{temp_file}.sorted"
             # Use a large 8GB memory buffer for sort, as requested.
             sort_cmd = ['sort', '-t,', '-k1,1', '-k2,2', '-S', '8G', '-T', os.path.dirname(temp_file), temp_file]
+            # Byte order (LC_ALL=C) is the order join_sorted_files compares keys
+            # in. A locale collation (e.g. en_US.UTF-8 orders 'web-01' < 'web01'
+            # < 'Web02') disagrees with it and can split one (timestamp, VM) key
+            # into separate PhysC-only and RunQ-only rows.
+            sort_env = dict(os.environ, LC_ALL='C')
             with open(sorted_file, 'w', encoding='utf-8') as outfile:
-                subprocess.run(sort_cmd, stdout=outfile, check=True)
+                subprocess.run(sort_cmd, stdout=outfile, check=True, env=sort_env)
             sorted_files[metric] = sorted_file
         join_sorted_files(sorted_files, master_temp_filename)
     finally:
@@ -511,7 +517,6 @@ def join_sorted_files(sorted_files, master_temp_filename):
     try:
         for metric, sorted_file in sorted_files.items():
             file_handles[metric] = open(sorted_file, 'r', encoding='utf-8')
-            next(file_handles[metric])  # Skip header
             line = file_handles[metric].readline()
             if line:
                 parts = line.strip().split(',')
