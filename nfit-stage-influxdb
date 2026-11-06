@@ -149,10 +149,11 @@ def _open_query_stream(client, params):
     raise InfluxDBClientError(body, response.status_code)
 
 
-def _iter_response_chunks(response):
+def _iter_response_chunks(response, meter=None):
     """Yields each decoded chunk object of a chunked /query response, in the
     encoding the server chose: concatenated MessagePack objects, or one JSON
-    object per line. Raises IncompleteResponseError on a truncated object."""
+    object per line. Raises IncompleteResponseError on a truncated object.
+    If given, meter.bytes is increased by the response body bytes read."""
     content_type = (response.headers.get('Content-Type') or '').split(';')[0].strip()
     if content_type == 'application/x-msgpack':
         import msgpack
@@ -163,6 +164,8 @@ def _iter_response_chunks(response):
                 continue
             unpacker.feed(block)
             fed += len(block)
+            if meter is not None:
+                meter.bytes += len(block)
             for chunk in unpacker:
                 yield chunk
         if hasattr(unpacker, 'tell') and unpacker.tell() != fed:
@@ -170,6 +173,8 @@ def _iter_response_chunks(response):
                 f'truncated chunk: {fed - unpacker.tell()} byte(s) left undecoded')
         return
     for raw in response.iter_lines():
+        if meter is not None:
+            meter.bytes += len(raw) + 1
         if not raw:
             continue
         try:
@@ -178,7 +183,7 @@ def _iter_response_chunks(response):
             raise IncompleteResponseError(f'truncated chunk: {exc}') from exc
 
 
-def iter_influxql_points(client, database, query, chunk_size):
+def iter_influxql_points(client, database, query, chunk_size, meter=None):
     """
     Streams one InfluxQL v1 SELECT as (tags, point) pairs. Timestamps are exact
     integer nanoseconds (epoch=ns) and fields are addressed by name.
@@ -190,7 +195,7 @@ def iter_influxql_points(client, database, query, chunk_size):
     Completion is verified: every chunk but the last carries "partial": true, so
     a stream that ends on a partial chunk, delivers no chunk at all, or breaks
     off mid-transfer raises IncompleteResponseError. An error reported in any
-    chunk raises InfluxQueryError.
+    chunk raises InfluxQueryError. An optional meter accumulates response bytes.
     """
     import requests  # dependency of the influxdb client package
 
@@ -200,7 +205,7 @@ def iter_influxql_points(client, database, query, chunk_size):
     saw_chunk = False
     last_partial = False
     try:
-        for chunk in _iter_response_chunks(response):
+        for chunk in _iter_response_chunks(response, meter):
             saw_chunk = True
             if 'error' in chunk:
                 raise InfluxQueryError(chunk['error'])
@@ -946,11 +951,1064 @@ def truncate_to_last_valid_physc(filepath, tail_read_size=2 * 1024 * 1024):
     except OSError:
         return None
 
+# ==============================================================================
+# Discovery and bounded probe (Increment 3b)
+# ==============================================================================
+# Read-only diagnostics for collection readiness. These modes never take the
+# cache lock and never write to the staging directory. Their output directory
+# is split in two:
+#   <out>/private/  raw probe points, target, pseudonym secret (if generated)
+#                   and run metadata. Contains estate identifiers: treat it
+#                   like stage/.
+#   <out>/report/   pseudonymised JSON and Markdown report, safe to share.
+# A retained private/ directory can be re-analysed without database access.
+
+# Approved fields per measurement, in SELECT order. Only those discovered in
+# the database are selected. Tolerances and capture policy are decided after
+# the probe (Increment 4), not here.
+PROBE_MEASUREMENT_FIELDS = (
+    ('cpu_util', ('physical_consumed', 'physical_busy', 'freq_pct', 'user_pct',
+                  'kern_pct', 'idle_pct', 'wait_pct', 'entitlement')),
+    ('kernel', ('run_queue',)),
+    ('processor_pool', ('pool_id', 'phys_cpus_pool', 'idle_cores', 'busy_cores',
+                        'scaled_busy_cores', 'max_cores', 'global_pool_busy_cores',
+                        'global_pool_tot_cores', 'max_capacity_cores',
+                        'entitled_capacity_cores', 'max_capacity_raw',
+                        'entitled_capacity_raw', 'max_capacity', 'entitled_capacity')),
+    ('partition_type', ('shared_enabled', 'capped', 'pool_util_authority')),
+    ('identity', ('njmon_version',)),
+)
+# Schema discovery only; no data is read from these.
+DISCOVERY_ONLY_MEASUREMENTS = ('cpu_physical_total',)
+# Never selected: collector command lines can carry connection credentials.
+FORBIDDEN_FIELDS = frozenset(('njmon_command',))
+# Pool capacity spellings and their units as published in njmon v90. The legacy
+# integer names have no verified unit and are never converted.
+POOL_CAPACITY_VARIANTS = (
+    ('max_capacity_cores', 'cores'), ('entitled_capacity_cores', 'cores'),
+    ('max_capacity_raw', 'hundredths of a core'), ('entitled_capacity_raw', 'hundredths of a core'),
+    ('max_capacity', 'legacy integer, unit unverified'),
+    ('entitled_capacity', 'legacy integer, unit unverified'),
+)
+PROBE_FORMAT_VERSION = 1
+PROBE_DEFAULT_MAX_ROWS = 200_000
+PROBE_DEFAULT_MAX_BYTES = 64 * 1024 * 1024
+PROBE_DEFAULT_MAX_SECONDS = 900
+PROBE_DEFAULT_CADENCE_S = 60
+PROBE_DEFAULT_CADENCE_TOLERANCE_S = 1.0
+PROBE_DEFAULT_MATCH_TOLERANCE_S = 30
+
+
+def influxql_ident(name):
+    """Double-quoted InfluxQL identifier."""
+    return '"' + str(name).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def influxql_string(value):
+    """Single-quoted InfluxQL string literal."""
+    return "'" + str(value).replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+
+def build_entity_filter(serials=None, hosts=None):
+    """WHERE fragment for managed-system serials and/or host names. The term
+    spelling matches the staging filter."""
+    parts = []
+    if serials:
+        parts.append('(' + ' OR '.join(f'"serial_no" = {influxql_string(s)}' for s in serials) + ')')
+    if hosts:
+        parts.append('(' + ' OR '.join(f'host = {influxql_string(h)}' for h in hosts) + ')')
+    if not parts:
+        raise ValueError('an entity filter needs at least one serial or host')
+    return ' AND '.join(parts)
+
+
+def parse_probe_window(text):
+    """'YYYY-MM-DDTHH:MM:SSZ/YYYY-MM-DDTHH:MM:SSZ' -> (start_ns, end_exclusive_ns)."""
+    import re
+    m = re.fullmatch(r'(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})Z/(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})Z',
+                     text.strip())
+    if not m:
+        raise ValueError(f"window '{text}' is not FROM/TO in UTC, "
+                         "e.g. 2026-11-05T10:00:00Z/2026-11-05T10:30:00Z")
+    start = utc_date_to_ns(m.group(1), m.group(2))
+    end = utc_date_to_ns(m.group(3), m.group(4))
+    if end <= start:
+        raise ValueError(f"window '{text}' does not end after it starts")
+    return start, end
+
+
+def discover_schema(client, measurements):
+    """Field keys (with every type the server reports) and tag keys for each
+    measurement. Field types can differ between shards, so a field may carry
+    several types. Presence says nothing about coverage in a given window."""
+    schema = {}
+    for m in measurements:
+        fields = {}
+        for p in client.query(f'SHOW FIELD KEYS FROM {influxql_ident(m)}').get_points():
+            types_seen = fields.setdefault(p['fieldKey'], [])
+            if p['fieldType'] not in types_seen:
+                types_seen.append(p['fieldType'])
+        tags = sorted({p['tagKey'] for p in
+                       client.query(f'SHOW TAG KEYS FROM {influxql_ident(m)}').get_points()})
+        schema[m] = {'fields': {k: sorted(v) for k, v in sorted(fields.items())}, 'tags': tags}
+    return schema
+
+
+def resolve_probe_fields(schema):
+    """Approved fields that exist, per probe measurement, with what is missing,
+    unexpected, forbidden or multi-typed."""
+    plan = {}
+    for m, approved in PROBE_MEASUREMENT_FIELDS:
+        present = schema.get(m, {}).get('fields', {})
+        plan[m] = {
+            'selected': [f for f in approved if f in present and f not in FORBIDDEN_FIELDS],
+            'missing': [f for f in approved if f not in present],
+            'unapproved': sorted(f for f in present if f not in approved),
+            'forbidden_present': sorted(f for f in present if f in FORBIDDEN_FIELDS),
+            'multi_type': sorted(f for f in present if len(present[f]) > 1),
+        }
+    return plan
+
+
+def build_probe_query(measurement, fields, entity_filter, start_ns, end_exclusive_ns):
+    """One bounded SELECT per measurement and window. GROUP BY * keeps every
+    tag set distinct, so a second series for the same host stays visible."""
+    select = ', '.join(influxql_ident(f) for f in fields)
+    return (f'SELECT {select} FROM {influxql_ident(measurement)} WHERE {entity_filter} '
+            f'AND time >= {start_ns} AND time < {end_exclusive_ns} GROUP BY *')
+
+
+class ProbeBudget:
+    """Row, response-byte and elapsed-time limits across a whole probe. Also the
+    byte meter passed to iter_influxql_points."""
+
+    def __init__(self, max_rows, max_bytes, max_seconds):
+        self.max_rows, self.max_bytes, self.max_seconds = max_rows, max_bytes, max_seconds
+        self.rows = 0
+        self.bytes = 0
+        self.started = time.monotonic()
+        self.exceeded = None
+
+    def elapsed(self):
+        return time.monotonic() - self.started
+
+    def check(self):
+        if self.exceeded is None:
+            if self.rows > self.max_rows:
+                self.exceeded = f'rows > {self.max_rows}'
+            elif self.bytes > self.max_bytes:
+                self.exceeded = f'response bytes > {self.max_bytes}'
+            elif self.elapsed() > self.max_seconds:
+                self.exceeded = f'elapsed > {self.max_seconds}s'
+        return self.exceeded
+
+
+def probe_measurement_to_file(client, database, query, chunk_size, raw_path, budget):
+    """Streams one probe query into a gzip JSON-lines file of
+    {"tags", "time", "fields"} records, retrying an interrupted or failed
+    response from the start. Returns the query's metadata record."""
+    import gzip
+    import requests
+    from influxdb.exceptions import InfluxDBServerError
+
+    retryable = (IncompleteResponseError, requests.exceptions.RequestException, InfluxDBServerError)
+    record = {'status': 'complete', 'rows': 0, 'wire_bytes': 0, 'attempts': 0, 'error': None}
+    started = time.monotonic()
+    for attempt in range(1, SLICE_ATTEMPTS + 1):
+        record['attempts'] = attempt
+        rows0, bytes0 = budget.rows, budget.bytes
+        rows = 0
+        points = iter_influxql_points(client, database, query, chunk_size, meter=budget)
+        try:
+            with gzip.open(raw_path, 'wt', encoding='utf-8') as fh:
+                for tags, point in points:
+                    ts = point.pop('time')
+                    fh.write(json.dumps({'tags': tags, 'time': ts, 'fields': point},
+                                        separators=(',', ':'), sort_keys=True) + '\n')
+                    rows += 1
+                    budget.rows += 1
+                    if rows % 1000 == 0 and budget.check():
+                        record['status'] = 'stopped by budget'
+                        break
+            if record['status'] == 'complete' and budget.check():
+                record['status'] = 'complete; budget reached'
+            record['rows'] = rows
+            record['wire_bytes'] = budget.bytes - bytes0
+            break
+        except InfluxQueryError as exc:
+            record.update(status='failed', error=f'query error: {exc}', rows=rows,
+                          wire_bytes=budget.bytes - bytes0)
+            break
+        except retryable as exc:
+            budget.rows, budget.bytes = rows0, bytes0
+            if attempt == SLICE_ATTEMPTS:
+                record.update(status='failed', error=f'{type(exc).__name__}: {exc}', rows=0, wire_bytes=0)
+                break
+            print(f"    WARNING: attempt {attempt} failed ({type(exc).__name__}); retrying in "
+                  f"{SLICE_RETRY_DELAY_S}s.", file=sys.stderr)
+            time.sleep(SLICE_RETRY_DELAY_S)
+        finally:
+            points.close()
+    record['elapsed_s'] = round(time.monotonic() - started, 3)
+    return record
+
+
+def _package_version(name):
+    try:
+        from importlib.metadata import version
+        return version(name)
+    except Exception:
+        return None
+
+
+def load_pseudonym_secret(explicit_path, script_root, private_dir):
+    """HMAC secret for pseudonyms, read as dev/nfit-redact reads it, so that
+    pseudonyms agree with nfit-redact wherever the same secret is available.
+    Otherwise a probe-local secret is created in private/ and pseudonyms
+    correlate only within this probe. Returns (secret_bytes, source)."""
+    candidates = [(explicit_path, 'given file'),
+                  (os.environ.get('NFIT_REDACT_SECRET_FILE'), 'NFIT_REDACT_SECRET_FILE'),
+                  (os.path.join(script_root, '.private', 'redact.secret'), 'nfit-redact default')]
+    for path, source in candidates:
+        if not path:
+            continue
+        if os.path.isfile(path):
+            with open(path, encoding='utf-8') as fh:
+                data = fh.read().strip()
+            if len(data) < 32:
+                raise SystemExit(f'Error: pseudonym secret is too short ({source}).')
+            return data.encode('utf-8'), source
+        if source == 'given file':
+            raise SystemExit('Error: --pseudonym-secret file not found.')
+    path = os.path.join(private_dir, 'pseudonym.secret')
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as fh:
+            return fh.read().strip().encode('utf-8'), 'probe-local'
+    secret = os.urandom(32).hex()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        fh.write(secret + '\n')
+    return secret.encode('utf-8'), 'probe-local'
+
+
+class Pseudonymiser:
+    """HMAC-SHA256(secret, lower(term)) truncated to six hex digits, prefixed by
+    category, exactly as dev/nfit-redact computes it."""
+
+    def __init__(self, secret):
+        self.secret = secret
+
+    def _digest(self, term):
+        import hashlib
+        import hmac
+        return hmac.new(self.secret, str(term).lower().encode('utf-8'), hashlib.sha256).hexdigest()[:6]
+
+    def vm(self, name):
+        return 'vm_' + self._digest(name) if name else 'vm_(none)'
+
+    def sys(self, serial):
+        return 'sys_' + self._digest(serial) if serial else 'sys_(none)'
+
+    def series(self, tags):
+        """Pseudonym for a complete tag set."""
+        return 'ser_' + self._digest(json.dumps(tags, sort_keys=True))
+
+
+def _quantile(sorted_vals, q):
+    """Linear-interpolation quantile (Hyndman-Fan type 7) of sorted values."""
+    if not sorted_vals:
+        return None
+    pos = (len(sorted_vals) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * (pos - lo)
+
+
+def _summary(values, digits=6):
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return {'n': 0}
+
+    def r(v):
+        return round(v, digits)
+    return {'n': len(vals), 'min': r(vals[0]), 'p10': r(_quantile(vals, 0.10)),
+            'p50': r(_quantile(vals, 0.50)), 'p90': r(_quantile(vals, 0.90)), 'max': r(vals[-1])}
+
+
+def _type_name(v):
+    if isinstance(v, bool):
+        return 'boolean'
+    if isinstance(v, int):
+        return 'integer'
+    if isinstance(v, float):
+        return 'float'
+    if isinstance(v, str):
+        return 'string'
+    return type(v).__name__
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def load_probe_records(private_dir, meta):
+    """{measurement: [record, ...]} for every query that delivered rows, each
+    record carrying its window index. Adds raw byte counts to the queries."""
+    import gzip
+    out = {}
+    for q in meta.get('queries', []):
+        if not q.get('raw_file') or q.get('rows', 0) == 0 or q['status'] == 'failed':
+            continue
+        path = os.path.join(private_dir, q['raw_file'])
+        raw_bytes = 0
+        recs = out.setdefault(q['measurement'], [])
+        with gzip.open(path, 'rt', encoding='utf-8') as fh:
+            for line in fh:
+                raw_bytes += len(line.encode('utf-8'))
+                rec = json.loads(line)
+                rec['window'] = q['window']
+                recs.append(rec)
+        q['_raw_bytes'] = raw_bytes
+        q['_raw_gz_bytes'] = os.path.getsize(path)
+    return out
+
+
+def _series_analysis(recs, ps, params):
+    """Series identity, cadence and duplicates for one measurement."""
+    from collections import Counter
+    nominal_ns = params['cadence_s'] * NS_PER_SECOND
+    tol_ns = int(params['cadence_tolerance_s'] * NS_PER_SECOND)
+    series = defaultdict(list)                  # (window, tags json) -> [(time, fields)]
+    host_series = defaultdict(set)              # host -> {tags json}
+    host_serials = defaultdict(set)
+    extra_tags = defaultdict(set)
+    for r in recs:
+        key = json.dumps(r['tags'], sort_keys=True)
+        series[(r['window'], key)].append((r['time'], r['fields']))
+        host = r['tags'].get('host')
+        host_series[host].add(key)
+        host_serials[host].add(r['tags'].get('serial_no'))
+        for k, v in r['tags'].items():
+            if k not in ('host', 'serial_no'):
+                extra_tags[k].add(v)
+
+    medians, within, total_intervals, gaps = [], 0, 0, 0
+    off_counts = Counter()
+    exact_dup = conflict_dup = 0
+    off_nominal = set()
+    for (window, key), rows in series.items():
+        rows.sort(key=lambda x: x[0])
+        times = [t for t, _ in rows]
+        for (t1, f1), (t2, f2) in zip(rows, rows[1:]):
+            if t1 == t2:
+                if f1 == f2:
+                    exact_dup += 1
+                else:
+                    conflict_dup += 1
+        distinct = sorted(set(times))
+        for t in distinct:
+            off_counts[(t // NS_PER_SECOND) % 60] += 1
+        diffs = [b - a for a, b in zip(distinct, distinct[1:])]
+        if diffs:
+            med = _quantile(sorted(diffs), 0.5)
+            medians.append(med / NS_PER_SECOND)
+            if abs(med - nominal_ns) > tol_ns:
+                off_nominal.add(ps.series(json.loads(key)))
+            within += sum(1 for d in diffs if abs(d - nominal_ns) <= tol_ns)
+            gaps += sum(1 for d in diffs if d > 1.5 * nominal_ns)
+            total_intervals += len(diffs)
+
+    # Staging groups by host and writes second-resolution timestamps, so two
+    # distinct points of one host within one second collide on the legacy key.
+    by_host = defaultdict(lambda: defaultdict(set))   # (window, host) -> ns -> {tags json}
+    for (window, key), rows in series.items():
+        host = json.loads(key).get('host')
+        for t, _ in rows:
+            by_host[(window, host)][t].add(key)
+    same_second = cross_series_same_ns = 0
+    for ns_map in by_host.values():
+        sec_counts = Counter(t // NS_PER_SECOND for t in ns_map)
+        same_second += sum(c - 1 for c in sec_counts.values() if c > 1)
+        cross_series_same_ns += sum(1 for keys in ns_map.values() if len(keys) > 1)
+
+    return {
+        'rows': len(recs),
+        'series': len({key for (_, key) in series}),
+        'hosts': len(host_series),
+        'systems': sorted({ps.sys(s) for ss in host_serials.values() for s in ss}),
+        'hosts_with_multiple_series': {ps.vm(h): len(k) for h, k in sorted(host_series.items(), key=lambda x: str(x[0]))
+                                       if len(k) > 1},
+        'hosts_under_multiple_serials': sorted(ps.vm(h) for h, s in host_serials.items() if len(s) > 1),
+        'extra_tag_keys': {k: len(v) for k, v in sorted(extra_tags.items())},
+        'cadence': {
+            'nominal_s': params['cadence_s'], 'tolerance_s': params['cadence_tolerance_s'],
+            'series_median_interval_s': _summary(medians, 3),
+            'intervals': total_intervals,
+            'share_within_tolerance': round(within / total_intervals, 4) if total_intervals else None,
+            'gaps_over_1_5x_nominal': gaps,
+            'series_off_nominal': sorted(off_nominal),
+            'second_of_minute_top': [[sec, n] for sec, n in sorted(off_counts.items(),
+                                                                   key=lambda x: (-x[1], x[0]))[:5]],
+        },
+        'duplicates': {
+            'exact_same_series': exact_dup,
+            'conflicting_same_series': conflict_dup,
+            'same_ns_across_series_of_host': cross_series_same_ns,
+            'legacy_same_second_collisions': same_second,
+        },
+    }
+
+
+def _field_coverage(recs, fields, ps):
+    """Per selected field: non-null share, value types seen in the data and the
+    hosts that never report it (collector schema variants)."""
+    rows = len(recs)
+    hosts = {r['tags'].get('host') for r in recs}
+    out = {}
+    for f in fields:
+        present = [r for r in recs if r['fields'].get(f) is not None]
+        with_field = {r['tags'].get('host') for r in present}
+        out[f] = {'non_null': len(present), 'rows': rows,
+                  'share': round(len(present) / rows, 4) if rows else None,
+                  'types_in_data': sorted({_type_name(r['fields'][f]) for r in present}),
+                  'hosts_without_any_value': sorted(ps.vm(h) for h in hosts - with_field)}
+    return out
+
+
+def _legacy_second_key(rec):
+    return (rec['window'], rec['tags'].get('host'), rec['time'] // NS_PER_SECOND)
+
+
+def _cpu_pairing(cpu, kernel):
+    """PhysB/PhysC pairing, the PhysB/PhysC ratio and two reconstruction
+    residuals by entitlement regime, and CPU/RunQ pairing on the legacy key.
+    Descriptive only: no tolerance or estimator is chosen here."""
+    eps = 1e-9
+    regimes = ('at_or_below_entitlement', 'above_entitlement')
+    c_rows = b_rows = both = b_missing = b_gt_c = c_zero = 0
+    ratio = {'all': [], regimes[0]: [], regimes[1]: []}
+    resid_util = {r: [] for r in regimes}
+    resid_ent = {r: [] for r in regimes}
+    freq = []
+    for rec in cpu:
+        f = rec['fields']
+        c, b = _num(f.get('physical_consumed')), _num(f.get('physical_busy'))
+        e = _num(f.get('entitlement'))
+        idle, wait = _num(f.get('idle_pct')), _num(f.get('wait_pct'))
+        if _num(f.get('freq_pct')) is not None:
+            freq.append(f['freq_pct'])
+        if c is not None:
+            c_rows += 1
+        if b is not None:
+            b_rows += 1
+        if c is None:
+            continue
+        if b is None:
+            b_missing += 1
+            continue
+        both += 1
+        if c == 0:
+            c_zero += 1        # ratio unavailable, not zero or infinite
+            continue
+        if b > c + eps:
+            b_gt_c += 1
+        ratio['all'].append(b / c)
+        if e is None:
+            continue
+        regime = regimes[0] if c <= e + eps else regimes[1]
+        ratio[regime].append(b / c)
+        if idle is not None and wait is not None:
+            busy_frac = 1 - (idle + wait) / 100.0
+            resid_util[regime].append(b - c * busy_frac)
+            resid_ent[regime].append(b - e * busy_frac)
+    kernel_keys = {_legacy_second_key(r) for r in kernel}
+    cpu_keys = {_legacy_second_key(r) for r in cpu}
+    return {
+        'rows_with_physc': c_rows, 'rows_with_physb': b_rows, 'rows_with_both': both,
+        'physb_missing_where_physc_present': b_missing,
+        'physc_zero_with_physb': c_zero,
+        'physb_above_physc': b_gt_c,
+        'physb_over_physc': {k: _summary(v, 4) for k, v in ratio.items()},
+        'residual_physb_minus_physc_x_busy_pct': {k: _summary(v, 4) for k, v in resid_util.items()},
+        'residual_physb_minus_entitlement_x_busy_pct': {k: _summary(v, 4) for k, v in resid_ent.items()},
+        'freq_pct': _summary(freq, 2),
+        'cpu_runq_pairing': {'cpu_keys': len(cpu_keys), 'kernel_keys': len(kernel_keys),
+                             'matched_keys': len(cpu_keys & kernel_keys)},
+    }
+
+
+def _pool_analysis(recs, ps, params):
+    """Pool membership, reporter identity and cross-reporter agreement. Values
+    are compared, never combined: repeated views of one pool are not
+    independent resources."""
+    import bisect
+    tol_ns = params['match_tolerance_s'] * NS_PER_SECOND
+    by_pool = defaultdict(lambda: defaultdict(list))     # pool -> (window, host) -> [(t, fields)]
+    host_pools = defaultdict(set)
+    no_pool = 0
+    for r in recs:
+        pid = r['fields'].get('pool_id')
+        if pid is None:
+            no_pool += 1
+            continue
+        host = r['tags'].get('host')
+        by_pool[pid][(r['window'], host)].append((r['time'], r['fields']))
+        host_pools[(r['window'], host)].add(pid)
+    config_fields = ('phys_cpus_pool', 'max_capacity_cores', 'entitled_capacity_cores',
+                     'max_capacity_raw', 'entitled_capacity_raw', 'max_capacity',
+                     'entitled_capacity', 'global_pool_tot_cores')
+    pools = {}
+    for pid in sorted(by_pool, key=lambda x: (type(x).__name__, x)):
+        reporters = by_pool[pid]
+        rows = [x for v in reporters.values() for x in v]
+        distinct = {}
+        for f in config_fields:
+            vals = sorted({x[1].get(f) for x in rows if _num(x[1].get(f)) is not None})
+            if vals:
+                distinct[f] = {'count': len(vals), 'values': vals[:10]}
+        raw_vs_cores, idle_busy_resid = [], []
+        for _, fx in rows:
+            for cores_f, raw_f in (('max_capacity_cores', 'max_capacity_raw'),
+                                   ('entitled_capacity_cores', 'entitled_capacity_raw')):
+                c, raw = _num(fx.get(cores_f)), _num(fx.get(raw_f))
+                if c is not None and raw is not None:
+                    raw_vs_cores.append(abs(raw / 100.0 - c))
+            i, b, n = _num(fx.get('idle_cores')), _num(fx.get('busy_cores')), _num(fx.get('phys_cpus_pool'))
+            if None not in (i, b, n):
+                idle_busy_resid.append(i + b - n)
+        pairs = []
+        keys = sorted(reporters, key=lambda k: (k[0], str(k[1])))
+        for i, ka in enumerate(keys):
+            for kb in keys[i + 1:]:
+                if ka[0] != kb[0]:
+                    continue
+                a = sorted(reporters[ka], key=lambda x: x[0])
+                b = sorted(reporters[kb], key=lambda x: x[0])
+                bt = [x[0] for x in b]
+                offsets, d_idle, d_busy = [], [], []
+                for t, fa in a:
+                    # Only while both report this pool: after a pool move the
+                    # nearest point of the other reporter is not a counterpart.
+                    if t < bt[0] - tol_ns or t > bt[-1] + tol_ns:
+                        continue
+                    j = bisect.bisect_left(bt, t)
+                    near = min((k for k in (j - 1, j) if 0 <= k < len(bt)), key=lambda k: abs(bt[k] - t))
+                    off = abs(bt[near] - t)
+                    offsets.append(off / NS_PER_SECOND)
+                    if off <= tol_ns:
+                        fb = b[near][1]
+                        for fld, acc in (('idle_cores', d_idle), ('busy_cores', d_busy)):
+                            va, vb = _num(fa.get(fld)), _num(fb.get(fld))
+                            if va is not None and vb is not None:
+                                acc.append(abs(va - vb))
+                pairs.append({'reporters': sorted([ps.vm(ka[1]), ps.vm(kb[1])]), 'window': ka[0],
+                              'nearest_offset_s': _summary(offsets, 3),
+                              'abs_diff_idle_cores_within_tolerance': _summary(d_idle, 4),
+                              'abs_diff_busy_cores_within_tolerance': _summary(d_busy, 4)})
+        cadences = []
+        for rows_r in reporters.values():
+            ts = sorted({x[0] for x in rows_r})
+            d = [y - x for x, y in zip(ts, ts[1:])]
+            if d:
+                cadences.append(_quantile(sorted(d), 0.5) / NS_PER_SECOND)
+        pools[str(pid)] = {
+            'rows': len(rows),
+            'reporters': len({k[1] for k in reporters}),
+            'reporter_median_interval_s': _summary(cadences, 3),
+            'distinct_config_values': distinct,
+            'abs_raw_div_100_minus_cores': _summary(raw_vs_cores, 6),
+            'idle_plus_busy_minus_phys_cpus_pool': _summary(idle_busy_resid, 4),
+            'reporter_pairs': pairs[:20],
+            'reporter_pairs_total': len(pairs),
+        }
+    return {'rows_without_pool_id': no_pool, 'pools': pools,
+            'hosts_reporting_several_pools': sorted({ps.vm(h) for (w, h), p in host_pools.items() if len(p) > 1}),
+            'match_tolerance_s': params['match_tolerance_s'],
+            'notes': ['reporter comparisons describe agreement only; values are never summed or merged',
+                      'idle+busy-phys_cpus_pool is informational; nFit does not rely on that identity']}
+
+
+def _capability_analysis(recs, fields, ps):
+    """Value distributions of capability and collector-identity fields. A
+    window's values are not a historical capability timeline."""
+    from collections import Counter
+    out = {}
+    for f in fields:
+        counts = Counter()
+        per_host = defaultdict(list)
+        for r in sorted(recs, key=lambda x: x['time']):
+            v = r['fields'].get(f)
+            if v is None:
+                continue
+            counts[str(v)] += 1
+            per_host[r['tags'].get('host')].append(str(v))
+        out[f] = {'value_counts': dict(sorted(counts.items())),
+                  'hosts_by_last_value': dict(sorted(Counter(vs[-1] for vs in per_host.values()).items())),
+                  'hosts_changing_in_window': sorted(ps.vm(h) for h, vs in per_host.items() if len(set(vs)) > 1)}
+    return out
+
+
+def _cost_analysis(meta, records):
+    """Measured rows and bytes, and a labelled 90-day extrapolation for the
+    probe's own scope (its hosts and series only)."""
+    windows_h = sum((e - s) / NS_PER_SECOND / 3600 for s, e in meta['windows'])
+    out = {}
+    for m, recs in records.items():
+        qs = [q for q in meta['queries'] if q['measurement'] == m and q['status'] != 'failed']
+        rows = sum(q['rows'] for q in qs)
+        wire = sum(q['wire_bytes'] for q in qs)
+        gz = sum(q.get('_raw_gz_bytes', 0) for q in qs)
+        n_series = len({(r['window'], json.dumps(r['tags'], sort_keys=True)) for r in recs})
+        series_per_window = n_series / max(1, len(meta['windows']))
+        per_day = rows / series_per_window / windows_h * 24 if windows_h and series_per_window else 0
+        rows_90d = per_day * 90 * series_per_window
+        out[m] = {
+            'rows': rows, 'wire_bytes': wire,
+            'raw_jsonl_bytes': sum(q.get('_raw_bytes', 0) for q in qs), 'raw_gzip_bytes': gz,
+            'wire_bytes_per_row': round(wire / rows, 1) if rows else None,
+            'gzip_bytes_per_row': round(gz / rows, 1) if rows else None,
+            'elapsed_s': round(sum(q['elapsed_s'] for q in qs), 3),
+            'rows_per_series_per_day': round(per_day, 1),
+            'extrapolated_90d_rows_probe_scope': int(round(rows_90d)),
+            'extrapolated_90d_wire_bytes_probe_scope': int(round(rows_90d * wire / rows)) if rows else None,
+            'extrapolated_90d_gzip_bytes_probe_scope': int(round(rows_90d * gz / rows)) if rows else None,
+        }
+    cpu, kernel = records.get('cpu_util', []), records.get('kernel', [])
+    if cpu:
+        # Sizes are computed from the real identifiers; only numbers are reported.
+        runq = {_legacy_second_key(r): r['fields'].get('run_queue') for r in kernel}
+        legacy_bytes, added = [], defaultdict(list)
+        for r in cpu:
+            c = r['fields'].get('physical_consumed')
+            q = runq.get(_legacy_second_key(r))
+            if c is None or q is None:
+                continue
+            ts = ns_to_legacy_timestamp(r['time'])
+            legacy_bytes.append(len(f"{ts},{r['tags'].get('host', '')},{c},{q}\n".encode('utf-8')))
+            for f, v in r['fields'].items():
+                if f != 'physical_consumed':
+                    added[f].append(1 + (len(str(v)) if v is not None else 0))
+        out['l1_row_bytes'] = {
+            'legacy_four_columns_mean': round(sum(legacy_bytes) / len(legacy_bytes), 1) if legacy_bytes else None,
+            'added_per_optional_column_mean': {f: round(sum(v) / len(v), 1) for f, v in sorted(added.items())},
+            'paired_rows': len(legacy_bytes),
+        }
+    out['note'] = ('the extrapolation scales the observed per-series rate to 90 days for the probed '
+                   'hosts and series only; it is not an estate or managed-system estimate')
+    return out
+
+
+def analyse_probe(meta, records, ps, redact=lambda text: text):
+    """Pseudonymised probe report as a JSON-serialisable dict. `redact` is
+    applied to free text that may echo the query (server error messages)."""
+    params = meta['parameters']
+    report = {
+        'probe_format': meta['probe_format'],
+        'stager_version': meta['stager_version'],
+        'created_utc': meta['created_utc'],
+        'mode': meta['mode'],
+        'environment': meta['environment'],
+        'pseudonyms': meta['pseudonym_source'],
+        'target': {'systems': sorted(ps.sys(s) for s in meta['target'].get('serials', [])),
+                   'hosts': sorted(ps.vm(h) for h in meta['target'].get('hosts', []))},
+        'windows_utc': [[ns_to_utc_datetime(s).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                         ns_to_utc_datetime(e).strftime('%Y-%m-%dT%H:%M:%SZ')] for s, e in meta['windows']],
+        'parameters': params,
+        'budgets': meta['budgets'],
+        'budget_exceeded': meta.get('budget_exceeded'),
+        'retention_policies': meta['retention_policies'],
+        'schema': meta['schema'],
+        'plan': meta['plan'],
+        'schema_checks': {},
+        'queries': [],
+        'measurements': {},
+    }
+    for q in meta['queries']:
+        entry = {k: q[k] for k in ('window', 'measurement', 'fields', 'status', 'rows',
+                                    'wire_bytes', 'elapsed_s', 'attempts') if k in q}
+        if q.get('error'):
+            entry['error'] = redact(q['error'])
+        report['queries'].append(entry)
+    sch = meta['schema']
+    for m in sch:
+        tags = sch[m]['tags']
+        report['schema_checks'][m] = {
+            'measurement_present': bool(sch[m]['fields'] or tags),
+            'host_is_tag': 'host' in tags, 'serial_no_is_tag': 'serial_no' in tags}
+    if 'processor_pool' in sch:
+        pf = sch['processor_pool']['fields']
+        report['schema_checks']['processor_pool'].update({
+            'pool_id_is_field': 'pool_id' in pf,
+            'pool_id_is_tag': 'pool_id' in sch['processor_pool']['tags'],
+            'capacity_variants': {f: {'unit': unit, 'types': pf[f]}
+                                  for f, unit in POOL_CAPACITY_VARIANTS if f in pf}})
+    for m, _ in PROBE_MEASUREMENT_FIELDS:
+        recs = records.get(m)
+        if not recs:
+            continue
+        selected = meta['plan'][m]['selected']
+        entry = _series_analysis(recs, ps, params)
+        entry['field_coverage'] = _field_coverage(recs, selected, ps)
+        if m == 'processor_pool':
+            entry['pool'] = _pool_analysis(recs, ps, params)
+        if m in ('partition_type', 'identity'):
+            entry['capability'] = _capability_analysis(recs, selected, ps)
+        report['measurements'][m] = entry
+    if records.get('cpu_util'):
+        report['measurements']['cpu_util']['pairing'] = _cpu_pairing(records['cpu_util'],
+                                                                      records.get('kernel', []))
+    if records:
+        report['cost'] = _cost_analysis(meta, records)
+    return report
+
+
+def _md_summary(s):
+    if not s or not s.get('n'):
+        return '–'
+    return f"n={s['n']} min={s['min']} p10={s['p10']} p50={s['p50']} p90={s['p90']} max={s['max']}"
+
+
+def _md_measurement(m, e, add):
+    add(f"## {m}\n")
+    add(f"- Rows {e['rows']}; series {e['series']}; hosts {e['hosts']}; systems {', '.join(e['systems'])}")
+    if e['hosts_with_multiple_series']:
+        add(f"- **Hosts with more than one series:** {e['hosts_with_multiple_series']}")
+    if e['hosts_under_multiple_serials']:
+        add(f"- **Hosts under more than one serial:** {', '.join(e['hosts_under_multiple_serials'])}")
+    if e['extra_tag_keys']:
+        add(f"- Other tag keys (distinct values): {e['extra_tag_keys']}")
+    c = e['cadence']
+    add(f"- Cadence (nominal {c['nominal_s']} s ± {c['tolerance_s']} s): series medians "
+        f"{_md_summary(c['series_median_interval_s'])}; share of intervals within tolerance "
+        f"{c['share_within_tolerance']}; gaps > 1.5× nominal {c['gaps_over_1_5x_nominal']}")
+    if c['series_off_nominal']:
+        add(f"- Series off nominal: {', '.join(c['series_off_nominal'][:20])}")
+    add(f"- Most common second-of-minute offsets [second, points]: {c['second_of_minute_top']}")
+    d = e['duplicates']
+    add(f"- Duplicates: exact {d['exact_same_series']}; conflicting {d['conflicting_same_series']}; "
+        f"same ns across series of one host {d['same_ns_across_series_of_host']}; "
+        f"legacy same-second collisions {d['legacy_same_second_collisions']}")
+    add('\n| Field | Non-null | Share | Types in data | Hosts without any value |')
+    add('|---|---:|---:|---|---|')
+    for f, fc in e['field_coverage'].items():
+        hw = fc['hosts_without_any_value']
+        add(f"| {f} | {fc['non_null']} | {fc['share']} | {'/'.join(fc['types_in_data']) or '–'} | "
+            f"{len(hw)}{(' (' + ', '.join(hw[:10]) + ')') if hw else ''} |")
+    add('')
+    if 'pairing' in e:
+        p = e['pairing']
+        add('### PhysB/PhysC pairing\n')
+        add(f"- Rows with PhysC {p['rows_with_physc']}, PhysB {p['rows_with_physb']}, both {p['rows_with_both']}; "
+            f"PhysB missing where PhysC present {p['physb_missing_where_physc_present']}; "
+            f"PhysC = 0 {p['physc_zero_with_physb']}; PhysB > PhysC {p['physb_above_physc']}")
+        for k, v in p['physb_over_physc'].items():
+            add(f"- PhysB/PhysC, {k.replace('_', ' ')}: {_md_summary(v)}")
+        for k, v in p['residual_physb_minus_physc_x_busy_pct'].items():
+            add(f"- PhysB − PhysC×(1−(idle+wait)/100), {k.replace('_', ' ')}: {_md_summary(v)}")
+        for k, v in p['residual_physb_minus_entitlement_x_busy_pct'].items():
+            add(f"- PhysB − entitlement×(1−(idle+wait)/100), {k.replace('_', ' ')}: {_md_summary(v)}")
+        add(f"- freq_pct: {_md_summary(p['freq_pct'])}")
+        cr = p['cpu_runq_pairing']
+        add(f"- CPU/RunQ on the legacy (host, UTC second) key: CPU keys {cr['cpu_keys']}, "
+            f"RunQ keys {cr['kernel_keys']}, matched {cr['matched_keys']}\n")
+    if 'pool' in e:
+        pl = e['pool']
+        add('### Pools\n')
+        add(f"- Rows without pool_id {pl['rows_without_pool_id']}; hosts reporting several pools: "
+            f"{', '.join(pl['hosts_reporting_several_pools']) or '–'}; match tolerance {pl['match_tolerance_s']} s")
+        for pid, pv in pl['pools'].items():
+            add(f"- Pool {pid}: rows {pv['rows']}, reporters {pv['reporters']}, reporter median interval "
+                f"{_md_summary(pv['reporter_median_interval_s'])}")
+            for f, dv in pv['distinct_config_values'].items():
+                add(f"  - {f}: {dv['count']} distinct {dv['values']}")
+            add(f"  - |raw/100 − cores|: {_md_summary(pv['abs_raw_div_100_minus_cores'])}")
+            add(f"  - idle+busy−phys_cpus_pool (informational): "
+                f"{_md_summary(pv['idle_plus_busy_minus_phys_cpus_pool'])}")
+            for pr in pv['reporter_pairs']:
+                add(f"  - {' / '.join(pr['reporters'])} (window {pr['window']}): nearest offset s "
+                    f"{_md_summary(pr['nearest_offset_s'])}; |Δidle| "
+                    f"{_md_summary(pr['abs_diff_idle_cores_within_tolerance'])}; |Δbusy| "
+                    f"{_md_summary(pr['abs_diff_busy_cores_within_tolerance'])}")
+            if pv['reporter_pairs_total'] > len(pv['reporter_pairs']):
+                add(f"  - {pv['reporter_pairs_total'] - len(pv['reporter_pairs'])} more pair(s) in the JSON report")
+        for n in pl['notes']:
+            add(f"- Note: {n}")
+        add('')
+    if 'capability' in e:
+        add('### Values\n')
+        for f, cv in e['capability'].items():
+            add(f"- {f}: values {cv['value_counts']}; hosts by last value {cv['hosts_by_last_value']}; "
+                f"changing in window {', '.join(cv['hosts_changing_in_window']) or '–'}")
+        add('')
+
+
+def render_probe_markdown(rep):
+    """Human-readable view of the pseudonymised report."""
+    lines = []
+    add = lines.append
+    add(f"# nFit InfluxDB probe report ({rep['mode']})\n")
+    add(f"- Created: {rep['created_utc']} by nfit-stage-influxdb {rep['stager_version']}")
+    env = rep['environment']
+    add(f"- Server: InfluxDB {env.get('server_version')}; Python {env.get('python')}; "
+        f"influxdb {env.get('influxdb')}; msgpack {env.get('msgpack')}; requests {env.get('requests')}")
+    add(f"- Target: systems {', '.join(rep['target']['systems']) or '–'}; "
+        f"hosts {', '.join(rep['target']['hosts']) or '–'} (pseudonym secret: {rep['pseudonyms']})")
+    for s, e in rep['windows_utc']:
+        add(f"- Window: [{s}, {e})")
+    b = rep['budgets']
+    add(f"- Budgets: {b['max_rows']} rows, {b['max_bytes']} response bytes, {b['max_seconds']} s; "
+        f"exceeded: {rep['budget_exceeded'] or 'no'}")
+    add('\n## Retention policies\n')
+    for rp in rep['retention_policies']:
+        add(f"- {rp.get('name')}: duration {rp.get('duration')}, shard group {rp.get('shardGroupDuration')}, "
+            f"default {rp.get('default')}")
+    add('\n## Schema\n')
+    for m, s in rep['schema'].items():
+        chk = rep['schema_checks'].get(m, {})
+        add(f"### {m}\n")
+        if not chk.get('measurement_present'):
+            add('- Not present in this database.\n')
+            continue
+        add(f"- Tags: {', '.join(s['tags'])}; host is a tag: {chk['host_is_tag']}; "
+            f"serial_no is a tag: {chk['serial_no_is_tag']}")
+        add('- Fields: ' + ', '.join(f"{k} ({'/'.join(v)})" for k, v in s['fields'].items()))
+        plan = rep['plan'].get(m)
+        if plan:
+            add(f"- Selected: {', '.join(plan['selected']) or '–'}")
+            add(f"- Approved but absent: {', '.join(plan['missing']) or '–'}")
+            if plan['multi_type']:
+                add(f"- **Several types across shards:** {', '.join(plan['multi_type'])}")
+            if plan['forbidden_present']:
+                add(f"- Never selected (may hold credentials): {', '.join(plan['forbidden_present'])}")
+        if m == 'processor_pool':
+            add(f"- pool_id is a field: {chk.get('pool_id_is_field')}; is a tag: {chk.get('pool_id_is_tag')}")
+            for f, v in chk.get('capacity_variants', {}).items():
+                add(f"- Capacity variant {f}: {v['unit']}; types {'/'.join(v['types'])}")
+        add('')
+    if rep['queries']:
+        add('## Queries\n')
+        add('| Window | Measurement | Status | Rows | Response bytes | Seconds | Attempts |')
+        add('|---|---|---|---:|---:|---:|---:|')
+        for q in rep['queries']:
+            status = q['status'] + (': ' + q['error'] if q.get('error') else '')
+            add(f"| {q['window']} | {q['measurement']} | {status} | {q.get('rows', 0)} | "
+                f"{q.get('wire_bytes', 0)} | {q.get('elapsed_s', 0)} | {q.get('attempts', 0)} |")
+        add('')
+    for m, e in rep['measurements'].items():
+        _md_measurement(m, e, add)
+    if 'cost' in rep:
+        add('## Cost\n')
+        add('| Measurement | Rows | Response bytes | Bytes/row | Gzip bytes/row | Seconds | Rows/series/day '
+            '| 90-day rows (probe scope) | 90-day gzip bytes (probe scope) |')
+        add('|---|---:|---:|---:|---:|---:|---:|---:|---:|')
+        for m, cv in rep['cost'].items():
+            if not isinstance(cv, dict) or 'rows' not in cv:
+                continue
+            add(f"| {m} | {cv['rows']} | {cv['wire_bytes']} | {cv['wire_bytes_per_row']} | "
+                f"{cv['gzip_bytes_per_row']} | {cv['elapsed_s']} | {cv['rows_per_series_per_day']} | "
+                f"{cv['extrapolated_90d_rows_probe_scope']} | {cv['extrapolated_90d_gzip_bytes_probe_scope']} |")
+        l1 = rep['cost'].get('l1_row_bytes')
+        if l1:
+            add(f"\n- L1 row: legacy four columns {l1['legacy_four_columns_mean']} bytes (mean over "
+                f"{l1['paired_rows']} paired rows); added per optional column {l1['added_per_optional_column_mean']}")
+        add(f"- Note: {rep['cost']['note']}")
+    return '\n'.join(lines) + '\n'
+
+
+def _identifier_vocabulary(records, meta):
+    """Terms that must never appear in report/: target names, the database
+    name and every tag value seen. Short terms are ignored as too ambiguous."""
+    vocab = set(meta['target'].get('serials', [])) | set(meta['target'].get('hosts', []))
+    vocab.add(meta.get('database') or '')
+    for recs in records.values():
+        for r in recs:
+            vocab.update(str(v) for v in r['tags'].values())
+    return {v for v in vocab if len(v) >= 3}
+
+
+def _identifier_pattern(vocab):
+    import re
+    if not vocab:
+        return None
+    alternation = '|'.join(re.escape(t) for t in sorted(vocab, key=len, reverse=True))
+    return re.compile(r'(?<![A-Za-z0-9_])(?:' + alternation + r')(?![A-Za-z0-9_])', re.IGNORECASE)
+
+
+def write_probe_report(out_dir, script_root, secret_path=None):
+    """(Re)builds report/ from private/. Fails closed: if a tag value, target
+    name or the database name appears anywhere in the rendered report, nothing
+    is written to report/."""
+    private_dir = os.path.join(out_dir, 'private')
+    with open(os.path.join(private_dir, 'meta.json'), encoding='utf-8') as fh:
+        meta = json.load(fh)
+    secret, source = load_pseudonym_secret(secret_path, script_root, private_dir)
+    meta['pseudonym_source'] = source
+    ps = Pseudonymiser(secret)
+    records = load_probe_records(private_dir, meta)
+    pattern = _identifier_pattern(_identifier_vocabulary(records, meta))
+
+    def redact(text):
+        return pattern.sub('<redacted>', text) if pattern else text
+
+    report = analyse_probe(meta, records, ps, redact)
+    text_json = json.dumps(report, indent=2, default=str) + '\n'
+    text_md = render_probe_markdown(report)
+    if pattern:
+        leaks = len(pattern.findall(text_json)) + len(pattern.findall(text_md))
+        if leaks:
+            raise SystemExit(f'Error: {leaks} identifier occurrence(s) found in the rendered report; '
+                             'nothing was written to report/.')
+    report_dir = os.path.join(out_dir, 'report')
+    os.makedirs(report_dir, exist_ok=True)
+    for name, text in (('probe-report.json', text_json), ('probe-report.md', text_md)):
+        tmp = os.path.join(report_dir, name + '.tmp')
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+        os.replace(tmp, os.path.join(report_dir, name))
+    return report
+
+
+def run_probe_mode(args, script_root, cache_dir):
+    """--discover, --probe and --reanalyse. Returns an exit status: 0 complete,
+    1 usage or setup error, 2 finished with failed queries or a budget stop."""
+    if args.reanalyse:
+        out_dir = os.path.abspath(args.reanalyse)
+        if not os.path.isfile(os.path.join(out_dir, 'private', 'meta.json')):
+            print(f'Error: no probe metadata under {os.path.join(out_dir, "private")}.', file=sys.stderr)
+            return 1
+        write_probe_report(out_dir, script_root, args.pseudonym_secret)
+        print(f'Report rebuilt without database access: {os.path.join(out_dir, "report")}')
+        return 0
+
+    out_dir = os.path.abspath(args.probe_out)
+    stage_real, out_real = os.path.realpath(cache_dir), os.path.realpath(out_dir)
+    if out_real == stage_real or out_real.startswith(stage_real + os.sep):
+        print('Error: --probe-out must not be inside the staging directory.', file=sys.stderr)
+        return 1
+    if os.path.exists(out_dir) and os.listdir(out_dir):
+        print('Error: --probe-out exists and is not empty; probe results are retained, not overwritten.',
+              file=sys.stderr)
+        return 1
+    try:
+        windows = [parse_probe_window(w) for w in (args.window or [])]
+    except ValueError as exc:
+        print(f'Error: {exc}', file=sys.stderr)
+        return 1
+    if args.probe and not windows:
+        print('Error: --probe needs at least one --window FROM/TO.', file=sys.stderr)
+        return 1
+    if args.discover and windows:
+        print('Error: --discover reads metadata only; use --probe for windows.', file=sys.stderr)
+        return 1
+
+    serials = [s.strip() for s in args.mgsys.split(',')] if args.mgsys else []
+    if args.vms:
+        hosts = [s.strip() for s in args.vms.split(',')]
+    elif args.vmfile:
+        with open(args.vmfile, encoding='utf-8') as fh:
+            hosts = [line.strip() for line in fh if line.strip()]
+    else:
+        hosts = []
+    serials, hosts = [s for s in serials if s], [h for h in hosts if h]
+    if args.probe and not (serials or hosts):
+        print('Error: --probe needs --mgsys, --vms or --vmfile.', file=sys.stderr)
+        return 1
+
+    client, db_version, db_config = get_db_client(os.path.join(script_root, 'etc', 'influxdb.conf'))
+    if db_version != 1:
+        print('Error: probing supports InfluxDB 1.x (InfluxQL over the v1 API) only.', file=sys.stderr)
+        return 1
+    database = db_config['DATABASE']
+    # Probe only: bound each socket wait so a stalled server ends the query
+    # (and its retries) instead of hanging. The staging path is unchanged.
+    client._timeout = args.max_seconds
+
+    private_dir = os.path.join(out_dir, 'private')
+    os.makedirs(os.path.join(private_dir, 'raw'), exist_ok=True)
+    try:
+        os.chmod(private_dir, 0o700)
+    except OSError:
+        pass
+
+    mode = 'probe' if args.probe else 'discover'
+    print(f'Mode: {mode}; {len(serials)} system(s), {len(hosts)} host(s), {len(windows)} window(s).')
+    print('- Discovering schema...', end='', flush=True)
+    try:
+        server_version = client.ping()
+    except Exception as exc:  # the version is informative only
+        server_version = f'unavailable ({type(exc).__name__})'
+    schema = discover_schema(client, [m for m, _ in PROBE_MEASUREMENT_FIELDS] + list(DISCOVERY_ONLY_MEASUREMENTS))
+    try:
+        rps = client.get_list_retention_policies(database)
+    except Exception as exc:  # may need privileges the probe user lacks
+        rps = [{'name': f'unavailable ({type(exc).__name__})'}]
+    plan = resolve_probe_fields(schema)
+    print(' [DONE]')
+
+    meta = {
+        'probe_format': PROBE_FORMAT_VERSION, 'stager_version': VERSION, 'mode': mode,
+        'created_utc': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'environment': {'server_version': server_version, 'python': sys.version.split()[0],
+                        'influxdb': _package_version('influxdb'), 'msgpack': _package_version('msgpack'),
+                        'requests': _package_version('requests')},
+        'database': database,
+        'retention_policies': rps, 'schema': schema, 'plan': plan,
+        'target': {'serials': serials, 'hosts': hosts},
+        'windows': [[s, e] for s, e in windows],
+        'budgets': {'max_rows': args.max_rows, 'max_bytes': args.max_bytes, 'max_seconds': args.max_seconds},
+        'parameters': {'cadence_s': PROBE_DEFAULT_CADENCE_S,
+                       'cadence_tolerance_s': PROBE_DEFAULT_CADENCE_TOLERANCE_S,
+                       'match_tolerance_s': args.match_tolerance, 'chunk_size': args.chunk_size},
+        'queries': [], 'budget_exceeded': None,
+    }
+
+    if args.probe:
+        entity_filter = build_entity_filter(serials, hosts)
+        budget = ProbeBudget(args.max_rows, args.max_bytes, args.max_seconds)
+        for wi, (start, end) in enumerate(windows):
+            for m, _ in PROBE_MEASUREMENT_FIELDS:
+                fields = plan[m]['selected']
+                entry = {'window': wi, 'measurement': m, 'fields': fields}
+                skip = None
+                if not fields:
+                    skip = 'skipped: no approved field present'
+                elif budget.check():
+                    skip = 'skipped: budget exceeded'
+                if skip:
+                    entry.update(status=skip, rows=0, wire_bytes=0, elapsed_s=0, attempts=0)
+                    meta['queries'].append(entry)
+                    continue
+                raw_file = f'raw/w{wi}-{m}.jsonl.gz'
+                print(f'- Window {wi}, {m}...', end='', flush=True)
+                query = build_probe_query(m, fields, entity_filter, start, end)
+                entry.update(probe_measurement_to_file(client, database, query, args.chunk_size,
+                                                       os.path.join(private_dir, raw_file), budget))
+                entry['raw_file'] = raw_file
+                meta['queries'].append(entry)
+                print(f" [{entry['status']}: {entry['rows']} rows, {entry['wire_bytes']} bytes, "
+                      f"{entry['elapsed_s']} s]")
+        meta['budget_exceeded'] = budget.exceeded
+
+    with open(os.path.join(private_dir, 'meta.json'), 'w', encoding='utf-8') as fh:
+        json.dump(meta, fh, indent=2)
+        fh.write('\n')
+    write_probe_report(out_dir, script_root, args.pseudonym_secret)
+    print(f'Report (pseudonymised): {os.path.join(out_dir, "report", "probe-report.md")}')
+    print(f'Private raw data and metadata (contains identifiers): {private_dir}')
+    failed = sum(1 for q in meta['queries'] if q['status'] == 'failed')
+    if failed or meta['budget_exceeded']:
+        print(f"WARNING: {failed} failed query(ies); budget exceeded: {meta['budget_exceeded'] or 'no'}.",
+              file=sys.stderr)
+        return 2
+    return 0
+
+
 def main():
     """Main function for the nfit-stage-influxdb script."""
     # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="Query InfluxDB and stage data for nfit analysis.", formatter_class=argparse.RawTextHelpFormatter)
-    target_group = parser.add_mutually_exclusive_group(required=True)
+    # Required for every mode except --reanalyse; checked after parsing.
+    target_group = parser.add_mutually_exclusive_group(required=False)
     target_group.add_argument("--mgsys", "--system", "--serial", "--host", help="A comma-separated list of managed system serial numbers.")
     target_group.add_argument("--vms", help="A comma-separated list of specific VM hostnames.")
     target_group.add_argument("--vmfile", help="Path to a file with a list of VM hostnames.")
@@ -975,9 +2033,51 @@ def main():
     parser.add_argument("--slice-hours", type=int, default=DEFAULT_SLICE_HOURS, dest="slice_hours",
         help=f"Length of each half-open acquisition time slice in hours (default: {DEFAULT_SLICE_HOURS}).\n"
              "An interrupted slice is rolled back and retried without repeating completed slices.")
+    probe_group = parser.add_argument_group(
+        "discovery and bounded probe (read-only; never touches the staging cache)")
+    probe_mode = probe_group.add_mutually_exclusive_group()
+    probe_mode.add_argument("--discover", action="store_true",
+        help="Record server version, retention policies and field/tag keys, then exit.")
+    probe_mode.add_argument("--probe", action="store_true",
+        help="Discovery plus one bounded query per measurement and --window, then exit.")
+    probe_mode.add_argument("--reanalyse", metavar="DIR",
+        help="Rebuild the report of a retained probe directory without database access.")
+    probe_group.add_argument("--probe-out", metavar="DIR", dest="probe_out",
+        help="New or empty output directory: private/ (identifiers) and report/ (pseudonymised).")
+    probe_group.add_argument("--window", action="append", metavar="FROM/TO",
+        help="Half-open UTC window, e.g. 2026-11-05T10:00:00Z/2026-11-05T10:30:00Z (repeatable).")
+    probe_group.add_argument("--max-rows", type=int, default=PROBE_DEFAULT_MAX_ROWS, dest="max_rows",
+        help=f"Probe row budget (default: {PROBE_DEFAULT_MAX_ROWS}).")
+    probe_group.add_argument("--max-bytes", type=int, default=PROBE_DEFAULT_MAX_BYTES, dest="max_bytes",
+        help=f"Probe response-byte budget (default: {PROBE_DEFAULT_MAX_BYTES}).")
+    probe_group.add_argument("--max-seconds", type=int, default=PROBE_DEFAULT_MAX_SECONDS, dest="max_seconds",
+        help=f"Probe elapsed-time budget (default: {PROBE_DEFAULT_MAX_SECONDS}).")
+    probe_group.add_argument("--match-tolerance", type=int, default=PROBE_DEFAULT_MATCH_TOLERANCE_S,
+        dest="match_tolerance",
+        help=f"Seconds within which two pool reporters' observations are compared "
+             f"(default: {PROBE_DEFAULT_MATCH_TOLERANCE_S}). A report parameter, not a capture tolerance.")
+    probe_group.add_argument("--pseudonym-secret", metavar="FILE", dest="pseudonym_secret",
+        help="HMAC secret for report pseudonyms (default: as dev/nfit-redact, else probe-local).")
     args = parser.parse_args()
     if args.chunk_size < 1 or args.slice_hours < 1:
         parser.error("--chunk-size and --slice-hours must be positive.")
+    if not (args.mgsys or args.vms or args.vmfile) and not args.reanalyse:
+        parser.error("one of the arguments --mgsys/--system/--serial/--host --vms --vmfile is required")
+    probe_requested = args.discover or args.probe or args.reanalyse
+    if probe_requested:
+        staging_only = [name for name, used in (
+            ("--startd", args.startd), ("--endd", args.endd), ("--days", args.days),
+            ("--append", args.append), ("--cleanup", args.cleanup),
+            ("--preserve-results", args.preserve_results), ("--config", args.config),
+            ("--show-cache-info", args.show_cache_info)) if used]
+        if staging_only:
+            parser.error(f"{', '.join(staging_only)} cannot be combined with probe modes.")
+        if not args.reanalyse and not args.probe_out:
+            parser.error("--discover and --probe need --probe-out DIR.")
+        if args.max_rows < 1 or args.max_bytes < 1 or args.max_seconds < 1 or args.match_tolerance < 0:
+            parser.error("probe budgets must be positive and --match-tolerance non-negative.")
+    elif args.probe_out or args.window:
+        parser.error("--probe-out and --window apply only to --discover or --probe.")
 
     # --- Initial Setup & Timing ---
     script_start_time = time.time()
@@ -990,6 +2090,10 @@ def main():
     script_root = os.path.dirname(os.path.abspath(__file__))
     cache_dir   = args.datadir if args.datadir else os.path.join(script_root, 'stage')
     tmp_dir     = os.path.join(script_root, 'tmp')
+
+    # --- Probe modes: read-only, no cache lock, nothing written to the stage ---
+    if probe_requested:
+        sys.exit(run_probe_mode(args, script_root, cache_dir))
 
     # --- Early exit: --show-cache-info does not require an InfluxDB connection ---
     if args.show_cache_info:
