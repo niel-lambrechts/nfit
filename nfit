@@ -58,6 +58,17 @@ my $VERSION = '9.26.219.0';
 #   2: engine text fields are character strings; the cache read decodes once.
 my $L2_CACHE_FORMAT_VERSION = 2;
 
+# --- L1 data-cache schema ---
+# Versions of .nfit.cache.data this engine reads. Schema 1 is the original
+# four-column file. Schema 2 appends optional columns (for example PhysB),
+# declared in the cache manifest as data_schema_version and data_columns.
+# The four required columns always come first, in this order.
+my @L1_SUPPORTED_SCHEMA_VERSIONS = (1, 2);
+my @L1_REQUIRED_COLUMNS          = qw(Timestamp VMName PhysC RunQ);
+# Header spellings accepted for a required column. VM_Name is written by the
+# synthetic generator test/nfit-datagen.pl.
+my %L1_COLUMN_ALIASES            = (VM_Name => 'VMName');
+
 # --- Configuration ---
 my $DEFAULT_AVG_METHOD     = 'ema';
 my $DEFAULT_DECAY_LEVEL    = 'medium';
@@ -163,6 +174,7 @@ my $batch_flag  = 0;
 my $no_weekends_flag = 0;
 
 my ($help, $show_version, $verbose, $quiet, $show_progress_flag) = (0, 0, 0, 0, 0);
+my $show_capabilities = 0;
 
 GetOptions(
     'manifest=s'          => \$manifest_file,
@@ -219,7 +231,21 @@ GetOptions(
     'version'             => \$show_version,
     'q|quiet'             => \$quiet,
     'show-progress'       => \$show_progress_flag,
+    'capabilities'        => \$show_capabilities,
 ) or die usage();
+
+# Machine-readable capability report for orchestrators (nfit-profile checks
+# the L1 schema versions before handing a cache to this engine).
+if ($show_capabilities)
+{
+    print JSON->new->canonical->encode({
+        engine             => 'nfit',
+        version            => $VERSION,
+        l1_schema_versions => [ @L1_SUPPORTED_SCHEMA_VERSIONS ],
+        l2_cache_format    => $L2_CACHE_FORMAT_VERSION,
+    }) . "\n";
+    exit 0;
+}
 
 # Enforce mutual exclusivity for decay models
 if ($enable_windowed_decay && $decay_over_states_flag) {
@@ -2031,6 +2057,121 @@ sub load_or_build_cache_index {
 # RETURNS:
 #   Byte offset where seeking occurred (for progress calculation)
 # ==============================================================================
+# ==============================================================================
+# SUBROUTINE: _read_cache_manifest_meta
+# PURPOSE:    Reads the stager's .nfit.cache.manifest ("key: value" lines) into
+#             a hash. Lines without a colon are ignored; {} when absent.
+# ==============================================================================
+sub _read_cache_manifest_meta
+{
+    my ($cache_dir) = @_;
+    my %meta;
+    my $path = File::Spec->catfile($cache_dir, $CACHE_MANIFEST_FILE);
+    open my $fh, '<', $path or return \%meta;
+    while (my $line = <$fh>)
+    {
+        $line =~ s/[\r\n]+$//;
+        next unless $line =~ /^\s*([^:]+?)\s*:\s*(.*?)\s*$/;
+        $meta{$1} = $2;
+    }
+    close $fh;
+    return \%meta;
+}
+
+# ==============================================================================
+# SUBROUTINE: _resolve_l1_layout
+# PURPOSE:    Validates the L1 header against the schema declared in the cache
+#             manifest and returns the layout the main loop uses.
+#               Schema 1 (no data_schema_version): exactly the four required
+#                 columns; the original positional parse is kept.
+#               Schema 2: the four required columns first, in order, then the
+#                 optional columns; the header must equal data_columns.
+#             An unsupported version, a missing or misplaced required column,
+#             a repeated column or undeclared columns are fatal: misreading the
+#             cache silently would corrupt every downstream result.
+# RETURNS:    { legacy => 0|1, schema => N, columns => [...], index => {name => i} }
+# ==============================================================================
+sub _resolve_l1_layout
+{
+    my ($header_line, $meta, $data_file) = @_;
+
+    die "FATAL: L1 cache '$data_file' has no header line.\n" unless defined $header_line;
+    (my $h = $header_line) =~ s/[\r\n]+$//;
+    my @columns = map
+    {
+        my $c = $_;
+        $c =~ s/^\s+|\s+$//g;
+        $L1_COLUMN_ALIASES{$c} // $c;
+    } split /,/, $h, -1;
+
+    my $schema = $meta->{data_schema_version} // 1;
+    unless (grep { $_ eq $schema } @L1_SUPPORTED_SCHEMA_VERSIONS)
+    {
+        die "FATAL: L1 cache '$data_file' declares data_schema_version '$schema'; nfit $VERSION supports "
+          . join(', ', @L1_SUPPORTED_SCHEMA_VERSIONS) . ". Upgrade nfit.\n";
+    }
+
+    for my $i (0 .. $#L1_REQUIRED_COLUMNS)
+    {
+        unless (defined $columns[$i] && $columns[$i] eq $L1_REQUIRED_COLUMNS[$i])
+        {
+            die "FATAL: L1 cache '$data_file' header must begin with "
+              . join(',', @L1_REQUIRED_COLUMNS) . "; found '$h'.\n";
+        }
+    }
+
+    my %index;
+    for my $i (0 .. $#columns)
+    {
+        die "FATAL: L1 cache '$data_file' header repeats column '$columns[$i]'.\n"
+            if exists $index{$columns[$i]};
+        $index{$columns[$i]} = $i;
+    }
+
+    if ($schema == 1 && @columns != @L1_REQUIRED_COLUMNS)
+    {
+        die "FATAL: L1 cache '$data_file' has columns beyond schema 1 ('$h') without a declared "
+          . "data_schema_version. Restage the cache.\n";
+    }
+    if ($schema >= 2)
+    {
+        my $declared = $meta->{data_columns} // '';
+        die "FATAL: L1 cache '$data_file' header '$h' does not match the manifest's data_columns '$declared'.\n"
+            unless $declared eq $h;
+    }
+
+    return {
+        legacy  => ($schema == 1) ? 1 : 0,
+        schema  => $schema,
+        columns => \@columns,
+        index   => \%index,
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _l1_data_identity
+# PURPOSE:    Identity of the staged data and states for the L2 cache key.
+#             Uses the manifest's data_revision/states_revision when the stager
+#             records them; otherwise the files' size and modification time.
+# ==============================================================================
+sub _l1_data_identity
+{
+    my ($cache_dir, $meta) = @_;
+    my %id = (schema => ($meta->{data_schema_version} // 1));
+    for my $item (['data', $CACHE_DATA_FILE, 'data_revision'], ['states', $CACHE_STATES_FILE, 'states_revision'])
+    {
+        my ($label, $file, $revision_key) = @$item;
+        if (defined $meta->{$revision_key} && $meta->{$revision_key} ne '')
+        {
+            $id{$label} = "rev:$meta->{$revision_key}";
+            next;
+        }
+        my @st = stat(File::Spec->catfile($cache_dir, $file));
+        $id{$label} = @st ? "stat:$st[7]:$st[9]" : 'absent';
+    }
+    return \%id;
+}
+
 sub seek_to_start_date {
     my ($fh, $index, $start_date_str) = @_;
 
@@ -2596,7 +2737,10 @@ sub run_single_pass_from_manifest {
 
     # 3. Handle L2 Caching
     # Generate a unique key from the manifest and all relevant global arguments.
-    my $canonical_key = generate_manifest_key($args_ref, $manifest);
+    # The key includes the staged data's identity, so no cached result survives
+    # a restage, append or configuration-state change.
+    my $data_identity = _l1_data_identity($nmon_dir, _read_cache_manifest_meta($nmon_dir));
+    my $canonical_key = generate_manifest_key({ %$args_ref, data_identity => $data_identity }, $manifest);
     my $results_cache_path = File::Spec->catfile($nmon_dir, ".nfit.cache.results");
 
     my $cached_result_aref = lookup_cached_result($canonical_key, $results_cache_path);
@@ -2839,7 +2983,8 @@ sub run_single_pass_from_manifest {
 
     # --- Open data cache ---
     open my $data_fh, '<:raw', $data_cache_file or die "FATAL: Cannot open $data_cache_file: $!";
-    my $header = <$data_fh>; # Read header to determine column indices if needed
+    my $header = <$data_fh>; # Header determines the column layout (schema-aware)
+    my $l1_layout = _resolve_l1_layout($header, _read_cache_manifest_meta($nmon_dir), $data_cache_file);
 
     # --- Seek to start date if index available ---
     if ($cache_index) {
@@ -2907,7 +3052,19 @@ sub run_single_pass_from_manifest {
         $record_counter++;
 
         chomp $line;
-        my ($ts_str, $vm, $physc, $runq) = split ',', $line, 4;
+        my ($ts_str, $vm, $physc, $runq);
+        if ($l1_layout->{legacy})
+        {
+            # Schema 1 fast path: identical to the original positional parse.
+            ($ts_str, $vm, $physc, $runq) = split ',', $line, 4;
+        }
+        else
+        {
+            # Schema 2+: the required columns are the first four; optional
+            # columns follow and are ignored until a transform consumes them.
+            my @fields = split ',', $line, -1;
+            ($ts_str, $vm, $physc, $runq) = @fields[0 .. 3];
+        }
 
         # early exit for non-numeric/corrupt data
         next unless (defined $physc && defined $runq && looks_like_number($physc) && looks_like_number($runq));
@@ -3855,6 +4012,7 @@ sub generate_manifest_key {
     # that influence the final numerical result.
     my $data_for_key = {
         cache_format => $L2_CACHE_FORMAT_VERSION,
+        data_identity => $args_href->{data_identity},
         manifest => $manifest_href,
         args => {
             # --- Data Scoping & Filtering Flags ---
@@ -5096,5 +5254,6 @@ Other:
   -h, --help                 : Display this help message.
   -v, --verbose              : Enable verbose output for debugging.
   --version                  : Display script version.
+  --capabilities             : Print supported L1 schema versions and L2 cache format (JSON) and exit.
 END_USAGE
 }
