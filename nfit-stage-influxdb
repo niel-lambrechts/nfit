@@ -2118,6 +2118,406 @@ def run_probe_mode(args, script_root, cache_dir):
     return 0
 
 
+# ==============================================================================
+# Processor-pool evidence sidecar (Increment 3d)
+# ==============================================================================
+# Raw processor_pool observations, one row per reporter observation, kept per
+# managed system in <serial>/.nfit.cache.pool.observations.csv.gz. Columns use
+# the InfluxDB field names unchanged; capacity variants stay distinct and the
+# legacy integer capacity fields keep unresolved units. Every reporter's exact
+# timestamp and source identity is retained: repeated views of one pool are
+# not independent observations and are never summed or reconciled here (a
+# derived one-row-per-pool view comes later). Missing pool data is never zero
+# availability. Pool capture runs after the CPU files are written and never
+# changes them; its outcome is recorded under pool_* keys in the manifest.
+POOL_OBSERVATIONS_FILE = '.nfit.cache.pool.observations.csv.gz'
+POOL_SERIES_FILE = '.nfit.cache.pool.series'
+POOL_FILE_SCHEMA_VERSION = 1
+POOL_SOURCE_FIELDS = dict(PROBE_MEASUREMENT_FIELDS)['processor_pool']
+POOL_COLUMNS = ('time_ns', 'host', 'series_id') + POOL_SOURCE_FIELDS
+# Units as the published njmon v90 source defines them; the installed
+# collector versions vary, and the legacy integer names are not converted.
+POOL_FIELD_UNITS = {
+    'pool_id': 'identifier within the managed system',
+    'phys_cpus_pool': 'processors', 'idle_cores': 'cores', 'busy_cores': 'cores',
+    'scaled_busy_cores': 'cores (nominal-frequency scaled)', 'max_cores': 'cores (interval statistic)',
+    'global_pool_busy_cores': 'cores', 'global_pool_tot_cores': 'cores',
+    'max_capacity_cores': 'cores', 'entitled_capacity_cores': 'cores',
+    'max_capacity_raw': 'hundredths of a core', 'entitled_capacity_raw': 'hundredths of a core',
+    'max_capacity': 'unresolved (legacy integer)', 'entitled_capacity': 'unresolved (legacy integer)',
+}
+POOL_UNITS_SOURCE = 'njmon v90 published source; installed collector versions vary'
+POOL_FILES = (POOL_OBSERVATIONS_FILE, POOL_SERIES_FILE, POOL_OBSERVATIONS_FILE + '.work',
+              POOL_SERIES_FILE + '.work')
+
+
+def pool_series_id(tags):
+    """Stable short identifier of a complete tag set (host and every other tag)."""
+    import hashlib
+    return hashlib.sha256(json.dumps(tags, sort_keys=True).encode('utf-8')).hexdigest()[:12]
+
+
+def resolve_pool_fields(client):
+    """([field or None per POOL_SOURCE_FIELDS], {field: availability}). A field
+    is selected only when SHOW FIELD KEYS reports it with numeric types only."""
+    fields = discover_schema(client, ['processor_pool'])['processor_pool']['fields']
+    selected, availability = [], {}
+    for f in POOL_SOURCE_FIELDS:
+        types_seen = fields.get(f)
+        if not types_seen:
+            selected.append(None)
+            availability[f] = 'absent from schema'
+        elif set(types_seen) - {'float', 'integer'}:
+            selected.append(None)
+            availability[f] = f"not selected: type {'/'.join(types_seen)}"
+        else:
+            selected.append(f)
+            availability[f] = 'present in schema'
+    return selected, availability
+
+
+class PoolWork:
+    """One managed system's pool capture in progress. Rows of the current slice
+    go to a temporary file; a completed slice is appended to the work file as
+    its own gzip member, so the file stays a valid gzip stream that grows by
+    whole slices and a failed slice leaves no trace."""
+
+    def __init__(self, serial_dir, tmp_dir):
+        import gzip
+        self.final = os.path.join(serial_dir, POOL_OBSERVATIONS_FILE)
+        self.work = self.final + '.work'
+        self.tmp_dir = tmp_dir
+        with gzip.open(self.work, 'wb') as gz:
+            gz.write((','.join(POOL_COLUMNS) + '\n').encode('utf-8'))
+        self.rows = 0
+        self.nonempty = dict.fromkeys(POOL_SOURCE_FIELDS, 0)
+        self.series = {}
+        self.pool_ids = set()
+        self.min_ns = self.max_ns = None
+        self.completed_slices = 0
+        self._slice = None
+
+    def begin_slice(self):
+        self._slice = tempfile.TemporaryFile(mode='w+', encoding='utf-8', dir=self.tmp_dir)
+        self._pending = {'rows': 0, 'nonempty': dict.fromkeys(POOL_SOURCE_FIELDS, 0), 'series': {},
+                         'pools': set(), 'min': None, 'max': None}
+
+    def add(self, tags, point):
+        ts = int(point['time'])
+        sid = pool_series_id(tags)
+        p = self._pending
+        cells = [str(ts), tags.get('host') or '', sid]
+        for f in POOL_SOURCE_FIELDS:
+            v = point.get(f)
+            if v is None:
+                cells.append('')
+            else:
+                cells.append(str(v))
+                p['nonempty'][f] += 1
+        if any(ch in cells[1] for ch in ',"\r\n'):      # RFC 4180 quoting, should a host need it
+            cells[1] = '"' + cells[1].replace('"', '""') + '"'
+        self._slice.write(','.join(cells) + '\n')
+        p['rows'] += 1
+        p['series'][sid] = tags
+        if point.get('pool_id') is not None:
+            p['pools'].add(point['pool_id'])
+        p['min'] = ts if p['min'] is None else min(p['min'], ts)
+        p['max'] = ts if p['max'] is None else max(p['max'], ts)
+
+    def commit_slice(self):
+        import gzip
+        p = self._pending
+        if p['rows']:
+            self._slice.seek(0)
+            with gzip.open(self.work, 'ab') as gz:
+                for block in iter(lambda: self._slice.read(1 << 20), ''):
+                    gz.write(block.encode('utf-8'))
+            self.rows += p['rows']
+            for f, n in p['nonempty'].items():
+                self.nonempty[f] += n
+            self.series.update(p['series'])
+            self.pool_ids |= p['pools']
+            for ns in (p['min'], p['max']):
+                if ns is not None:
+                    self.min_ns = ns if self.min_ns is None else min(self.min_ns, ns)
+                    self.max_ns = ns if self.max_ns is None else max(self.max_ns, ns)
+        self.completed_slices += 1
+        self.abort_slice()
+
+    def abort_slice(self):
+        if self._slice is not None:
+            self._slice.close()
+            self._slice = None
+
+
+def acquire_pool_observations(client, database, serial_dirs, entity_filter, slices, chunk_size, tmp_dir):
+    """
+    Streams processor_pool for every slice (one query per slice, all selected
+    fields, GROUP BY * to keep reporter identity) into one PoolWork per
+    managed system, routed by the serial_no tag. An interrupted slice is rolled
+    back and retried; a slice that still fails is recorded and the remaining
+    slices continue. A query error is deterministic and ends the capture.
+    Returns (works or None, info) where info carries field availability,
+    failed slices, an error message and rows outside the target systems.
+    """
+    import requests
+    from influxdb.exceptions import InfluxDBServerError
+    retryable = (IncompleteResponseError, requests.exceptions.RequestException, InfluxDBServerError)
+    selected, availability = resolve_pool_fields(client)
+    info = {'availability': availability, 'failed_slices': [], 'error': None, 'rows_outside_target': 0}
+    if not any(selected):
+        return None, info
+    columns = ', '.join(influxql_ident(f) for f in selected if f)
+    works = {serial: PoolWork(d, tmp_dir) for serial, d in serial_dirs.items()}
+    for s, e in slices:
+        if info['error']:
+            info['failed_slices'].append((s, e))
+            continue
+        query = (f'SELECT {columns} FROM "processor_pool" WHERE {entity_filter} '
+                 f'AND time >= {s} AND time < {e} GROUP BY *')
+        for attempt in range(1, SLICE_ATTEMPTS + 1):
+            outside = 0
+            for w in works.values():
+                w.begin_slice()
+            try:
+                for tags, point in iter_influxql_points(client, database, query, chunk_size):
+                    w = works.get(tags.get('serial_no'))
+                    if w is None:
+                        outside += 1
+                        continue
+                    w.add(tags, point)
+                for w in works.values():
+                    w.commit_slice()
+                info['rows_outside_target'] += outside
+                break
+            except InfluxQueryError as exc:
+                for w in works.values():
+                    w.abort_slice()
+                info['error'] = f'query error: {exc}'
+                info['failed_slices'].append((s, e))
+                break
+            except retryable as exc:
+                for w in works.values():
+                    w.abort_slice()
+                if attempt == SLICE_ATTEMPTS:
+                    info['failed_slices'].append((s, e))
+                    print(f"\n    WARNING: processor_pool slice [{s}, {e}) failed after {attempt} attempts "
+                          f"({type(exc).__name__}); continuing with the next slice.", file=sys.stderr)
+                    break
+                delay = SLICE_RETRY_DELAY_S * (2 ** (attempt - 1))
+                print(f"\n    WARNING: processor_pool slice [{s}, {e}) attempt {attempt} failed "
+                      f"({type(exc).__name__}); retrying in {delay}s.", file=sys.stderr)
+                time.sleep(delay)
+    return works, info
+
+
+def _sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for block in iter(lambda: fh.read(1 << 20), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def read_manifest_lines(manifest_path):
+    if not os.path.isfile(manifest_path):
+        return []
+    with open(manifest_path, encoding='utf-8') as fh:
+        return [line.rstrip('\n') for line in fh if line.strip()]
+
+
+def replace_manifest_pool_lines(manifest_path, pool_lines):
+    """Rewrites the manifest with its pool_* lines replaced, every other line
+    kept verbatim (so data_revision and states_revision are untouched).
+    Written to a temporary file and renamed into place."""
+    kept = [line for line in read_manifest_lines(manifest_path) if not line.startswith('pool_')]
+    tmp = manifest_path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        for line in kept + list(pool_lines):
+            fh.write(line + '\n')
+    os.replace(tmp, manifest_path)
+
+
+def carried_pool_lines(serial_dir):
+    """pool_* lines of the existing manifest, kept when the CPU files are
+    rewritten without a new pool capture. Lines that describe a published pool
+    file are kept only while that file exists."""
+    manifest = os.path.join(serial_dir, '.nfit.cache.manifest')
+    lines = [line for line in read_manifest_lines(manifest) if line.startswith('pool_')]
+    published = any(line.startswith('pool_file:') for line in lines)
+    if published and not os.path.isfile(os.path.join(serial_dir, POOL_OBSERVATIONS_FILE)):
+        return []
+    return lines
+
+
+def _pool_status(info, works_present, n_slices):
+    """complete, partial or failed from the failed-slice count."""
+    if not works_present:
+        return 'unsupported'
+    failed = len(info['failed_slices'])
+    if failed == 0:
+        return 'complete'
+    return 'failed' if failed >= n_slices else 'partial'
+
+
+def _pool_manifest_lines(status, mode, scope, window, n_slices, info, work=None, published=False, now=None):
+    slices = f"total={n_slices}; failed={len(info['failed_slices'])}"
+    if info['failed_slices']:
+        slices += '; failed_slices=' + ' '.join(f'[{s}, {e})' for s, e in info['failed_slices'])
+    lines = [
+        f"pool_schema_version: {POOL_FILE_SCHEMA_VERSION}",
+        f"pool_capture_status: {status}",
+        f"pool_capture_mode: {mode}",
+        f"pool_scope: {scope}",
+        f"pool_window_ns: [{window[0]}, {window[1]})",
+        f"pool_slices: {slices}",
+        "pool_field_availability: " + '; '.join(f"{f}={a}" for f, a in info['availability'].items()),
+        f"pool_captured_at: {now}",
+    ]
+    if info['error']:
+        lines.append(f"pool_error: {info['error']}")
+    if published and work is not None:
+        lines += [
+            f"pool_file: {POOL_OBSERVATIONS_FILE}",
+            f"pool_series_file: {POOL_SERIES_FILE}",
+            f"pool_columns: {','.join(POOL_COLUMNS)}",
+            f"pool_revision: sha256:{_sha256_file(work.final)}",
+            f"pool_series_revision: sha256:{_sha256_file(os.path.join(os.path.dirname(work.final), POOL_SERIES_FILE))}",
+            f"pool_rows: {work.rows}",
+            f"pool_series: {len(work.series)}",
+            f"pool_reporters: {len({t.get('host') for t in work.series.values()})}",
+            "pool_ids: " + (', '.join(str(p) for p in sorted(work.pool_ids, key=lambda x: (str(type(x)), x))) or '-'),
+            f"pool_observation_range_ns: [{work.min_ns}, {work.max_ns}]" if work.rows else "pool_observation_range_ns: -",
+            "pool_nonempty: " + '; '.join(f"{f}={n}" for f, n in work.nonempty.items()),
+            "pool_units: " + '; '.join(f"{f}={POOL_FIELD_UNITS[f]}" for f in POOL_SOURCE_FIELDS),
+            f"pool_units_source: {POOL_UNITS_SOURCE}",
+            f"pool_rows_outside_target_run_wide: {info['rows_outside_target']}",
+        ]
+    return lines
+
+
+def publish_pool_capture(serial_dir, work, status, mode, scope, window, n_slices, info):
+    """
+    Publishes one managed system's pool capture and updates its manifest.
+    A complete capture replaces any existing pool file. A partial capture is
+    published only when no usable (complete or partial) pool file exists; a
+    failed capture never replaces one. When an existing file is kept, its
+    pool_* lines stay and pool_last_attempt records the attempt that did not
+    replace it. Returns (status, published).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    manifest = os.path.join(serial_dir, '.nfit.cache.manifest')
+    existing = carried_pool_lines(serial_dir)
+    existing_status = next((line.split(':', 1)[1].strip() for line in existing
+                            if line.startswith('pool_capture_status:')), None)
+    usable_existing = (os.path.isfile(os.path.join(serial_dir, POOL_OBSERVATIONS_FILE))
+                       and existing_status in ('complete', 'partial'))
+    publish = work is not None and (status == 'complete' or (status == 'partial' and not usable_existing))
+    if publish:
+        series_tmp = os.path.join(serial_dir, POOL_SERIES_FILE + '.work')
+        with open(series_tmp, 'w', encoding='utf-8') as fh:
+            json.dump(work.series, fh, indent=1, sort_keys=True)
+            fh.write('\n')
+        os.replace(series_tmp, os.path.join(serial_dir, POOL_SERIES_FILE))
+        os.replace(work.work, work.final)
+        replace_manifest_pool_lines(manifest, _pool_manifest_lines(
+            status, mode, scope, window, n_slices, info, work, True, now))
+        return status, True
+    if work is not None and os.path.exists(work.work):
+        os.remove(work.work)
+    if usable_existing:
+        attempt = (f"pool_last_attempt: {status} at {now}; window [{window[0]}, {window[1]}); "
+                   f"slices total={n_slices} failed={len(info['failed_slices'])}"
+                   + (f"; {info['error']}" if info['error'] else '') + '; existing pool file kept')
+        replace_manifest_pool_lines(manifest, [line for line in existing
+                                               if not line.startswith('pool_last_attempt:')] + [attempt])
+    else:
+        replace_manifest_pool_lines(manifest, _pool_manifest_lines(
+            status, mode, scope, window, n_slices, info, None, False, now))
+    return status, False
+
+
+def run_pool_capture(client, database, serial_dirs, entity_filter, window, slice_hours, chunk_size,
+                     tmp_dir, mode, scope):
+    """Acquires and publishes pool observations for the given managed systems
+    over one window. Never raises for an acquisition problem: the outcome is
+    returned per system as (status, published) and recorded in its manifest."""
+    slices = build_time_slices(window[0], window[1], slice_hours * 3600 * NS_PER_SECOND)
+    print(f"- Streaming processor-pool observations ({len(serial_dirs)} system(s), {len(slices)} slice(s))...",
+          end='', flush=True)
+    started = time.time()
+    works, info = None, {'availability': {}, 'failed_slices': [], 'error': None, 'rows_outside_target': 0}
+    try:
+        works, info = acquire_pool_observations(client, database, serial_dirs, entity_filter, slices,
+                                                chunk_size, tmp_dir)
+    except Exception as exc:   # pool evidence is optional to the CPU cache; record, do not abort
+        info['error'] = f'{type(exc).__name__}: {exc}'
+        info['failed_slices'] = list(slices)
+        if works:
+            for w in works.values():
+                w.abort_slice()
+    print(f" [DONE: {format_duration(time.time() - started)}]")
+    results = {}
+    for serial, d in serial_dirs.items():
+        work = works.get(serial) if works else None
+        if works is None:
+            status = 'failed' if info['error'] else 'unsupported'
+        else:
+            status = _pool_status(info, True, len(slices))
+        status, published = publish_pool_capture(d, work, status, mode, scope, window, len(slices), info)
+        rows = work.rows if (work is not None and published) else 0
+        print(f"    - {serial}: pool capture {status}"
+              + (f", {rows:,} observations from {len({t.get('host') for t in work.series.values()})} reporter(s)"
+                 if published else '')
+              + ('' if published or status in ('unsupported',) else ' (no pool file published)')
+              + (f"; {info['error']}" if info['error'] else ''))
+        results[serial] = (status, published)
+    return results
+
+
+def run_pool_only(args, script_root, cache_dir):
+    """
+    --pool-only: re-acquires the processor-pool file of existing caches over
+    each cache's recorded window, whole UTC days from data_start to the day of
+    data_end, the window a full staging run of that cache queries. The data
+    and states files, and the manifest's other lines (including data_revision
+    and states_revision), are left untouched. An existing usable pool file is
+    kept unless the new capture is complete. Returns 0 when every system's
+    capture is complete, 3 otherwise, 1 on a setup error.
+    """
+    serials = [s.strip() for s in args.mgsys.split(',') if s.strip()]
+    targets = {}
+    for serial in serials:
+        serial_dir = os.path.join(cache_dir, serial)
+        manifest = read_cache_manifest(os.path.join(serial_dir, '.nfit.cache.manifest'))
+        if not (os.path.isfile(os.path.join(serial_dir, '.nfit.cache.data'))
+                and manifest.get('data_start') and manifest.get('data_end')):
+            print(f"Error: no staged cache with a recorded window for {serial} under {cache_dir}.", file=sys.stderr)
+            return 1
+        window = (utc_date_to_ns(manifest['data_start'][:10]),
+                  utc_date_to_ns(manifest['data_end'][:10], '23:59:59') + 1)
+        targets[serial] = (serial_dir, window)
+
+    client, db_version, db_config = get_db_client(os.path.join(script_root, 'etc', 'influxdb.conf'))
+    if db_version != 1:
+        print("Error: only InfluxDB 1.x with InfluxQL over the v1 API is supported.", file=sys.stderr)
+        return 1
+    tmp_dir = os.path.join(script_root, 'tmp')
+    os.makedirs(tmp_dir, exist_ok=True)
+    print("\n## Pool-only capture (data and states files are not changed)")
+    all_complete = True
+    with FcntlLock(os.path.join(cache_dir, '.nfit.cache.lock')):
+        for serial, (serial_dir, window) in targets.items():
+            print(f"  - {serial}: window [{ns_to_legacy_timestamp(window[0])}, "
+                  f"{ns_to_legacy_timestamp(window[1] - 1)}]")
+            results = run_pool_capture(client, db_config['DATABASE'], {serial: serial_dir},
+                                       build_entity_filter([serial]), window, args.slice_hours,
+                                       args.chunk_size, tmp_dir, 'pool-only', 'managed system')
+            all_complete = all_complete and results[serial][0] == 'complete'
+    return 0 if all_complete else 3
+
+
 # --- L1 schema 2 helpers -------------------------------------------------------
 def l1_columns_for_schema(schema):
     """Exact L1 header for a schema version."""
@@ -2274,6 +2674,17 @@ def main():
         help="L1 cache layout (default: 1). 1: Timestamp,VMName,PhysC,RunQ.\n"
              "2: adds PhysB and FreqPct, acquired with PhysC in one cpu_util query; blank\n"
              "cells where unavailable. --append requires the existing cache's layout.")
+    parser.add_argument("--pool-capture", choices=("off", "optional", "required"), default="off",
+        dest="pool_capture",
+        help="Processor-pool evidence file per system (default: off). Captured after the CPU\n"
+             "files, which never depend on it. optional: a failed or partial capture is recorded\n"
+             "and the run succeeds. required: the run then exits with status 3.\n"
+             "Not yet available with --append; use --pool-only afterwards.")
+    parser.add_argument("--pool-only", action="store_true", dest="pool_only",
+        help="Re-acquire only the processor-pool file of existing --mgsys caches over each\n"
+             "cache's recorded window; data, states and their revisions are not changed. An\n"
+             "existing usable pool file is kept unless the new capture is complete.\n"
+             "Exit status 3 if any capture is not complete.")
     parser.add_argument("--slice-hours", type=int, default=DEFAULT_SLICE_HOURS, dest="slice_hours",
         help=f"Length of each half-open acquisition time slice in hours (default: {DEFAULT_SLICE_HOURS}).\n"
              "An interrupted slice is rolled back and retried without repeating completed slices.")
@@ -2314,7 +2725,8 @@ def main():
             ("--append", args.append), ("--cleanup", args.cleanup),
             ("--preserve-results", args.preserve_results), ("--config", args.config),
             ("--show-cache-info", args.show_cache_info),
-            ("--l1-schema", args.l1_schema != 1)) if used]
+            ("--l1-schema", args.l1_schema != 1),
+            ("--pool-capture", args.pool_capture != "off"), ("--pool-only", args.pool_only)) if used]
         if staging_only:
             parser.error(f"{', '.join(staging_only)} cannot be combined with probe modes.")
         if not args.reanalyse and not args.probe_out:
@@ -2323,6 +2735,19 @@ def main():
             parser.error("probe budgets must be positive and --match-tolerance non-negative.")
     elif args.probe_out or args.window:
         parser.error("--probe-out and --window apply only to --discover or --probe.")
+    if args.pool_only:
+        not_with_pool_only = [name for name, used in (
+            ("--startd", args.startd), ("--endd", args.endd), ("--days", args.days),
+            ("--append", args.append), ("--cleanup", args.cleanup),
+            ("--preserve-results", args.preserve_results), ("--config", args.config),
+            ("--show-cache-info", args.show_cache_info), ("--l1-schema", args.l1_schema != 1),
+            ("--pool-capture", args.pool_capture != "off")) if used]
+        if not_with_pool_only:
+            parser.error(f"{', '.join(not_with_pool_only)} cannot be combined with --pool-only.")
+        if not args.mgsys:
+            parser.error("--pool-only needs --mgsys: it works on existing per-system caches.")
+    if args.append and args.pool_capture != "off":
+        parser.error("--pool-capture is not yet available with --append; append, then run --pool-only.")
 
     # --- Initial Setup & Timing ---
     script_start_time = time.time()
@@ -2339,6 +2764,10 @@ def main():
     # --- Probe modes: read-only, no cache lock, nothing written to the stage ---
     if probe_requested:
         sys.exit(run_probe_mode(args, script_root, cache_dir))
+
+    # --- Pool-only: processor-pool file of existing caches; CPU files untouched ---
+    if args.pool_only:
+        sys.exit(run_pool_only(args, script_root, cache_dir))
 
     # --- Early exit: --show-cache-info does not require an InfluxDB connection ---
     if args.show_cache_info:
@@ -2448,6 +2877,7 @@ def main():
 
     lock_path = os.path.join(cache_dir, '.nfit.cache.lock')
     master_temp_filename = None
+    pool_exit_status = 0
 
     try:
         with FcntlLock(lock_path):
@@ -2626,7 +3056,7 @@ def main():
                     files_to_delete = [
                         '.nfit.cache.data',
                         '.nfit.cache.states',
-                    ]
+                    ] + list(POOL_FILES)
 
                     if not args.preserve_results:
                         files_to_delete.append('.nfit.cache.results')
@@ -2748,6 +3178,9 @@ def main():
                     except ValueError:
                         pass
 
+                # Pool evidence has its own window and outcome: keep its manifest
+                # lines (while their file exists) unless this run cleaned up.
+                pool_lines = [] if args.cleanup else carried_pool_lines(serial_cache_dir)
                 schema2_lines = []
                 if args.l1_schema == 2:
                     schema2_lines = l1_schema2_manifest_lines(
@@ -2761,7 +3194,7 @@ def main():
                         f"data_end: {manifest_data_end}\n"
                         f"staged_by: nfit-stage-influxdb.py v{VERSION}\n"
                     )
-                    for manifest_line in schema2_lines:
+                    for manifest_line in schema2_lines + pool_lines:
                         f.write(manifest_line + "\n")
 
                 with open(os.path.join(serial_cache_dir, '.nfit_stage_id'), 'w') as f:
@@ -2770,6 +3203,23 @@ def main():
                 print(f"    - InfluxDB cache location: {serial_cache_dir}")
 
             print(f"[DONE: {format_duration(time.time() - phase4_start_time)}]")
+
+            # --- Phase 5: Processor-pool evidence (optional; CPU files are final) ---
+            if args.pool_capture != 'off' and data_by_serial:
+                print("\n## Phase 5: Processor-Pool Evidence")
+                pool_scope = ('managed system' if args.mgsys else
+                              'hosts (--vms/--vmfile): pools seen only through the selected hosts')
+                pool_results = run_pool_capture(
+                    client, db_config['DATABASE'],
+                    {serial: os.path.join(cache_dir, serial) for serial in data_by_serial},
+                    entity_filter, (start_ns, end_exclusive_ns), args.slice_hours, args.chunk_size,
+                    tmp_dir, args.pool_capture, pool_scope)
+                incomplete = sorted(s for s, (status, _) in pool_results.items() if status != 'complete')
+                if incomplete:
+                    print(f"WARNING: pool capture not complete for {len(incomplete)} system(s); "
+                          f"the CPU cache files are complete and unaffected.", file=sys.stderr)
+                    if args.pool_capture == 'required':
+                        pool_exit_status = 3
 
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
@@ -2786,6 +3236,8 @@ def main():
         print("----------------------------------------------------------------------")
         total_duration = time.time() - script_start_time
         print(f"Staging complete. Total execution time: {format_duration(total_duration)}")
+    if pool_exit_status:
+        sys.exit(pool_exit_status)
 
 if __name__ == "__main__":
     main()
