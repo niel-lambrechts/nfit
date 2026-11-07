@@ -2119,6 +2119,254 @@ def run_probe_mode(args, script_root, cache_dir):
 
 
 # ==============================================================================
+# Generation publication (Increment 3e)
+# ==============================================================================
+# A system's cache files are published together as one generation. The new
+# files are built in <serial>/.work/, validated, and swapped into place under
+# the exclusive publication lock, with a journal that makes an interrupted swap
+# recoverable. Readers (nfit, nfit-profile) hold the same lock shared while
+# they use a system's files and refuse a directory whose journal is present.
+# The guarantee is that a reader works on one complete generation or refuses
+# until recovery has run; replacing several files is not physically atomic.
+#
+# Durable order: (1) work files written and fsynced, work directory fsynced;
+# (2) work generation validated; (3) exclusive lock; journal written to a
+# temporary name, fsynced, renamed into place, directory fsynced; (4) current
+# files moved to .previous/, new files renamed into place, directories fsynced;
+# (5) dependent files invalidated (the byte-offset index when CPU data
+# changed; the results cache on --cleanup); (6) journal removed, directory
+# fsynced. Recovery repeats (4) to (6) from the journal and is idempotent.
+PUBLISH_LOCK_FILE = '.nfit.cache.publish.lock'      # created once, never removed
+PUBLISH_JOURNAL = '.publish.journal'
+PUBLISH_WORK_DIR = '.work'
+PUBLISH_PREVIOUS_DIR = '.previous'
+PUBLISH_DEFAULT_WAIT_S = 1800
+CACHE_INDEX_FILE = '.nfit.cache.idx'
+RESULTS_CACHE_FILE = '.nfit.cache.results'
+_PUBLISH_FAULT = None          # test hook: callable(step) raising to simulate an interruption
+
+
+class PublicationError(Exception):
+    """A publication could not be committed or recovered."""
+
+
+class PublicationTimeout(PublicationError):
+    """Readers held the publication lock for longer than the allowed wait."""
+
+
+def _fault(step):
+    if _PUBLISH_FAULT is not None:
+        _PUBLISH_FAULT(step)
+
+
+def _fsync_path(path):
+    """fsync a file or directory by path (directories need it for renames)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class PublishLock:
+    """Exclusive publication lock of one system directory, taken with a bounded
+    wait for shared holders (readers) to finish."""
+
+    def __init__(self, serial_dir, wait_s):
+        self.path = os.path.join(serial_dir, PUBLISH_LOCK_FILE)
+        self.wait_s = wait_s
+        self.fh = None
+
+    def __enter__(self):
+        self.fh = open(self.path, 'a')
+        deadline = time.monotonic() + self.wait_s
+        announced = False
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    self.fh.close()
+                    raise PublicationTimeout(
+                        f'readers held {self.path} for more than {self.wait_s}s; nothing was published')
+                if not announced:
+                    print(f"    - Waiting for readers of {os.path.dirname(self.path)} to finish...",
+                          file=sys.stderr)
+                    announced = True
+                time.sleep(0.2)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fh, fcntl.LOCK_UN)
+        self.fh.close()
+
+
+def begin_work_dir(serial_dir):
+    """A fresh, empty work directory (an uncommitted one from an earlier run is
+    discarded by recover_publication first)."""
+    work = os.path.join(serial_dir, PUBLISH_WORK_DIR)
+    os.makedirs(work, exist_ok=True)
+    for name in os.listdir(work):
+        os.remove(os.path.join(work, name))
+    return work
+
+
+def _discard_work_dir(serial_dir):
+    work = os.path.join(serial_dir, PUBLISH_WORK_DIR)
+    if os.path.isdir(work):
+        for name in os.listdir(work):
+            os.remove(os.path.join(work, name))
+        os.rmdir(work)
+
+
+def _validate_work_generation(serial_dir, work, replaced):
+    """Checks the work files against the new manifest before they are
+    published: header against the declared layout, and every recorded content
+    hash recomputed. Returns {name: sha256} for the journal."""
+    digests = {name: _sha256_file(os.path.join(work, name)) for name in replaced}
+    manifest_path = os.path.join(work, '.nfit.cache.manifest')
+    if not os.path.isfile(manifest_path):
+        raise PublicationError('work generation has no manifest')
+    meta = read_cache_manifest(manifest_path)
+
+    def current_or_work(name):
+        p = os.path.join(work, name)
+        return p if name in replaced else os.path.join(serial_dir, name)
+
+    data_path = current_or_work('.nfit.cache.data')
+    if os.path.isfile(data_path):
+        with open(data_path, encoding='utf-8') as fh:
+            header = fh.readline().rstrip('\r\n')
+        declared = meta.get('data_columns')
+        if declared is not None and header != declared:
+            raise PublicationError('data header differs from data_columns')
+        if declared is None and len(header.split(',')) != len(L1_REQUIRED_COLUMNS):
+            raise PublicationError('schema-1 data file does not have four columns')
+    for key, name in (('data_revision', '.nfit.cache.data'), ('states_revision', '.nfit.cache.states'),
+                      ('pool_revision', POOL_OBSERVATIONS_FILE), ('pool_series_revision', POOL_SERIES_FILE)):
+        if key not in meta:
+            continue
+        path = current_or_work(name)
+        digest = digests.get(name) or (_sha256_file(path) if os.path.isfile(path) else None)
+        if meta[key] != f'sha256:{digest}':
+            raise PublicationError(f'{key} does not match {name}')
+    return digests
+
+
+def publish_generation(serial_dir, work, replace=(), remove=(), invalidate=(), wait_s=PUBLISH_DEFAULT_WAIT_S):
+    """
+    Publishes the files named in `replace` (built in `work`), removes those in
+    `remove` (moved to .previous/), and deletes the dependent files in
+    `invalidate`, as one generation. The previous generation's files are kept
+    in .previous/ until the next publication. Raises PublicationError (and
+    publishes nothing) if validation fails or readers hold the lock too long.
+    """
+    replace, remove = list(replace), list(remove)
+    for name in replace:
+        p = os.path.join(work, name)
+        with open(p, 'rb+') as fh:
+            os.fsync(fh.fileno())
+    _fsync_path(work)
+    _fault('work_written')
+    digests = _validate_work_generation(serial_dir, work, replace)
+    _fault('validated')
+    with PublishLock(serial_dir, wait_s):
+        previous = os.path.join(serial_dir, PUBLISH_PREVIOUS_DIR)
+        os.makedirs(previous, exist_ok=True)
+        for name in os.listdir(previous):            # the older previous generation
+            os.remove(os.path.join(previous, name))
+        _fsync_path(previous)
+        journal = {'version': 1, 'generation': f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')}-{os.getpid()}",
+                   'files': [{'name': n, 'op': 'replace', 'sha256': digests[n]} for n in replace]
+                            + [{'name': n, 'op': 'remove'} for n in remove],
+                   'invalidate': list(invalidate)}
+        tmp = os.path.join(serial_dir, PUBLISH_JOURNAL + '.tmp')
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            json.dump(journal, fh, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, os.path.join(serial_dir, PUBLISH_JOURNAL))
+        _fsync_path(serial_dir)
+        _fault('journal')
+        _complete_journal(serial_dir, journal, 'publish')
+    return journal['generation']
+
+
+def _complete_journal(serial_dir, journal, phase):
+    """Steps (4) to (6). Idempotent: every step checks what is already done,
+    so it also completes a publication that an earlier run left part-way."""
+    work = os.path.join(serial_dir, PUBLISH_WORK_DIR)
+    previous = os.path.join(serial_dir, PUBLISH_PREVIOUS_DIR)
+    os.makedirs(previous, exist_ok=True)
+    for entry in journal['files']:
+        name = entry['name']
+        current, new, prev = (os.path.join(d, name) for d in (serial_dir, work, previous))
+        if entry['op'] == 'remove':
+            if os.path.exists(current):
+                os.replace(current, prev)
+            _fault(f'{phase}:removed:{name}')
+            continue
+        if os.path.exists(current) and _sha256_file(current) == entry['sha256']:
+            continue                                     # already in place
+        if not (os.path.exists(new) and _sha256_file(new) == entry['sha256']):
+            raise PublicationError(f'cannot complete publication of {name}: new file missing or changed')
+        if os.path.exists(current):
+            os.replace(current, prev)
+            _fault(f'{phase}:moved:{name}')
+        os.replace(new, current)
+        _fault(f'{phase}:placed:{name}')
+    _fsync_path(previous)
+    _fsync_path(serial_dir)
+    for name in journal.get('invalidate', []):
+        path = os.path.join(serial_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+    _fault(f'{phase}:invalidated')
+    os.remove(os.path.join(serial_dir, PUBLISH_JOURNAL))
+    _fsync_path(serial_dir)
+    _fault(f'{phase}:journal_removed')
+    _discard_work_dir(serial_dir)
+
+
+def recover_publication(serial_dir, wait_s=PUBLISH_DEFAULT_WAIT_S):
+    """
+    Run before a staging run touches a system directory. With a journal, the
+    interrupted publication is completed (its work generation was validated
+    before the journal was written); without one, a left-over work directory
+    was never committed and is discarded. Holds the exclusive lock; safe to
+    repeat after another interruption. Returns 'completed', 'discarded' or None.
+    """
+    if not os.path.isdir(serial_dir):
+        return None
+    journal_path = os.path.join(serial_dir, PUBLISH_JOURNAL)
+    work = os.path.join(serial_dir, PUBLISH_WORK_DIR)
+    if not os.path.exists(journal_path) and not os.path.isdir(work):
+        return None
+    with PublishLock(serial_dir, wait_s):
+        if os.path.exists(journal_path):
+            try:
+                with open(journal_path, encoding='utf-8') as fh:
+                    journal = json.load(fh)
+            except ValueError as exc:
+                raise PublicationError(f'{journal_path} is unreadable ({exc}); manual inspection needed') from exc
+            _complete_journal(serial_dir, journal, 'recover')
+            print(f"    - Completed an interrupted publication in {serial_dir}.", file=sys.stderr)
+            return 'completed'
+        if os.path.isdir(work):
+            _discard_work_dir(serial_dir)
+            print(f"    - Discarded an uncommitted work generation in {serial_dir}.", file=sys.stderr)
+            return 'discarded'
+    return None
+
+
+def revision_manifest_lines(data_path, states_path):
+    """data_revision and states_revision (content hashes) for a schema-1
+    manifest; nfit keys results by them in preference to size and mtime."""
+    return [f"data_revision: sha256:{_sha256_file(data_path)}",
+            f"states_revision: sha256:{_sha256_file(states_path)}"]
+
+
+# ==============================================================================
 # Processor-pool evidence sidecar (Increment 3d)
 # ==============================================================================
 # Raw processor_pool observations, one row per reporter observation, kept per
@@ -2147,8 +2395,6 @@ POOL_FIELD_UNITS = {
     'max_capacity': 'unresolved (legacy integer)', 'entitled_capacity': 'unresolved (legacy integer)',
 }
 POOL_UNITS_SOURCE = 'njmon v90 published source; installed collector versions vary'
-POOL_FILES = (POOL_OBSERVATIONS_FILE, POOL_SERIES_FILE, POOL_OBSERVATIONS_FILE + '.work',
-              POOL_SERIES_FILE + '.work')
 
 
 def pool_series_id(tags):
@@ -2184,8 +2430,9 @@ class PoolWork:
 
     def __init__(self, serial_dir, tmp_dir):
         import gzip
-        self.final = os.path.join(serial_dir, POOL_OBSERVATIONS_FILE)
-        self.work = self.final + '.work'
+        self.serial_dir = serial_dir
+        self.work_dir = begin_work_dir(serial_dir)
+        self.work = os.path.join(self.work_dir, POOL_OBSERVATIONS_FILE)
         self.tmp_dir = tmp_dir
         with gzip.open(self.work, 'wb') as gz:
             gz.write((','.join(POOL_COLUMNS) + '\n').encode('utf-8'))
@@ -2327,16 +2574,14 @@ def read_manifest_lines(manifest_path):
         return [line.rstrip('\n') for line in fh if line.strip()]
 
 
-def replace_manifest_pool_lines(manifest_path, pool_lines):
-    """Rewrites the manifest with its pool_* lines replaced, every other line
-    kept verbatim (so data_revision and states_revision are untouched).
-    Written to a temporary file and renamed into place."""
+def write_manifest_with_pool_lines(manifest_path, out_path, pool_lines):
+    """Writes to out_path the manifest at manifest_path with its pool_* lines
+    replaced, every other line kept verbatim (so data_revision and
+    states_revision, and with them the CPU identities, are unchanged)."""
     kept = [line for line in read_manifest_lines(manifest_path) if not line.startswith('pool_')]
-    tmp = manifest_path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as fh:
+    with open(out_path, 'w', encoding='utf-8') as fh:
         for line in kept + list(pool_lines):
             fh.write(line + '\n')
-    os.replace(tmp, manifest_path)
 
 
 def carried_pool_lines(serial_dir):
@@ -2382,8 +2627,8 @@ def _pool_manifest_lines(status, mode, scope, window, n_slices, info, work=None,
             f"pool_file: {POOL_OBSERVATIONS_FILE}",
             f"pool_series_file: {POOL_SERIES_FILE}",
             f"pool_columns: {','.join(POOL_COLUMNS)}",
-            f"pool_revision: sha256:{_sha256_file(work.final)}",
-            f"pool_series_revision: sha256:{_sha256_file(os.path.join(os.path.dirname(work.final), POOL_SERIES_FILE))}",
+            f"pool_revision: sha256:{_sha256_file(work.work)}",
+            f"pool_series_revision: sha256:{_sha256_file(os.path.join(work.work_dir, POOL_SERIES_FILE))}",
             f"pool_rows: {work.rows}",
             f"pool_series: {len(work.series)}",
             f"pool_reporters: {len({t.get('host') for t in work.series.values()})}",
@@ -2397,9 +2642,11 @@ def _pool_manifest_lines(status, mode, scope, window, n_slices, info, work=None,
     return lines
 
 
-def publish_pool_capture(serial_dir, work, status, mode, scope, window, n_slices, info):
+def publish_pool_capture(serial_dir, work, status, mode, scope, window, n_slices, info,
+                         wait_s=PUBLISH_DEFAULT_WAIT_S):
     """
-    Publishes one managed system's pool capture and updates its manifest.
+    Publishes one managed system's pool capture as a new generation (pool
+    observations, pool series and manifest; data and states untouched).
     A complete capture replaces any existing pool file. A partial capture is
     published only when no usable (complete or partial) pool file exists; a
     failed capture never replaces one. When an existing file is kept, its
@@ -2414,32 +2661,32 @@ def publish_pool_capture(serial_dir, work, status, mode, scope, window, n_slices
     usable_existing = (os.path.isfile(os.path.join(serial_dir, POOL_OBSERVATIONS_FILE))
                        and existing_status in ('complete', 'partial'))
     publish = work is not None and (status == 'complete' or (status == 'partial' and not usable_existing))
+    work_dir = work.work_dir if work is not None else begin_work_dir(serial_dir)
+    new_manifest = os.path.join(work_dir, '.nfit.cache.manifest')
     if publish:
-        series_tmp = os.path.join(serial_dir, POOL_SERIES_FILE + '.work')
-        with open(series_tmp, 'w', encoding='utf-8') as fh:
+        with open(os.path.join(work_dir, POOL_SERIES_FILE), 'w', encoding='utf-8') as fh:
             json.dump(work.series, fh, indent=1, sort_keys=True)
             fh.write('\n')
-        os.replace(series_tmp, os.path.join(serial_dir, POOL_SERIES_FILE))
-        os.replace(work.work, work.final)
-        replace_manifest_pool_lines(manifest, _pool_manifest_lines(
+        write_manifest_with_pool_lines(manifest, new_manifest, _pool_manifest_lines(
             status, mode, scope, window, n_slices, info, work, True, now))
+        publish_generation(serial_dir, work_dir,
+                           replace=(POOL_OBSERVATIONS_FILE, POOL_SERIES_FILE, '.nfit.cache.manifest'),
+                           wait_s=wait_s)
         return status, True
-    if work is not None and os.path.exists(work.work):
-        os.remove(work.work)
     if usable_existing:
         attempt = (f"pool_last_attempt: {status} at {now}; window [{window[0]}, {window[1]}); "
                    f"slices total={n_slices} failed={len(info['failed_slices'])}"
                    + (f"; {info['error']}" if info['error'] else '') + '; existing pool file kept')
-        replace_manifest_pool_lines(manifest, [line for line in existing
-                                               if not line.startswith('pool_last_attempt:')] + [attempt])
+        lines = [line for line in existing if not line.startswith('pool_last_attempt:')] + [attempt]
     else:
-        replace_manifest_pool_lines(manifest, _pool_manifest_lines(
-            status, mode, scope, window, n_slices, info, None, False, now))
+        lines = _pool_manifest_lines(status, mode, scope, window, n_slices, info, None, False, now)
+    write_manifest_with_pool_lines(manifest, new_manifest, lines)
+    publish_generation(serial_dir, work_dir, replace=('.nfit.cache.manifest',), wait_s=wait_s)
     return status, False
 
 
 def run_pool_capture(client, database, serial_dirs, entity_filter, window, slice_hours, chunk_size,
-                     tmp_dir, mode, scope):
+                     tmp_dir, mode, scope, wait_s=PUBLISH_DEFAULT_WAIT_S):
     """Acquires and publishes pool observations for the given managed systems
     over one window. Never raises for an acquisition problem: the outcome is
     returned per system as (status, published) and recorded in its manifest."""
@@ -2465,7 +2712,8 @@ def run_pool_capture(client, database, serial_dirs, entity_filter, window, slice
             status = 'failed' if info['error'] else 'unsupported'
         else:
             status = _pool_status(info, True, len(slices))
-        status, published = publish_pool_capture(d, work, status, mode, scope, window, len(slices), info)
+        status, published = publish_pool_capture(d, work, status, mode, scope, window, len(slices), info,
+                                                 wait_s)
         rows = work.rows if (work is not None and published) else 0
         print(f"    - {serial}: pool capture {status}"
               + (f", {rows:,} observations from {len({t.get('host') for t in work.series.values()})} reporter(s)"
@@ -2490,6 +2738,11 @@ def run_pool_only(args, script_root, cache_dir):
     targets = {}
     for serial in serials:
         serial_dir = os.path.join(cache_dir, serial)
+        try:
+            recover_publication(serial_dir, args.publish_wait)
+        except PublicationError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 4
         manifest = read_cache_manifest(os.path.join(serial_dir, '.nfit.cache.manifest'))
         if not (os.path.isfile(os.path.join(serial_dir, '.nfit.cache.data'))
                 and manifest.get('data_start') and manifest.get('data_end')):
@@ -2511,9 +2764,14 @@ def run_pool_only(args, script_root, cache_dir):
         for serial, (serial_dir, window) in targets.items():
             print(f"  - {serial}: window [{ns_to_legacy_timestamp(window[0])}, "
                   f"{ns_to_legacy_timestamp(window[1] - 1)}]")
-            results = run_pool_capture(client, db_config['DATABASE'], {serial: serial_dir},
-                                       build_entity_filter([serial]), window, args.slice_hours,
-                                       args.chunk_size, tmp_dir, 'pool-only', 'managed system')
+            try:
+                results = run_pool_capture(client, db_config['DATABASE'], {serial: serial_dir},
+                                           build_entity_filter([serial]), window, args.slice_hours,
+                                           args.chunk_size, tmp_dir, 'pool-only', 'managed system',
+                                           args.publish_wait)
+            except PublicationError as exc:
+                print(f"Error: publication failed for {serial}: {exc}", file=sys.stderr)
+                return 4
             all_complete = all_complete and results[serial][0] == 'complete'
     return 0 if all_complete else 3
 
@@ -2685,6 +2943,10 @@ def main():
              "cache's recorded window; data, states and their revisions are not changed. An\n"
              "existing usable pool file is kept unless the new capture is complete.\n"
              "Exit status 3 if any capture is not complete.")
+    parser.add_argument("--publish-wait", type=int, default=PUBLISH_DEFAULT_WAIT_S, dest="publish_wait",
+        help=f"Seconds to wait for readers (nfit, nfit-profile) of a system to finish before\n"
+             f"publishing its new cache files (default: {PUBLISH_DEFAULT_WAIT_S}). On timeout nothing is\n"
+             f"published for that system and the run exits with status 4.")
     parser.add_argument("--slice-hours", type=int, default=DEFAULT_SLICE_HOURS, dest="slice_hours",
         help=f"Length of each half-open acquisition time slice in hours (default: {DEFAULT_SLICE_HOURS}).\n"
              "An interrupted slice is rolled back and retried without repeating completed slices.")
@@ -2716,6 +2978,8 @@ def main():
     args = parser.parse_args()
     if args.chunk_size < 1 or args.slice_hours < 1:
         parser.error("--chunk-size and --slice-hours must be positive.")
+    if args.publish_wait < 0:
+        parser.error("--publish-wait must not be negative.")
     if not (args.mgsys or args.vms or args.vmfile) and not args.reanalyse:
         parser.error("one of the arguments --mgsys/--system/--serial/--host --vms --vmfile is required")
     probe_requested = args.discover or args.probe or args.reanalyse
@@ -2829,6 +3093,10 @@ def main():
             )
             sys.exit(1)
 
+        # Finish any interrupted publication before the existing caches are read.
+        for serial in known:
+            recover_publication(os.path.join(cache_dir, serial), args.publish_wait)
+        known = scan_cache_directories(cache_dir)
         earliest_end = min(m['data_end'] for m in known.values())
         # Use the date of the earliest data_end, not +1 day, so that the transition
         # day is re-queried in full.  Per-row cutoffs at full-precision timestamps
@@ -3048,36 +3316,27 @@ def main():
                 print(f"  - Processing serial: {serial}")
                 serial_cache_dir = os.path.join(cache_dir, serial)
                 os.makedirs(serial_cache_dir, exist_ok=True)
+                # Complete or discard an interrupted publication before reading
+                # anything, then build the new generation in the work directory.
+                recover_publication(serial_cache_dir, args.publish_wait)
+                work_dir = begin_work_dir(serial_cache_dir)
+                publish_remove, publish_invalidate = [], [CACHE_INDEX_FILE]
 
                 if args.cleanup:
                     print(f"    - Performing cleanup for {serial}...")
-
-                    # Define files for selective deletion
-                    files_to_delete = [
-                        '.nfit.cache.data',
-                        '.nfit.cache.states',
-                    ] + list(POOL_FILES)
-
+                    # Published with the new generation: pool evidence is removed,
+                    # and the results cache too unless --preserve-results.
+                    publish_remove += [POOL_OBSERVATIONS_FILE, POOL_SERIES_FILE]
                     if not args.preserve_results:
-                        files_to_delete.append('.nfit.cache.results')
+                        publish_invalidate.append(RESULTS_CACHE_FILE)
                         print("      - Removing L2 results cache.")
                     else:
                         print("      - Preserving L2 results cache (--preserve-results).")
 
-                    for filename in files_to_delete:
-                        path_to_delete = os.path.join(serial_cache_dir, filename)
-                        try:
-                            if os.path.isfile(path_to_delete):
-                                os.remove(path_to_delete)
-                            elif os.path.isdir(path_to_delete):
-                                import shutil
-                                shutil.rmtree(path_to_delete)
-                        except Exception as e:
-                            print(f"      - WARNING: Could not remove {path_to_delete}. Error: {e}", file=sys.stderr)
-
                 # --- Create Performance Data Cache (.nfit.cache.data) ---
                 perf_cache_start = time.time()
-                cache_data_path = os.path.join(serial_cache_dir, '.nfit.cache.data')
+                published_data_path = os.path.join(serial_cache_dir, '.nfit.cache.data')
+                cache_data_path = os.path.join(work_dir, '.nfit.cache.data')
                 vms_for_this_serial = set(data['states'].keys())
 
                 # In append mode, first truncate the existing L1 cache in-place to
@@ -3085,8 +3344,12 @@ def main():
                 # open for append.  The trimmed end timestamp becomes the row-level
                 # cutoff so that only new, non-overlapping rows are written.
                 serial_cutoff   = None
-                cache_open_mode = 'a' if (args.append and os.path.exists(cache_data_path)) else 'w'
-                if args.append and os.path.exists(cache_data_path):
+                cache_open_mode = 'a' if (args.append and os.path.exists(published_data_path)) else 'w'
+                if cache_open_mode == 'a':
+                    # The published file is never modified: the work copy is
+                    # trimmed and appended to, then published as a whole.
+                    import shutil
+                    shutil.copyfile(published_data_path, cache_data_path)
                     trunc_ts = truncate_to_last_valid_physc(cache_data_path)
                     if trunc_ts is None:
                         print(f"    WARNING: Could not determine truncation point for {serial}. "
@@ -3094,7 +3357,7 @@ def main():
                               file=sys.stderr)
                         serial_cutoff = serial_append_cutoffs.get(serial)
                     else:
-                        print(f"    - Existing cache trimmed in-place to {trunc_ts}.")
+                        print(f"    - Existing cache trimmed to {trunc_ts} (work copy).")
                         serial_cutoff = trunc_ts
 
                 rows_written = 0
@@ -3135,10 +3398,11 @@ def main():
 
                 # --- Create / Update Configuration State Cache (.nfit.cache.states) ---
                 state_cache_start  = time.time()
-                cache_states_path  = os.path.join(serial_cache_dir, '.nfit.cache.states')
-                if args.append and os.path.exists(cache_states_path):
+                published_states_path = os.path.join(serial_cache_dir, '.nfit.cache.states')
+                cache_states_path  = os.path.join(work_dir, '.nfit.cache.states')
+                if args.append and os.path.exists(published_states_path):
                     try:
-                        with open(cache_states_path, 'r') as f:
+                        with open(published_states_path, 'r') as f:
                             existing_states = json.load(f)
                         states_to_write = _merge_config_states(existing_states, data['states'])
                         state_action = 'merged'
@@ -3181,12 +3445,15 @@ def main():
                 # Pool evidence has its own window and outcome: keep its manifest
                 # lines (while their file exists) unless this run cleaned up.
                 pool_lines = [] if args.cleanup else carried_pool_lines(serial_cache_dir)
-                schema2_lines = []
                 if args.l1_schema == 2:
                     schema2_lines = l1_schema2_manifest_lines(
                         cache_data_path, cache_states_path, cpu_availability, acq_stats,
                         (start_ns, end_exclusive_ns), args)
-                with open(os.path.join(serial_cache_dir, '.nfit.cache.manifest'), 'w') as f:
+                else:
+                    # Content revisions for schema 1 too: nfit keys results by them,
+                    # so different data of the same size and mtime is never matched.
+                    schema2_lines = revision_manifest_lines(cache_data_path, cache_states_path)
+                with open(os.path.join(work_dir, '.nfit.cache.manifest'), 'w') as f:
                     f.write(
                         f"cache_build_status: success\n"
                         f"build_timestamp: {datetime.now(timezone.utc).isoformat()}\n"
@@ -3197,8 +3464,14 @@ def main():
                     for manifest_line in schema2_lines + pool_lines:
                         f.write(manifest_line + "\n")
 
-                with open(os.path.join(serial_cache_dir, '.nfit_stage_id'), 'w') as f:
+                with open(os.path.join(work_dir, '.nfit_stage_id'), 'w') as f:
                     f.write(f"Created by nfit-stage-influxdb.py v{VERSION} for system {serial}\n")
+
+                publish_generation(serial_cache_dir, work_dir,
+                                   replace=('.nfit.cache.data', '.nfit.cache.states',
+                                            '.nfit.cache.manifest', '.nfit_stage_id'),
+                                   remove=publish_remove, invalidate=publish_invalidate,
+                                   wait_s=args.publish_wait)
 
                 print(f"    - InfluxDB cache location: {serial_cache_dir}")
 
@@ -3213,7 +3486,7 @@ def main():
                     client, db_config['DATABASE'],
                     {serial: os.path.join(cache_dir, serial) for serial in data_by_serial},
                     entity_filter, (start_ns, end_exclusive_ns), args.slice_hours, args.chunk_size,
-                    tmp_dir, args.pool_capture, pool_scope)
+                    tmp_dir, args.pool_capture, pool_scope, args.publish_wait)
                 incomplete = sorted(s for s, (status, _) in pool_results.items() if status != 'complete')
                 if incomplete:
                     print(f"WARNING: pool capture not complete for {len(incomplete)} system(s); "
@@ -3221,6 +3494,9 @@ def main():
                     if args.pool_capture == 'required':
                         pool_exit_status = 3
 
+    except PublicationError as e:
+        print(f"\nERROR: publication failed: {e}", file=sys.stderr)
+        pool_exit_status = 4
     except Exception as e:
         print(f"\nAn unexpected error occurred: {e}", file=sys.stderr)
         # Attempt to clean up the lock file in case of an unhandled error.

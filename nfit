@@ -318,6 +318,9 @@ unless (-f $manifest_file_check)
 # Re-assign the validated, absolute path back to the nmon_dir variable for use throughout the script.
 $nmon_dir = abs_path($resolved_cache_dir);
 
+# Shared publication lock before any L1 file is read; held until exit.
+_acquire_publish_lock($nmon_dir);
+
 $runq_avg_method_str = lc($runq_avg_method_str);
 if ($runq_avg_method_str ne 'none' && $runq_avg_method_str ne 'sma' && $runq_avg_method_str ne 'ema')
 {
@@ -2170,6 +2173,84 @@ sub _l1_data_identity
         $id{$label} = @st ? "stat:$st[7]:$st[9]" : 'absent';
     }
     return \%id;
+}
+
+# ==============================================================================
+# SUBROUTINE: _acquire_publish_lock
+# PURPOSE:    Holds a shared lock on a cache directory's publication lock file
+#             (.nfit.cache.publish.lock) from before the first read of its L1
+#             files until the process exits. nfit-stage-influxdb swaps in a new
+#             generation of a system's files only under the exclusive lock, so a
+#             reader works on one complete generation. With the lock held, a
+#             directory whose publication journal (.publish.journal) is present
+#             is refused: an interrupted publication the stager has not yet
+#             recovered.
+#             A process started by one that already holds the lock (listed in
+#             NFIT_PUBLISH_LOCK_HELD, which this sets for its children) takes
+#             its own shared lock when that is immediately possible, and
+#             otherwise relies on the parent's, which a waiting publisher cannot
+#             pass. Parent and child therefore cannot deadlock behind a waiting
+#             publisher, whatever the platform's lock fairness.
+#             Where the lock file cannot be opened (a read-only copy), the cache
+#             is read without it: no publisher can write there either.
+# ARGUMENTS:  1. $cache_dir (string): one system's cache directory
+# RETURNS:    Nothing. Dies if the directory has an unrecovered publication.
+# ==============================================================================
+our %PUBLISH_LOCKS;
+sub _acquire_publish_lock
+{
+    my ($cache_dir) = @_;
+    my $dir = abs_path($cache_dir) // $cache_dir;
+    return if exists $PUBLISH_LOCKS{$dir};
+    my $lock_path = File::Spec->catfile($dir, '.nfit.cache.publish.lock');
+    my %held = map { $_ => 1 } grep { length } split /\n/, ($ENV{NFIT_PUBLISH_LOCK_HELD} // '');
+    my $fh;
+    if (open($fh, '>>', $lock_path) || open($fh, '<', $lock_path))
+    {
+        unless (flock($fh, LOCK_SH | LOCK_NB))
+        {
+            if ($held{$dir})
+            {
+                close $fh;
+                undef $fh;    # the parent's shared lock covers this process's reads
+            }
+            else
+            {
+                print STDERR "  -> Waiting for a cache publication to finish ($dir)\n";
+                flock($fh, LOCK_SH) or die "FATAL: Cannot lock '$lock_path': $!\n";
+            }
+        }
+    }
+    else
+    {
+        undef $fh;
+    }
+    $PUBLISH_LOCKS{$dir} = $fh;
+    if (-e File::Spec->catfile($dir, '.publish.journal'))
+    {
+        die "FATAL: The cache in '$dir' has an interrupted publication that has not been recovered "
+          . "(.publish.journal present). Run nfit-stage-influxdb for this system to complete it, then retry.\n";
+    }
+    $held{$dir} = 1;
+    $ENV{NFIT_PUBLISH_LOCK_HELD} = join("\n", sort keys %held);
+    return;
+}
+
+# ==============================================================================
+# SUBROUTINE: _release_publish_lock
+# PURPOSE:    Releases the shared publication lock of a cache directory this
+#             process no longer reads, and removes it from NFIT_PUBLISH_LOCK_HELD.
+# ==============================================================================
+sub _release_publish_lock
+{
+    my ($cache_dir) = @_;
+    my $dir = abs_path($cache_dir) // $cache_dir;
+    return unless exists $PUBLISH_LOCKS{$dir};
+    my $fh = delete $PUBLISH_LOCKS{$dir};
+    close $fh if defined $fh;
+    my %held = map { $_ => 1 } grep { length && $_ ne $dir } split /\n/, ($ENV{NFIT_PUBLISH_LOCK_HELD} // '');
+    $ENV{NFIT_PUBLISH_LOCK_HELD} = join("\n", sort keys %held);
+    return;
 }
 
 sub seek_to_start_date {

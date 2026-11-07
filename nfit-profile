@@ -899,6 +899,13 @@ else
     }
 }
 
+# --- Publication lock: shared, on every candidate cache, before any L1 read ---
+# Held for the whole run, so every read below and every nfit child sees one
+# generation of each system's files (released for systems a --vm filter drops).
+my @candidate_cache_dirs = map { defined $_ ? File::Spec->catfile($base_cache_dir, $_) : $nmon_dir }
+                           @target_systems_to_process;
+_acquire_publish_lock($_) foreach @candidate_cache_dirs;
+
 # If a --vm filter was provided, we must refine our list of target systems.
 # This only makes sense in a multi-system context where we can check each one.
 if (scalar(@target_systems_to_process) > 1 && defined $target_vm_name)
@@ -927,7 +934,9 @@ if (scalar(@target_systems_to_process) > 1 && defined $target_vm_name)
         }
     }
     # The new target list is only the systems that contain the specified VMs.
+    my @dropped_systems = grep { !$systems_with_target_vms{$_} } @target_systems_to_process;
     @target_systems_to_process = sort keys %systems_with_target_vms;
+    _release_publish_lock(File::Spec->catfile($base_cache_dir, $_)) foreach @dropped_systems;
 }
 
 if (!@target_systems_to_process)
@@ -18049,6 +18058,84 @@ sub _engine_supported_l1_schemas
         }
     }
     return \@schemas;
+}
+
+# ==============================================================================
+# SUBROUTINE: _acquire_publish_lock
+# PURPOSE:    Holds a shared lock on a cache directory's publication lock file
+#             (.nfit.cache.publish.lock) from before the first read of its L1
+#             files until the process exits. nfit-stage-influxdb swaps in a new
+#             generation of a system's files only under the exclusive lock, so a
+#             reader works on one complete generation. With the lock held, a
+#             directory whose publication journal (.publish.journal) is present
+#             is refused: an interrupted publication the stager has not yet
+#             recovered.
+#             A process started by one that already holds the lock (listed in
+#             NFIT_PUBLISH_LOCK_HELD, which this sets for its children) takes
+#             its own shared lock when that is immediately possible, and
+#             otherwise relies on the parent's, which a waiting publisher cannot
+#             pass. Parent and child therefore cannot deadlock behind a waiting
+#             publisher, whatever the platform's lock fairness.
+#             Where the lock file cannot be opened (a read-only copy), the cache
+#             is read without it: no publisher can write there either.
+# ARGUMENTS:  1. $cache_dir (string): one system's cache directory
+# RETURNS:    Nothing. Dies if the directory has an unrecovered publication.
+# ==============================================================================
+our %PUBLISH_LOCKS;
+sub _acquire_publish_lock
+{
+    my ($cache_dir) = @_;
+    my $dir = abs_path($cache_dir) // $cache_dir;
+    return if exists $PUBLISH_LOCKS{$dir};
+    my $lock_path = File::Spec->catfile($dir, '.nfit.cache.publish.lock');
+    my %held = map { $_ => 1 } grep { length } split /\n/, ($ENV{NFIT_PUBLISH_LOCK_HELD} // '');
+    my $fh;
+    if (open($fh, '>>', $lock_path) || open($fh, '<', $lock_path))
+    {
+        unless (flock($fh, LOCK_SH | LOCK_NB))
+        {
+            if ($held{$dir})
+            {
+                close $fh;
+                undef $fh;    # the parent's shared lock covers this process's reads
+            }
+            else
+            {
+                print STDERR "  -> Waiting for a cache publication to finish ($dir)\n";
+                flock($fh, LOCK_SH) or die "FATAL: Cannot lock '$lock_path': $!\n";
+            }
+        }
+    }
+    else
+    {
+        undef $fh;
+    }
+    $PUBLISH_LOCKS{$dir} = $fh;
+    if (-e File::Spec->catfile($dir, '.publish.journal'))
+    {
+        die "FATAL: The cache in '$dir' has an interrupted publication that has not been recovered "
+          . "(.publish.journal present). Run nfit-stage-influxdb for this system to complete it, then retry.\n";
+    }
+    $held{$dir} = 1;
+    $ENV{NFIT_PUBLISH_LOCK_HELD} = join("\n", sort keys %held);
+    return;
+}
+
+# ==============================================================================
+# SUBROUTINE: _release_publish_lock
+# PURPOSE:    Releases the shared publication lock of a cache directory this
+#             process no longer reads, and removes it from NFIT_PUBLISH_LOCK_HELD.
+# ==============================================================================
+sub _release_publish_lock
+{
+    my ($cache_dir) = @_;
+    my $dir = abs_path($cache_dir) // $cache_dir;
+    return unless exists $PUBLISH_LOCKS{$dir};
+    my $fh = delete $PUBLISH_LOCKS{$dir};
+    close $fh if defined $fh;
+    my %held = map { $_ => 1 } grep { length && $_ ne $dir } split /\n/, ($ENV{NFIT_PUBLISH_LOCK_HELD} // '');
+    $ENV{NFIT_PUBLISH_LOCK_HELD} = join("\n", sort keys %held);
+    return;
 }
 
 # ==============================================================================
