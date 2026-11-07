@@ -57,7 +57,9 @@ my $VERSION = '9.26.219.0';
 # never served.
 #   2: engine text fields are character strings; the cache read decodes once.
 #   3: results of caches with a PhysB column carry paired outputs (metrics.physb).
-my $L2_CACHE_FORMAT_VERSION = 3;
+#   4: --no-weekends excludes Saturday and Sunday (a16eb08); format-3 results
+#      were computed with the earlier rule and must not be served.
+my $L2_CACHE_FORMAT_VERSION = 4;
 
 # --- L1 data-cache schema ---
 # Versions of .nfit.cache.data this engine reads. Schema 1 is the original
@@ -87,7 +89,12 @@ my $ACTIVE_PHYSC_THRESHOLD = 0.15; # Original threshold for RunQ normalization
 my $PAIRED_GAP_FACTOR          = 1.5;          # a gap is > 1.5 x the detected interval
 my $PAIRED_B_ABOVE_C_TOLERANCE = 1e-6;         # PhysB above PhysC by more is an invalid pair
 my $PAIRED_SECONDS_PER_DAY     = 86_400;
-my $PAIRED_DERIVATION_VERSION  = 'paired-1';   # recorded in physbProvenance and history
+my $PAIRED_DERIVATION_VERSION  = 'paired-2';   # recorded in physbProvenance and history
+                                               #   paired-2: plausibility rejections (non-finite,
+                                               #   above the VM's virtual-processor ceiling)
+my $CALENDAR_RULES_VERSION     = 'weekday-v2'; # --no-weekends = Saturday and Sunday excluded
+my $PAIRED_CEILING_FACTOR      = 1.05;         # tolerance on the virtual-processor ceiling
+my $PAIRED_CEILING_MARGIN      = 0.05;         # cores
 my $SAFETY_MARGIN_FOR_THRESHOLD_CONST = 1.05; # Safety margin for ACTIVE_PHYSC_THRESHOLD calculation
 my $PLACEHOLDER_ENTITLEMENT_ADJUSTMENT_FACTOR = 1.0; # Placeholder in ACTIVE_PHYSC_THRESHOLD calc
 
@@ -251,6 +258,8 @@ if ($show_capabilities)
         version            => $VERSION,
         l1_schema_versions => [ @L1_SUPPORTED_SCHEMA_VERSIONS ],
         l2_cache_format    => $L2_CACHE_FORMAT_VERSION,
+        physb_derivation_version => $PAIRED_DERIVATION_VERSION,
+        calendar_rules     => $CALENDAR_RULES_VERSION,
     }) . "\n";
     exit 0;
 }
@@ -2270,7 +2279,15 @@ sub _release_publish_lock
 # touched. The paired population is the legacy-retained rows (numeric PhysC and
 # RunQ) that pass the same date, exclusion, state and per-transform time
 # filters, and that carry a valid PhysB:
-#   valid pair   PhysB numeric, >= 0 and <= PhysC + $PAIRED_B_ABOVE_C_TOLERANCE
+#   valid pair   PhysC and PhysB finite and >= 0, PhysB <= PhysC +
+#                $PAIRED_B_ABOVE_C_TOLERANCE, and both at most the VM's ceiling:
+#                $PAIRED_CEILING_FACTOR x its largest virtual-processor count over
+#                its states + $PAIRED_CEILING_MARGIN (a VM cannot consume more
+#                physical cores than it has virtual processors); without VP
+#                metadata, the pool size; without either, no ceiling (counted).
+#                Rejected samples stay in the L1 file and in the legacy path;
+#                they are excluded from the paired population, counted by
+#                reason, and break the smoothing run
 #   weight       elapsed seconds since the previous valid pair of the same VM,
 #                transform and state when 0 < dt <= $PAIRED_GAP_FACTOR x the
 #                detected interval; otherwise (first pair, gap, state change,
@@ -2330,27 +2347,59 @@ sub _paired_weight
 # PURPOSE:    Accumulates one legacy-retained PhysC sample (with its PhysB cell)
 #             for one VM, state bin and PhysC transform.
 # ==============================================================================
+sub _paired_finite
+{
+    my ($x) = @_;
+    return (defined $x && looks_like_number($x) && $x == $x && $x != 9**9**9 && $x != -9**9**9);
+}
+
+# Plausibility ceiling (cores) of a VM's PhysC and PhysB, from its states.
+sub _paired_ceiling
+{
+    my ($ctx, $vm, $states_aref) = @_;
+    return $ctx->{ceiling}{$vm} if exists $ctx->{ceiling}{$vm};
+    my ($vps, $pool) = (0, 0);
+    foreach my $s (@{ $states_aref // [] })
+    {
+        my $m = $s->{metadata} // {};
+        $vps  = $m->{virtual_cpus} if _paired_finite($m->{virtual_cpus}) && $m->{virtual_cpus} > $vps;
+        $pool = $m->{pool_cpu}     if _paired_finite($m->{pool_cpu})     && $m->{pool_cpu}     > $pool;
+    }
+    my $basis = $vps > 0 ? 'virtual_cpus' : $pool > 0 ? 'pool_cpu' : 'none';
+    my $base  = $vps > 0 ? $vps : $pool;
+    my $ceiling = $base > 0 ? $PAIRED_CEILING_FACTOR * $base + $PAIRED_CEILING_MARGIN : undef;
+    return $ctx->{ceiling}{$vm} = { value => $ceiling, basis => $basis };
+}
+
 sub _paired_update
 {
-    my ($ctx, $vm, $bin, $key, $entry, $epoch, $c, $b) = @_;
+    my ($ctx, $vm, $bin, $key, $entry, $epoch, $c, $b, $ceiling, $f) = @_;
     my $interval_s = $ctx->{interval_s};
     my $acc = $ctx->{acc}{$vm}{$bin}{$key} //= {
         sumB => 0, sumC => 0, w_pair => 0, w_c => 0, validPairs => 0, missingB => 0,
-        nonNumericB => 0, bAboveC => 0, sameSecondSamples => 0, resets => 0, packed => '',
-        first => undef, last => undef,
+        nonNumericB => 0, bAboveC => 0, nonFiniteC => 0, cAboveCeiling => 0, bAboveCeiling => 0,
+        sameSecondSamples => 0, resets => 0, packed => '', first => undef, last => undef,
+        ceiling => $ceiling, freqUnavailable => 0, daily => {},
     };
+    my $day = int($epoch / $PAIRED_SECONDS_PER_DAY);
+    my $daily = $acc->{daily}{$day} //= { sumB => 0, sumC => 0, w_pair => 0, w_c => 0, f_sum => 0, f_w => 0 };
 
     # PhysC timeline: every legacy-retained sample of this transform.
     my $ctime = $ctx->{ctime}{$vm}{$key} //= {};
     my $wc = _paired_weight($ctime, $epoch, $bin, $interval_s);
     @$ctime{qw(t bin broken)} = ($epoch, $bin, 0);
     $acc->{w_c} += $wc;
+    $daily->{w_c} += $wc;
 
     my $st = $ctx->{pstate}{$vm}{$key} //= {};
     my $reason;
-    if (!defined $b || $b eq '')                { $reason = 'missingB'; }
-    elsif (!looks_like_number($b) || $b < 0)    { $reason = 'nonNumericB'; }
-    elsif ($b > $c + $PAIRED_B_ABOVE_C_TOLERANCE) { $reason = 'bAboveC'; }
+    my $limit = $ceiling ? $ceiling->{value} : undef;
+    if (!_paired_finite($c) || $c < 0)            { $reason = 'nonFiniteC'; }
+    elsif (defined $limit && $c > $limit)          { $reason = 'cAboveCeiling'; }
+    elsif (!defined $b || $b eq '')                { $reason = 'missingB'; }
+    elsif (!_paired_finite($b) || $b < 0)          { $reason = 'nonNumericB'; }
+    elsif (defined $limit && $b > $limit)          { $reason = 'bAboveCeiling'; }
+    elsif ($b > $c + $PAIRED_B_ABOVE_C_TOLERANCE)  { $reason = 'bAboveC'; }
     if ($reason)
     {
         $acc->{$reason}++;
@@ -2378,6 +2427,12 @@ sub _paired_update
     $acc->{sumC}   += $c * $w / 60;
     $acc->{w_pair} += $w;
     $acc->{validPairs}++;
+    $daily->{sumB}   += $b * $w / 60;
+    $daily->{sumC}   += $c * $w / 60;
+    $daily->{w_pair} += $w;
+    # FreqPct is context only: time-weighted over valid pairs where it is finite.
+    if (_paired_finite($f) && $f >= 0) { $daily->{f_sum} += $f * $w; $daily->{f_w} += $w; }
+    else                               { $acc->{freqUnavailable}++; }
     $acc->{first} //= $epoch;
     $acc->{last}    = $epoch;
 
@@ -2399,12 +2454,22 @@ sub _paired_update
 sub _paired_expected_seconds
 {
     my ($start, $end, $entry) = @_;
-    return 0 unless defined $start && defined $end && $end > $start;
+    my $by_day = _paired_expected_by_day($start, $end, $entry);
+    my $total = 0;
+    $total += $_ for values %$by_day;
+    return $total;
+}
+
+# The same, per UTC day index (int(epoch / 86400)); days with none are omitted.
+sub _paired_expected_by_day
+{
+    my ($start, $end, $entry) = @_;
+    my %by_day;
+    return \%by_day unless defined $start && defined $end && $end > $start;
     my $filter = $entry->{time_filter} // 'none';
     my @allowed = $filter eq 'online' ? ([8 * 3600, 17 * 3600])
                 : $filter eq 'batch'  ? ([0, 6 * 3600], [18 * 3600, $PAIRED_SECONDS_PER_DAY])
                 :                       ([0, $PAIRED_SECONDS_PER_DAY]);
-    my $total = 0;
     my $day = $start - ($start % $PAIRED_SECONDS_PER_DAY);
     while ($day <= $end)
     {
@@ -2418,12 +2483,12 @@ sub _paired_expected_seconds
                 my $z = $day + $iv->[1];
                 $a = $start if $a < $start;
                 $z = $end   if $z > $end;
-                $total += $z - $a if $z > $a;
+                $by_day{ $day / $PAIRED_SECONDS_PER_DAY } += $z - $a if $z > $a;
             }
         }
         $day += $PAIRED_SECONDS_PER_DAY;
     }
-    return $total;
+    return \%by_day;
 }
 
 sub _paired_round
@@ -2487,7 +2552,9 @@ sub _paired_finalize
                 my $p_end   = @ends   ? min(@ends)   : undef;
                 # Each sample stands for the interval it closes, so the expected
                 # time runs one interval past the period's last instant.
-                my $expected_s = _paired_expected_seconds($p_start, defined $p_end ? $p_end + $ctx->{interval_s} : undef, $entry);
+                my $expected_by_day = _paired_expected_by_day($p_start, defined $p_end ? $p_end + $ctx->{interval_s} : undef, $entry);
+                my $expected_s = 0;
+                $expected_s += $_ for values %$expected_by_day;
                 my $truncated_start = (defined $span_start && defined $ctx->{range_min} && $ctx->{range_min} > $span_start
                                        && (!defined $args->{window_start} || $ctx->{range_min} > $args->{window_start})) ? JSON::true : JSON::false;
                 my $truncated_end   = (defined $span_end && defined $ctx->{range_max} && $ctx->{range_max} < $span_end
@@ -2507,6 +2574,10 @@ sub _paired_finalize
                         pairedCoverage  => $expected_min > 0 ? _paired_round($paired_min / $expected_min, 4) : undef,
                         truncatedAtStart => $truncated_start,
                         truncatedAtEnd   => $truncated_end,
+                        # Support extent, distinct from the period extent above.
+                        firstPair       => defined $acc->{first} ? gmtime($acc->{first})->datetime : undef,
+                        lastPair        => defined $acc->{last}  ? gmtime($acc->{last})->datetime  : undef,
+                        pairedDays      => scalar(grep { $acc->{daily}{$_}{w_pair} > 0 } keys %{ $acc->{daily} }),
                     },
                     pairedExposure => {
                         sumB => _paired_round($acc->{sumB}, 4),    # core-minutes
@@ -2519,8 +2590,14 @@ sub _paired_finalize
                         missingB          => $acc->{missingB},
                         nonNumericB       => $acc->{nonNumericB},
                         bAboveC           => $acc->{bAboveC},
+                        nonFiniteC        => $acc->{nonFiniteC},
+                        cAboveCeiling     => $acc->{cAboveCeiling},
+                        bAboveCeiling     => $acc->{bAboveCeiling},
+                        ceilingCores      => _paired_round($acc->{ceiling}{value}, 4),
+                        ceilingBasis      => $acc->{ceiling}{basis},
                         sameSecondSamples => $acc->{sameSecondSamples},
                         runResets         => $acc->{resets},
+                        freqPctUnavailable => $acc->{freqUnavailable},
                     },
                 );
 
@@ -2551,7 +2628,7 @@ sub _paired_finalize
                     $percentiles_needed{$_} = 1 for @{ $prof->{percentiles} // [] };
                 }
                 my @p_list = sort { $a <=> $b } keys %percentiles_needed;
-                my (%profile_b, %tail);
+                my (%profile_b, %tail, %tail_daily);
                 if (@rows)
                 {
                     my @c_sorted = sort { $a <=> $b } map { $_->[0] } @rows;
@@ -2572,6 +2649,8 @@ sub _paired_finalize
                             $sb += $r->[1];
                             $sc += $r->[0];
                             $days{ $r->[2] } = 1;
+                            my $td = $tail_daily{"P$p"}{ $r->[2] } //= [0, 0, 0];
+                            $td->[0]++; $td->[1] += $r->[1]; $td->[2] += $r->[0];
                         }
                         $tail{"P$p"} = {
                             threshold    => _paired_round($thr, 4),
@@ -2600,12 +2679,44 @@ sub _paired_finalize
                 }
                 $common{smoothedWindows} = scalar @rows;
 
+                # Daily sufficient statistics (additive; history derives no
+                # percentile from them). Days are UTC and limited to the period.
+                my %day_set = map { $_ => 1 } (keys %$expected_by_day, keys %{ $acc->{daily} });
+                my @daily_common;
+                foreach my $d (sort { $a <=> $b } keys %day_set)
+                {
+                    my $dd = $acc->{daily}{$d} // {};
+                    push @daily_common, {
+                        _day            => $d,
+                        date            => gmtime($d * $PAIRED_SECONDS_PER_DAY)->ymd,
+                        expectedMinutes => _paired_round(($expected_by_day->{$d} // 0) / 60, 1),
+                        physcMinutes    => _paired_round(($dd->{w_c} // 0) / 60, 1),
+                        pairedMinutes   => _paired_round(($dd->{w_pair} // 0) / 60, 1),
+                        sumB            => _paired_round($dd->{sumB} // 0, 4),
+                        sumC            => _paired_round($dd->{sumC} // 0, 4),
+                        freqPctMean     => ($dd->{f_w} // 0) > 0 ? _paired_round($dd->{f_sum} / $dd->{f_w}, 2) : undef,
+                        freqPctMinutes  => _paired_round(($dd->{f_w} // 0) / 60, 1),
+                    };
+                }
+
                 foreach my $profile_name (keys %{ $entry->{profiles} // {} })
                 {
                     my %per = %common;
                     my @mine = map { "P$_" } @{ $entry->{profiles}{$profile_name}{percentiles} // [] };
                     $per{profileValueB} = { map { $_ => $profile_b{$_} } grep { exists $profile_b{$_} } @mine };
                     $per{tail}          = { map { $_ => $tail{$_} }      grep { exists $tail{$_} } @mine };
+                    $per{daily} = [ map {
+                        my %row = %$_;
+                        my $d = delete $row{_day};
+                        my %t;
+                        foreach my $pk (grep { exists $tail{$_} } @mine)
+                        {
+                            my $td = $tail_daily{$pk}{$d} // [0, 0, 0];
+                            $t{$pk} = { windows => $td->[0], sumB => _paired_round($td->[1], 4), sumC => _paired_round($td->[2], 4) };
+                        }
+                        $row{tail} = \%t;
+                        \%row;
+                    } @daily_common ];
                     $out{$vm}{$bin}{$profile_name} = \%per;
                 }
             }
@@ -3466,6 +3577,7 @@ sub run_single_pass_from_manifest {
     # only when the cache declares PhysB; otherwise nothing below changes.
     my $physb_index = ($args_ref->{physb_paired} && !$l1_layout->{legacy}) ? $l1_layout->{index}{PhysB} : undef;
     my $paired_ctx  = defined $physb_index ? { interval_s => $detected_interval_secs } : undef;
+    my $freqpct_index = defined $physb_index ? $l1_layout->{index}{FreqPct} : undef;
 
     # --- Seek to start date if index available ---
     if ($cache_index) {
@@ -3533,7 +3645,7 @@ sub run_single_pass_from_manifest {
         $record_counter++;
 
         chomp $line;
-        my ($ts_str, $vm, $physc, $runq, $physb);
+        my ($ts_str, $vm, $physc, $runq, $physb, $freqpct);
         if ($l1_layout->{legacy})
         {
             # Schema 1 fast path: identical to the original positional parse.
@@ -3545,7 +3657,8 @@ sub run_single_pass_from_manifest {
             # columns follow and are ignored until a transform consumes them.
             my @fields = split ',', $line, -1;
             ($ts_str, $vm, $physc, $runq) = @fields[0 .. 3];
-            $physb = $fields[$physb_index] if defined $physb_index;
+            $physb   = $fields[$physb_index]   if defined $physb_index;
+            $freqpct = $fields[$freqpct_index] if defined $freqpct_index;
         }
 
         # early exit for non-numeric/corrupt data
@@ -3607,6 +3720,7 @@ sub run_single_pass_from_manifest {
         process_data_point($tp, $vm, $physc, $runq, $manifest, $states_by_vm, \%analysis_data, \%raw_data, \%transform_states, \%persistent_transform_states, \%daily_raw_data, {
             paired_ctx                => $paired_ctx,
             physb                     => $physb,
+            freqpct                   => $freqpct,
             vms_to_process            => \%vms_to_process,
             start_date_str            => $start_date_str,
             end_date_str              => $end_date_str,
@@ -3769,6 +3883,7 @@ sub run_single_pass_from_manifest {
         _attach_paired_results(\@output_objects, $paired_results, $is_aggregated_run, {
             source            => $column_sources{PhysB} // 'PhysB',
             derivationVersion => $PAIRED_DERIVATION_VERSION,
+            calendarRules     => $CALENDAR_RULES_VERSION,
             dataRevision      => $l1_manifest_meta->{data_revision},
             detectedIntervalS => $detected_interval_secs + 0,
         });
@@ -3866,7 +3981,6 @@ sub process_data_point {
         my $line_time = substr($tp->hms(':'), 0, 5);
 
         # 4a. Check for --no-weekends filter.
-        # (See _transform_excludes_day for a known defect in this test.)
         next if ($entry->{no_weekends} && _transform_excludes_day($tp));
 
         # 4b. Check for time-of-day filters (online/batch).
@@ -3875,7 +3989,8 @@ sub process_data_point {
 
         # --- Paired PhysC/PhysB path (only when the cache has a PhysB column) ---
         if ($filters->{paired_ctx} && $entry->{metric} eq 'PhysC') {
-            _paired_update($filters->{paired_ctx}, $vm, $bin_key, $key, $entry, $ts_epoch, $physc, $filters->{physb});
+            _paired_update($filters->{paired_ctx}, $vm, $bin_key, $key, $entry, $ts_epoch, $physc, $filters->{physb},
+                           _paired_ceiling($filters->{paired_ctx}, $vm, $states_by_vm->{$vm}), $filters->{freqpct});
         }
 
         # --- Data processing continues only if the data point was not filtered out ---

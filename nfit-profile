@@ -582,6 +582,12 @@ my $use_l1_baseline = 0;  # Phase 6: Emergency escape hatch — forces legacy L1
 # Seasonality related variables
 my $apply_seasonality_event;
 my $update_history_flag = 0; # New unified history update flag
+my $physb_history_flag = 0;  # --physb-history: PhysBMetrics blocks in monthly history (opt-in)
+# PhysB history constants (see the PhysB history section)
+my $PHYSB_HISTORY_SCHEMA_VERSION = 1;
+my $PHYSB_HISTORY_FEATURE        = 'PhysB-v1';
+my @PHYSB_INVALID_REASONS  = qw(missingB nonNumericB bAboveC nonFiniteC cAboveCeiling bAboveCeiling);
+my @PHYSB_QUALITY_COUNTERS = (qw(validPairs sameSecondSamples runResets freqPctUnavailable), @PHYSB_INVALID_REASONS);
 my $min_history_days_arg;    # New flag for partial month processing
 my $reset_seasonal_cache = 0;
 my $seasonal_auto_flag = 0; # Automatic Seasonal Discovery Flag
@@ -625,6 +631,7 @@ GetOptions(
     'seasonal'                   => \$seasonal_auto_flag,
     'seasonal-scope=s'           => \$seasonal_scope,
     'update-history'             => \$update_history_flag,
+    'physb-history'              => \$physb_history_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
@@ -14660,9 +14667,27 @@ sub update_monthly_history {
     }
     print STDERR "  ⧗ Data cache time range: " . $cache_start_obj->date . " - " . $cache_end_obj->date . "\n";
 
+    # --- PhysB history (opt-in, --physb-history) ---
+    my $physb;
+    if ($physb_history_flag)
+    {
+        my $identity  = _cache_physb_identity($system_cache_dir);
+        my $semantics = _engine_physb_semantics();
+        if (!$identity) {
+            print STDERR "  ↳  --physb-history: the cache declares no PhysB column; no PhysB blocks are written\n";
+        } elsif (!$semantics) {
+            die "[ERROR] --physb-history needs an nfit engine that reports its paired-derivation semantics "
+              . "(nfit --capabilities). Upgrade nfit.\n";
+        } else {
+            $physb = { identity => $identity, semantics => $semantics,
+                       signature => _physb_history_signature($identity, $semantics, _physb_history_manifest()) };
+        }
+    }
+
     # --- Step 1: Load existing history ONCE ---
     my $history_data = read_unified_history($system_cache_dir);
     my @months_to_process;
+    my @physb_months;      # stored months whose PhysC analysis is kept; PhysB blocks only
 
     # --- Step 2: Planning Stage - Discover unprocessed months ---
     print STDERR "  ↳  Scanning data cache for unprocessed or incomplete months\n";
@@ -14698,6 +14723,13 @@ sub update_monthly_history {
         if ($should_process) {
             push @months_to_process, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period };
         }
+        elsif ($physb && $days_in_period > 0
+               && ref(_safe_dig($history_data, $month_key, 'MonthlyWorkloadAnalysis')) eq 'HASH'
+               && _physb_month_needs_block($history_data->{$month_key}, $physb->{signature},
+                                           $effective_start_obj->strftime('%Y-%m-%d'), $effective_end_obj->strftime('%Y-%m-%d'))) {
+            print STDERR "  ↳  PhysB blocks absent or out of date for $month_key; stored PhysC analysis is kept\n";
+            push @physb_months, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period };
+        }
         $iterator_month = $iterator_month->add_months(1);
     }
     print STDERR "  ✓ Data Cache examination complete\n";
@@ -14706,7 +14738,8 @@ sub update_monthly_history {
     if (@months_to_process) {
         my $first_month_key = $months_to_process[0]{key};
         _validate_pre_update_conditions($system_cache_dir, $first_month_key, $force_flag);
-
+    }
+    if (@months_to_process || @physb_months) {
         # Create checkpoint backup before any modifications
         print STDERR "  • Creating pre-tactical checkpoint backup\n";
         _create_checkpoint_backup($system_cache_dir, 'pre-tactical', 1);
@@ -14722,10 +14755,13 @@ sub update_monthly_history {
         _generate_monthly_and_seasonal_history(
             $system_cache_dir, \@months_to_process, $seasonality_config,
             \@all_historical_peaks, $history_data, $adaptive_runq_saturation_thresh,
-            $cache_start_obj
+            $cache_start_obj, $physb
         );
     } else {
         print STDERR "  ✓ No new months to process. History is up to date\n";
+    }
+    if (@physb_months) {
+        _backfill_physb_history($system_cache_dir, \@physb_months, $history_data, $adaptive_runq_saturation_thresh, $physb);
     }
 
     # Track if this was a first run (no pre-existing partitions in the canonical history dir).
@@ -14743,7 +14779,7 @@ sub update_monthly_history {
 
     # --- Step 4: Final Write ---
     # The history file is written only ONCE at the end if any changes were made.
-    if (@months_to_process || $was_enriched) {
+    if (@months_to_process || @physb_months || $was_enriched) {
         print "  ↳  Finalising updates to history cache.\n";
 
         _write_full_history($system_cache_dir, $history_data);
@@ -14765,7 +14801,7 @@ sub update_monthly_history {
 #             modifying a single in-memory hash to prevent data corruption.
 # ==============================================================================
 sub _generate_monthly_and_seasonal_history {
-    my ($system_cache_dir, $months_to_process_aref, $seasonality_config, $all_historical_peaks_aref, $history_data_href, $adaptive_runq_saturation_thresh, $cache_start_obj) = @_;
+    my ($system_cache_dir, $months_to_process_aref, $seasonality_config, $all_historical_peaks_aref, $history_data_href, $adaptive_runq_saturation_thresh, $cache_start_obj, $physb) = @_;
 
     foreach my $month_job (@$months_to_process_aref) {
         my $month_key = $month_job->{key};
@@ -14774,7 +14810,18 @@ sub _generate_monthly_and_seasonal_history {
 
         # --- PHASE 1: Generate MonthlyWorkloadAnalysis ---
         print "\n--- Processing Month: $month_key (Period: $start_str to $end_str) ---\n";
-        my $workload_analysis = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str, $adaptive_runq_saturation_thresh);
+        my $workload_analysis = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str, $adaptive_runq_saturation_thresh, $physb);
+
+        # --- PhysB blocks: never lost when a month is re-analysed ---
+        # New blocks come with the analysis when --physb-history is active;
+        # stored blocks are carried for VMs without a new one, and kept where
+        # the new window does not contain theirs (see _graft_physb_metrics).
+        my $previous_mwa      = _safe_dig($history_data_href, $month_key, 'MonthlyWorkloadAnalysis') // {};
+        my $previous_metadata = _safe_dig($history_data_href, $month_key, 'Metadata') // {};
+        my %new_physb = map { $_ => delete $workload_analysis->{$_}{PhysBMetrics} }
+                        grep { ref($workload_analysis->{$_}) eq 'HASH' && $workload_analysis->{$_}{PhysBMetrics} }
+                        keys %$workload_analysis;
+        my $physb_stats = _graft_physb_metrics($workload_analysis, \%new_physb, $previous_mwa);
 
         # --- Merge DailyPeakSeries: first-write-wins against existing history ---
         # Capture the existing DailyPeakSeries from this month's partition before the
@@ -14827,6 +14874,22 @@ sub _generate_monthly_and_seasonal_history {
                 LastUpdated        => localtime()->datetime(),
             }
         };
+        if ($physb)
+        {
+            _physb_mark_month($history_data_href->{$month_key}{Metadata}, $physb->{signature},
+                              _physb_month_window($start_str, $end_str), $physb_stats);
+        }
+        elsif ($physb_stats->{carried} || $physb_stats->{kept})
+        {
+            # Stored blocks carried unchanged keep their marker and feature tag.
+            $history_data_href->{$month_key}{Metadata}{$_} = $previous_metadata->{$_}
+                for grep { exists $previous_metadata->{$_} } qw(Features PhysB);
+        }
+        if (%new_physb || $physb_stats->{carried} || $physb_stats->{kept})
+        {
+            print STDERR "  [INFO] PhysB blocks for $month_key: $physb_stats->{written} written, $physb_stats->{kept} kept "
+                       . "(wider stored window), $physb_stats->{carried} carried.\n";
+        }
 
         # --- PHASE 2: Generate SeasonalEventSnapshots for this month ---
         print "  - Discovering seasonal events for month: $month_key...\n";
@@ -17645,6 +17708,402 @@ sub _assemble_monthly_analysis {
 }
 
 # ==============================================================================
+# PhysB history (Increment 6b; design v3.2 §4)
+# ------------------------------------------------------------------------------
+# Opt-in (--physb-history). When the system's L1 cache declares a PhysB
+# column, the monthly engine run adds --physb-paired and each VM's
+# MonthlyWorkloadAnalysis entry gains a PhysBMetrics block. Nothing else in
+# the month changes: the paired outputs are additive in the engine (I2) and
+# the block is a new key (I6).
+#
+# Three extents are kept apart and never conflated:
+#   window   the month's analysis window: the part of the calendar month the
+#            cache covers. 'complete' is true only when the window is the
+#            whole calendar month. It says nothing about a VM's coverage.
+#   period   per population, the VM's state span within the window (where it
+#            could have been observed on this system).
+#   support  per population, where valid PhysC/PhysB pairs exist: first and
+#            last pair, paired days, paired minutes and coverage ratios.
+# A VM present for part of a complete month therefore shows a complete
+# window with low paired coverage; 'available' is not an approval status.
+#
+# Populations: whole-period exposure, coverage, quality and the daily
+# statistics depend only on a transform's time-of-day and weekday filters,
+# so they are stored once per population ('none', 'online', 'batch', with
+# '+no-weekends'); tails and profile values depend on the profile and are
+# stored per profile with the population they belong to.
+#
+# Extension and re-runs: a block is always recomputed from L1 over the whole
+# window, never merged from stored parts, so non-additive values (percentiles,
+# tails) are computed over the combined period and exposure is never
+# double-counted. A stored block whose window is not contained in the new
+# window is kept (rolling retention can shorten a cache), and so is a stored
+# block for a VM the new run does not report.
+# ==============================================================================
+# (Constants are declared with the other globals near the top.)
+
+# Declared PhysB identity of a cache, or undef when it has no PhysB column.
+sub _cache_physb_identity
+{
+    my ($system_cache_dir) = @_;
+    my $manifest = File::Spec->catfile($system_cache_dir, '.nfit.cache.manifest');
+    my %meta;
+    open my $fh, '<', $manifest or return undef;
+    while (my $line = <$fh>)
+    {
+        $meta{$1} = $2 if $line =~ /^\s*([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$/;
+    }
+    close $fh;
+    my @columns = map { s/^\s+|\s+$//gr } split /,/, ($meta{data_columns} // '');
+    return undef unless grep { $_ eq 'PhysB' } @columns;
+    my %sources = map { split /=/, $_, 2 } map { s/^\s+|\s+$//gr } split /;/, ($meta{column_sources} // '');
+    return { dataRevision => $meta{data_revision}, physbSource => $sources{PhysB} // 'PhysB' };
+}
+
+# Paired-derivation semantics of the configured engine ('nfit --capabilities'),
+# or undef when the engine reports none (it predates paired history).
+sub _engine_physb_semantics
+{
+    (my $quoted = $nfit_script_path) =~ s/'/'\\''/g;
+    my $text = `'$quoted' --capabilities 2>/dev/null`;
+    return undef unless $? == 0 && defined $text && $text =~ /\S/;
+    my $caps = eval { decode_json($text) };
+    return undef unless ref($caps) eq 'HASH' && $caps->{physb_derivation_version};
+    return { derivationVersion => $caps->{physb_derivation_version}, calendarRules => $caps->{calendar_rules} };
+}
+
+# Everything a stored block's validity depends on, apart from its window.
+sub _physb_history_signature
+{
+    my ($identity, $semantics, $historical_manifest) = @_;
+    require Digest::SHA;
+    return {
+        derivationVersion => $semantics->{derivationVersion},
+        calendarRules     => $semantics->{calendarRules},
+        dataRevision      => $identity->{dataRevision},
+        profileManifest   => substr(Digest::SHA::sha256_hex(JSON->new->canonical->encode($historical_manifest)), 0, 16),
+    };
+}
+
+# The PhysC history manifest exactly as the monthly analysis builds it.
+sub _physb_history_manifest
+{
+    my $runq_behavior = $runq_perc_behavior_mode // 'none';
+    return _sanitise_manifest_for_history(build_transform_manifest(\@profiles, $nfit_runq_avg_method_str, $runq_behavior));
+}
+
+sub _physb_population_key
+{
+    my ($entry) = @_;
+    return ($entry->{time_filter} // 'none') . ($entry->{no_weekends} ? '+no-weekends' : '');
+}
+
+sub _physb_round
+{
+    my ($v, $places) = @_;
+    return undef unless defined $v;
+    return 0 + sprintf("%.${places}f", $v);
+}
+
+# The analysis window of a month: the dates analysed and whether they are the
+# whole calendar month.
+sub _physb_month_window
+{
+    my ($start_str, $end_str) = @_;
+    my $first = Time::Piece->strptime(substr($start_str, 0, 7) . '-01', '%Y-%m-%d');
+    my $last  = Time::Piece->new($first->epoch)->add_months(1) - ONE_DAY;
+    return {
+        monthStart  => $first->ymd,
+        monthEnd    => $last->ymd,
+        windowStart => $start_str,
+        windowEnd   => $end_str,
+        complete    => ($start_str eq $first->ymd && $end_str eq $last->ymd) ? JSON::true : JSON::false,
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _assemble_physb_metrics
+# PURPOSE:    Builds MonthlyWorkloadAnalysis.<vm>.PhysBMetrics from the paired
+#             outputs of one monthly engine run (metrics.physb per VM state).
+#             Additive quantities are summed over states; profile values and
+#             tails come from the newest state that has them, as the PhysC
+#             ProfileValues do, and name that state.
+# RETURNS:    { vm => block }
+# ==============================================================================
+sub _assemble_physb_metrics
+{
+    my ($parsed_href, $historical_manifest, $window, $signature) = @_;
+
+    my %population_of;
+    my %percentile_of;
+    foreach my $key (keys %$historical_manifest)
+    {
+        my $entry = $historical_manifest->{$key};
+        next unless ref($entry) eq 'HASH' && ($entry->{metric} // '') eq 'PhysC';
+        $population_of{$_} = _physb_population_key($entry) for keys %{ $entry->{profiles} // {} };
+    }
+    foreach my $profile (@profiles)
+    {
+        my ($p) = ($profile->{flags} // '') =~ /(?:-p|--percentile)\s+([0-9.]+)/;
+        $percentile_of{ $profile->{name} } = 'P' . clean_perc_label($p // $DEFAULT_PERCENTILE);
+    }
+    my $pick = sub {    # the profile's own percentile, or the only one reported
+        my ($profile, $h) = @_;
+        return undef unless ref($h) eq 'HASH' && %$h;
+        my $k = $percentile_of{$profile};
+        return $h->{$k} if defined $k && exists $h->{$k};
+        my @keys = keys %$h;
+        return @keys == 1 ? $h->{ $keys[0] } : undef;
+    };
+
+    my %blocks;
+    foreach my $vm (sort keys %$parsed_href)
+    {
+        my @objects = sort { ($a->{state}{id} // 0) <=> ($b->{state}{id} // 0) }
+                      grep { ref($_) eq 'HASH' && ref(_safe_dig($_, 'metrics', 'physb')) eq 'HASH' }
+                      @{ $parsed_href->{$vm} // [] };
+        next unless @objects;
+        my $provenance = $objects[-1]{physbProvenance} // {};
+
+        my (%populations, %profiles_out);
+        foreach my $object (@objects)
+        {
+            my $state_id = $object->{state}{id};
+            foreach my $profile (sort keys %{ $object->{metrics}{physb} })
+            {
+                my $r   = $object->{metrics}{physb}{$profile};
+                my $key = $population_of{$profile} // 'unknown';
+                my $pop = $populations{$key} //= {
+                    _states => {}, _days => {}, _reasons => {}, available => 0,
+                    expectedMinutes => 0, physcMinutes => 0, pairedMinutes => 0, sumB => 0, sumC => 0,
+                    quality => { map { $_ => 0 } @PHYSB_QUALITY_COUNTERS },
+                    daily => [], context => [],
+                };
+                # Population quantities: once per state (identical across the
+                # transforms that share the population).
+                unless ($pop->{_states}{$state_id}++)
+                {
+                    my $cov = $r->{coverage} // {};
+                    my $exp = $r->{pairedExposure} // {};
+                    $pop->{expectedMinutes} += $cov->{expectedMinutes} // 0;
+                    $pop->{physcMinutes}    += $cov->{physcMinutes}    // 0;
+                    $pop->{pairedMinutes}   += $cov->{pairedMinutes}   // 0;
+                    $pop->{sumB}            += $exp->{sumB} // 0;
+                    $pop->{sumC}            += $exp->{sumC} // 0;
+                    foreach my $f (@PHYSB_QUALITY_COUNTERS)
+                    {
+                        $pop->{quality}{$f} += _safe_dig($r, 'quality', $f) // 0;
+                    }
+                    my $ceiling = _safe_dig($r, 'quality', 'ceilingCores');
+                    if (defined $ceiling && (!defined $pop->{ceilingCores} || $ceiling > $pop->{ceilingCores}))
+                    {
+                        $pop->{ceilingCores} = $ceiling;
+                        $pop->{ceilingBasis} = _safe_dig($r, 'quality', 'ceilingBasis');
+                    }
+                    foreach my $pair (['periodStart', -1], ['firstPair', -1], ['periodEnd', 1], ['lastPair', 1])
+                    {
+                        my ($f, $dir) = @$pair;
+                        my $v = $cov->{$f};
+                        next unless defined $v;
+                        $pop->{$f} = $v if !defined $pop->{$f} || ($dir < 0 ? $v lt $pop->{$f} : $v gt $pop->{$f});
+                    }
+                    if (($r->{status} // '') eq 'available') { $pop->{available}++; }
+                    elsif (defined $r->{reason})              { $pop->{_reasons}{ $r->{reason} } = 1; }
+                    foreach my $d (@{ $r->{daily} // [] })
+                    {
+                        $pop->{_days}{ $d->{date} } = 1 if ($d->{pairedMinutes} // 0) > 0;
+                        push @{ $pop->{daily} }, {
+                            date => $d->{date}, stateId => $state_id,
+                            map { $_ => $d->{$_} } qw(expectedMinutes physcMinutes pairedMinutes sumB sumC),
+                        };
+                        push @{ $pop->{context} }, {
+                            date => $d->{date}, stateId => $state_id,
+                            freqPctMean => $d->{freqPctMean}, freqPctMinutes => $d->{freqPctMinutes},
+                        } if ($d->{pairedMinutes} // 0) > 0;
+                    }
+                }
+
+                # Profile quantities: newest state with an available result.
+                my $po = $profiles_out{$profile} //= { population => $key, statesAvailable => 0, states => 0 };
+                $po->{states}++;
+                next unless ($r->{status} // '') eq 'available';
+                $po->{statesAvailable}++;
+                my $tail = $pick->($profile, $r->{tail});
+                my $pk   = $percentile_of{$profile};
+                $po->{stateId}         = $state_id;
+                $po->{profileValueB}   = $pick->($profile, $r->{profileValueB});
+                $po->{smoothedWindows} = $r->{smoothedWindows};
+                $po->{tail} = $tail ? { map { $_ => $tail->{$_} } qw(threshold windows tiesIncluded distinctDays sumB sumC busyShare) } : undef;
+                $po->{tailDaily} = [
+                    map  { { date => $_->{date}, stateId => $state_id, %{ $pick->($profile, $_->{tail}) // {} } } }
+                    grep { (($pick->($profile, $_->{tail}) // {})->{windows} // 0) > 0 } @{ $r->{daily} // [] }
+                ];
+            }
+        }
+
+        my %populations_out;
+        foreach my $key (sort keys %populations)
+        {
+            my $p = $populations{$key};
+            my $q = $p->{quality};
+            $q->{invalidPairs} = sum0(map { $q->{$_} } @PHYSB_INVALID_REASONS);
+            $q->{ceilingCores} = $p->{ceilingCores};
+            $q->{ceilingBasis} = $p->{ceilingBasis};
+            my $exp_min = $p->{expectedMinutes};
+            $populations_out{$key} = {
+                status => $p->{available} ? 'available' : 'unavailable',
+                ($p->{available} ? () : (reason => join('; ', sort keys %{ $p->{_reasons} }) || undef)),
+                Coverage => {
+                    periodStart     => $p->{periodStart},
+                    periodEnd       => $p->{periodEnd},
+                    firstPair       => $p->{firstPair},
+                    lastPair        => $p->{lastPair},
+                    pairedDays      => scalar(keys %{ $p->{_days} }),
+                    states          => scalar(keys %{ $p->{_states} }),
+                    expectedMinutes => _physb_round($exp_min, 1),
+                    physcMinutes    => _physb_round($p->{physcMinutes}, 1),
+                    pairedMinutes   => _physb_round($p->{pairedMinutes}, 1),
+                    physcCoverage   => $exp_min > 0 ? _physb_round($p->{physcMinutes} / $exp_min, 4) : undef,
+                    pairedCoverage  => $exp_min > 0 ? _physb_round($p->{pairedMinutes} / $exp_min, 4) : undef,
+                },
+                Quality        => $q,
+                PairedExposure => { sumB => _physb_round($p->{sumB}, 4), sumC => _physb_round($p->{sumC}, 4) },
+                BusyShare      => $p->{sumC} > 0 ? _physb_round($p->{sumB} / $p->{sumC}, 4) : undef,
+                DailyByState   => [ sort { $a->{date} cmp $b->{date} || ($a->{stateId} // 0) <=> ($b->{stateId} // 0) } @{ $p->{daily} } ],
+                Context        => [ sort { $a->{date} cmp $b->{date} || ($a->{stateId} // 0) <=> ($b->{stateId} // 0) } @{ $p->{context} } ],
+            };
+        }
+
+        $blocks{$vm} = {
+            schemaVersion => $PHYSB_HISTORY_SCHEMA_VERSION,
+            Source => {
+                physbSource       => $provenance->{source},
+                derivationVersion => $provenance->{derivationVersion},
+                calendarRules     => $provenance->{calendarRules},
+                dataRevision      => $provenance->{dataRevision},
+                detectedIntervalS => $provenance->{detectedIntervalS},
+                profileManifest   => $signature->{profileManifest},
+            },
+            Coverage       => { %$window },
+            Populations    => \%populations_out,
+            ProfileValuesB => { map { $_ => $profiles_out{$_}{profileValueB} } grep { defined $profiles_out{$_}{profileValueB} } keys %profiles_out },
+            TailByProfile  => { map { $_ => $profiles_out{$_}{tail} } grep { defined $profiles_out{$_}{tail} } keys %profiles_out },
+            Profiles       => { map {
+                my $po = $profiles_out{$_};
+                $_ => { map { $_ => $po->{$_} } qw(population stateId states statesAvailable smoothedWindows tailDaily) }
+            } keys %profiles_out },
+        };
+    }
+    return \%blocks;
+}
+
+# True when the stored window is not contained in the new one.
+sub _physb_window_not_contained
+{
+    my ($stored, $new) = @_;
+    return 0 unless ref($stored) eq 'HASH' && defined $stored->{windowStart} && defined $stored->{windowEnd};
+    return ($new->{windowStart} gt $stored->{windowStart} || $new->{windowEnd} lt $stored->{windowEnd}) ? 1 : 0;
+}
+
+# ==============================================================================
+# SUBROUTINE: _graft_physb_metrics
+# PURPOSE:    Places new PhysBMetrics blocks on the VMs of a month's
+#             MonthlyWorkloadAnalysis, keeping stored blocks that must not be
+#             replaced: a VM without a new block keeps its stored one; a stored
+#             block whose window is not contained in the new window is kept.
+#             Only VMs already present in the target receive a block.
+# RETURNS:    { written, kept, carried, skipped }
+# ==============================================================================
+sub _graft_physb_metrics
+{
+    my ($target_mwa, $new_blocks, $previous_mwa) = @_;
+    my %stats = (written => 0, kept => 0, carried => 0, skipped => 0);
+    foreach my $vm (sort keys %$target_mwa)
+    {
+        next unless ref($target_mwa->{$vm}) eq 'HASH';
+        my $old = _safe_dig($previous_mwa // {}, $vm, 'PhysBMetrics');
+        my $new = $new_blocks->{$vm};
+        if ($new && $old && _physb_window_not_contained($old->{Coverage}, $new->{Coverage}))
+        {
+            $target_mwa->{$vm}{PhysBMetrics} = $old;
+            $stats{kept}++;
+        }
+        elsif ($new)
+        {
+            $target_mwa->{$vm}{PhysBMetrics} = $new;
+            $stats{written}++;
+        }
+        elsif ($old)
+        {
+            $target_mwa->{$vm}{PhysBMetrics} = $old;
+            $stats{carried}++;
+        }
+    }
+    $stats{skipped} = scalar grep { !exists $target_mwa->{$_} } keys %{ $new_blocks // {} };
+    return \%stats;
+}
+
+# Records the month-level PhysB marker that makes re-runs idempotent.
+sub _physb_mark_month
+{
+    my ($metadata, $signature, $window, $stats) = @_;
+    my %features = map { $_ => 1 } @{ $metadata->{Features} // [] };
+    $features{$PHYSB_HISTORY_FEATURE} = 1;
+    $metadata->{Features} = [ sort keys %features ];
+    $metadata->{PhysB} = {
+        %$signature,
+        windowStart  => $window->{windowStart},
+        windowEnd    => $window->{windowEnd},
+        # The window last evaluated; each block also carries its own window,
+        # which differs where a wider stored block was kept or carried.
+        vmsWritten   => $stats->{written},
+        vmsKept      => $stats->{kept},
+        vmsCarried   => $stats->{carried},
+        updated      => gmtime()->datetime . 'Z',
+    };
+    return;
+}
+
+# Whether a stored month needs its PhysB blocks (re)computed for this window.
+sub _physb_month_needs_block
+{
+    my ($month_data, $signature, $window_start, $window_end) = @_;
+    my $marker = _safe_dig($month_data, 'Metadata', 'PhysB');
+    return 1 unless ref($marker) eq 'HASH';
+    return 0 if _physb_window_not_contained($marker, { windowStart => $window_start, windowEnd => $window_end });
+    return 1 if $window_start ne ($marker->{windowStart} // '') || $window_end ne ($marker->{windowEnd} // '');
+    return (grep { ($marker->{$_} // '') ne ($signature->{$_} // '') } keys %$signature) ? 1 : 0;
+}
+
+# ==============================================================================
+# SUBROUTINE: _backfill_physb_history
+# PURPOSE:    Adds PhysB blocks to stored months whose PhysC analysis is kept
+#             as it is. The monthly engine run is repeated with the paired
+#             outputs; only the PhysBMetrics blocks are taken from it.
+# ==============================================================================
+sub _backfill_physb_history
+{
+    my ($system_cache_dir, $jobs_aref, $history_data_href, $adaptive_runq_saturation_thresh, $physb) = @_;
+    foreach my $job (@$jobs_aref)
+    {
+        my $month_key = $job->{key};
+        my $start_str = $job->{start_obj}->strftime('%Y-%m-%d');
+        my $end_str   = $job->{end_obj}->strftime('%Y-%m-%d');
+        print "\n--- PhysB back-fill: $month_key (Period: $start_str to $end_str) ---\n";
+        my $fresh = _generate_monthly_workload_analysis($system_cache_dir, $start_str, $end_str,
+                                                        $adaptive_runq_saturation_thresh, $physb);
+        my %blocks = map { $_ => $fresh->{$_}{PhysBMetrics} } grep { $fresh->{$_}{PhysBMetrics} } keys %$fresh;
+        my $mwa   = $history_data_href->{$month_key}{MonthlyWorkloadAnalysis};
+        my $stats = _graft_physb_metrics($mwa, \%blocks, $mwa);
+        _physb_mark_month($history_data_href->{$month_key}{Metadata}, $physb->{signature},
+                          _physb_month_window($start_str, $end_str), $stats);
+        print STDERR "  [INFO] PhysB blocks for $month_key: $stats->{written} written, $stats->{kept} kept (wider stored window), "
+                   . "$stats->{carried} carried, $stats->{skipped} VM(s) without a stored analysis.\n";
+    }
+    return;
+}
+
+# ==============================================================================
 # SUBROUTINE: _generate_monthly_workload_analysis
 # PURPOSE:    Performs a full single-pass analysis for a given time period
 #             (typically one month) using the manifest-driven Single Pass Engine
@@ -17655,7 +18114,7 @@ sub _assemble_monthly_analysis {
 #             I/O reduction (16x for a typical 16-profile configuration).
 # ==============================================================================
 sub _generate_monthly_workload_analysis {
-    my ($system_cache_dir, $start_date_str, $end_date_str, $adaptive_runq_saturation_thresh) = @_;
+    my ($system_cache_dir, $start_date_str, $end_date_str, $adaptive_runq_saturation_thresh, $physb) = @_;
 
     print STDERR "\n  [+] Single Pass Engine (monthly analysis)\n";
 
@@ -17715,6 +18174,9 @@ sub _generate_monthly_workload_analysis {
                  . "--runq-avg-method $nfit_runq_avg_method_str "
                  . "--enable-clipping-detection "  # Historical capacity measurement
                  . "--show-progress";
+    # PhysB history (opt-in): paired outputs are additive; PhysC outputs are
+    # unchanged by the flag (I2).
+    $nfit_cmd .= " --physb-paired" if $physb;
 
     # Execute nfit once for all profiles
     print STDERR "  • Invoking nFit engine for date range: $start_date_str to $end_date_str\n";
@@ -17771,6 +18233,16 @@ sub _generate_monthly_workload_analysis {
         $start_date_str,  # Boundary for filtering
         $end_date_str     # Boundary for filtering
     );
+
+    if ($physb)
+    {
+        my $blocks = _assemble_physb_metrics($parsed_results, $historical_manifest,
+                                             _physb_month_window($start_date_str, $end_date_str), $physb->{signature});
+        foreach my $vm (keys %$blocks)
+        {
+            $analysis_results->{$vm}{PhysBMetrics} = $blocks->{$vm} if ref($analysis_results->{$vm}) eq 'HASH';
+        }
+    }
 
     return $analysis_results;
 }
@@ -19206,6 +19678,10 @@ Model behaviour depends on the event configuration:
   --update-history                          : Populate or extend the historical system snapshot cache.
                                               Discovers completed months and seasonal events from the staged data cache
                                               and records workload and forecasting snapshots for advanced analysis and adaptive scoring.
+
+  --physb-history                           : With --update-history, add PhysBMetrics blocks (paired PhysC/PhysB
+                                              exposure, coverage and tails) when the cache declares a PhysB column.
+                                              Stored months gain blocks without their PhysC analysis changing.
 
   --min-history-days <N>                    : When updating history, allow partial months with at least N days of data
                                               (Default: 28 days).
