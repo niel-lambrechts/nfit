@@ -56,7 +56,8 @@ my $VERSION = '9.26.219.0';
 # cached results changes, so that entries written by earlier versions are
 # never served.
 #   2: engine text fields are character strings; the cache read decodes once.
-my $L2_CACHE_FORMAT_VERSION = 2;
+#   3: results of caches with a PhysB column carry paired outputs (metrics.physb).
+my $L2_CACHE_FORMAT_VERSION = 3;
 
 # --- L1 data-cache schema ---
 # Versions of .nfit.cache.data this engine reads. Schema 1 is the original
@@ -82,6 +83,11 @@ my $DEFAULT_RUNQ_AVG_METHOD = "ema";
 
 my $FLOAT_EPSILON          = 1e-9; # Small number for float comparisons
 my $ACTIVE_PHYSC_THRESHOLD = 0.15; # Original threshold for RunQ normalization
+# Paired PhysC/PhysB transforms (see "Paired PhysC/PhysB transforms" below).
+my $PAIRED_GAP_FACTOR          = 1.5;          # a gap is > 1.5 x the detected interval
+my $PAIRED_B_ABOVE_C_TOLERANCE = 1e-6;         # PhysB above PhysC by more is an invalid pair
+my $PAIRED_SECONDS_PER_DAY     = 86_400;
+my $PAIRED_DERIVATION_VERSION  = 'paired-1';   # recorded in physbProvenance and history
 my $SAFETY_MARGIN_FOR_THRESHOLD_CONST = 1.05; # Safety margin for ACTIVE_PHYSC_THRESHOLD calculation
 my $PLACEHOLDER_ENTITLEMENT_ADJUSTMENT_FACTOR = 1.0; # Placeholder in ACTIVE_PHYSC_THRESHOLD calc
 
@@ -175,6 +181,7 @@ my $no_weekends_flag = 0;
 
 my ($help, $show_version, $verbose, $quiet, $show_progress_flag) = (0, 0, 0, 0, 0);
 my $show_capabilities = 0;
+my $physb_paired_flag = 0;   # --physb-paired: paired PhysC/PhysB outputs (needs a PhysB column)
 
 GetOptions(
     'manifest=s'          => \$manifest_file,
@@ -232,6 +239,7 @@ GetOptions(
     'q|quiet'             => \$quiet,
     'show-progress'       => \$show_progress_flag,
     'capabilities'        => \$show_capabilities,
+    'physb-paired'        => \$physb_paired_flag,
 ) or die usage();
 
 # Machine-readable capability report for orchestrators (nfit-profile checks
@@ -613,6 +621,7 @@ if ($manifest_file) {
     run_single_pass_from_manifest({
         # --- File/Cache Arguments ---
         manifest_file           => $manifest_file,
+        physb_paired            => $physb_paired_flag,
         nmon_dir                => $nmon_dir, # This is the resolved path from the Smart Dispatcher
 
         # --- Filtering Arguments ---
@@ -2253,6 +2262,393 @@ sub _release_publish_lock
     return;
 }
 
+# ==============================================================================
+# Paired PhysC/PhysB transforms (Increment 6, design v3.2 §3)
+# ==============================================================================
+# Active only when the L1 cache declares a PhysB column; schema-1 runs never
+# reach this code and the legacy PhysC/RunQ state, arrays and outputs are not
+# touched. The paired population is the legacy-retained rows (numeric PhysC and
+# RunQ) that pass the same date, exclusion, state and per-transform time
+# filters, and that carry a valid PhysB:
+#   valid pair   PhysB numeric, >= 0 and <= PhysC + $PAIRED_B_ABOVE_C_TOLERANCE
+#   weight       elapsed seconds since the previous valid pair of the same VM,
+#                transform and state when 0 < dt <= $PAIRED_GAP_FACTOR x the
+#                detected interval; otherwise (first pair, gap, state change,
+#                previous sample invalid) the detected interval: a sample is
+#                never given the time since a distant predecessor
+#   same second  a valid pair with dt = 0 (two samples in one UTC second) has
+#                zero elapsed time: it carries no weight, is not smoothed, and
+#                is counted, without assuming it duplicates its neighbour
+#   smoothing    the transform's own method and window (SMA, or EMA seeded by
+#                an SMA of the window), applied to C and B in lock step; the
+#                run is reset (and re-warmed) after any invalid pair, gap or
+#                state change, so a smoothed value only ever spans contiguous
+#                valid pairs of one state
+# (Constants are declared with the other engine constants near the top.)
+
+# ==============================================================================
+# SUBROUTINE: _transform_excludes_day / _transform_includes_time
+# PURPOSE:    The per-transform weekday and time-of-day filters, shared by the
+#             legacy path and the paired path's expected-time calculation so
+#             both always admit the same samples.
+#             KNOWN DEFECT (preserved): Time::Piece day_of_week is 0 = Sunday ..
+#             6 = Saturday, so the --no-weekends test below excludes Mondays
+#             and keeps weekends. Correcting it changes sizing and is a
+#             separate, reviewed change.
+# ==============================================================================
+sub _transform_excludes_day
+{
+    my ($tp) = @_;
+    my $day_of_week = $tp->day_of_week;
+    return ($day_of_week == 1 || $day_of_week == 7);
+}
+
+sub _transform_includes_time
+{
+    my ($time_filter_type, $line_time) = @_;
+    return 1 if $time_filter_type eq 'none';
+    return ($line_time ge '08:00' && $line_time lt '17:00') if $time_filter_type eq 'online';
+    return ($line_time ge '18:00' || $line_time lt '06:00') if $time_filter_type eq 'batch';
+    return 0;
+}
+
+# ==============================================================================
+# SUBROUTINE: _paired_weight
+# PURPOSE:    Elapsed-time weight (seconds) of a sample given the previous
+#             sample of its timeline: dt when 0 <= dt <= gap limit within the
+#             same state, otherwise the detected interval.
+# ==============================================================================
+sub _paired_weight
+{
+    my ($prev, $epoch, $bin, $interval_s) = @_;
+    return $interval_s unless defined $prev && defined $prev->{t} && $prev->{bin} eq $bin && !$prev->{broken};
+    my $dt = $epoch - $prev->{t};
+    return ($dt >= 0 && $dt <= $PAIRED_GAP_FACTOR * $interval_s) ? $dt : $interval_s;
+}
+
+# ==============================================================================
+# SUBROUTINE: _paired_update
+# PURPOSE:    Accumulates one legacy-retained PhysC sample (with its PhysB cell)
+#             for one VM, state bin and PhysC transform.
+# ==============================================================================
+sub _paired_update
+{
+    my ($ctx, $vm, $bin, $key, $entry, $epoch, $c, $b) = @_;
+    my $interval_s = $ctx->{interval_s};
+    my $acc = $ctx->{acc}{$vm}{$bin}{$key} //= {
+        sumB => 0, sumC => 0, w_pair => 0, w_c => 0, validPairs => 0, missingB => 0,
+        nonNumericB => 0, bAboveC => 0, sameSecondSamples => 0, resets => 0, packed => '',
+        first => undef, last => undef,
+    };
+
+    # PhysC timeline: every legacy-retained sample of this transform.
+    my $ctime = $ctx->{ctime}{$vm}{$key} //= {};
+    my $wc = _paired_weight($ctime, $epoch, $bin, $interval_s);
+    @$ctime{qw(t bin broken)} = ($epoch, $bin, 0);
+    $acc->{w_c} += $wc;
+
+    my $st = $ctx->{pstate}{$vm}{$key} //= {};
+    my $reason;
+    if (!defined $b || $b eq '')                { $reason = 'missingB'; }
+    elsif (!looks_like_number($b) || $b < 0)    { $reason = 'nonNumericB'; }
+    elsif ($b > $c + $PAIRED_B_ABOVE_C_TOLERANCE) { $reason = 'bAboveC'; }
+    if ($reason)
+    {
+        $acc->{$reason}++;
+        $st->{broken} = 1;                 # the next valid pair starts a new run
+        return;
+    }
+
+    my $dt = (defined $st->{t} && !$st->{broken} && $st->{bin} eq $bin) ? $epoch - $st->{t} : undef;
+    if (defined $dt && $dt == 0)
+    {
+        $acc->{sameSecondSamples}++;
+        return;
+    }
+    my $continuous = (defined $dt && $dt > 0 && $dt <= $PAIRED_GAP_FACTOR * $interval_s);
+    my $w = $continuous ? $dt : $interval_s;
+    unless ($continuous)
+    {
+        $acc->{resets}++ if defined $st->{t};
+        $st->{c_state} = initialise_transform_state($entry);
+        $st->{b_state} = initialise_transform_state($entry);
+    }
+    @$st{qw(t bin broken)} = ($epoch, $bin, 0);
+
+    $acc->{sumB}   += $b * $w / 60;
+    $acc->{sumC}   += $c * $w / 60;
+    $acc->{w_pair} += $w;
+    $acc->{validPairs}++;
+    $acc->{first} //= $epoch;
+    $acc->{last}    = $epoch;
+
+    my $c_smooth = update_transform_state($c, $st->{c_state});
+    my $b_smooth = update_transform_state($b, $st->{b_state});
+    if (defined $c_smooth && defined $b_smooth)
+    {
+        $acc->{packed} .= pack('f<f<L<', $c_smooth, $b_smooth, int($epoch / $PAIRED_SECONDS_PER_DAY));
+    }
+    return;
+}
+
+# ==============================================================================
+# SUBROUTINE: _paired_expected_seconds
+# PURPOSE:    Seconds in [start, end] that a transform's weekday and time-of-day
+#             filters admit, evaluated day by day with the same predicates as
+#             the sample filter.
+# ==============================================================================
+sub _paired_expected_seconds
+{
+    my ($start, $end, $entry) = @_;
+    return 0 unless defined $start && defined $end && $end > $start;
+    my $filter = $entry->{time_filter} // 'none';
+    my @allowed = $filter eq 'online' ? ([8 * 3600, 17 * 3600])
+                : $filter eq 'batch'  ? ([0, 6 * 3600], [18 * 3600, $PAIRED_SECONDS_PER_DAY])
+                :                       ([0, $PAIRED_SECONDS_PER_DAY]);
+    my $total = 0;
+    my $day = $start - ($start % $PAIRED_SECONDS_PER_DAY);
+    while ($day <= $end)
+    {
+        my $day_tp = gmtime($day);                 # scalar context: a Time::Piece object
+        my $skip = $entry->{no_weekends} && _transform_excludes_day($day_tp);
+        unless ($skip)
+        {
+            foreach my $iv (@allowed)
+            {
+                my $a = $day + $iv->[0];
+                my $z = $day + $iv->[1];
+                $a = $start if $a < $start;
+                $z = $end   if $z > $end;
+                $total += $z - $a if $z > $a;
+            }
+        }
+        $day += $PAIRED_SECONDS_PER_DAY;
+    }
+    return $total;
+}
+
+sub _paired_round
+{
+    my ($v, $places) = @_;
+    return undef unless defined $v;
+    return 0 + sprintf("%.${places}f", $v);
+}
+
+# Percentiles of a sorted list after the transform's --filter-above-perc rule,
+# exactly as finalize_results applies it to the legacy series.
+sub _paired_profile_percentiles
+{
+    my ($sorted_aref, $filter_perc, $p_list_aref) = @_;
+    my @values = @$sorted_aref;
+    if (defined $filter_perc && $filter_perc > 0 && @values)
+    {
+        my $threshold = calculate_percentile(\@values, $filter_perc);
+        @values = grep { $_ >= ($threshold - $FLOAT_EPSILON) } @values if defined $threshold;
+    }
+    return calculate_percentiles_from_packed(\@values, $p_list_aref);
+}
+
+# ==============================================================================
+# SUBROUTINE: _paired_finalize
+# PURPOSE:    Per VM, state bin and PhysC transform: whole-period paired
+#             exposure, coverage, quality, and per requested percentile the
+#             marginal busy profile value and the paired tail (design §3.3).
+#             Coverage is reported, not judged: the period is the bin's span
+#             within the analysis window and the cache's observed range;
+#             truncation at either end is flagged.
+# ==============================================================================
+sub _paired_finalize
+{
+    my ($ctx, $manifest, $states_by_vm, $args) = @_;
+    my %out;
+    foreach my $vm (keys %{ $ctx->{acc} })
+    {
+        foreach my $bin (keys %{ $ctx->{acc}{$vm} })
+        {
+            foreach my $key (keys %{ $ctx->{acc}{$vm}{$bin} })
+            {
+                my $acc   = $ctx->{acc}{$vm}{$bin}{$key};
+                my $entry = $manifest->{$key};
+
+                # Period: bin span (state or time window) within the analysis
+                # window and the cache's observed range.
+                my ($span_start, $span_end);
+                if (defined $args->{time_windows_aref} && $args->{enable_windowed_decay})
+                {
+                    my ($w) = grep { $_->{id} eq $bin } @{ $args->{time_windows_aref} };
+                    ($span_start, $span_end) = ($w->{start_obj}->epoch, $w->{end_obj}->epoch - 1) if $w;
+                }
+                elsif (my $s = $states_by_vm->{$vm}[$bin])
+                {
+                    ($span_start, $span_end) = ($s->{start_time}->epoch, $s->{end_time}->epoch);
+                }
+                my @starts = grep { defined } ($span_start, $args->{window_start}, $ctx->{range_min});
+                my @ends   = grep { defined } ($span_end, $args->{window_end}, $ctx->{range_max});
+                my $p_start = @starts ? max(@starts) : undef;
+                my $p_end   = @ends   ? min(@ends)   : undef;
+                # Each sample stands for the interval it closes, so the expected
+                # time runs one interval past the period's last instant.
+                my $expected_s = _paired_expected_seconds($p_start, defined $p_end ? $p_end + $ctx->{interval_s} : undef, $entry);
+                my $truncated_start = (defined $span_start && defined $ctx->{range_min} && $ctx->{range_min} > $span_start
+                                       && (!defined $args->{window_start} || $ctx->{range_min} > $args->{window_start})) ? JSON::true : JSON::false;
+                my $truncated_end   = (defined $span_end && defined $ctx->{range_max} && $ctx->{range_max} < $span_end
+                                       && (!defined $args->{window_end} || $ctx->{range_max} < $args->{window_end})) ? JSON::true : JSON::false;
+
+                my $paired_min = $acc->{w_pair} / 60;
+                my $physc_min  = $acc->{w_c} / 60;
+                my $expected_min = $expected_s / 60;
+                my %common = (
+                    coverage => {
+                        periodStart     => defined $p_start ? gmtime($p_start)->datetime : undef,
+                        periodEnd       => defined $p_end   ? gmtime($p_end)->datetime   : undef,
+                        expectedMinutes => _paired_round($expected_min, 1),
+                        physcMinutes    => _paired_round($physc_min, 1),
+                        pairedMinutes   => _paired_round($paired_min, 1),
+                        physcCoverage   => $expected_min > 0 ? _paired_round($physc_min / $expected_min, 4) : undef,
+                        pairedCoverage  => $expected_min > 0 ? _paired_round($paired_min / $expected_min, 4) : undef,
+                        truncatedAtStart => $truncated_start,
+                        truncatedAtEnd   => $truncated_end,
+                    },
+                    pairedExposure => {
+                        sumB => _paired_round($acc->{sumB}, 4),    # core-minutes
+                        sumC => _paired_round($acc->{sumC}, 4),
+                        pairedMinutes => _paired_round($paired_min, 1),
+                    },
+                    busyShare => $acc->{sumC} > 0 ? _paired_round($acc->{sumB} / $acc->{sumC}, 4) : undef,
+                    quality => {
+                        validPairs        => $acc->{validPairs},
+                        missingB          => $acc->{missingB},
+                        nonNumericB       => $acc->{nonNumericB},
+                        bAboveC           => $acc->{bAboveC},
+                        sameSecondSamples => $acc->{sameSecondSamples},
+                        runResets         => $acc->{resets},
+                    },
+                );
+
+                my @rows;
+                my $n = length($acc->{packed}) / 12;
+                for (my $i = 0; $i < $n; $i++)
+                {
+                    push @rows, [ unpack('f<f<L<', substr($acc->{packed}, $i * 12, 12)) ];
+                }
+                if (!$acc->{validPairs})
+                {
+                    $common{status} = 'unavailable';
+                    $common{reason} = 'no valid PhysC/PhysB pairs';
+                }
+                elsif (!@rows)
+                {
+                    $common{status} = 'unavailable';
+                    $common{reason} = 'no complete smoothed window';
+                }
+                else
+                {
+                    $common{status} = 'available';
+                }
+
+                my %percentiles_needed;
+                foreach my $prof (values %{ $entry->{profiles} // {} })
+                {
+                    $percentiles_needed{$_} = 1 for @{ $prof->{percentiles} // [] };
+                }
+                my @p_list = sort { $a <=> $b } keys %percentiles_needed;
+                my (%profile_b, %tail);
+                if (@rows)
+                {
+                    my @c_sorted = sort { $a <=> $b } map { $_->[0] } @rows;
+                    my @b_sorted = sort { $a <=> $b } map { $_->[1] } @rows;
+                    my $c_p = _paired_profile_percentiles(\@c_sorted, $entry->{filter_perc}, \@p_list);
+                    my $b_p = _paired_profile_percentiles(\@b_sorted, $entry->{filter_perc}, \@p_list);
+                    foreach my $p (@p_list)
+                    {
+                        $profile_b{"P$p"} = _paired_round($b_p->{$p}, 4);
+                        my $thr = $c_p->{$p};
+                        next unless defined $thr;
+                        my ($windows, $ties, $sb, $sc, %days) = (0, 0, 0, 0);
+                        foreach my $r (@rows)
+                        {
+                            next unless $r->[0] >= $thr - $FLOAT_EPSILON;
+                            $windows++;
+                            $ties++ if abs($r->[0] - $thr) <= $FLOAT_EPSILON;
+                            $sb += $r->[1];
+                            $sc += $r->[0];
+                            $days{ $r->[2] } = 1;
+                        }
+                        $tail{"P$p"} = {
+                            threshold    => _paired_round($thr, 4),
+                            windows      => $windows,
+                            tiesIncluded => $ties,
+                            distinctDays => scalar(keys %days),
+                            sumB         => _paired_round($sb, 4),     # sums of smoothed values
+                            sumC         => _paired_round($sc, 4),
+                            busyShare    => $sc > 0 ? _paired_round($sb / $sc, 4) : undef,
+                            meanB        => $windows ? _paired_round($sb / $windows, 4) : undef,
+                            meanC        => $windows ? _paired_round($sc / $windows, 4) : undef,
+                            meanNonBusy  => $windows ? _paired_round(($sc - $sb) / $windows, 4) : undef,
+                        };
+                    }
+                    my @ratios = sort { $a <=> $b } map { $_->[1] / $_->[0] }
+                                 grep { $_->[0] > $ACTIVE_PHYSC_THRESHOLD } @rows;
+                    my $dist = calculate_percentiles_from_packed(\@ratios, [10, 50, 90]);
+                    $common{busyShareDist} = {
+                        activeThreshold   => _paired_round($ACTIVE_PHYSC_THRESHOLD, 4),
+                        windows           => scalar(@ratios),
+                        suppressedWindows => scalar(@rows) - scalar(@ratios),
+                        P10 => _paired_round($dist->{10}, 4),
+                        P50 => _paired_round($dist->{50}, 4),
+                        P90 => _paired_round($dist->{90}, 4),
+                    };
+                }
+                $common{smoothedWindows} = scalar @rows;
+
+                foreach my $profile_name (keys %{ $entry->{profiles} // {} })
+                {
+                    my %per = %common;
+                    my @mine = map { "P$_" } @{ $entry->{profiles}{$profile_name}{percentiles} // [] };
+                    $per{profileValueB} = { map { $_ => $profile_b{$_} } grep { exists $profile_b{$_} } @mine };
+                    $per{tail}          = { map { $_ => $tail{$_} }      grep { exists $tail{$_} } @mine };
+                    $out{$vm}{$bin}{$profile_name} = \%per;
+                }
+            }
+        }
+    }
+    return \%out;
+}
+
+# ==============================================================================
+# SUBROUTINE: _attach_paired_results
+# PURPOSE:    Adds the paired results to the assembled output objects without
+#             touching any existing field: metrics.physb.<profile> on per-state
+#             objects; physbByState.<state id or window id>.<profile> on
+#             aggregated (decay) objects; physbProvenance on both.
+# ==============================================================================
+sub _attach_paired_results
+{
+    my ($objects_aref, $paired, $is_aggregated, $provenance) = @_;
+    foreach my $obj (@$objects_aref)
+    {
+        my $vm = $obj->{vmName};
+        next unless defined $vm && exists $paired->{$vm};
+        if ($is_aggregated)
+        {
+            my %by_state;
+            foreach my $bin (keys %{ $paired->{$vm} })
+            {
+                $by_state{ $bin =~ /^\d+$/ ? $bin + 1 : $bin } = $paired->{$vm}{$bin};
+            }
+            $obj->{physbByState} = \%by_state;
+        }
+        else
+        {
+            my $bin = ($obj->{state}{id} // 0) - 1;
+            next unless exists $paired->{$vm}{$bin};
+            $obj->{metrics}{physb} = $paired->{$vm}{$bin};
+        }
+        $obj->{physbProvenance} = $provenance;
+    }
+    return;
+}
+
 sub seek_to_start_date {
     my ($fh, $index, $start_date_str) = @_;
 
@@ -3065,7 +3461,12 @@ sub run_single_pass_from_manifest {
     # --- Open data cache ---
     open my $data_fh, '<:raw', $data_cache_file or die "FATAL: Cannot open $data_cache_file: $!";
     my $header = <$data_fh>; # Header determines the column layout (schema-aware)
-    my $l1_layout = _resolve_l1_layout($header, _read_cache_manifest_meta($nmon_dir), $data_cache_file);
+    my $l1_manifest_meta = _read_cache_manifest_meta($nmon_dir);
+    my $l1_layout = _resolve_l1_layout($header, $l1_manifest_meta, $data_cache_file);
+    # Paired PhysC/PhysB transforms run only on request (--physb-paired) and
+    # only when the cache declares PhysB; otherwise nothing below changes.
+    my $physb_index = ($args_ref->{physb_paired} && !$l1_layout->{legacy}) ? $l1_layout->{index}{PhysB} : undef;
+    my $paired_ctx  = defined $physb_index ? { interval_s => $detected_interval_secs } : undef;
 
     # --- Seek to start date if index available ---
     if ($cache_index) {
@@ -3133,7 +3534,7 @@ sub run_single_pass_from_manifest {
         $record_counter++;
 
         chomp $line;
-        my ($ts_str, $vm, $physc, $runq);
+        my ($ts_str, $vm, $physc, $runq, $physb);
         if ($l1_layout->{legacy})
         {
             # Schema 1 fast path: identical to the original positional parse.
@@ -3145,6 +3546,7 @@ sub run_single_pass_from_manifest {
             # columns follow and are ignored until a transform consumes them.
             my @fields = split ',', $line, -1;
             ($ts_str, $vm, $physc, $runq) = @fields[0 .. 3];
+            $physb = $fields[$physb_index] if defined $physb_index;
         }
 
         # early exit for non-numeric/corrupt data
@@ -3196,7 +3598,16 @@ sub run_single_pass_from_manifest {
             }
         }
 
+        if ($paired_ctx) {
+            # Observed range of the cache within the analysis window (all VMs).
+            my $e = $tp->epoch;
+            $paired_ctx->{range_min} = $e if !defined $paired_ctx->{range_min} || $e < $paired_ctx->{range_min};
+            $paired_ctx->{range_max} = $e if !defined $paired_ctx->{range_max} || $e > $paired_ctx->{range_max};
+        }
+
         process_data_point($tp, $vm, $physc, $runq, $manifest, $states_by_vm, \%analysis_data, \%raw_data, \%transform_states, \%persistent_transform_states, \%daily_raw_data, {
+            paired_ctx                => $paired_ctx,
+            physb                     => $physb,
             vms_to_process            => \%vms_to_process,
             start_date_str            => $start_date_str,
             end_date_str              => $end_date_str,
@@ -3342,6 +3753,28 @@ sub run_single_pass_from_manifest {
         ) };
     }
 
+    # 9b. Paired PhysC/PhysB results (additive; absent without a PhysB column)
+    if ($paired_ctx) {
+        my $window_start = defined $start_date_str
+            ? Time::Piece->strptime("$start_date_str 00:00:00", "%Y-%m-%d %H:%M:%S")->epoch : undef;
+        my $window_end = defined $end_date_str
+            ? Time::Piece->strptime("$end_date_str 23:59:59", "%Y-%m-%d %H:%M:%S")->epoch : undef;
+        my $paired_results = _paired_finalize($paired_ctx, $manifest, $states_by_vm, {
+            window_start          => $window_start,
+            window_end            => $window_end,
+            enable_windowed_decay => $args_ref->{enable_windowed_decay},
+            time_windows_aref     => $time_windows_aref,
+        });
+        my %column_sources = map { split /=/, $_, 2 } map { s/^\s+|\s+$//gr }
+                             split /;/, ($l1_manifest_meta->{column_sources} // '');
+        _attach_paired_results(\@output_objects, $paired_results, $is_aggregated_run, {
+            source            => $column_sources{PhysB} // 'PhysB',
+            derivationVersion => $PAIRED_DERIVATION_VERSION,
+            dataRevision      => $l1_manifest_meta->{data_revision},
+            detectedIntervalS => $detected_interval_secs + 0,
+        });
+    }
+
     # 10. Save new result to L2 Cache and print to STDOUT
     my $lock_file = File::Spec->catfile($nmon_dir, $CACHE_LOCK_FILE);
     save_result_to_cache($canonical_key, \@output_objects, $results_cache_path, $lock_file) if @output_objects;
@@ -3434,22 +3867,16 @@ sub process_data_point {
         my $line_time = substr($tp->hms(':'), 0, 5);
 
         # 4a. Check for --no-weekends filter.
-        if ($entry->{no_weekends}) {
-            my $day_of_week = $tp->day_of_week; # Sunday=1, Saturday=7 in Time::Piece
-            next if ($day_of_week == 1 || $day_of_week == 7);
-        }
+        # (See _transform_excludes_day for a known defect in this test.)
+        next if ($entry->{no_weekends} && _transform_excludes_day($tp));
 
         # 4b. Check for time-of-day filters (online/batch).
         my $time_filter_type = $entry->{time_filter};
-        if ($time_filter_type ne 'none') {
-            my $include_line = 0;
-            if ($time_filter_type eq 'online') {
-                $include_line = 1 if ($line_time ge '08:00' && $line_time lt '17:00');
-            } elsif ($time_filter_type eq 'batch') {
-                $include_line = 1 if ($line_time ge '18:00' || $line_time lt '06:00');
-            }
-            # Skip to the next transform if this data point is filtered out.
-            next unless $include_line;
+        next unless _transform_includes_time($time_filter_type, $line_time);
+
+        # --- Paired PhysC/PhysB path (only when the cache has a PhysB column) ---
+        if ($filters->{paired_ctx} && $entry->{metric} eq 'PhysC') {
+            _paired_update($filters->{paired_ctx}, $vm, $bin_key, $key, $entry, $ts_epoch, $physc, $filters->{physb});
         }
 
         # --- Data processing continues only if the data point was not filtered out ---
@@ -4116,6 +4543,7 @@ sub generate_manifest_key {
             growth_projection_days       => $args_href->{growth_projection_days},
             max_growth_inflation_percent => $args_href->{max_growth_inflation_percent},
             enable_clipping_detection    => $args_href->{enable_clipping_detection},
+            physb_paired                 => ($args_href->{physb_paired} ? 1 : 0),
 
             # --- Output Formatting Flags ---
             round_arg                    => $args_href->{round_arg},
@@ -5336,5 +5764,7 @@ Other:
   -v, --verbose              : Enable verbose output for debugging.
   --version                  : Display script version.
   --capabilities             : Print supported L1 schema versions and L2 cache format (JSON) and exit.
+  --physb-paired             : Add paired PhysC/PhysB outputs (metrics.physb / physbByState) when the
+                               L1 cache has a PhysB column. Additive: no existing output changes.
 END_USAGE
 }
