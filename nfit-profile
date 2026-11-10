@@ -189,6 +189,12 @@ my $VCPU_RATIO_MIN = 1.00;                              # Minimum allowable VCPU
 my $VCPU_RATIO_MAX = 2.00;                              # IBM guidance (typical): keep VCPU <= ~2.00x entitlement
 
 my $VCPU_MIN_ABS = 1;                                   # Never recommend below 1 VP
+
+# Structural feasibility checks (rationale only; see _log_structural_feasibility).
+# PowerVM accepts between a minimum and 1.00 processing units per virtual
+# processor. The minimum is 0.05 from firmware FW760 (0.10 on earlier levels).
+my $MIN_ENT_PER_VP = 0.05;                              # Minimum entitlement (cores) per VP
+my $STRUCTURAL_ENT_TOLERANCE = 0.005;                   # Entitlements are compared as shown in the CSV (two decimals)
 my $VCPU_MIN_FOR_ENT_GE_0_5_LT_1 = 1;                    # For 0.5 <= rENT < 1.0, 1 VP is sufficient
 my $VCPU_ROUND_UP_TO_EVEN = 0;                           # RETIRED: rVCPU evenisation is disabled chain-wide. This flag no
                                                          # longer gates any sizing - it only ever gated the rationale's
@@ -1918,6 +1924,33 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     Other Diagnostic Flags:\n";
         print {$LOG_FH} "                       - MicroPartitionRunQOverride: RunQ-driven VP sizing applied\n";
         print {$LOG_FH} "                         for micro-partition (<1 core entitlement) workloads.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Structural         End-of-system checks on the recommendations as a set. They change no\n";
+        print {$LOG_FH} "  Feasibility Checks recommendation; they state whether the proposals can be applied together\n";
+        print {$LOG_FH} "                     and in which order.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Planning Profile   The profile that carries an LPAR's sizing decision: the one matching its\n";
+        print {$LOG_FH} "                     configured TIER, or tier 3 on the hinted pattern (O3/B3/G3) where no\n";
+        print {$LOG_FH} "                     TIER is configured. Other profiles are alternative plans.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Pool Entitlement   For a user-defined pool: the sum of its LPARs' proposed entitlements\n";
+        print {$LOG_FH} "  Feasibility        against the pool ceiling (Pool Size). The pool limits its members'\n";
+        print {$LOG_FH} "                     combined consumption to the ceiling, so guarantees that sum above it\n";
+        print {$LOG_FH} "                     cannot all be delivered together.\n";
+        print {$LOG_FH} "                       - SHORTFALL: the proposed sum exceeds the ceiling by the stated amount.\n";
+        print {$LOG_FH} "                       - FITS: no shortfall among the LPARs analysed; conditional on the pool\n";
+        print {$LOG_FH} "                         having no member outside the analysis.\n";
+        print {$LOG_FH} "                       - Fits alone: whether one LPAR's increase fits while every other\n";
+        print {$LOG_FH} "                         member keeps its installed entitlement.\n";
+        print {$LOG_FH} "                       - Lowest sum across all profiles: each member taken at its lowest\n";
+        print {$LOG_FH} "                         profile value; a shortfall here remains under any TIER selection.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Entitlement/Width  A proposed entitlement that its VP count cannot carry. PowerVM requires\n";
+        print {$LOG_FH} "  Mismatch           0.05 x VPs <= entitlement <= VPs. A mismatch means the tactical VP\n";
+        print {$LOG_FH} "                     recommendation and the proposed entitlement cannot be applied as a pair.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Order of Change    The tactical pair is valid, but the current VP count cannot carry the\n";
+        print {$LOG_FH} "                     proposed entitlement: the VP change must be made before the entitlement.\n";
         print {$LOG_FH} "======================================================================\n\n";
     }
 
@@ -2468,6 +2501,16 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         # per system before proceeding to the next.
         if (@vm_order) {
             _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef);
+
+            # Structural feasibility checks on the completed set of
+            # recommendations (rationale only; nothing is changed).
+            my $structural_summary = _log_structural_feasibility(
+                $open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order, \@profiles, \%vm_tier_overrides);
+            if ($structural_summary->{PoolShortfalls} || $structural_summary->{WidthMismatches})
+            {
+                printf STDERR "  [WARN] Structural checks: %d pool(s) with an entitlement shortfall, %d LPAR(s) with an entitlement/VP mismatch (see rationale)\n",
+                    $structural_summary->{PoolShortfalls}, $structural_summary->{WidthMismatches};
+            }
         }
     }
 
@@ -10932,6 +10975,611 @@ sub _round_up_to_even
     $n = 1 if ($n < 1);
     $n++ if (($n % 2) == 1);
     return $n;
+}
+
+# ==============================================================================
+# Structural feasibility checks (rationale only)
+#
+# Each LPAR is sized on its own. These two checks read the recommendations of a
+# system as a set, after every LPAR has been sized. Neither changes a
+# recommendation, the CSV or the history:
+#
+#   1. Pool entitlement feasibility. The entitlements proposed for the members
+#      of a user-defined shared processor pool can add up to more than the
+#      pool's ceiling. The pool limits its members' combined consumption to
+#      that ceiling, so such guarantees cannot all be delivered together.
+#   2. Entitlement / VP consistency. PowerVM requires
+#      $MIN_ENT_PER_VP x VPs <= entitlement <= VPs. A proposed entitlement
+#      outside that band for the tactical (or the current) VP count needs a VP
+#      change before it can be applied.
+# ==============================================================================
+
+# ==============================================================================
+# SUBROUTINE: _assess_ent_vp_pair
+# PURPOSE:    Decides whether a proposed entitlement can be applied with the
+#             tactical VP recommendation, and with the current VP count.
+# ARGUMENTS:  hashref: proposed_ent, tactical_vp, current_vp (each may be undef)
+# RETURNS:    hashref: Status, ProposedEnt (as shown in the CSV), MinVPs, MaxVPs,
+#             TacticalVP, CurrentVP. Status is one of
+#               OK                   - the pair is deliverable as it stands
+#               WIDTH_BELOW_ENT      - tactical VPs are fewer than the entitlement
+#               ENT_BELOW_VP_MINIMUM - entitlement is below the minimum for the
+#                                      tactical VPs
+#               RAISE_VPS_FIRST      - tactical pair is valid; current VPs are too
+#                                      few, so VPs must rise before the entitlement
+#               REDUCE_VPS_FIRST     - tactical pair is valid; current VPs are too
+#                                      many, so VPs must fall before the entitlement
+#               UNKNOWN              - no usable entitlement or VP count
+# ==============================================================================
+sub _assess_ent_vp_pair
+{
+    my ($terms) = @_;
+    $terms = {} unless (defined $terms && ref($terms) eq 'HASH');
+
+    my %out = (
+        Status      => 'UNKNOWN',
+        ProposedEnt => undef,
+        MinVPs      => undef,
+        MaxVPs      => undef,
+        TacticalVP  => undef,
+        CurrentVP   => undef,
+    );
+
+    my $ent = $terms->{proposed_ent};
+    return \%out unless (defined $ent && looks_like_number($ent) && $ent > 0);
+
+    # Compare the value the planner reads in the CSV (two decimals).
+    my $ent_shown = sprintf('%.2f', $ent) + 0;
+    return \%out unless ($ent_shown > 0);
+
+    my $tactical = $terms->{tactical_vp};
+    my $current  = $terms->{current_vp};
+    $tactical = (defined $tactical && looks_like_number($tactical) && $tactical >= 1) ? int($tactical) : undef;
+    $current  = (defined $current  && looks_like_number($current)  && $current  >= 1) ? int($current)  : undef;
+
+    # Fewest VPs that can carry the entitlement (at most one core per VP).
+    my $min_vps = int($ent_shown);
+    if ($ent_shown - $min_vps > $FLOAT_EPSILON)
+    {
+        $min_vps++;
+    }
+    # Most VPs the entitlement can carry (minimum entitlement per VP). Zero
+    # means the entitlement is below the minimum for a single VP.
+    my $max_vps = int(($ent_shown / $MIN_ENT_PER_VP) + 1e-6);
+
+    $out{ProposedEnt} = $ent_shown;
+    $out{MinVPs}      = $min_vps;
+    $out{MaxVPs}      = $max_vps;
+    $out{TacticalVP}  = $tactical;
+    $out{CurrentVP}   = $current;
+
+    if (!defined $tactical && !defined $current)
+    {
+        return \%out;
+    }
+
+    if (defined $tactical && $tactical < $min_vps)
+    {
+        $out{Status} = 'WIDTH_BELOW_ENT';
+    }
+    elsif (defined $tactical && $tactical > $max_vps)
+    {
+        $out{Status} = 'ENT_BELOW_VP_MINIMUM';
+    }
+    elsif (defined $current && $current < $min_vps)
+    {
+        $out{Status} = 'RAISE_VPS_FIRST';
+    }
+    elsif (defined $current && $current > $max_vps)
+    {
+        $out{Status} = 'REDUCE_VPS_FIRST';
+    }
+    else
+    {
+        $out{Status} = 'OK';
+    }
+    return \%out;
+}
+
+# ==============================================================================
+# SUBROUTINE: _assess_pool_entitlement_feasibility
+# PURPOSE:    Sums the installed and the proposed entitlements of the LPARs of
+#             each user-defined pool and compares them with the pool ceiling.
+# ARGUMENTS:  arrayref of member hashrefs: vm, pool_id, pool_cpu, current_ent,
+#             proposed_ent, lowest_ent, planning_profile, tier_source.
+#             A member without a proposal keeps its current entitlement.
+# RETURNS:    arrayref of pool hashrefs, ordered by pool ID: PoolId, Status
+#             (SHORTFALL, FITS, CEILING_CONFLICT, CEILING_UNAVAILABLE), Ceiling,
+#             CeilingValues, InstalledSum, ProposedSum, LowestSum, Shortfall,
+#             LowestShortfall, InstalledExceedsCeiling, InstalledComplete,
+#             ProposedComplete, ConfiguredTierCount, Members (rows).
+# NOTES:      The default pool (ID 0) is not assessed. Values are compared as
+#             shown in the CSV (two decimals). Only the members supplied are
+#             counted: a shortfall is therefore a minimum, and FITS holds only
+#             if the pool has no other member.
+# ==============================================================================
+sub _assess_pool_entitlement_feasibility
+{
+    my ($members_aref) = @_;
+    $members_aref = [] unless (defined $members_aref && ref($members_aref) eq 'ARRAY');
+
+    my %by_pool;
+    foreach my $member (@$members_aref)
+    {
+        next unless (defined $member && ref($member) eq 'HASH');
+        my $pool_id = $member->{pool_id};
+        next unless (defined $pool_id && looks_like_number($pool_id) && $pool_id != 0);
+        push @{ $by_pool{ $pool_id + 0 } }, $member;
+    }
+
+    my @pools;
+    foreach my $pool_id (sort { $a <=> $b } keys %by_pool)
+    {
+        my @members = sort { ($a->{vm} // '') cmp ($b->{vm} // '') } @{ $by_pool{$pool_id} };
+
+        my %ceiling_seen;
+        foreach my $member (@members)
+        {
+            my $size = $member->{pool_cpu};
+            if (defined $size && looks_like_number($size) && $size > 0)
+            {
+                $ceiling_seen{ sprintf('%.2f', $size) } = 1;
+            }
+        }
+        my @ceiling_values = sort { $a <=> $b } map { $_ + 0 } keys %ceiling_seen;
+        my $ceiling = (scalar(@ceiling_values) == 1) ? $ceiling_values[0] : undef;
+
+        my ($installed_sum, $proposed_sum, $lowest_sum) = (0, 0, 0);
+        my ($installed_complete, $proposed_complete, $configured_count) = (1, 1, 0);
+        my @rows;
+        foreach my $member (@members)
+        {
+            my $current  = _structural_shown_value($member->{current_ent});
+            my $proposed = _structural_shown_value($member->{proposed_ent});
+            my $lowest   = _structural_shown_value($member->{lowest_ent});
+
+            if (defined $current)
+            {
+                $installed_sum += $current;
+            }
+            else
+            {
+                $installed_complete = 0;
+            }
+
+            # A member without a proposal keeps what it has.
+            my $proposed_used = $proposed // $current;
+            if (defined $proposed_used)
+            {
+                $proposed_sum += $proposed_used;
+            }
+            else
+            {
+                $proposed_complete = 0;
+            }
+
+            my $lowest_used = $proposed_used;
+            if (defined $lowest && (!defined $lowest_used || $lowest < $lowest_used))
+            {
+                $lowest_used = $lowest;
+            }
+            $lowest_sum += $lowest_used if (defined $lowest_used);
+
+            $configured_count++ if (($member->{tier_source} // '') eq 'CONFIGURED_TIER');
+
+            push @rows, {
+                Vm              => $member->{vm},
+                PlanningProfile => $member->{planning_profile},
+                TierSource      => $member->{tier_source},
+                Current         => $current,
+                Proposed        => $proposed,
+                Change          => (defined $current && defined $proposed) ? ($proposed - $current) : undef,
+                SumIfAlone      => undef,
+                FitsAlone       => undef,
+            };
+        }
+
+        # For each proposed increase: does it fit if every other member keeps
+        # its installed entitlement?
+        if (defined $ceiling && $installed_complete)
+        {
+            foreach my $row (@rows)
+            {
+                next unless (defined $row->{Change} && $row->{Change} > $STRUCTURAL_ENT_TOLERANCE);
+                $row->{SumIfAlone} = $installed_sum + $row->{Change};
+                $row->{FitsAlone}  = ($row->{SumIfAlone} <= $ceiling + $STRUCTURAL_ENT_TOLERANCE) ? 1 : 0;
+            }
+        }
+
+        my %pool = (
+            PoolId                  => $pool_id,
+            Status                  => 'FITS',
+            Ceiling                 => $ceiling,
+            CeilingValues           => \@ceiling_values,
+            InstalledSum            => $installed_sum,
+            ProposedSum             => $proposed_sum,
+            LowestSum               => $lowest_sum,
+            Shortfall               => 0,
+            LowestShortfall         => 0,
+            InstalledExceedsCeiling => 0,
+            InstalledComplete       => $installed_complete,
+            ProposedComplete        => $proposed_complete,
+            ConfiguredTierCount     => $configured_count,
+            Members                 => \@rows,
+        );
+
+        if (!defined $ceiling)
+        {
+            $pool{Status} = scalar(@ceiling_values) ? 'CEILING_CONFLICT' : 'CEILING_UNAVAILABLE';
+        }
+        else
+        {
+            if ($proposed_sum > $ceiling + $STRUCTURAL_ENT_TOLERANCE)
+            {
+                $pool{Status}    = 'SHORTFALL';
+                $pool{Shortfall} = $proposed_sum - $ceiling;
+            }
+            if ($lowest_sum > $ceiling + $STRUCTURAL_ENT_TOLERANCE)
+            {
+                $pool{LowestShortfall} = $lowest_sum - $ceiling;
+            }
+            if ($installed_sum > $ceiling + $STRUCTURAL_ENT_TOLERANCE)
+            {
+                $pool{InstalledExceedsCeiling} = 1;
+            }
+        }
+        push @pools, \%pool;
+    }
+    return \@pools;
+}
+
+# A positive entitlement as the CSV shows it (two decimals), else undef.
+sub _structural_shown_value
+{
+    my ($value) = @_;
+    return undef unless (defined $value && looks_like_number($value) && $value > 0);
+    my $shown = sprintf('%.2f', $value) + 0;
+    return ($shown > 0) ? $shown : undef;
+}
+
+# Tactical VP recommendation of one profile, as the CSV shows it: the Tactical
+# value, else the profile's rVCPU. Returns undef when neither is available.
+sub _structural_tactical_vp
+{
+    my ($core, $profile_name) = @_;
+    return undef unless (defined $core && ref($core) eq 'HASH' && defined $profile_name);
+    foreach my $key (qw(Profile_rVCPU_Tactical Profile_rVCPU))
+    {
+        next unless (defined $core->{$key} && ref($core->{$key}) eq 'HASH');
+        my $value = $core->{$key}{$profile_name};
+        return $value + 0 if (defined $value && looks_like_number($value) && $value >= 1);
+    }
+    return undef;
+}
+
+# Planner-facing text for a non-OK entitlement / VP pair: (finding, action).
+sub _describe_ent_vp_pair
+{
+    my ($pair, $strategic_vp) = @_;
+    my $status   = $pair->{Status} // '';
+    my $tactical = $pair->{TacticalVP};
+    my $current  = $pair->{CurrentVP};
+    my $context  = '';
+    my @bits;
+    push @bits, "current $current" if (defined $current);
+    push @bits, 'strategic rVCPU ' . int($strategic_vp)
+        if (defined $strategic_vp && looks_like_number($strategic_vp) && $strategic_vp >= 1);
+    $context = ' (' . join(', ', @bits) . ')' if (@bits);
+
+    if ($status eq 'WIDTH_BELOW_ENT')
+    {
+        return (
+            sprintf("ENTITLEMENT/WIDTH MISMATCH: proposed ENT %.2f needs at least %d VPs; the tactical VP recommendation is %d%s.",
+                $pair->{ProposedEnt}, $pair->{MinVPs}, $tactical, $context),
+            sprintf("Raise VPs to %d or more before the entitlement can be applied.", $pair->{MinVPs}),
+        );
+    }
+    if ($status eq 'ENT_BELOW_VP_MINIMUM' && $pair->{MaxVPs} < 1)
+    {
+        return (
+            sprintf("ENTITLEMENT/WIDTH MISMATCH: proposed ENT %.2f is below the minimum for a single VP (%.2f cores).",
+                $pair->{ProposedEnt}, $MIN_ENT_PER_VP),
+            sprintf("Hold the entitlement at %.2f or more.", $tactical * $MIN_ENT_PER_VP),
+        );
+    }
+    if ($status eq 'ENT_BELOW_VP_MINIMUM')
+    {
+        return (
+            sprintf("ENTITLEMENT/WIDTH MISMATCH: proposed ENT %.2f carries at most %d VPs (%.2f cores per VP minimum); the tactical VP recommendation is %d%s.",
+                $pair->{ProposedEnt}, $pair->{MaxVPs}, $MIN_ENT_PER_VP, $tactical, $context),
+            sprintf("Reduce VPs to %d or fewer first, or hold the entitlement at %.2f or more.",
+                $pair->{MaxVPs}, $tactical * $MIN_ENT_PER_VP),
+        );
+    }
+    if ($status eq 'RAISE_VPS_FIRST')
+    {
+        return (
+            sprintf("ORDER OF CHANGE: proposed ENT %.2f needs at least %d VPs and the LPAR has %d.",
+                $pair->{ProposedEnt}, $pair->{MinVPs}, $current),
+            sprintf("Raise VPs%s before the entitlement.",
+                (defined $tactical ? " (tactical recommendation $tactical)" : '')),
+        );
+    }
+    if ($status eq 'REDUCE_VPS_FIRST')
+    {
+        return (
+            sprintf("ORDER OF CHANGE: proposed ENT %.2f carries at most %d VPs and the LPAR has %d.",
+                $pair->{ProposedEnt}, $pair->{MaxVPs}, $current),
+            sprintf("Reduce VPs%s before the entitlement.",
+                (defined $tactical ? " (tactical recommendation $tactical)" : '')),
+        );
+    }
+    return ('', '');
+}
+
+# ==============================================================================
+# SUBROUTINE: _log_structural_feasibility
+# PURPOSE:    Runs both structural checks for one system and writes the
+#             "Structural Feasibility Checks" section to its rationale log.
+#             Reads the assimilation map only; nothing in it is changed.
+# ARGUMENTS:  1. rationale log file handle (may be undef: nothing is written)
+#             2. assimilation map (hashref)   3. VM order (arrayref)
+#             4. loaded profiles (arrayref)   5. configured VM tiers (hashref)
+# RETURNS:    hashref: PoolsAssessed, PoolShortfalls, WidthMismatches, OrderNotes
+#             (the last two count LPARs, on their planning profile).
+# ==============================================================================
+sub _log_structural_feasibility
+{
+    my ($log_fh, $map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href) = @_;
+
+    my %summary = (PoolsAssessed => 0, PoolShortfalls => 0, WidthMismatches => 0, OrderNotes => 0);
+    return \%summary unless (defined $map_ref && ref($map_ref) eq 'HASH'
+        && defined $vm_order_aref && ref($vm_order_aref) eq 'ARRAY' && @$vm_order_aref);
+    $profiles_aref       = [] unless (defined $profiles_aref && ref($profiles_aref) eq 'ARRAY');
+    $tier_overrides_href = {} unless (defined $tier_overrides_href && ref($tier_overrides_href) eq 'HASH');
+
+    # Actionable profiles: those shown in the CSV, without the measurement-only
+    # peak helper.
+    my @actionable = map { $_->{name} }
+        grep { ref($_) eq 'HASH' && $_->{csv_output} && defined $_->{name}
+               && $_->{name} ne $MANDATORY_PEAK_PROFILE_FOR_HINT } @$profiles_aref;
+
+    my (@members, @vm_findings);
+    foreach my $vm_name (@$vm_order_aref)
+    {
+        next unless (exists $map_ref->{$vm_name} && ref($map_ref->{$vm_name}) eq 'HASH');
+        my $vm_map  = $map_ref->{$vm_name};
+        my $cfg     = (exists $vm_map->{Configuration} && ref($vm_map->{Configuration}) eq 'HASH') ? $vm_map->{Configuration} : {};
+        my $core    = (exists $vm_map->{CoreResults}   && ref($vm_map->{CoreResults}) eq 'HASH')   ? $vm_map->{CoreResults}   : {};
+        my $hinting = (exists $vm_map->{Hinting}       && ref($vm_map->{Hinting}) eq 'HASH')       ? $vm_map->{Hinting}       : {};
+        my $values  = (exists $core->{ProfileValues}   && ref($core->{ProfileValues}) eq 'HASH')   ? $core->{ProfileValues}   : {};
+
+        # The planning profile resolved for the CSV; resolved here only if the
+        # map does not carry it.
+        my $planning = $hinting->{ResolvedPlanningProfile};
+        my $source   = $hinting->{TierPolicySource};
+        if (!defined $planning || $planning eq '')
+        {
+            my $resolved = _resolve_vm_tier_pattern_policy(
+                ($tier_overrides_href->{$vm_name} // ''), ($hinting->{AutoTier} // ''), $profiles_aref);
+            $planning = $resolved->{ResolvedPlanningProfile};
+            $source   = $resolved->{TierPolicySource};
+        }
+
+        my $proposed = (defined $planning && exists $values->{$planning}) ? $values->{$planning} : undef;
+        $proposed = undef unless (defined $proposed && looks_like_number($proposed) && $proposed > 0);
+
+        my $current_vp = $cfg->{virtual_cpus};
+        my ($lowest, %pair_by_profile);
+        foreach my $profile_name (@actionable)
+        {
+            next unless (exists $values->{$profile_name});
+            my $value = $values->{$profile_name};
+            next unless (defined $value && looks_like_number($value) && $value > 0);
+            $lowest = $value if (!defined $lowest || $value < $lowest);
+
+            my $pair = _assess_ent_vp_pair({
+                proposed_ent => $value,
+                tactical_vp  => _structural_tactical_vp($core, $profile_name),
+                current_vp   => $current_vp,
+            });
+            if ($pair->{Status} ne 'OK' && $pair->{Status} ne 'UNKNOWN')
+            {
+                $pair_by_profile{$profile_name} = $pair;
+            }
+        }
+
+        push @members, {
+            vm               => $vm_name,
+            pool_id          => $cfg->{pool_id},
+            pool_cpu         => $cfg->{pool_cpu},
+            current_ent      => $cfg->{entitlement},
+            proposed_ent     => $proposed,
+            lowest_ent       => $lowest,
+            planning_profile => $planning,
+            tier_source      => $source,
+        };
+
+        if (%pair_by_profile)
+        {
+            my $strategic = (exists $core->{Profile_rVCPU} && ref($core->{Profile_rVCPU}) eq 'HASH'
+                && defined $planning) ? $core->{Profile_rVCPU}{$planning} : undef;
+            push @vm_findings, {
+                vm        => $vm_name,
+                planning  => $planning,
+                strategic => $strategic,
+                pairs     => \%pair_by_profile,
+            };
+            my $planning_status = (defined $planning && exists $pair_by_profile{$planning})
+                ? $pair_by_profile{$planning}{Status} : 'OK';
+            if ($planning_status eq 'WIDTH_BELOW_ENT' || $planning_status eq 'ENT_BELOW_VP_MINIMUM')
+            {
+                $summary{WidthMismatches}++;
+            }
+            elsif ($planning_status ne 'OK')
+            {
+                $summary{OrderNotes}++;
+            }
+        }
+    }
+
+    my $pools = _assess_pool_entitlement_feasibility(\@members);
+    $summary{PoolsAssessed}  = scalar(@$pools);
+    $summary{PoolShortfalls} = scalar(grep { $_->{Status} eq 'SHORTFALL' } @$pools);
+
+    return \%summary unless (defined $log_fh && ref($log_fh));
+
+    my $rule = '-' x 70;
+    my @out;
+    push @out, '', '=' x 70, 'Structural Feasibility Checks', '=' x 70;
+    push @out, "  These checks read the recommendations as a set. They change no recommendation.";
+    push @out, "  Basis: each LPAR's planning profile (its configured TIER; tier 3 on the hinted";
+    push @out, "  pattern where no TIER is configured) and the configuration shown in the CSV.";
+    push @out, '';
+    push @out, "  A. Pool Entitlement Feasibility (user-defined pools)", "  $rule";
+
+    if (!@$pools)
+    {
+        push @out, "    No LPAR in this analysis is in a user-defined pool.";
+    }
+    foreach my $pool (@$pools)
+    {
+        my $n_members = scalar(@{ $pool->{Members} });
+        my %title = (
+            SHORTFALL           => 'SHORTFALL',
+            FITS                => 'FITS (among the LPARs analysed)',
+            CEILING_CONFLICT    => 'CEILING UNCONFIRMED',
+            CEILING_UNAVAILABLE => 'CEILING UNAVAILABLE',
+        );
+        push @out, sprintf("    Pool %s - %s", $pool->{PoolId}, $title{ $pool->{Status} } // $pool->{Status});
+
+        if (defined $pool->{Ceiling})
+        {
+            push @out, sprintf("      - Pool ceiling (Pool Size)       : %.2f cores", $pool->{Ceiling});
+        }
+        elsif ($pool->{Status} eq 'CEILING_CONFLICT')
+        {
+            push @out, sprintf("      - Pool ceiling (Pool Size)       : members report different sizes (%s); no verdict is given",
+                join(', ', map { sprintf('%.2f', $_) } @{ $pool->{CeilingValues} }));
+        }
+        else
+        {
+            push @out, "      - Pool ceiling (Pool Size)       : not reported; no verdict is given";
+        }
+        push @out, sprintf("      - LPARs analysed in the pool     : %d (%d with a configured TIER, %d on default tier 3)",
+            $n_members, $pool->{ConfiguredTierCount}, $n_members - $pool->{ConfiguredTierCount});
+        push @out, sprintf("      - Installed entitlement (sum)    : %.2f cores%s%s", $pool->{InstalledSum},
+            ((defined $pool->{Ceiling} && !$pool->{InstalledExceedsCeiling} && $pool->{InstalledComplete})
+                ? sprintf(" (%.2f below the ceiling)", $pool->{Ceiling} - $pool->{InstalledSum}) : ''),
+            ($pool->{InstalledComplete} ? '' : ' (incomplete: an LPAR reports no entitlement)'));
+        push @out, sprintf("      - Proposed entitlement (sum)     : %.2f cores%s", $pool->{ProposedSum},
+            ($pool->{ProposedComplete} ? '' : ' (incomplete)'));
+        if ($pool->{Status} eq 'SHORTFALL')
+        {
+            push @out, sprintf("      - Shortfall                      : %.2f cores", $pool->{Shortfall});
+            if ($pool->{LowestShortfall} > 0)
+            {
+                push @out, sprintf("      - Lowest sum across all profiles : %.2f cores (a shortfall of %.2f remains under any profile selection)",
+                    $pool->{LowestSum}, $pool->{LowestShortfall});
+            }
+            else
+            {
+                push @out, sprintf("      - Lowest sum across all profiles : %.2f cores (within the ceiling: the shortfall depends on the TIER selection)",
+                    $pool->{LowestSum});
+            }
+        }
+        if ($pool->{InstalledExceedsCeiling})
+        {
+            push @out, "      - Note: the installed entitlements already exceed the reported ceiling. Verify the";
+            push @out, "        pool's configured maximum and its membership before acting on this result.";
+        }
+
+        if ($pool->{Status} eq 'SHORTFALL' || $pool->{Status} eq 'CEILING_CONFLICT')
+        {
+            push @out, sprintf("      %-28s %-22s %8s %9s %8s  %s", 'LPAR', 'Planning profile', 'Current', 'Proposed', 'Change', 'Fits alone');
+            push @out, sprintf("      %-28s %-22s %8s %9s %8s  %s", '-' x 28, '-' x 22, '-' x 8, '-' x 9, '-' x 8, '-' x 10);
+            foreach my $row (@{ $pool->{Members} })
+            {
+                my $profile_label = ($row->{PlanningProfile} // '?')
+                    . ((($row->{TierSource} // '') eq 'CONFIGURED_TIER') ? '' : ' (default)');
+                my $fits = '';
+                if (defined $row->{FitsAlone})
+                {
+                    $fits = $row->{FitsAlone} ? 'Yes' : sprintf('No (%.2f)', $row->{SumIfAlone});
+                }
+                push @out, sprintf("      %-28s %-22s %8s %9s %8s  %s",
+                    ($row->{Vm} // '?'), $profile_label,
+                    (defined $row->{Current}  ? sprintf('%.2f', $row->{Current})  : 'n/a'),
+                    (defined $row->{Proposed} ? sprintf('%.2f', $row->{Proposed}) : 'kept'),
+                    (defined $row->{Change}   ? sprintf('%+.2f', $row->{Change})  : ''),
+                    $fits);
+            }
+        }
+        if ($pool->{Status} eq 'SHORTFALL')
+        {
+            push @out, "      - Meaning: the pool limits its members' combined consumption to the ceiling, so these";
+            push @out, "        guarantees cannot all be delivered together. \"Fits alone\" shows whether one increase";
+            push @out, "        fits while every other member keeps its installed entitlement.";
+            push @out, "      - Options: review the competing guarantees within the pool, or the pool ceiling (a";
+            push @out, "        licensing decision). More VPs do not add capacity to a pool at its ceiling.";
+        }
+        push @out, '';
+    }
+    push @out, "    Notes: a pool is assessed from the LPARs in this analysis whose current configuration";
+    push @out, "    places them in it. A member absent from the data is not counted, so a shortfall is a";
+    push @out, "    minimum and FITS is conditional on the membership being complete. Sums use the";
+    push @out, "    entitlements shown in the CSV; any rounding up applied later can only raise them. The";
+    push @out, "    default pool (ID 0) is not assessed.";
+    push @out, '';
+    push @out, "  B. Entitlement / VP Consistency", "  $rule";
+    push @out, sprintf("    PowerVM requires %.2f x VPs <= entitlement <= VPs. Each profile's proposed entitlement is", $MIN_ENT_PER_VP);
+    push @out, "    compared with its tactical VP recommendation and with the current VP count.";
+
+    if (!@vm_findings)
+    {
+        push @out, "    No inconsistency found.";
+    }
+    my %group_of = (
+        WIDTH_BELOW_ENT      => 'entitlement/width mismatch',
+        ENT_BELOW_VP_MINIMUM => 'entitlement/width mismatch',
+        RAISE_VPS_FIRST      => 'order of change',
+        REDUCE_VPS_FIRST     => 'order of change',
+    );
+    foreach my $finding (@vm_findings)
+    {
+        my $planning = $finding->{planning} // '';
+        push @out, sprintf("    %s (planning profile %s)", $finding->{vm}, ($planning ne '' ? $planning : 'unresolved'));
+        if ($planning ne '' && exists $finding->{pairs}{$planning})
+        {
+            my ($found, $action) = _describe_ent_vp_pair($finding->{pairs}{$planning}, $finding->{strategic});
+            push @out, "      - $found", "        $action";
+        }
+        else
+        {
+            push @out, "      - Planning profile: consistent.";
+        }
+        # Other profiles are alternative plans for the same LPAR: named by
+        # finding, with their figures left to the CSV.
+        my (%others, @others);
+        foreach my $profile_name (grep { exists $finding->{pairs}{$_} && $_ ne $planning } @actionable)
+        {
+            my $group = $group_of{ $finding->{pairs}{$profile_name}{Status} } // 'other';
+            push @{ $others{$group} }, $profile_name;
+        }
+        foreach my $group ('entitlement/width mismatch', 'order of change')
+        {
+            next unless (exists $others{$group});
+            push @others, "$group in " . join(', ', @{ $others{$group} });
+        }
+        if (@others)
+        {
+            push @out, "      - Other profiles (alternative plans): " . join('; ', @others);
+        }
+    }
+    push @out, '';
+
+    print {$log_fh} join("\n", @out) . "\n";
+    return \%summary;
 }
 
 # ==============================================================================
