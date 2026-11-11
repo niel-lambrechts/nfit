@@ -6,7 +6,7 @@
 # with the figures in the CSV of the same run (planning profile by configured
 # TIER, else tier 3 on the hinted pattern), that the shortfall and the
 # entitlement/VP findings follow from those figures, and that the CSV carries
-# no trace of the checks.
+# only the two major alerts, leading VM_Comments, on the rows they concern.
 # ==============================================================================
 import calendar
 import csv
@@ -124,11 +124,31 @@ class StructuralFeasibilityTests(unittest.TestCase):
     def section(self):
         return self.log[self.log.index('Structural Feasibility Checks'):]
 
-    def test_run_succeeds_and_csv_carries_no_trace(self):
+    def test_run_succeeds(self):
         self.assertEqual(self.proc.returncode, 0, self.proc.stderr[-1500:])
         self.assertEqual(set(self.rows), set(VMS))
-        for word in ('SHORTFALL', 'MISMATCH', 'Structural', 'ORDER OF CHANGE'):
-            self.assertNotIn(word, self.csv_text)
+
+    def test_csv_carries_only_the_major_alerts_in_vm_comments(self):
+        members = [vm for vm, v in VMS.items() if v[2] == POOL_ID]
+        proposed = sum(float(self.rows[vm][self.planning_profile(vm)]) for vm in members)
+        short = proposed > POOL_SIZE + 0.005
+        for vm in VMS:
+            profile = self.planning_profile(vm)
+            ent = round(float(self.rows[vm][profile]), 2)
+            tactical = int(self.rows[vm][profile + '_rVCPU_Tactical'])
+            mismatch = tactical < math.ceil(ent - 1e-9) or tactical > int(ent / MIN_ENT_PER_VP + 1e-6)
+            expected = (['[POOL_SHORTFALL]'] if short and vm in members else []) + (['[VP_MISMATCH]'] if mismatch else [])
+            comments = self.rows[vm]['VM_Comments']
+            found = re.findall(r'\[(?:POOL_SHORTFALL|VP_MISMATCH)\]', comments)
+            self.assertEqual(found, expected, vm)
+            if expected:                                       # alerts lead; other comments follow
+                self.assertTrue(comments.startswith('; '.join(expected)), comments)
+            for column, value in self.rows[vm].items():        # nowhere else in the row
+                if column != 'VM_Comments':
+                    self.assertNotIn('SHORTFALL', value or '')
+                    self.assertNotIn('MISMATCH', value or '')
+        self.assertNotIn('ORDER OF CHANGE', self.csv_text)     # order notes stay in the rationale
+        self.assertNotIn('Structural', self.csv_text)
 
     def test_pool_sums_agree_with_the_csv(self):
         members = [vm for vm, v in VMS.items() if v[2] == POOL_ID]
@@ -177,7 +197,7 @@ class StructuralFeasibilityTests(unittest.TestCase):
     def test_terms_used_are_defined_in_the_terminology_reference(self):
         reference = self.log[self.log.index('Key Terminology Reference'):self.log.index('Structural Feasibility Checks\n')]
         for term in ('Planning Profile', 'Pool Entitlement', 'Entitlement/Width', 'Order of Change', 'Fits alone',
-                     'Lowest sum across all profiles'):
+                     'Lowest sum across all profiles', '[POOL_SHORTFALL]', '[VP_MISMATCH]'):
             self.assertIn(term, reference)
 
 

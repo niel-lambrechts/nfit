@@ -2,8 +2,9 @@
 # ==============================================================================
 # TEST FILE: test/structural_feasibility.t
 # PURPOSE:   Regression cover for the structural feasibility checks written to
-#            the rationale log: pool entitlement feasibility and entitlement /
-#            VP consistency. The live subroutines are extracted from nfit-profile
+#            the rationale log and flagged in the CSV VM_Comments column: pool
+#            entitlement feasibility and entitlement / VP consistency. The live
+#            subroutines are extracted from nfit-profile
 #            and evaluated in an isolated package, so the assertions run against
 #            production source, not a copy.
 # USAGE:     perl test/structural_feasibility.t   (or through dev/run-tests)
@@ -22,6 +23,7 @@ close $fh;
 my @names = qw(
     _assess_ent_vp_pair _assess_pool_entitlement_feasibility
     _structural_shown_value _structural_tactical_vp _describe_ent_vp_pair
+    _collect_structural_findings _structural_csv_tags
     _log_structural_feasibility _resolve_vm_tier_pattern_policy
 );
 my $code = '';
@@ -264,6 +266,30 @@ like($buffer, qr/Pool 40 - SHORTFALL.*?Shortfall\s+: 1\.00 cores\n\s+- Lowest su
 like($buffer, qr/w1 \(planning profile G3-95W15\)\n\s+- ENTITLEMENT\/WIDTH MISMATCH: proposed ENT 0\.47 carries at most 9 VPs \(0\.05 cores per VP minimum\); the tactical VP recommendation is 12 \(current 16\)\.\n\s+Reduce VPs to 9 or fewer first, or hold the entitlement at 0\.60 or more\./,
     'an entitlement below the minimum for the tactical VPs is a mismatch, with the entitlement that would hold');
 is($summary->{WidthMismatches}, 1, '  and is counted');
+
+like($buffer, qr/PowerVM requires 0\.05 x VPs <= entitlement <= VPs \(the 0\.05 minimum applies on supported\n\s+firmware and operating system levels\)/,
+    'the firmware condition on the minimum is stated');
+like($buffer, qr/The HMC counts the pool's reserved capacity and every member's entitlement\./, 'what FITS leaves out is stated');
+like($buffer, qr/It is not evidence that the pool ran\n\s+out of capacity/, 'a shortfall is distinguished from pool depletion');
+
+# --- _structural_csv_tags ---------------------------------------------------------
+my $tags = UUT::_structural_csv_tags(UUT::_collect_structural_findings(\%map, \@order, \@profiles, \%tiers));
+is_deeply($tags, {
+    lparA => ['[POOL_SHORTFALL]'], lparB => ['[POOL_SHORTFALL]'], lparC => ['[POOL_SHORTFALL]'],
+    lparD => ['[POOL_SHORTFALL]', '[VP_MISMATCH]'],
+}, 'every member of the short pool is tagged; the mismatched LPAR carries both alerts; an order note is not an alert');
+is($canon->encode(\%map), $before, 'collecting the findings leaves the assimilation map as it was');
+$tags = UUT::_structural_csv_tags(UUT::_collect_structural_findings(\%map2, [qw(f1 f2 c1 c2 t1 t2 w1)], \@profiles, {}));
+is_deeply($tags, { t1 => ['[POOL_SHORTFALL]'], t2 => ['[POOL_SHORTFALL]'], w1 => ['[VP_MISMATCH]'] },
+    'a pool that fits or has an unconfirmed ceiling is not tagged; an entitlement below the VP minimum is');
+is_deeply(UUT::_structural_csv_tags(UUT::_collect_structural_findings({}, [], \@profiles, {})), {}, 'empty analysis: no alerts');
+is_deeply(UUT::_structural_csv_tags(undef), {}, 'no findings: no alerts');
+# A finding on another profile only (planning profile consistent) is not an alert.
+$tags = UUT::_structural_csv_tags(UUT::_collect_structural_findings(
+    { alt => { Configuration => { entitlement => 0.5, virtual_cpus => 1, pool_id => 0, pool_cpu => 16 }, Hinting => {},
+               CoreResults => { ProfileValues => { 'P-99W1' => 1.5, 'G3-95W15' => 0.8 },
+                                Profile_rVCPU_Tactical => { 'P-99W1' => 1, 'G3-95W15' => 1 } } } }, ['alt'], \@profiles, {}));
+is_deeply($tags, {}, 'a mismatch on an alternative profile alone is not a CSV alert');
 
 # No log handle: the summary is still returned and nothing is written.
 $summary = UUT::_log_structural_feasibility(undef, \%map, \@order, \@profiles, \%tiers);
