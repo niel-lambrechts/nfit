@@ -592,6 +592,26 @@ my $physb_history_flag = 0;  # --physb-history: PhysBMetrics blocks in monthly h
 # PhysB history constants (see the PhysB history section)
 my $PHYSB_HISTORY_SCHEMA_VERSION = 1;
 my $PHYSB_HISTORY_FEATURE        = 'PhysB-v1';
+
+# --pool-history: observed pool busy and configuration in monthly history (opt-in).
+my $pool_history_flag = 0;
+my $POOL_HISTORY_PROJECTION = 'observed-pool-busy-1';   # what a reader may expect in the block
+my $POOL_HISTORY_FEATURE    = 'PoolBusy-observed-1';
+my $POOL_OBSERVATIONS_FILE  = '.nfit.cache.pool.observations.csv.gz';
+# The mechanical reduction of pool observations. Any change here changes the
+# reduction hash, so stored blocks are recomputed.
+my %POOL_REDUCTION = (
+    version               => 'pool-busy-reduction-1',
+    minute                => 'utc-half-open',
+    representative        => 'nearest-minute-midpoint',
+    alignToleranceSeconds => 30,
+    acrossReporters       => 'median',
+    rangeAbsCores         => 0.05,      # a busy reading above size x (1 + rangeRel) + rangeAbsCores is not credible
+    rangeRel              => 0.01,
+    quantiles             => 'linear-interpolation-at-rank-(n-1)p',
+    stateBridgeSeconds    => 120,       # a state runs to the next when that starts this soon after its last sample
+    precision             => 4,
+);
 my @PHYSB_INVALID_REASONS  = qw(missingB nonNumericB bAboveC nonFiniteC cAboveCeiling bAboveCeiling);
 my @PHYSB_QUALITY_COUNTERS = (qw(validPairs sameSecondSamples runResets freqPctUnavailable), @PHYSB_INVALID_REASONS);
 my $min_history_days_arg;    # New flag for partial month processing
@@ -638,6 +658,7 @@ GetOptions(
     'seasonal-scope=s'           => \$seasonal_scope,
     'update-history'             => \$update_history_flag,
     'physb-history'              => \$physb_history_flag,
+    'pool-history'               => \$pool_history_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
@@ -15447,6 +15468,15 @@ sub update_monthly_history {
         }
     }
 
+    # --- Pool history (opt-in, --pool-history) ---
+    my $pool_context;
+    if ($pool_history_flag)
+    {
+        $pool_context = _pool_history_context($system_cache_dir);
+        print STDERR "  ↳  --pool-history: the cache holds no pool observations; no pool blocks are written\n" unless $pool_context;
+    }
+    my @pool_months;       # months whose pool block is absent or out of date
+
     # --- Step 1: Load existing history ONCE ---
     my $history_data = read_unified_history($system_cache_dir);
     my @months_to_process;
@@ -15496,6 +15526,16 @@ sub update_monthly_history {
             print STDERR "  ↳  PhysB blocks absent or out of date for $month_key; stored PhysC analysis is kept\n";
             push @physb_months, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period };
         }
+        if ($pool_context && $days_in_period > 0
+            && ($should_process || ref(_safe_dig($history_data, $month_key, 'MonthlyWorkloadAnalysis')) eq 'HASH'))
+        {
+            my ($window_start, $window_end) = _pool_job_window($effective_start_obj, $effective_end_obj);
+            if (_pool_month_needs_block(($history_data->{$month_key} // {}), $pool_context->{signature},
+                                        _pool_iso($window_start), _pool_iso($window_end)))
+            {
+                push @pool_months, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period };
+            }
+        }
         $iterator_month = $iterator_month->add_months(1);
     }
     print STDERR "  ✓ Data Cache examination complete\n";
@@ -15505,7 +15545,7 @@ sub update_monthly_history {
         my $first_month_key = $months_to_process[0]{key};
         _validate_pre_update_conditions($system_cache_dir, $first_month_key, $force_flag);
     }
-    if (@months_to_process || @physb_months) {
+    if (@months_to_process || @physb_months || @pool_months) {
         # Create checkpoint backup before any modifications
         print STDERR "  • Creating pre-tactical checkpoint backup\n";
         _create_checkpoint_backup($system_cache_dir, 'pre-tactical', 1);
@@ -15529,6 +15569,11 @@ sub update_monthly_history {
     if (@physb_months) {
         _backfill_physb_history($system_cache_dir, \@physb_months, $history_data, $adaptive_runq_saturation_thresh, $physb);
     }
+    my $pool_months_written = 0;
+    if (@pool_months) {
+        print STDERR "  ↳  Pool blocks absent or out of date for: " . join(", ", map { $_->{key} } @pool_months) . "\n";
+        $pool_months_written = _build_pool_history($system_cache_dir, \@pool_months, $history_data, $pool_context);
+    }
 
     # Track if this was a first run (no pre-existing partitions in the canonical history dir).
     # _write_full_history dies on failure, so reaching this point confirms a successful write.
@@ -15545,7 +15590,7 @@ sub update_monthly_history {
 
     # --- Step 4: Final Write ---
     # The history file is written only ONCE at the end if any changes were made.
-    if (@months_to_process || @physb_months || $was_enriched) {
+    if (@months_to_process || @physb_months || $pool_months_written || $was_enriched) {
         print "  ↳  Finalising updates to history cache.\n";
 
         _write_full_history($system_cache_dir, $history_data);
@@ -15630,6 +15675,9 @@ sub _generate_monthly_and_seasonal_history {
             }
         }
 
+        # A stored pool block is never lost when a month is re-analysed.
+        my $previous_pool_history = _safe_dig($history_data_href, $month_key, 'PoolHistory');
+
         # --- Populate the in-memory hash ---
         $history_data_href->{$month_key} = {
             MonthlyWorkloadAnalysis => $workload_analysis,
@@ -15640,6 +15688,12 @@ sub _generate_monthly_and_seasonal_history {
                 LastUpdated        => localtime()->datetime(),
             }
         };
+        if (ref($previous_pool_history) eq 'HASH' && ref($previous_metadata->{PoolEvidence}) eq 'HASH')
+        {
+            $history_data_href->{$month_key}{PoolHistory}            = $previous_pool_history;
+            $history_data_href->{$month_key}{Metadata}{PoolEvidence} = $previous_metadata->{PoolEvidence};
+            $history_data_href->{$month_key}{Metadata}{Features}     = [ $POOL_HISTORY_FEATURE ];
+        }
         if ($physb)
         {
             _physb_mark_month($history_data_href->{$month_key}{Metadata}, $physb->{signature},
@@ -18842,6 +18896,616 @@ sub _physb_month_needs_block
 }
 
 # ==============================================================================
+# Pool history, observed projection (opt-in, --pool-history)
+# ------------------------------------------------------------------------------
+# With --update-history, each stored month gains a PoolHistory block built from
+# the cache's pool observations and configuration states:
+#
+#   PoolHistory.<serial>:<pool>.segments[]   one per unchanged pool roster and
+#                                            configuration within the window
+#     members[]   installed entitlement and VPs of each LPAR in the pool
+#     daily[]     concurrent pool busy per UTC day: supported and expected
+#                 minutes, core-minutes, P50, P95, P99 and maximum
+#     plans[]     always empty here: a sizing plan is recorded by a planning
+#                 run, never by the history update
+#   Metadata.PoolEvidence                    projection, reduction, sources,
+#                                            window and when it became available
+#
+# This is the projection $POOL_HISTORY_PROJECTION: observed busy and observed
+# configuration only. Pool scarcity and member exposure are not evaluated, and
+# no key for them is written, so a reader can never mistake "not evaluated"
+# for a measured zero. Reserved pool capacity is not collected (null), and the
+# ceiling is the pool size the LPARs report, not a verified HMC maximum.
+#
+# The reduction is mechanical (%POOL_REDUCTION):
+#   1. per pool, UTC minute and reporter: identical observations collapse; a
+#      reporter with conflicting series in the minute is excluded; otherwise
+#      the observation nearest the minute midpoint is taken (an equal-distance
+#      pair with different values excludes the reporter);
+#   2. a reading counts when its busy value is finite, not negative and not
+#      above the pool size the minute's reporters agree on (a valid zero counts);
+#   3. the minute value is the median across reporters, never a sum;
+#   4. daily statistics are taken over those minute values.
+#
+# Extension and re-runs follow the PhysB blocks: a month's block is always
+# recomputed from the cache over the whole window, a stored block with a wider
+# window is kept, and an unchanged window and source leave the partition as
+# it is.
+# ==============================================================================
+
+sub _pool_iso
+{
+    my ($epoch) = @_;
+    return gmtime($epoch)->datetime . 'Z';
+}
+
+sub _pool_round
+{
+    my ($value) = @_;
+    return undef unless defined $value;
+    return 0 + sprintf('%.' . $POOL_REDUCTION{precision} . 'f', $value);
+}
+
+# Median of a list (mean of the two middle values for an even count).
+sub _pool_median
+{
+    my @sorted = sort { $a <=> $b } @_;
+    my $n = scalar @sorted;
+    return undef unless $n;
+    return ($n % 2) ? $sorted[($n - 1) / 2] : ($sorted[$n / 2 - 1] + $sorted[$n / 2]) / 2;
+}
+
+# Quantile of an ascending list by linear interpolation at rank (n - 1) x p.
+sub _pool_quantile
+{
+    my ($sorted_aref, $p) = @_;
+    my $n = scalar @$sorted_aref;
+    return undef unless $n;
+    my $rank  = ($n - 1) * $p;
+    my $lower = int($rank);
+    my $upper = ($lower + 1 < $n) ? $lower + 1 : $lower;
+    return $sorted_aref->[$lower] + ($sorted_aref->[$upper] - $sorted_aref->[$lower]) * ($rank - $lower);
+}
+
+# A cell as a number: (value, problem) with problem undef, 'blank' or 'invalid'.
+sub _pool_number
+{
+    my ($cell) = @_;
+    return (undef, 'blank') unless (defined $cell && $cell ne '');
+    return (undef, 'invalid') unless (looks_like_number($cell) && $cell !~ /nan|inf/i);
+    return (undef, 'invalid') if ($cell < 0);
+    return ($cell + 0, undef);
+}
+
+# The cache's pool observations and what a stored block's validity depends on,
+# or undef when the cache has no pool observations.
+sub _pool_history_context
+{
+    my ($system_cache_dir) = @_;
+    my $path = File::Spec->catfile($system_cache_dir, $POOL_OBSERVATIONS_FILE);
+    return undef unless (-f $path);
+
+    my %meta;
+    if (open my $fh, '<', File::Spec->catfile($system_cache_dir, '.nfit.cache.manifest'))
+    {
+        while (my $line = <$fh>)
+        {
+            $meta{$1} = $2 if $line =~ /^\s*([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$/;
+        }
+        close $fh;
+    }
+    require Digest::SHA;
+    my $file_hash = sub
+    {
+        my ($file) = @_;
+        return 'unavailable' unless (-f $file);
+        return 'sha256:' . Digest::SHA->new(256)->addfile($file, 'b')->hexdigest;
+    };
+    my $pool_revision   = $meta{pool_revision}   // $file_hash->($path);
+    my $states_revision = $meta{states_revision} // $file_hash->(File::Spec->catfile($system_cache_dir, '.nfit.cache.states'));
+
+    # The capture window of the pool observations, [start, end) in seconds.
+    my ($window_start, $window_end);
+    if (($meta{pool_window_ns} // '') =~ /\[\s*(\d+)\s*,\s*(\d+)\s*\)/)
+    {
+        ($window_start, $window_end) = (substr($1, 0, -9) + 0, substr($2, 0, -9) + 0);
+    }
+
+    return {
+        path          => $path,
+        serial        => basename($system_cache_dir),
+        captureStatus => $meta{pool_capture_status} // 'unrecorded',
+        captureStart  => $window_start,
+        captureEnd    => $window_end,
+        signature     => {
+            projection     => $POOL_HISTORY_PROJECTION,
+            reductionHash  => substr(Digest::SHA::sha256_hex(JSON->new->canonical->encode(\%POOL_REDUCTION)), 0, 16),
+            poolRevision   => $pool_revision,
+            statesRevision => $states_revision,
+        },
+    };
+}
+
+# Whether a stored month needs its pool block (re)computed for this window.
+sub _pool_month_needs_block
+{
+    my ($month_data, $signature, $window_start, $window_end) = @_;
+    my $marker = _safe_dig($month_data, 'Metadata', 'PoolEvidence');
+    return 1 unless (ref($marker) eq 'HASH' && ref(_safe_dig($month_data, 'PoolHistory')) eq 'HASH');
+    my ($stored_start, $stored_end) = ($marker->{windowStart} // '', $marker->{windowEndExclusive} // '');
+    # A wider stored window is kept (rolling retention can shorten a cache).
+    return 0 if ($stored_start ne '' && $stored_end ne ''
+        && $stored_start le $window_start && $stored_end ge $window_end
+        && ($stored_start ne $window_start || $stored_end ne $window_end));
+    return 1 if ($stored_start ne $window_start || $stored_end ne $window_end);
+    return (grep { ($marker->{$_} // '') ne ($signature->{$_} // '') } keys %$signature) ? 1 : 0;
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_partition_observations
+# PURPOSE:    One pass over the pool observations: rows inside any requested
+#             window are written, reduced to the fields the reduction needs, to
+#             one temporary file per UTC day. Memory then never exceeds one
+#             day of one system.
+# RETURNS:    (hashref day number => file, hashref of counts)
+# ==============================================================================
+sub _pool_partition_observations
+{
+    my ($path, $windows_aref, $tmp_dir) = @_;
+    require IO::Uncompress::Gunzip;
+    require Digest::MD5;
+    require Text::ParseWords;
+
+    my $in = IO::Uncompress::Gunzip->new($path, MultiStream => 1)
+        or die "[ERROR] Cannot read pool observations '$path': $IO::Uncompress::Gunzip::GunzipError\n";
+    my (%column, %handle, %file, %counts);
+    my ($lowest, $highest) = (min(map { $_->[0] } @$windows_aref), max(map { $_->[1] } @$windows_aref));
+
+    while (my $line = <$in>)
+    {
+        chomp $line;
+        next if $line eq '';
+        my @field = (index($line, '"') >= 0) ? Text::ParseWords::parse_line(',', 0, $line) : split(/,/, $line, -1);
+        if ($field[0] eq 'time_ns')
+        {
+            my %seen = map { $field[$_] => $_ } 0 .. $#field;
+            die "[ERROR] The pool observations carry two different headers.\n"
+                if (%column && join(',', map { "$_=$seen{$_}" } sort keys %seen) ne join(',', map { "$_=$column{$_}" } sort keys %column));
+            %column = %seen;
+            foreach my $required (qw(time_ns host series_id pool_id busy_cores))
+            {
+                die "[ERROR] The pool observations have no $required column.\n" unless exists $column{$required};
+            }
+            next;
+        }
+        die "[ERROR] The pool observations have no header.\n" unless %column;
+        my $time_ns = $field[0];
+        unless ($time_ns =~ /^\d{10,}$/)
+        {
+            $counts{badTime}++;
+            next;
+        }
+        $counts{rowsRead}++;
+        my $seconds = substr($time_ns, 0, -9) + 0;
+        next if ($seconds < $lowest || $seconds >= $highest);
+        next unless grep { $seconds >= $_->[0] && $seconds < $_->[1] } @$windows_aref;
+
+        my $day = int($seconds / 86400);
+        my $out = $handle{$day};
+        if (!$out)
+        {
+            $file{$day} = File::Spec->catfile($tmp_dir, "pool-$day.tsv");
+            open $out, '>', $file{$day} or die "[ERROR] Cannot write '$file{$day}': $!\n";
+            $handle{$day} = $out;
+        }
+        # Every value after the identity columns takes part in the duplicate
+        # and conflict tests, as one digest.
+        my $values = Digest::MD5::md5_hex(join("\x1f", map { $_ // '' } @field[3 .. $#field]));
+        my $size   = exists $column{phys_cpus_pool} ? ($field[ $column{phys_cpus_pool} ] // '') : '';
+        print {$out} join("\t", $seconds, substr($time_ns, -9), $field[ $column{pool_id} ], $field[ $column{host} ],
+            $field[ $column{series_id} ], $size, ($field[ $column{busy_cores} ] // ''), $values), "\n";
+        $counts{rowsInWindow}++;
+    }
+    close $in;
+    close $_ for values %handle;
+    return (\%file, \%counts);
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_reduce_day
+# PURPOSE:    Applies the reduction to one day's observations.
+# RETURNS:    hashref pool => { minute epoch => { value (median busy, undef when
+#             no reporter gave a valid reading), reporters, size (agreed pool
+#             size or undef), ambiguous, invalid, duplicates, noBusy } }
+# ==============================================================================
+sub _pool_reduce_day
+{
+    my ($file) = @_;
+    my %by_reporter;      # pool => minute => host => [ [offset_ns, series, size, busy, digest, time key], ... ]
+    open my $in, '<', $file or die "[ERROR] Cannot read '$file': $!\n";
+    while (my $line = <$in>)
+    {
+        chomp $line;
+        my ($seconds, $nanos, $pool, $host, $series, $size, $busy, $digest) = split /\t/, $line, -1;
+        my $minute = $seconds - ($seconds % 60);
+        my $offset = abs(($seconds - $minute - 30) * 1_000_000_000 + $nanos);
+        push @{ $by_reporter{$pool}{$minute}{$host} }, [ $offset, $series, $size, $busy, $digest, "$seconds.$nanos" ];
+    }
+    close $in;
+
+    my $tolerance_ns = $POOL_REDUCTION{alignToleranceSeconds} * 1_000_000_000;
+    my %minutes;
+    foreach my $pool (keys %by_reporter)
+    {
+        foreach my $minute (keys %{ $by_reporter{$pool} })
+        {
+            my %record = (value => undef, reporters => 0, size => undef, ambiguous => 0, invalid => 0, duplicates => 0, noBusy => 0);
+            my @selected;
+            foreach my $host (keys %{ $by_reporter{$pool}{$minute} })
+            {
+                # Identical observations (same instant, same values) collapse.
+                my (%seen, @distinct);
+                foreach my $obs (@{ $by_reporter{$pool}{$minute}{$host} })
+                {
+                    if ($seen{ $obs->[5] . '|' . $obs->[4] }++)
+                    {
+                        $record{duplicates}++;
+                        next;
+                    }
+                    push @distinct, $obs;
+                }
+                my %series = map { $_->[1] => 1 } @distinct;
+                my %values = map { $_->[4] => 1 } @distinct;
+                if (keys %series > 1 && keys %values > 1)
+                {
+                    $record{ambiguous}++;
+                    next;
+                }
+                my @ranked = sort { $a->[0] <=> $b->[0] || $a->[5] cmp $b->[5] } @distinct;
+                next if ($ranked[0][0] > $tolerance_ns);
+                if (@ranked > 1 && $ranked[1][0] == $ranked[0][0] && $ranked[1][4] ne $ranked[0][4])
+                {
+                    $record{ambiguous}++;
+                    next;
+                }
+                push @selected, $ranked[0];
+            }
+
+            # The pool size the minute's reporters agree on bounds a credible reading.
+            my %sizes;
+            foreach my $obs (@selected)
+            {
+                my ($size, $problem) = _pool_number($obs->[2]);
+                $sizes{$size} = 1 if (defined $size && $size > 0);
+            }
+            my @size_values = keys %sizes;
+            $record{size} = (@size_values == 1) ? $size_values[0] + 0 : undef;
+            $record{sizeConflict} = (@size_values > 1) ? 1 : 0;
+
+            my @busy;
+            foreach my $obs (@selected)
+            {
+                my ($value, $problem) = _pool_number($obs->[3]);
+                if (defined $problem)
+                {
+                    $record{ ($problem eq 'blank') ? 'noBusy' : 'invalid' }++;
+                    next;
+                }
+                if (defined $record{size}
+                    && $value > $record{size} * (1 + $POOL_REDUCTION{rangeRel}) + $POOL_REDUCTION{rangeAbsCores})
+                {
+                    $record{invalid}++;
+                    next;
+                }
+                push @busy, $value;
+            }
+            $record{reporters} = scalar @busy;
+            $record{value}     = _pool_median(@busy);
+            $minutes{$pool}{$minute} = \%record;
+        }
+    }
+    return \%minutes;
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_segments
+# PURPOSE:    The segments of each pool within [window_start, window_end): the
+#             intervals over which the pool's roster and its members'
+#             entitlement, VPs, mode, SMT and reported pool size are unchanged,
+#             from the configuration states. Bounds are whole UTC minutes.
+#             A state runs to the next state of the same LPAR when that starts
+#             within stateBridgeSeconds of its last sample.
+# RETURNS:    hashref pool => [ { from, to, members => [...], sizes => {...} } ]
+# ==============================================================================
+sub _pool_segments
+{
+    my ($states_db, $window_start, $window_end) = @_;
+    my %intervals;      # pool => [ [from, to, member hashref, reported size] ]
+    foreach my $vm (sort keys %{ $states_db // {} })
+    {
+        my @states = sort { $a->{start_epoch} <=> $b->{start_epoch} }
+                     grep { ref($_) eq 'HASH' && defined $_->{start_epoch} && defined $_->{end_epoch} } @{ $states_db->{$vm} // [] };
+        foreach my $i (0 .. $#states)
+        {
+            my $meta = $states[$i]{metadata} // {};
+            my $pool = $meta->{pool_id};
+            next unless (defined $pool && looks_like_number($pool));
+            my $from = $states[$i]{start_epoch};
+            my $to   = $states[$i]{end_epoch} + 60;
+            if ($i < $#states && $states[ $i + 1 ]{start_epoch} - $states[$i]{end_epoch} <= $POOL_REDUCTION{stateBridgeSeconds})
+            {
+                $to = $states[ $i + 1 ]{start_epoch};
+            }
+            $from -= $from % 60;
+            $to   += (60 - $to % 60) % 60;
+            $from = $window_start if ($from < $window_start);
+            $to   = $window_end   if ($to > $window_end);
+            next if ($from >= $to);
+            my %member = (
+                vm               => $vm,
+                stateStartUTC    => _pool_iso($states[$i]{start_epoch}),
+                entitlement      => (looks_like_number($meta->{entitlement} // '')  ? $meta->{entitlement} + 0  : undef),
+                virtualProcessors=> (looks_like_number($meta->{virtual_cpus} // '') ? $meta->{virtual_cpus} + 0 : undef),
+                capped           => (looks_like_number($meta->{capped} // '')       ? ($meta->{capped} ? JSON::true : JSON::false) : undef),
+                smt              => (looks_like_number($meta->{smt} // '')          ? $meta->{smt} + 0          : undef),
+            );
+            my $size = (looks_like_number($meta->{pool_cpu} // '') && $meta->{pool_cpu} > 0) ? $meta->{pool_cpu} + 0 : undef;
+            push @{ $intervals{ $pool + 0 } }, [ $from, $to, \%member, $size ];
+        }
+    }
+
+    my %segments;
+    foreach my $pool (keys %intervals)
+    {
+        my %bound = ($window_start => 1, $window_end => 1);
+        $bound{ $_->[0] } = $bound{ $_->[1] } = 1 for @{ $intervals{$pool} };
+        my @bounds = sort { $a <=> $b } keys %bound;
+        my @list;
+        foreach my $i (0 .. $#bounds - 1)
+        {
+            my ($from, $to) = @bounds[ $i, $i + 1 ];
+            my @covering = grep { $_->[0] <= $from && $_->[1] >= $to } @{ $intervals{$pool} };
+            my @members  = sort { $a->{vm} cmp $b->{vm} || $a->{stateStartUTC} cmp $b->{stateStartUTC} } map { $_->[2] } @covering;
+            my %sizes    = map { $_->[3] => 1 } grep { defined $_->[3] } @covering;
+            # The same roster and configuration continue the previous segment.
+            my $identity = join('|', (map { join(',', $_->{vm}, map { $_ // '' } @{$_}{qw(entitlement virtualProcessors capped smt)}) } @members),
+                                'sizes=' . join(',', sort keys %sizes));
+            if (@list && $list[-1]{identity} eq $identity && $list[-1]{to} == $from)
+            {
+                $list[-1]{to} = $to;
+                next;
+            }
+            push @list, { from => $from, to => $to, members => \@members, sizes => \%sizes, identity => $identity };
+        }
+        $segments{$pool} = \@list;
+    }
+    return \%segments;
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_build_month
+# PURPOSE:    The PoolHistory block of one month window from the reduced
+#             minutes and the configuration states.
+# RETURNS:    (PoolHistory hashref, hashref of counts)
+# ==============================================================================
+sub _pool_build_month
+{
+    my ($context, $states_db, $window_start, $window_end, $day_files) = @_;
+
+    my $segments = _pool_segments($states_db, $window_start, $window_end);
+    my %daily;        # pool => segment index => day => accumulator
+    my %observed_size;
+    my %counts = (pools => 0, segments => 0, supportedMinutes => 0);
+
+    # Expected minutes: the part of the window the pool capture covers.
+    my $capture_start = defined $context->{captureStart} ? $context->{captureStart} - ($context->{captureStart} % 60) : $window_start;
+    my $capture_end   = defined $context->{captureEnd}   ? $context->{captureEnd} + ((60 - $context->{captureEnd} % 60) % 60) : $window_end;
+
+    foreach my $day (sort { $a <=> $b } grep { $_ * 86400 < $window_end && ($_ + 1) * 86400 > $window_start } keys %$day_files)
+    {
+        my $minutes = _pool_reduce_day($day_files->{$day});
+        foreach my $pool (keys %$minutes)
+        {
+            my $pool_key = looks_like_number($pool) ? $pool + 0 : $pool;
+            # A pool seen only in the observations has one segment and no known member.
+            $segments->{$pool_key} //= [ { from => $window_start, to => $window_end, members => [], sizes => {} } ];
+            foreach my $minute (keys %{ $minutes->{$pool} })
+            {
+                next if ($minute < $window_start || $minute >= $window_end);
+                my ($index) = grep { $segments->{$pool_key}[$_]{from} <= $minute && $minute < $segments->{$pool_key}[$_]{to} }
+                              0 .. $#{ $segments->{$pool_key} };
+                next unless defined $index;
+                my $record = $minutes->{$pool}{$minute};
+                my $acc = $daily{$pool_key}{$index}{$day} //= { values => [], reporters => [], ambiguous => 0, invalid => 0,
+                                                                 duplicates => 0, noBusy => 0, sizeConflict => 0 };
+                $acc->{$_} += $record->{$_} for qw(ambiguous invalid duplicates noBusy sizeConflict);
+                if (defined $record->{value})
+                {
+                    push @{ $acc->{values} }, $record->{value};
+                    push @{ $acc->{reporters} }, $record->{reporters};
+                }
+                $observed_size{$pool_key}{$index}{ $record->{size} } = 1 if defined $record->{size};
+            }
+        }
+    }
+
+    my %history;
+    foreach my $pool (sort { $a <=> $b } grep { looks_like_number($_) } keys %$segments)
+    {
+        my @out;
+        foreach my $index (0 .. $#{ $segments->{$pool} })
+        {
+            my $segment = $segments->{$pool}[$index];
+
+            # Ceiling: the pool size the members' states report; failing that,
+            # the size the pool's reporters give. Never a verified HMC maximum.
+            my ($ceiling, $basis, $source) = (undef, 'unknown', undef);
+            my @state_sizes    = sort { $a <=> $b } keys %{ $segment->{sizes} };
+            my @observed_sizes = sort { $a <=> $b } keys %{ $observed_size{$pool}{$index} // {} };
+            if (@state_sizes)
+            {
+                ($ceiling, $basis) = (@state_sizes == 1) ? ($state_sizes[0] + 0, 'reportedPoolSize') : (undef, 'conflict');
+                $source = 'configurationStates';
+            }
+            elsif (@observed_sizes)
+            {
+                ($ceiling, $basis) = (@observed_sizes == 1) ? ($observed_sizes[0] + 0, 'reportedPoolSize') : (undef, 'conflict');
+                $source = 'poolObservations';
+            }
+
+            my @entitlements = map { $_->{entitlement} } @{ $segment->{members} };
+            my $installed = (@entitlements && !grep { !defined $_ } @entitlements) ? _pool_round(sum0(@entitlements)) : undef;
+
+            my @days;
+            my $first_day = int($segment->{from} / 86400);
+            my $last_day  = int(($segment->{to} - 1) / 86400);
+            foreach my $day ($first_day .. $last_day)
+            {
+                my $from = max($segment->{from}, $day * 86400, $capture_start);
+                my $to   = min($segment->{to}, ($day + 1) * 86400, $capture_end);
+                my $expected = ($to > $from) ? int(($to - $from) / 60) : 0;
+                my $acc = $daily{$pool}{$index}{$day};
+                next unless ($expected || $acc);
+                my @values    = sort { $a <=> $b } @{ $acc ? $acc->{values} : [] };
+                my @reporters = sort { $a <=> $b } @{ $acc ? $acc->{reporters} : [] };
+                my %entry = (
+                    date             => gmtime($day * 86400)->ymd,
+                    expectedMinutes  => $expected,
+                    supportedMinutes => scalar(@values),
+                    busy             => undef,
+                    reporters        => undef,
+                    excluded         => {
+                        ambiguousReporterMinutes => ($acc ? $acc->{ambiguous} : 0),
+                        invalidReadings          => ($acc ? $acc->{invalid} : 0),
+                        duplicateObservations    => ($acc ? $acc->{duplicates} : 0),
+                        readingsWithoutBusy      => ($acc ? $acc->{noBusy} : 0),
+                        sizeConflictMinutes      => ($acc ? $acc->{sizeConflict} : 0),
+                    },
+                );
+                if (@values)
+                {
+                    $entry{busy} = {
+                        sumCoreMinutes => _pool_round(sum0(@values)),
+                        p50            => _pool_round(_pool_quantile(\@values, 0.50)),
+                        p95            => _pool_round(_pool_quantile(\@values, 0.95)),
+                        p99            => _pool_round(_pool_quantile(\@values, 0.99)),
+                        max            => _pool_round($values[-1]),
+                    };
+                    $entry{reporters} = {
+                        min                   => $reporters[0],
+                        median                => _pool_round(_pool_median(@reporters)),
+                        max                   => $reporters[-1],
+                        singleReporterMinutes => scalar(grep { $_ == 1 } @reporters),
+                    };
+                    $counts{supportedMinutes} += scalar(@values);
+                }
+                push @days, \%entry;
+            }
+
+            push @out, {
+                id                      => sprintf('%s@%s', $pool, _pool_iso($segment->{from})),
+                fromUTC                 => _pool_iso($segment->{from}),
+                toUTCExclusive          => _pool_iso($segment->{to}),
+                scope                   => ($pool == 0 ? 'default' : 'user'),
+                ceiling                 => $ceiling,
+                ceilingBasis            => $basis,
+                ceilingSource           => $source,
+                reserved                => undef,
+                reservedBasis           => 'notCollected',
+                membership              => (@{ $segment->{members} } ? 'configurationStates' : 'noMemberInStates'),
+                membershipConfidence    => 'unverified',
+                members                 => $segment->{members},
+                installedEntitlementSum => $installed,
+                daily                   => \@days,
+                plans                   => [],
+            };
+            $counts{segments}++;
+        }
+        $history{ $context->{serial} . ':' . $pool } = { projection => $POOL_HISTORY_PROJECTION, segments => \@out };
+        $counts{pools}++;
+    }
+    return (\%history, \%counts);
+}
+
+# ==============================================================================
+# SUBROUTINE: _build_pool_history
+# PURPOSE:    Writes the observed pool projection into the in-memory history
+#             for each month job. Nothing else in a month is touched.
+# ==============================================================================
+sub _build_pool_history
+{
+    my ($system_cache_dir, $jobs_aref, $history_data_href, $context) = @_;
+    return 0 unless ($context && @$jobs_aref);
+
+    my $states_db = {};
+    my $states_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.states');
+    if (-f $states_file)
+    {
+        open my $fh, '<:encoding(utf8)', $states_file or die "[ERROR] Cannot open states cache: $!\n";
+        my $text = do { local $/; <$fh> };
+        close $fh;
+        $states_db = decode_json($text);
+    }
+
+    my @windows = map { [ _pool_job_window($_->{start_obj}, $_->{end_obj}) ] } @$jobs_aref;
+    my $tmp_dir = File::Temp::tempdir('nfit_pool_history_XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my $started = time();
+    my ($day_files, $read_counts) = _pool_partition_observations($context->{path}, \@windows, $tmp_dir);
+
+    my $written = 0;
+    foreach my $i (0 .. $#$jobs_aref)
+    {
+        my $month_key = $jobs_aref->[$i]{key};
+        next unless (ref($history_data_href->{$month_key}) eq 'HASH');
+        my ($window_start, $window_end) = @{ $windows[$i] };
+        my ($pool_history, $counts) = _pool_build_month($context, $states_db, $window_start, $window_end, $day_files);
+
+        my $complete = (!defined $context->{captureStart} || $context->{captureStart} <= $window_start)
+                    && (!defined $context->{captureEnd}   || $context->{captureEnd}   >= $window_end);
+        $history_data_href->{$month_key}{PoolHistory} = $pool_history;
+        my $metadata = $history_data_href->{$month_key}{Metadata} //= {};
+        my %features = map { $_ => 1 } @{ $metadata->{Features} // [] };
+        $features{$POOL_HISTORY_FEATURE} = 1;
+        $metadata->{Features} = [ sort keys %features ];
+        $metadata->{PoolEvidence} = {
+            %{ $context->{signature} },
+            schemaVersion      => 1,
+            capabilities       => {
+                concurrentBusy        => 'observed',
+                observedConfiguration => 'observed',
+                scarcity              => 'notEvaluated',
+                memberExposure        => 'notEvaluated',
+                plans                 => 'notRecorded',
+            },
+            reduction          => { %POOL_REDUCTION },
+            calendarRules      => 'utc-day',
+            windowStart        => _pool_iso($window_start),
+            windowEndExclusive => _pool_iso($window_end),
+            captureStatus      => $context->{captureStatus},
+            status             => ($complete ? 'complete' : 'partial'),
+            reason             => ($complete ? '' : 'the pool capture does not cover the whole window'),
+            availableAt        => gmtime()->datetime . 'Z',
+            pools              => $counts->{pools},
+            segments           => $counts->{segments},
+            supportedMinutes   => $counts->{supportedMinutes},
+        };
+        $written++;
+        print STDERR "  [INFO] Pool history for $month_key ($POOL_HISTORY_PROJECTION): $counts->{pools} pool(s), "
+                   . "$counts->{segments} segment(s), $counts->{supportedMinutes} supported pool-minute(s).\n";
+    }
+    print STDERR "  [INFO] Pool observations: " . ($read_counts->{rowsRead} // 0) . " row(s) read, "
+               . ($read_counts->{rowsInWindow} // 0) . " in the window(s), " . (time() - $started) . "s.\n";
+    return $written;
+}
+
+# The half-open UTC window of a month job, as whole days: (start, end) epochs.
+sub _pool_job_window
+{
+    my ($start_obj, $end_obj) = @_;
+    return ($start_obj->epoch - ($start_obj->epoch % 86400), $end_obj->epoch - ($end_obj->epoch % 86400) + 86400);
+}
+
+# ==============================================================================
 # SUBROUTINE: _backfill_physb_history
 # PURPOSE:    Adds PhysB blocks to stored months whose PhysC analysis is kept
 #             as it is. The monthly engine run is repeated with the paired
@@ -20448,6 +21112,12 @@ Model behaviour depends on the event configuration:
   --physb-history                           : With --update-history, add PhysBMetrics blocks (paired PhysC/PhysB
                                               exposure, coverage and tails) when the cache declares a PhysB column.
                                               Stored months gain blocks without their PhysC analysis changing.
+
+  --pool-history                            : With --update-history, add PoolHistory blocks when the cache holds pool
+                                              observations: per pool, the concurrent busy cores per UTC day and the
+                                              installed entitlement and VPs of its members. Observed values only;
+                                              pool scarcity is not evaluated. Stored months gain blocks without their
+                                              analysis changing.
 
   --min-history-days <N>                    : When updating history, allow partial months with at least N days of data
                                               (Default: 28 days).
