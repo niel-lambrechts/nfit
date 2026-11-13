@@ -402,6 +402,12 @@ class MemberExposureTests(unittest.TestCase):
         self.assertIn(f'within installed    : {tot[0] - inst} minute(s)', block)
         self.assertIn(f'above installed     : {inst} minute(s)', block)
         self.assertIn(f'In credible scarcity  : {tot[2]} minute(s) (competition {tot[3]}', block)
+        # Additional borrowing = excess above the proposal - excess above installed, which also
+        # counts minutes already above the installed entitlement (all of vmA's in this fixture).
+        excess_i = sum(v[4][1][1] for v in ref.values())
+        self.assertIn(f'Additional borrowing  : {tot[1] - excess_i:.2f} core-minutes', block)
+        self.assertGreater(tot[1] - excess_i, 0)
+        self.assertNotIn('removes no guarantee', section)
         self.assertIn('Reading:', block)
 
     @staticmethod
