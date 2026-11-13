@@ -306,8 +306,14 @@ class PoolHistoryTests(unittest.TestCase):
         gained = json.loads(self.raw(plain))[MONTH]
         self.assertEqual(gained['MonthlyWorkloadAnalysis'], without['MonthlyWorkloadAnalysis'])
         self.assertEqual(gained['PoolHistory'], self.month()['PoolHistory'])
-        self.assertEqual({k: v for k, v in gained['Metadata'].items() if k not in ('PoolEvidence', 'Features')},
+        self.assertEqual({k: v for k, v in gained['Metadata'].items()
+                          if k not in ('PoolEvidence', 'Features', 'MemberExposureEvidence')},
                          {k: v for k, v in without['Metadata'].items() if k != 'Features'})
+        # Without a PhysB column, member exposure is marked unavailable, never left silent.
+        self.assertEqual((gained['Metadata']['MemberExposureEvidence']['status'],
+                          gained['Metadata']['MemberExposureEvidence']['reason']),
+                         ('unavailable', 'the CPU cache declares no PhysB column'))
+        self.assertNotIn('MemberExposure', gained)
 
     def test_a_stored_block_survives_a_re_analysis_without_the_option(self):
         r = self.make_root()

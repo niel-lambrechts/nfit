@@ -612,6 +612,32 @@ my %POOL_REDUCTION = (
     stateBridgeSeconds    => 120,       # a state runs to the next when that starts this soon after its last sample
     precision             => 4,
 );
+# Member busy exposure: a MemberExposure block with --pool-history, and the
+# "Entitlement Cut Exposure" rationale section with --pool-exposure (opt-in).
+my $pool_exposure_flag = 0;
+my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
+my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
+# The rules of the evaluation. Any change here changes the rules hash, so
+# stored blocks are recomputed.
+my %MEMBER_EXPOSURE_RULES = (
+    version                => 'member-busy-exposure-1',
+    minute                 => 'utc-half-open',
+    pairing                => 'numeric PhysB with 0 <= B <= C + pairToleranceCores; busy = mean B of the valid pairs in the minute',
+    pairToleranceCores     => 1e-6,
+    smoothing              => 'none',
+    classifier             => 'pool-scarcity-1',
+    localScarceAbsCores    => 0.10,     # local layer scarce: ceiling - pool busy <= max(abs, rel x ceiling)
+    localScarceRel         => 0.02,
+    physicalScarceAbsCores => 0.50,     # physical layer scarce: shared pool idle <= max(abs, rel x size)
+    physicalScarceRel      => 0.01,
+    othersAbsCores         => 0.10,     # competition: pool busy - member PhysC >= max(abs, rel x ceiling)
+    othersRel              => 0.02,
+    nearVp                 => 0.95,     # own width: PhysC >= nearVp x VPs (uncapped)
+    cappedNear             => 0.98,     #            PhysC >= cappedNear x entitlement (capped)
+    jointRunCredit         => 'day-the-run-ends',
+);
+my @MEMBER_EXPOSURE_COLUMNS = qw(aboveMinutes excessCoreMinutes aboveScarceMinutes aboveCompetitionMinutes
+                                 aboveOwnWidthMinutes aboveUnclassifiedMinutes longestJointRunMinutes);
 my @PHYSB_INVALID_REASONS  = qw(missingB nonNumericB bAboveC nonFiniteC cAboveCeiling bAboveCeiling);
 my @PHYSB_QUALITY_COUNTERS = (qw(validPairs sameSecondSamples runResets freqPctUnavailable), @PHYSB_INVALID_REASONS);
 my $min_history_days_arg;    # New flag for partial month processing
@@ -659,6 +685,7 @@ GetOptions(
     'update-history'             => \$update_history_flag,
     'physb-history'              => \$physb_history_flag,
     'pool-history'               => \$pool_history_flag,
+    'pool-exposure'              => \$pool_exposure_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
@@ -1984,6 +2011,27 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  Order of Change    The tactical pair is valid, but the current VP count cannot carry the\n";
         print {$LOG_FH} "                     proposed entitlement: the VP change must be made before the entitlement.\n";
+        if ($pool_exposure_flag)
+        {
+            print {$LOG_FH} "\n";
+            print {$LOG_FH} "  Entitlement Cut    For a proposed entitlement below the installed one: the LPAR's busy\n";
+            print {$LOG_FH} "  Exposure           (PhysB) minutes above the proposal over the analysis window, minute by\n";
+            print {$LOG_FH} "                     minute and unsmoothed. Observations only; nothing is changed.\n";
+            print {$LOG_FH} "                       - Paired minute: a minute with valid PhysC and PhysB samples.\n";
+            print {$LOG_FH} "                       - Within installed: busy above the proposal but within the installed\n";
+            print {$LOG_FH} "                         entitlement, which the current guarantee covers and the cut removes.\n";
+            print {$LOG_FH} "                       - Pool-classified minute: both pool layers known (the LPAR's pool\n";
+            print {$LOG_FH} "                         against its ceiling, the shared processor pool's idle cores), or\n";
+            print {$LOG_FH} "                         either one scarce.\n";
+            print {$LOG_FH} "                       - Credible scarcity: the pool's busy within max(0.10, 2%) of its\n";
+            print {$LOG_FH} "                         ceiling, or the shared pool's idle within max(0.50, 1%) of zero.\n";
+            print {$LOG_FH} "                       - Competition: scarcity while other LPARs consumed. An LPAR filling\n";
+            print {$LOG_FH} "                         its pool alone is not competing.\n";
+            print {$LOG_FH} "                       - Own width: PhysC at 95% or more of its VPs (98% of entitlement\n";
+            print {$LOG_FH} "                         when capped): the limit is the LPAR's own width.\n";
+            print {$LOG_FH} "                       - Longest joint run: the longest run of consecutive minutes above\n";
+            print {$LOG_FH} "                         the proposal in credible scarcity.\n";
+        }
         print {$LOG_FH} "======================================================================\n\n";
     }
 
@@ -2543,6 +2591,15 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             {
                 printf STDERR "  [WARN] Structural checks: %d pool(s) with an entitlement shortfall, %d LPAR(s) with an entitlement/VP mismatch (see rationale)\n",
                     $structural_summary->{PoolShortfalls}, $structural_summary->{WidthMismatches};
+            }
+
+            # Entitlement cut exposure (opt-in; rationale only; nothing is changed).
+            if ($pool_exposure_flag && $effective_start_date_obj && $effective_end_date_obj)
+            {
+                my $exposure_summary = _log_cut_exposure($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order,
+                    \@profiles, \%vm_tier_overrides, $current_cache_path, $effective_start_date_obj, $effective_end_date_obj);
+                printf STDERR "  [INFO] Entitlement cut exposure: %d cut(s), %d evaluated (%s; see rationale)\n",
+                    $exposure_summary->{Cuts}, $exposure_summary->{Evaluated}, $exposure_summary->{Status};
             }
         }
     }
@@ -15475,7 +15532,14 @@ sub update_monthly_history {
         $pool_context = _pool_history_context($system_cache_dir);
         print STDERR "  ↳  --pool-history: the cache holds no pool observations; no pool blocks are written\n" unless $pool_context;
     }
-    my @pool_months;       # months whose pool block is absent or out of date
+    my @pool_months;       # months whose pool or member exposure block is absent or out of date
+    my $exposure;          # member exposure: { context, reason } with --pool-history
+    if ($pool_context)
+    {
+        my ($exposure_context, $exposure_reason) = _exposure_context($system_cache_dir, $pool_context);
+        $exposure = { context => $exposure_context, reason => $exposure_reason };
+        print STDERR "  ↳  --pool-history: member exposure is not evaluated ($exposure_reason)\n" unless $exposure_context;
+    }
 
     # --- Step 1: Load existing history ONCE ---
     my $history_data = read_unified_history($system_cache_dir);
@@ -15530,10 +15594,17 @@ sub update_monthly_history {
             && ($should_process || ref(_safe_dig($history_data, $month_key, 'MonthlyWorkloadAnalysis')) eq 'HASH'))
         {
             my ($window_start, $window_end) = _pool_job_window($effective_start_obj, $effective_end_obj);
-            if (_pool_month_needs_block(($history_data->{$month_key} // {}), $pool_context->{signature},
-                                        _pool_iso($window_start), _pool_iso($window_end)))
+            my $month_data = $history_data->{$month_key} // {};
+            my $needs_pool = _pool_month_needs_block($month_data, $pool_context->{signature},
+                                                     _pool_iso($window_start), _pool_iso($window_end)) ? 1 : 0;
+            # A re-analysed month has new profile values, so its exposure is always recomputed.
+            my $needs_exposure = ($exposure->{context}
+                && ($should_process || _exposure_month_needs_block($month_data, $exposure->{context}{signature},
+                                                                   _pool_iso($window_start), _pool_iso($window_end)))) ? 1 : 0;
+            if ($needs_pool || $needs_exposure)
             {
-                push @pool_months, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period };
+                push @pool_months, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period,
+                                     pool => $needs_pool, exposure => $needs_exposure };
             }
         }
         $iterator_month = $iterator_month->add_months(1);
@@ -15571,8 +15642,11 @@ sub update_monthly_history {
     }
     my $pool_months_written = 0;
     if (@pool_months) {
-        print STDERR "  ↳  Pool blocks absent or out of date for: " . join(", ", map { $_->{key} } @pool_months) . "\n";
-        $pool_months_written = _build_pool_history($system_cache_dir, \@pool_months, $history_data, $pool_context);
+        my @pool_keys     = map { $_->{key} } grep { $_->{pool} } @pool_months;
+        my @exposure_keys = map { $_->{key} } grep { $_->{exposure} } @pool_months;
+        print STDERR "  ↳  Pool blocks absent or out of date for: " . join(", ", @pool_keys) . "\n" if @pool_keys;
+        print STDERR "  ↳  Member exposure blocks absent or out of date for: " . join(", ", @exposure_keys) . "\n" if @exposure_keys;
+        $pool_months_written = _build_pool_history($system_cache_dir, \@pool_months, $history_data, $pool_context, $exposure);
     }
 
     # Track if this was a first run (no pre-existing partitions in the canonical history dir).
@@ -15675,8 +15749,9 @@ sub _generate_monthly_and_seasonal_history {
             }
         }
 
-        # A stored pool block is never lost when a month is re-analysed.
+        # A stored pool or member exposure block is never lost when a month is re-analysed.
         my $previous_pool_history = _safe_dig($history_data_href, $month_key, 'PoolHistory');
+        my $previous_exposure     = _safe_dig($history_data_href, $month_key, 'MemberExposure');
 
         # --- Populate the in-memory hash ---
         $history_data_href->{$month_key} = {
@@ -15693,6 +15768,12 @@ sub _generate_monthly_and_seasonal_history {
             $history_data_href->{$month_key}{PoolHistory}            = $previous_pool_history;
             $history_data_href->{$month_key}{Metadata}{PoolEvidence} = $previous_metadata->{PoolEvidence};
             $history_data_href->{$month_key}{Metadata}{Features}     = [ $POOL_HISTORY_FEATURE ];
+        }
+        if (ref($previous_exposure) eq 'HASH' && ref($previous_metadata->{MemberExposureEvidence}) eq 'HASH')
+        {
+            $history_data_href->{$month_key}{MemberExposure}                   = $previous_exposure;
+            $history_data_href->{$month_key}{Metadata}{MemberExposureEvidence} = $previous_metadata->{MemberExposureEvidence};
+            push @{ $history_data_href->{$month_key}{Metadata}{Features} }, $MEMBER_EXPOSURE_FEATURE;
         }
         if ($physb)
         {
@@ -19102,21 +19183,30 @@ sub _pool_partition_observations
         # and conflict tests, as one digest.
         my $values = Digest::MD5::md5_hex(join("\x1f", map { $_ // '' } @field[3 .. $#field]));
         my $size   = exists $column{phys_cpus_pool} ? ($field[ $column{phys_cpus_pool} ] // '') : '';
+        # The shared processor pool fields, for the physical layer of member exposure.
+        my $global_size = exists $column{global_pool_tot_cores}  ? ($field[ $column{global_pool_tot_cores} ] // '')  : '';
+        my $global_busy = exists $column{global_pool_busy_cores} ? ($field[ $column{global_pool_busy_cores} ] // '') : '';
         print {$out} join("\t", $seconds, substr($time_ns, -9), $field[ $column{pool_id} ], $field[ $column{host} ],
-            $field[ $column{series_id} ], $size, ($field[ $column{busy_cores} ] // ''), $values), "\n";
+            $field[ $column{series_id} ], $size, ($field[ $column{busy_cores} ] // ''), $values, $global_size, $global_busy), "\n";
         $counts{rowsInWindow}++;
     }
     close $in;
     close $_ for values %handle;
+    $counts{physicalColumns} = (exists $column{global_pool_tot_cores} && exists $column{global_pool_busy_cores}) ? 1 : 0;
     return (\%file, \%counts);
 }
 
 # ==============================================================================
 # SUBROUTINE: _pool_reduce_day
 # PURPOSE:    Applies the reduction to one day's observations.
-# RETURNS:    hashref pool => { minute epoch => { value (median busy, undef when
+# RETURNS:    (hashref pool => { minute epoch => { value (median busy, undef when
 #             no reporter gave a valid reading), reporters, size (agreed pool
-#             size or undef), ambiguous, invalid, duplicates, noBusy } }
+#             size or undef), ambiguous, invalid, duplicates, noBusy } },
+#             hashref minute epoch => { idle, size, reporters } of the shared
+#             processor pool: per minute, each selected reporter once, its
+#             global_pool_tot_cores - global_pool_busy_cores when both are
+#             credible, combined by median. The physical layer feeds member
+#             exposure only; the PoolHistory block does not use it.)
 # ==============================================================================
 sub _pool_reduce_day
 {
@@ -19126,15 +19216,16 @@ sub _pool_reduce_day
     while (my $line = <$in>)
     {
         chomp $line;
-        my ($seconds, $nanos, $pool, $host, $series, $size, $busy, $digest) = split /\t/, $line, -1;
+        my ($seconds, $nanos, $pool, $host, $series, $size, $busy, $digest, $global_size, $global_busy) = split /\t/, $line, -1;
         my $minute = $seconds - ($seconds % 60);
         my $offset = abs(($seconds - $minute - 30) * 1_000_000_000 + $nanos);
-        push @{ $by_reporter{$pool}{$minute}{$host} }, [ $offset, $series, $size, $busy, $digest, "$seconds.$nanos" ];
+        push @{ $by_reporter{$pool}{$minute}{$host} }, [ $offset, $series, $size, $busy, $digest, "$seconds.$nanos", $global_size, $global_busy ];
     }
     close $in;
 
     my $tolerance_ns = $POOL_REDUCTION{alignToleranceSeconds} * 1_000_000_000;
     my %minutes;
+    my %global_of;        # minute => host => [shared pool size, shared pool busy]
     foreach my $pool (keys %by_reporter)
     {
         foreach my $minute (keys %{ $by_reporter{$pool} })
@@ -19169,6 +19260,7 @@ sub _pool_reduce_day
                     next;
                 }
                 push @selected, $ranked[0];
+                $global_of{$minute}{$host} //= [ $ranked[0][6], $ranked[0][7] ];
             }
 
             # The pool size the minute's reporters agree on bounds a credible reading.
@@ -19204,7 +19296,24 @@ sub _pool_reduce_day
             $minutes{$pool}{$minute} = \%record;
         }
     }
-    return \%minutes;
+
+    my %physical;
+    foreach my $minute (keys %global_of)
+    {
+        my (@idle, @size);
+        foreach my $pair (values %{ $global_of{$minute} })
+        {
+            my ($total, $total_problem) = _pool_number($pair->[0]);
+            my ($used, $used_problem)   = _pool_number($pair->[1]);
+            next if (defined $total_problem || defined $used_problem || $total <= 0);
+            next if ($used > $total * (1 + $POOL_REDUCTION{rangeRel}) + $POOL_REDUCTION{rangeAbsCores});
+            push @idle, max(0, $total - $used);
+            push @size, $total;
+        }
+        next unless @idle;
+        $physical{$minute} = { idle => _pool_median(@idle), size => _pool_median(@size), reporters => scalar @idle };
+    }
+    return (\%minutes, \%physical);
 }
 
 # ==============================================================================
@@ -19230,17 +19339,8 @@ sub _pool_segments
             my $meta = $states[$i]{metadata} // {};
             my $pool = $meta->{pool_id};
             next unless (defined $pool && looks_like_number($pool));
-            my $from = $states[$i]{start_epoch};
-            my $to   = $states[$i]{end_epoch} + 60;
-            if ($i < $#states && $states[ $i + 1 ]{start_epoch} - $states[$i]{end_epoch} <= $POOL_REDUCTION{stateBridgeSeconds})
-            {
-                $to = $states[ $i + 1 ]{start_epoch};
-            }
-            $from -= $from % 60;
-            $to   += (60 - $to % 60) % 60;
-            $from = $window_start if ($from < $window_start);
-            $to   = $window_end   if ($to > $window_end);
-            next if ($from >= $to);
+            my ($from, $to) = _pool_state_span(\@states, $i, $window_start, $window_end);
+            next unless defined $from;
             my %member = (
                 vm               => $vm,
                 stateStartUTC    => _pool_iso($states[$i]{start_epoch}),
@@ -19286,11 +19386,14 @@ sub _pool_segments
 # SUBROUTINE: _pool_build_month
 # PURPOSE:    The PoolHistory block of one month window from the reduced
 #             minutes and the configuration states.
+# ARGS:       $options (optional): days => [day numbers also to visit],
+#             on_day => sub (day, reduced minutes, physical layer), called
+#             for every day in ascending order (member exposure).
 # RETURNS:    (PoolHistory hashref, hashref of counts)
 # ==============================================================================
 sub _pool_build_month
 {
-    my ($context, $states_db, $window_start, $window_end, $day_files) = @_;
+    my ($context, $states_db, $window_start, $window_end, $day_files, $options) = @_;
 
     my $segments = _pool_segments($states_db, $window_start, $window_end);
     my %daily;        # pool => segment index => day => accumulator
@@ -19301,9 +19404,12 @@ sub _pool_build_month
     my $capture_start = defined $context->{captureStart} ? $context->{captureStart} - ($context->{captureStart} % 60) : $window_start;
     my $capture_end   = defined $context->{captureEnd}   ? $context->{captureEnd} + ((60 - $context->{captureEnd} % 60) % 60) : $window_end;
 
-    foreach my $day (sort { $a <=> $b } grep { $_ * 86400 < $window_end && ($_ + 1) * 86400 > $window_start } keys %$day_files)
+    my %days = map { $_ => 1 } keys %$day_files;
+    $days{$_} = 1 for @{ ($options // {})->{days} // [] };
+    foreach my $day (sort { $a <=> $b } grep { $_ * 86400 < $window_end && ($_ + 1) * 86400 > $window_start } keys %days)
     {
-        my $minutes = _pool_reduce_day($day_files->{$day});
+        my ($minutes, $physical) = $day_files->{$day} ? _pool_reduce_day($day_files->{$day}) : ({}, {});
+        $options->{on_day}->($day, $minutes, $physical) if ($options && $options->{on_day});
         foreach my $pool (keys %$minutes)
         {
             my $pool_key = looks_like_number($pool) ? $pool + 0 : $pool;
@@ -19429,12 +19535,14 @@ sub _pool_build_month
 
 # ==============================================================================
 # SUBROUTINE: _build_pool_history
-# PURPOSE:    Writes the observed pool projection into the in-memory history
-#             for each month job. Nothing else in a month is touched.
+# PURPOSE:    Writes the observed pool projection (jobs with pool => 1, the
+#             default) and the member exposure block (jobs with exposure => 1,
+#             when $exposure->{context} is available) into the in-memory
+#             history for each month job. Nothing else in a month is touched.
 # ==============================================================================
 sub _build_pool_history
 {
-    my ($system_cache_dir, $jobs_aref, $history_data_href, $context) = @_;
+    my ($system_cache_dir, $jobs_aref, $history_data_href, $context, $exposure) = @_;
     return 0 unless ($context && @$jobs_aref);
 
     my $states_db = {};
@@ -19452,19 +19560,104 @@ sub _build_pool_history
     my $started = time();
     my ($day_files, $read_counts) = _pool_partition_observations($context->{path}, \@windows, $tmp_dir);
 
+    # Member exposure: the CPU samples of every LPAR with a state in a pool.
+    my $with_exposure = ($exposure && $exposure->{context}) ? 1 : 0;
+    my @exposure_jobs = grep { $jobs_aref->[$_]{exposure} } 0 .. $#$jobs_aref;
+    my ($cpu_files, $populations) = ({}, {});
+    if ($with_exposure && @exposure_jobs)
+    {
+        my %wanted;
+        foreach my $vm (keys %$states_db)
+        {
+            $wanted{$vm} = 1 if grep { ref($_) eq 'HASH' && looks_like_number(($_->{metadata} // {})->{pool_id} // '') } @{ $states_db->{$vm} // [] };
+        }
+        ($cpu_files) = _exposure_partition_cpu($exposure->{context}{dataPath}, [ @windows[@exposure_jobs] ], $tmp_dir, \%wanted);
+        $populations = _exposure_populations();
+    }
+
     my $written = 0;
     foreach my $i (0 .. $#$jobs_aref)
     {
-        my $month_key = $jobs_aref->[$i]{key};
+        my $job       = $jobs_aref->[$i];
+        my $month_key = $job->{key};
         next unless (ref($history_data_href->{$month_key}) eq 'HASH');
         my ($window_start, $window_end) = @{ $windows[$i] };
-        my ($pool_history, $counts) = _pool_build_month($context, $states_db, $window_start, $window_end, $day_files);
+        my $want_pool = $job->{pool} // 1;
+        my $mwa = $history_data_href->{$month_key}{MonthlyWorkloadAnalysis};
+        my $trackers;
+        if ($with_exposure && $job->{exposure})
+        {
+            $trackers = _exposure_trackers($states_db, $window_start, $window_end, $populations, sub
+            {
+                my ($vm, $meta, $population, $profiles) = @_;
+                return _exposure_history_thresholds($mwa, $vm, $meta, $profiles);
+            });
+        }
+        my %options = $trackers
+            ? (days   => [ int($window_start / 86400) .. int(($window_end - 1) / 86400) ],
+               on_day => sub
+               {
+                   my ($day, $minutes, $physical) = @_;
+                   _exposure_process_day($trackers, $day, _exposure_read_cpu_day($cpu_files->{$day}), $minutes, $physical);
+               })
+            : ();
+        my ($pool_history, $counts) = _pool_build_month($context, $states_db, $window_start, $window_end, $day_files, \%options);
 
         my $complete = (!defined $context->{captureStart} || $context->{captureStart} <= $window_start)
                     && (!defined $context->{captureEnd}   || $context->{captureEnd}   >= $window_end);
-        $history_data_href->{$month_key}{PoolHistory} = $pool_history;
         my $metadata = $history_data_href->{$month_key}{Metadata} //= {};
         my %features = map { $_ => 1 } @{ $metadata->{Features} // [] };
+
+        if ($trackers)
+        {
+            my ($block, $exposure_counts) = _exposure_block($trackers, $context->{serial});
+            $history_data_href->{$month_key}{MemberExposure} = $block;
+            $features{$MEMBER_EXPOSURE_FEATURE} = 1;
+            $metadata->{MemberExposureEvidence} = {
+                %{ $exposure->{context}{signature} },
+                thresholdsHash     => _exposure_thresholds_hash($mwa),
+                schemaVersion      => 1,
+                columns            => [ @MEMBER_EXPOSURE_COLUMNS ],
+                zeroRow            => 'a threshold with no busy minute above it on the day is written as 0',
+                thresholdBases     => [ qw(installedEntitlement monthlyProfileValue) ],
+                thresholdProfiles  => 'actionable profiles (shown in the CSV), lower than the installed entitlement',
+                rules              => { %MEMBER_EXPOSURE_RULES },
+                layers             => { local => 'poolBusyAgainstCeiling',
+                                        physical => ($read_counts->{physicalColumns} ? 'sharedPoolIdle' : 'unavailable') },
+                calendarRules      => 'utc-day',
+                windowStart        => _pool_iso($window_start),
+                windowEndExclusive => _pool_iso($window_end),
+                status             => ($complete ? 'complete' : 'partial'),
+                reason             => ($complete ? '' : 'the pool capture does not cover the whole window'),
+                availableAt        => gmtime()->datetime . 'Z',
+                vms                => $exposure_counts->{vms},
+                states             => $exposure_counts->{states},
+                pairedMinutes      => $exposure_counts->{pairedMinutes},
+                classifiedMinutes  => $exposure_counts->{classifiedMinutes},
+            };
+            print STDERR "  [INFO] Member exposure for $month_key ($MEMBER_EXPOSURE_PROJECTION): $exposure_counts->{vms} LPAR(s), "
+                       . "$exposure_counts->{states} state(s), $exposure_counts->{pairedMinutes} paired minute(s), "
+                       . "$exposure_counts->{classifiedMinutes} pool-classified.\n";
+        }
+        elsif ($want_pool && $exposure && !$exposure->{context})
+        {
+            # Made explicit: a reader must not take an absent block for no exposure.
+            $metadata->{MemberExposureEvidence} = {
+                projection         => $MEMBER_EXPOSURE_PROJECTION,
+                status             => 'unavailable',
+                reason             => $exposure->{reason},
+                windowStart        => _pool_iso($window_start),
+                windowEndExclusive => _pool_iso($window_end),
+            };
+        }
+        $metadata->{Features} = [ sort keys %features ];
+        if (!$want_pool)
+        {
+            $written++;
+            next;
+        }
+
+        $history_data_href->{$month_key}{PoolHistory} = $pool_history;
         $features{$POOL_HISTORY_FEATURE} = 1;
         $metadata->{Features} = [ sort keys %features ];
         $metadata->{PoolEvidence} = {
@@ -19503,6 +19696,752 @@ sub _pool_job_window
 {
     my ($start_obj, $end_obj) = @_;
     return ($start_obj->epoch - ($start_obj->epoch % 86400), $end_obj->epoch - ($end_obj->epoch % 86400) + 86400);
+}
+
+# ==============================================================================
+# Member busy exposure (projection member-busy-exposure-1)
+# ------------------------------------------------------------------------------
+# With --update-history --pool-history, each stored month also gains a
+# MemberExposure block when the CPU cache declares a PhysB column:
+#
+#   MemberExposure.<vm>[]   one entry per configuration state in a pool
+#     populations.<key>     per profile window (the engine's time-of-day and
+#                           weekday filters: 'none', 'online', 'batch', with
+#                           '+no-weekends') and the profiles it serves:
+#       thresholds[]        the state's installed entitlement and each of the
+#                           month's actionable profile values (shown in the
+#                           CSV) below it, a candidate cut, with its basis and
+#                           profiles
+#       daily[]             per UTC day: expected, paired, pool-classified and
+#                           scarce minutes, and per threshold one array in the
+#                           order of Metadata.MemberExposureEvidence.columns,
+#                           or 0 when no busy minute was above the threshold
+#
+# Built from aligned minute observations (%MEMBER_EXPOSURE_RULES). A member
+# minute is paired when it has valid (PhysC, PhysB) samples (numeric B,
+# 0 <= B <= C + tolerance); its busy value is the mean B of those samples and
+# its PhysC the mean of all its samples. Busy is compared with a threshold
+# unsmoothed: a profile's smoothing window is a sizing device, while exposure
+# is what a guarantee would leave uncovered minute by minute.
+#
+# Pool classification (classifier pool-scarcity-1), per pool and minute:
+#   local      the pool's busy value (the pool history reduction) against
+#              its ceiling: scarce when ceiling - busy <= max(abs, rel x ceiling)
+#   physical   the shared processor pool's idle cores (median across the
+#              minute's reporters of global_pool_tot_cores minus
+#              global_pool_busy_cores): scarce when idle <= max(abs, rel x size)
+#   credible scarcity   either layer scarce
+#   classified          either layer scarce, or both open; a minute with one
+#                       layer open and the other unknown is unclassified,
+#                       because the unknown layer could be the limit
+#   competition         credible scarcity while other LPARs consumed: the
+#                       physical layer scarce, or the local layer scarce with
+#                       pool busy - the member's PhysC >= max(abs, rel x
+#                       ceiling); an LPAR alone in a full pool is not competing
+#   own width           PhysC at or above nearVp x VPs (uncapped), or
+#                       cappedNear x entitlement (capped)
+# A joint run is a run of consecutive minutes above a threshold in credible
+# scarcity; it is credited in full to the day it ends. These are observations
+# at minute resolution: pool headroom is never a member's reachable capacity,
+# and below-entitlement minutes are kept. Sizing arithmetic is not changed.
+#
+# With --pool-exposure, a standard run writes an "Entitlement Cut Exposure"
+# section to the rationale: for each LPAR whose planning-profile entitlement
+# is below its installed entitlement, the same evaluation over the run's
+# analysis window at the exact proposed value.
+# ==============================================================================
+# (Constants are declared with the other globals near the top.)
+
+sub _exposure_rules_hash
+{
+    require Digest::SHA;
+    return substr(Digest::SHA::sha256_hex(JSON->new->canonical->encode(\%MEMBER_EXPOSURE_RULES)), 0, 16);
+}
+
+sub _exposure_tolerance
+{
+    my ($abs_part, $rel_part, $capacity) = @_;
+    return max($abs_part, $rel_part * ($capacity // 0));
+}
+
+# Whether a population admits a minute, with the engine's filters
+# (_transform_excludes_day and _transform_includes_time in nfit) on the
+# cache's UTC clock: day of week 0 (Sunday) to 6, minute of the day 0 to 1439.
+sub _exposure_population_admits
+{
+    my ($key, $day_of_week, $minute_of_day) = @_;
+    my ($filter, $weekday_rule) = split /\+/, ($key // 'none'), 2;
+    return 0 if (($weekday_rule // '') eq 'no-weekends' && ($day_of_week == 0 || $day_of_week == 6));
+    if ($filter eq 'none')
+    {
+        return 1;
+    }
+    if ($filter eq 'online')
+    {
+        return ($minute_of_day >= 480 && $minute_of_day < 1020) ? 1 : 0;
+    }
+    if ($filter eq 'batch')
+    {
+        return ($minute_of_day >= 1080 || $minute_of_day < 360) ? 1 : 0;
+    }
+    return 0;
+}
+
+# Planner-facing name of a population key.
+sub _exposure_population_label
+{
+    my ($key) = @_;
+    my ($filter, $weekday_rule) = split /\+/, ($key // 'none'), 2;
+    my %label = (
+        none   => 'all hours',
+        online => 'online hours (08:00-17:00 UTC)',
+        batch  => 'batch hours (18:00-06:00 UTC)',
+    );
+    my $text = $label{$filter} // $filter;
+    $text .= ', weekdays only' if (($weekday_rule // '') eq 'no-weekends');
+    return $text;
+}
+
+# profile name => population key, from the transform manifest of the
+# monthly analysis.
+sub _exposure_profile_populations
+{
+    my $manifest = _physb_history_manifest();
+    my %population_of;
+    foreach my $entry (values %$manifest)
+    {
+        next unless (ref($entry) eq 'HASH' && ($entry->{metric} // '') eq 'PhysC');
+        $population_of{$_} = _physb_population_key($entry) for keys %{ $entry->{profiles} // {} };
+    }
+    return \%population_of;
+}
+
+# The configuration states of the cache, or an empty hash.
+sub _exposure_load_states
+{
+    my ($system_cache_dir) = @_;
+    my $states_file = File::Spec->catfile($system_cache_dir, '.nfit.cache.states');
+    return {} unless (-f $states_file);
+    open my $fh, '<:encoding(utf8)', $states_file or die "[ERROR] Cannot open states cache: $!\n";
+    my $text = do { local $/; <$fh> };
+    close $fh;
+    return decode_json($text);
+}
+
+# What member exposure needs from the cache: (context, '') or (undef, reason).
+sub _exposure_context
+{
+    my ($system_cache_dir, $pool_context) = @_;
+    return (undef, 'the cache holds no pool observations') unless $pool_context;
+    my $identity = _cache_physb_identity($system_cache_dir);
+    return (undef, 'the CPU cache declares no PhysB column') unless $identity;
+    my $data_path = File::Spec->catfile($system_cache_dir, $DATA_CACHE_FILE);
+    return (undef, 'the cache has no CPU data file') unless (-f $data_path);
+    return ({
+        dataPath  => $data_path,
+        signature => {
+            projection     => $MEMBER_EXPOSURE_PROJECTION,
+            rulesHash      => _exposure_rules_hash(),
+            poolRevision   => $pool_context->{signature}{poolRevision},
+            statesRevision => $pool_context->{signature}{statesRevision},
+            dataRevision   => $identity->{dataRevision} // ('size:' . (-s $data_path)),
+        },
+    }, '');
+}
+
+# A digest of a month's profile values, the source of its candidate thresholds.
+sub _exposure_thresholds_hash
+{
+    my ($mwa) = @_;
+    require Digest::SHA;
+    my @parts;
+    foreach my $vm (sort keys %{ (ref($mwa) eq 'HASH') ? $mwa : {} })
+    {
+        my $values = _safe_dig($mwa, $vm, 'ProfileValues');
+        next unless (ref($values) eq 'HASH');
+        foreach my $profile (sort keys %$values)
+        {
+            my $value = $values->{$profile};
+            push @parts, join('=', $vm, $profile, (looks_like_number($value // '') ? _pool_round($value) : ''));
+        }
+    }
+    return substr(Digest::SHA::sha256_hex(join("\n", @parts)), 0, 16);
+}
+
+# Whether a stored month needs its member exposure block (re)computed.
+sub _exposure_month_needs_block
+{
+    my ($month_data, $signature, $window_start, $window_end) = @_;
+    my $marker = _safe_dig($month_data, 'Metadata', 'MemberExposureEvidence');
+    return 1 unless (ref($marker) eq 'HASH' && ref(_safe_dig($month_data, 'MemberExposure')) eq 'HASH');
+    my ($stored_start, $stored_end) = ($marker->{windowStart} // '', $marker->{windowEndExclusive} // '');
+    # A wider stored window is kept (rolling retention can shorten a cache).
+    return 0 if ($stored_start ne '' && $stored_end ne ''
+        && $stored_start le $window_start && $stored_end ge $window_end
+        && ($stored_start ne $window_start || $stored_end ne $window_end));
+    return 1 if ($stored_start ne $window_start || $stored_end ne $window_end);
+    my %expected = (%$signature, thresholdsHash => _exposure_thresholds_hash(_safe_dig($month_data, 'MonthlyWorkloadAnalysis')));
+    return (grep { ($marker->{$_} // '') ne ($expected{$_} // '') } keys %expected) ? 1 : 0;
+}
+
+# The interval [from, to) a configuration state covers within a window, in
+# whole UTC minutes: a state runs to the next state of the same LPAR when
+# that starts within stateBridgeSeconds of its last sample. Returns () when
+# the state lies outside the window.
+sub _pool_state_span
+{
+    my ($states_aref, $i, $window_start, $window_end) = @_;
+    my $from = $states_aref->[$i]{start_epoch};
+    my $to   = $states_aref->[$i]{end_epoch} + 60;
+    if ($i < $#$states_aref && $states_aref->[ $i + 1 ]{start_epoch} - $states_aref->[$i]{end_epoch} <= $POOL_REDUCTION{stateBridgeSeconds})
+    {
+        $to = $states_aref->[ $i + 1 ]{start_epoch};
+    }
+    $from -= $from % 60;
+    $to   += (60 - $to % 60) % 60;
+    $from = $window_start if ($from < $window_start);
+    $to   = $window_end   if ($to > $window_end);
+    return ($from < $to) ? ($from, $to) : ();
+}
+
+# ==============================================================================
+# SUBROUTINE: _exposure_partition_cpu
+# PURPOSE:    One pass over the CPU cache: samples of the wanted LPARs inside
+#             any window are written as (epoch, LPAR, PhysC, PhysB) to one
+#             temporary file per UTC day.
+# RETURNS:    (hashref day number => file, hashref of counts)
+# ==============================================================================
+sub _exposure_partition_cpu
+{
+    my ($path, $windows_aref, $tmp_dir, $wanted_href) = @_;
+    require Time::Local;
+    open my $in, '<', $path or die "[ERROR] Cannot read the CPU cache '$path': $!\n";
+    my $header = <$in>;
+    die "[ERROR] The CPU cache '$path' has no header line.\n" unless defined $header;
+    $header =~ s/[\r\n]+$//;
+    my @columns = map { s/^\s+|\s+$//gr } split /,/, $header, -1;
+    my %index = map { $columns[$_] => $_ } 0 .. $#columns;
+    foreach my $required (qw(Timestamp VMName PhysC PhysB))
+    {
+        die "[ERROR] The CPU cache has no $required column.\n" unless exists $index{$required};
+    }
+    my ($i_time, $i_vm, $i_c, $i_b) = @index{qw(Timestamp VMName PhysC PhysB)};
+    my ($lowest, $highest) = (min(map { $_->[0] } @$windows_aref), max(map { $_->[1] } @$windows_aref));
+
+    my (%handle, %file, %counts, %day_epoch);
+    while (my $line = <$in>)
+    {
+        $line =~ s/[\r\n]+$//;
+        next if $line eq '';
+        my @field = split /,/, $line, -1;
+        my $vm = $field[$i_vm];
+        next unless (defined $vm && $wanted_href->{$vm});
+        my $stamp = $field[$i_time] // '';
+        my ($y, $mo, $d, $h, $mi, $s) = $stamp =~ /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/;
+        unless (defined $s)
+        {
+            $counts{badTime}++;
+            next;
+        }
+        my $base = $day_epoch{"$y$mo$d"} //= Time::Local::timegm(0, 0, 0, $d, $mo - 1, $y);
+        my $seconds = $base + $h * 3600 + $mi * 60 + $s;
+        next if ($seconds < $lowest || $seconds >= $highest);
+        next unless grep { $seconds >= $_->[0] && $seconds < $_->[1] } @$windows_aref;
+        my $day = int($seconds / 86400);
+        my $out = $handle{$day};
+        if (!$out)
+        {
+            $file{$day} = File::Spec->catfile($tmp_dir, "cpu-$day.tsv");
+            open $out, '>', $file{$day} or die "[ERROR] Cannot write '$file{$day}': $!\n";
+            $handle{$day} = $out;
+        }
+        print {$out} join("\t", $seconds, $vm, ($field[$i_c] // ''), ($field[$i_b] // '')), "\n";
+        $counts{samplesInWindow}++;
+    }
+    close $in;
+    close $_ for values %handle;
+    return (\%file, \%counts);
+}
+
+# One day of CPU samples: { LPAR => { minute => [samples, sum PhysC, valid
+# pairs, sum PhysB over valid pairs] } }. A sample needs a finite, non-negative
+# PhysC; a pair also needs a finite PhysB with 0 <= B <= C + tolerance.
+sub _exposure_read_cpu_day
+{
+    my ($file) = @_;
+    my %minutes;
+    return \%minutes unless (defined $file && -f $file);
+    my $tolerance = $MEMBER_EXPOSURE_RULES{pairToleranceCores};
+    open my $in, '<', $file or die "[ERROR] Cannot read '$file': $!\n";
+    while (my $line = <$in>)
+    {
+        chomp $line;
+        my ($seconds, $vm, $c, $b) = split /\t/, $line, -1;
+        my ($c_value, $c_problem) = _pool_number($c);
+        next if defined $c_problem;
+        my $acc = $minutes{$vm}{ $seconds - ($seconds % 60) } //= [ 0, 0, 0, 0 ];
+        $acc->[0]++;
+        $acc->[1] += $c_value;
+        my ($b_value, $b_problem) = _pool_number($b);
+        if (!defined $b_problem && $b_value <= $c_value + $tolerance)
+        {
+            $acc->[2]++;
+            $acc->[3] += $b_value;
+        }
+    }
+    close $in;
+    return \%minutes;
+}
+
+# ==============================================================================
+# SUBROUTINE: _exposure_trackers
+# PURPOSE:    One accumulator per LPAR configuration state in a pool and per
+#             population within [window_start, window_end).
+# ARGS:       $thresholds_cb->($vm, $metadata, $population, $profiles_aref)
+#             returns [ { value, basis, profiles } ] for that state.
+# RETURNS:    arrayref of trackers
+# ==============================================================================
+sub _exposure_trackers
+{
+    my ($states_db, $window_start, $window_end, $populations_href, $thresholds_cb, $wanted_href) = @_;
+    my @trackers;
+    foreach my $vm (sort keys %{ $states_db // {} })
+    {
+        next if ($wanted_href && !$wanted_href->{$vm});
+        my @states = sort { $a->{start_epoch} <=> $b->{start_epoch} }
+                     grep { ref($_) eq 'HASH' && defined $_->{start_epoch} && defined $_->{end_epoch} } @{ $states_db->{$vm} // [] };
+        foreach my $i (0 .. $#states)
+        {
+            my $meta = $states[$i]{metadata} // {};
+            my $pool = $meta->{pool_id};
+            next unless (defined $pool && looks_like_number($pool));
+            my ($from, $to) = _pool_state_span(\@states, $i, $window_start, $window_end);
+            next unless defined $from;
+            foreach my $population (sort keys %$populations_href)
+            {
+                my $thresholds = $thresholds_cb->($vm, $meta, $population, $populations_href->{$population});
+                next unless (ref($thresholds) eq 'ARRAY' && @$thresholds);
+                push @trackers, {
+                    vm         => $vm,
+                    pool       => $pool + 0,
+                    from       => $from,
+                    to         => $to,
+                    stateStart => $states[$i]{start_epoch},
+                    entitlement=> (looks_like_number($meta->{entitlement} // '')  ? $meta->{entitlement} + 0  : undef),
+                    vp         => (looks_like_number($meta->{virtual_cpus} // '') ? $meta->{virtual_cpus} + 0 : undef),
+                    capped     => (looks_like_number($meta->{capped} // '')       ? ($meta->{capped} ? 1 : 0) : undef),
+                    ceiling    => ((looks_like_number($meta->{pool_cpu} // '') && $meta->{pool_cpu} > 0) ? $meta->{pool_cpu} + 0 : undef),
+                    population => $population,
+                    profiles   => [ sort @{ $populations_href->{$population} } ],
+                    thresholds => $thresholds,
+                    runs       => [ map { [ undef, 0 ] } @$thresholds ],
+                    daily      => {},
+                };
+            }
+        }
+    }
+    return \@trackers;
+}
+
+# ==============================================================================
+# SUBROUTINE: _exposure_process_day
+# PURPOSE:    Adds one UTC day to every tracker, minute by minute, from the
+#             day's CPU samples, reduced pool minutes and physical layer.
+#             Days are processed in ascending order, so a joint run carries
+#             across midnight.
+# ==============================================================================
+sub _exposure_process_day
+{
+    my ($trackers_aref, $day, $cpu_href, $pool_minutes_href, $physical_href) = @_;
+    my %rule = %MEMBER_EXPOSURE_RULES;
+    my $eps = 1e-9;
+    my ($day_start, $day_end) = ($day * 86400, ($day + 1) * 86400);
+    my $day_of_week = ($day + 4) % 7;          # 1970-01-01 was a Thursday
+    my %admits;
+    foreach my $tracker (@$trackers_aref)
+    {
+        my $from = max($tracker->{from}, $day_start);
+        my $to   = min($tracker->{to}, $day_end);
+        next if ($from >= $to);
+        my $flags = $admits{ $tracker->{population} } //=
+            [ map { _exposure_population_admits($tracker->{population}, $day_of_week, $_) } 0 .. 1439 ];
+        my $member_minutes = $cpu_href->{ $tracker->{vm} } // {};
+        my $pool_minutes   = $pool_minutes_href->{ $tracker->{pool} } // {};
+        my @thresholds     = map { $_->{value} } @{ $tracker->{thresholds} };
+        my $acc = $tracker->{daily}{$day} //= {
+            expected => 0, paired => 0, classified => 0, scarce => 0,
+            exposure => [ map { [ (0) x scalar(@MEMBER_EXPOSURE_COLUMNS) ] } @thresholds ],
+        };
+        my ($ent, $vp, $capped) = @{$tracker}{qw(entitlement vp capped)};
+
+        for (my $minute = $from; $minute < $to; $minute += 60)
+        {
+            next unless $flags->[ ($minute - $day_start) / 60 ];
+            $acc->{expected}++;
+            my $sample = $member_minutes->{$minute};
+            next unless ($sample && $sample->[2]);
+            my $c = $sample->[1] / $sample->[0];
+            my $b = $sample->[3] / $sample->[2];
+            $acc->{paired}++;
+
+            # Pool classification of the minute.
+            my ($local, $others) = ('unknown', undef);
+            my $record  = $pool_minutes->{$minute};
+            my $ceiling = $tracker->{ceiling} // ($record ? $record->{size} : undef);
+            if ($record && defined $record->{value} && defined $ceiling && $ceiling > 0)
+            {
+                my $headroom = $ceiling - $record->{value};
+                $local  = ($headroom <= _exposure_tolerance($rule{localScarceAbsCores}, $rule{localScarceRel}, $ceiling) + $eps) ? 'scarce' : 'open';
+                $others = $record->{value} - $c;
+            }
+            my $physical = 'unknown';
+            my $layer = $physical_href ? $physical_href->{$minute} : undef;
+            if ($layer && defined $layer->{idle})
+            {
+                $physical = ($layer->{idle} <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $layer->{size}) + $eps)
+                          ? 'scarce' : 'open';
+            }
+            my $scarce      = ($local eq 'scarce' || $physical eq 'scarce') ? 1 : 0;
+            my $classified  = ($scarce || ($local eq 'open' && $physical eq 'open')) ? 1 : 0;
+            my $competition = ($physical eq 'scarce'
+                || ($local eq 'scarce' && defined $others
+                    && $others >= _exposure_tolerance($rule{othersAbsCores}, $rule{othersRel}, $ceiling) - $eps)) ? 1 : 0;
+            my $own_width = $capped
+                ? ((defined $ent && $ent > 0 && $c >= $rule{cappedNear} * $ent - $eps) ? 1 : 0)
+                : ((defined $vp && $vp > 0 && $c >= $rule{nearVp} * $vp - $eps) ? 1 : 0);
+            $acc->{classified}++ if $classified;
+            $acc->{scarce}++     if $scarce;
+
+            foreach my $k (0 .. $#thresholds)
+            {
+                next unless ($b > $thresholds[$k] + $eps);
+                my $e = $acc->{exposure}[$k];
+                $e->[0]++;
+                $e->[1] += $b - $thresholds[$k];
+                $e->[4]++ if $own_width;
+                $e->[5]++ unless $classified;
+                if ($scarce)
+                {
+                    $e->[2]++;
+                    $e->[3]++ if $competition;
+                    my $run = $tracker->{runs}[$k];
+                    $run->[1] = (defined $run->[0] && $run->[0] == $minute - 60) ? $run->[1] + 1 : 1;
+                    $run->[0] = $minute;
+                    $e->[6] = $run->[1] if ($run->[1] > $e->[6]);
+                }
+            }
+        }
+    }
+    return;
+}
+
+# The MemberExposure block of one window from its trackers:
+# (block hashref, hashref of counts).
+sub _exposure_block
+{
+    my ($trackers_aref, $serial) = @_;
+    my (%by_state, %counts);
+    $counts{$_} = 0 for qw(vms states pairedMinutes classifiedMinutes);
+    foreach my $tracker (@$trackers_aref)
+    {
+        my $entry = $by_state{ $tracker->{vm} }{ $tracker->{from} } //= {
+            stateStartUTC     => _pool_iso($tracker->{stateStart}),
+            fromUTC           => _pool_iso($tracker->{from}),
+            toUTCExclusive    => _pool_iso($tracker->{to}),
+            pool              => $serial . ':' . $tracker->{pool},
+            scope             => ($tracker->{pool} == 0 ? 'default' : 'user'),
+            entitlement       => $tracker->{entitlement},
+            virtualProcessors => $tracker->{vp},
+            capped            => (defined $tracker->{capped} ? ($tracker->{capped} ? JSON::true : JSON::false) : undef),
+            poolCeiling       => $tracker->{ceiling},
+            populations       => {},
+        };
+        my @days;
+        foreach my $day (sort { $a <=> $b } keys %{ $tracker->{daily} })
+        {
+            my $acc = $tracker->{daily}{$day};
+            next unless $acc->{expected};
+            push @days, {
+                date              => gmtime($day * 86400)->ymd,
+                expectedMinutes   => $acc->{expected},
+                pairedMinutes     => $acc->{paired},
+                classifiedMinutes => $acc->{classified},
+                scarceMinutes     => $acc->{scarce},
+                # A threshold with no busy minute above it is written as a single 0.
+                exposure          => [ map { $_->[0] ? [ $_->[0], _pool_round($_->[1]), @{$_}[ 2 .. $#$_ ] ] : 0 } @{ $acc->{exposure} } ],
+            };
+            $counts{pairedMinutes}     += $acc->{paired};
+            $counts{classifiedMinutes} += $acc->{classified};
+        }
+        $entry->{populations}{ $tracker->{population} } = {
+            profiles   => $tracker->{profiles},
+            thresholds => $tracker->{thresholds},
+            daily      => \@days,
+        };
+    }
+    my %block;
+    foreach my $vm (sort keys %by_state)
+    {
+        $block{$vm} = [ map { $by_state{$vm}{$_} } sort { $a <=> $b } keys %{ $by_state{$vm} } ];
+        $counts{vms}++;
+        $counts{states} += scalar @{ $block{$vm} };
+    }
+    return (\%block, \%counts);
+}
+
+# History thresholds of one state and population: its installed entitlement
+# and each of the month's profile values below it.
+sub _exposure_history_thresholds
+{
+    my ($mwa, $vm, $meta, $profiles_aref) = @_;
+    my $installed = looks_like_number($meta->{entitlement} // '') ? $meta->{entitlement} + 0 : undef;
+    my @out;
+    push @out, { value => _pool_round($installed), basis => 'installedEntitlement', profiles => [] } if defined $installed;
+    my $values = _safe_dig($mwa, $vm, 'ProfileValues');
+    my %profiles_at;
+    foreach my $profile (sort @{ $profiles_aref // [] })
+    {
+        my $value = (ref($values) eq 'HASH') ? $values->{$profile} : undef;
+        next unless (defined $value && looks_like_number($value) && $value > 0);
+        $value = _pool_round($value);
+        next if (defined $installed && $value >= $installed - $STRUCTURAL_ENT_TOLERANCE);
+        push @{ $profiles_at{$value} }, $profile;
+    }
+    push @out, { value => $_ + 0, basis => 'monthlyProfileValue', profiles => $profiles_at{$_} }
+        for sort { $b <=> $a } keys %profiles_at;
+    return \@out;
+}
+
+# The actionable profiles (shown in the CSV, without the measurement-only
+# peak helper) grouped by population: { population => [profiles] }.
+sub _exposure_populations
+{
+    my $population_of = _exposure_profile_populations();
+    my %actionable = map { $_->{name} => 1 }
+        grep { ref($_) eq 'HASH' && $_->{csv_output} && defined $_->{name} && $_->{name} ne $MANDATORY_PEAK_PROFILE_FOR_HINT } @profiles;
+    my %groups;
+    push @{ $groups{ $population_of->{$_} } }, $_ for sort grep { $actionable{$_} } keys %$population_of;
+    return \%groups;
+}
+
+# ==============================================================================
+# SUBROUTINE: _exposure_evaluate_window
+# PURPOSE:    Evaluates trackers over [window_start, window_end) directly from
+#             the cache (used by --pool-exposure, outside the history update).
+# RETURNS:    hashref of counts
+# ==============================================================================
+sub _exposure_evaluate_window
+{
+    my ($pool_context, $exposure_context, $trackers_aref, $window_start, $window_end) = @_;
+    my %wanted = map { $_->{vm} => 1 } @$trackers_aref;
+    my $tmp_dir = File::Temp::tempdir('nfit_exposure_XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my ($pool_files, $pool_counts) = _pool_partition_observations($pool_context->{path}, [ [ $window_start, $window_end ] ], $tmp_dir);
+    my ($cpu_files, $cpu_counts)   = _exposure_partition_cpu($exposure_context->{dataPath}, [ [ $window_start, $window_end ] ], $tmp_dir, \%wanted);
+    my $physical_minutes = 0;
+    foreach my $day (int($window_start / 86400) .. int(($window_end - 1) / 86400))
+    {
+        my ($minutes, $physical) = $pool_files->{$day} ? _pool_reduce_day($pool_files->{$day}) : ({}, {});
+        $physical_minutes += scalar keys %$physical;
+        _exposure_process_day($trackers_aref, $day, _exposure_read_cpu_day($cpu_files->{$day}), $minutes, $physical);
+    }
+    return { %$pool_counts, %$cpu_counts, physicalMinutes => $physical_minutes,
+             physicalColumns => $pool_counts->{physicalColumns} // 0 };
+}
+
+# Totals of one tracker over its days: base counts and, per threshold, the
+# summed columns with the longest joint run as a maximum.
+sub _exposure_totals
+{
+    my ($tracker) = @_;
+    my %total = (expected => 0, paired => 0, classified => 0, scarce => 0, days => 0,
+                 exposure => [ map { [ (0) x scalar(@MEMBER_EXPOSURE_COLUMNS) ] } @{ $tracker->{thresholds} } ],
+                 daysAbove => [ map { 0 } @{ $tracker->{thresholds} } ]);
+    foreach my $acc (values %{ $tracker->{daily} })
+    {
+        $total{$_} += $acc->{$_} for qw(expected paired classified scarce);
+        foreach my $k (0 .. $#{ $acc->{exposure} })
+        {
+            my ($from, $into) = ($acc->{exposure}[$k], $total{exposure}[$k]);
+            $into->[$_] += $from->[$_] for 0 .. 5;
+            $into->[6] = $from->[6] if ($from->[6] > $into->[6]);
+            $total{daysAbove}[$k]++ if $from->[0];
+        }
+    }
+    return \%total;
+}
+
+# Planner-facing reading of one cut: (sentences). The minutes the cut exposes
+# are those above the proposal and within the installed entitlement; every
+# count is of minutes above a threshold, so the difference between the two
+# thresholds is exact.
+sub _exposure_reading
+{
+    my ($total, $k_proposed, $k_installed) = @_;
+    return ('No paired PhysC/PhysB minute in this window: exposure is not measured.') unless $total->{paired};
+    my $p = $total->{exposure}[$k_proposed];
+    return ('No busy minute exceeded the proposed entitlement: the cut exposes no observed busy demand.') unless $p->[0];
+    my $i = defined $k_installed ? $total->{exposure}[$k_installed] : [ (0) x scalar(@MEMBER_EXPOSURE_COLUMNS) ];
+    my ($within, $scarce, $competition, $own, $unclassified) = map { $p->[$_] - $i->[$_] } (0, 2, 3, 4, 5);
+
+    my @text;
+    if (!$within)
+    {
+        push @text, 'Every busy minute above the proposal was already above the installed entitlement: the cut removes no guarantee the LPAR used.';
+        push @text, sprintf('%d of those minutes fell in credible scarcity while other LPARs consumed: that busy already competed.', $p->[3]) if $p->[3];
+        return @text;
+    }
+    push @text, sprintf('The cut exposes %d busy minute(s) that the installed entitlement covered.', $within);
+    if (!$scarce)
+    {
+        push @text, $unclassified
+            ? sprintf('None of them fell in credible pool scarcity, but %d are unclassified (a pool layer unknown), so contest is not ruled out for them.', $unclassified)
+            : 'None of them fell in credible pool scarcity: in this window that busy was never contested.';
+    }
+    elsif ($competition)
+    {
+        push @text, sprintf('%d of them fell in credible scarcity while other LPARs consumed (competition): without the guarantee that busy would have had to compete.', $competition);
+        push @text, sprintf('%d further minute(s) in scarcity were the LPAR filling the pool alone.', $scarce - $competition) if ($scarce > $competition);
+    }
+    else
+    {
+        push @text, sprintf('The %d of them in scarcity were the LPAR filling the pool alone (no other LPAR consuming): not competition.', $scarce);
+    }
+    push @text, sprintf('%d of them were at the LPAR\'s own width (VPs, or entitlement when capped): there its limit is its own width.', $own) if $own;
+    return @text;
+}
+
+# ==============================================================================
+# SUBROUTINE: _log_cut_exposure
+# PURPOSE:    Writes the "Entitlement Cut Exposure" section (--pool-exposure):
+#             for each LPAR whose planning-profile entitlement is below its
+#             installed entitlement, the busy the cut would expose over the
+#             analysis window, whether the installed guarantee covered it, and
+#             whether it coincided with credible pool scarcity, competition or
+#             the LPAR's own width. Nothing is changed.
+# RETURNS:    hashref { Cuts, Evaluated, Status }
+# ==============================================================================
+sub _log_cut_exposure
+{
+    my ($log_fh, $map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href, $cache_dir, $start_obj, $end_obj) = @_;
+    my %summary = (Cuts => 0, Evaluated => 0, Status => 'notEvaluated');
+    return \%summary unless (defined $log_fh && ref($log_fh) && ref($map_ref) eq 'HASH' && ref($vm_order_aref) eq 'ARRAY');
+    $tier_overrides_href //= {};
+
+    # Cuts on the planning profile, as the CSV shows them.
+    my $population_of = _exposure_profile_populations();
+    my @cuts;
+    foreach my $vm (@$vm_order_aref)
+    {
+        my $vm_map  = $map_ref->{$vm};
+        next unless (ref($vm_map) eq 'HASH');
+        my $cfg     = (ref($vm_map->{Configuration}) eq 'HASH') ? $vm_map->{Configuration} : {};
+        my $core    = (ref($vm_map->{CoreResults}) eq 'HASH')   ? $vm_map->{CoreResults}   : {};
+        my $hinting = (ref($vm_map->{Hinting}) eq 'HASH')       ? $vm_map->{Hinting}       : {};
+        my $planning = $hinting->{ResolvedPlanningProfile};
+        if (!defined $planning || $planning eq '')
+        {
+            $planning = _resolve_vm_tier_pattern_policy(($tier_overrides_href->{$vm} // ''), ($hinting->{AutoTier} // ''), $profiles_aref)->{ResolvedPlanningProfile};
+        }
+        next unless (defined $planning && ref($core->{ProfileValues}) eq 'HASH');
+        my $proposed = _structural_shown_value($core->{ProfileValues}{$planning});
+        my $current  = _structural_shown_value($cfg->{entitlement});
+        next unless (defined $proposed && defined $current && $proposed < $current - $STRUCTURAL_ENT_TOLERANCE);
+        push @cuts, { vm => $vm, planning => $planning, proposed => $proposed, current => $current,
+                      population => $population_of->{$planning} // 'none' };
+    }
+    $summary{Cuts} = scalar @cuts;
+
+    my @out = ('', '=' x 70, 'Entitlement Cut Exposure', '=' x 70);
+    push @out, "  For each LPAR whose planning-profile entitlement is below its installed entitlement:";
+    push @out, "  the busy (PhysB) minutes above the proposal over the analysis window, minute by minute,";
+    push @out, "  whether the installed guarantee covered them, and whether they fell in credible pool";
+    push @out, "  scarcity (competition) or at the LPAR's own width. Observations only; nothing is changed.";
+    push @out, '';
+
+    my $pool_context = _pool_history_context($cache_dir);
+    my ($exposure_context, $reason) = _exposure_context($cache_dir, $pool_context);
+    if (!@cuts)
+    {
+        push @out, "  No planning-profile entitlement cut in this analysis.";
+        $summary{Status} = 'noCuts';
+    }
+    elsif (!$exposure_context)
+    {
+        push @out, "  Not evaluated: $reason.";
+        $summary{Status} = 'unavailable';
+    }
+    else
+    {
+        my $window_start = $start_obj->epoch - ($start_obj->epoch % 86400);
+        my $window_end   = $end_obj->epoch - ($end_obj->epoch % 86400) + 86400;
+        my %cut_of = map { $_->{vm} => $_ } @cuts;
+        my %populations;
+        push @{ $populations{ $_->{population} } }, $_->{planning} for @cuts;
+        @$_ = uniq(@$_) for values %populations;
+        my $trackers = _exposure_trackers(_exposure_load_states($cache_dir), $window_start, $window_end, \%populations, sub
+        {
+            my ($vm, $meta, $population, $profiles) = @_;
+            my $cut = $cut_of{$vm};
+            return [] unless ($cut && $cut->{population} eq $population);
+            my @thresholds = ({ value => $cut->{proposed}, basis => 'proposedEntitlement', profiles => [ $cut->{planning} ] });
+            my $installed = looks_like_number($meta->{entitlement} // '') ? $meta->{entitlement} + 0 : undef;
+            push @thresholds, { value => $installed, basis => 'installedEntitlement', profiles => [] }
+                if (defined $installed && $installed > $cut->{proposed} + $STRUCTURAL_ENT_TOLERANCE);
+            return \@thresholds;
+        }, \%cut_of);
+        my $counts = _exposure_evaluate_window($pool_context, $exposure_context, $trackers, $window_start, $window_end);
+        $summary{Status} = 'evaluated';
+
+        push @out, sprintf("  Window: %s to %s (UTC days). Classifier %s; physical layer %s.",
+            _pool_iso($window_start), _pool_iso($window_end), $MEMBER_EXPOSURE_RULES{classifier},
+            ($counts->{physicalColumns} ? 'from the shared pool idle cores' : 'unavailable (no shared pool fields in the pool observations)'));
+        my %trackers_of;
+        push @{ $trackers_of{ $_->{vm} } }, $_ for @$trackers;
+        foreach my $cut (@cuts)
+        {
+            push @out, '', sprintf("  %s (planning profile %s; %s)", $cut->{vm}, $cut->{planning}, _exposure_population_label($cut->{population}));
+            push @out, sprintf("    Proposed entitlement %.2f, installed %.2f", $cut->{proposed}, $cut->{current});
+            my @list = @{ $trackers_of{ $cut->{vm} } // [] };
+            if (!@list)
+            {
+                push @out, "    Not evaluated: no configuration state in a shared pool within the window.";
+                next;
+            }
+            $summary{Evaluated}++;
+            foreach my $tracker (@list)
+            {
+                my $total = _exposure_totals($tracker);
+                my ($k_installed) = grep { $tracker->{thresholds}[$_]{basis} eq 'installedEntitlement' } 0 .. $#{ $tracker->{thresholds} };
+                my $p = $total->{exposure}[0];
+                my $pct = sub { my ($n, $d) = @_; return $d ? sprintf('%.1f%%', 100 * $n / $d) : 'n/a' };
+                push @out, sprintf("    State from %s: pool %s, entitlement %s, VPs %s, %s",
+                    _pool_iso($tracker->{stateStart}), $tracker->{pool},
+                    (defined $tracker->{entitlement} ? sprintf('%.2f', $tracker->{entitlement}) : 'unknown'),
+                    ($tracker->{vp} // 'unknown'), ($tracker->{capped} ? 'capped' : 'uncapped'));
+                push @out, sprintf("      Minutes in window     : %d expected, %d paired (%s), %d pool-classified (%s of paired), %d in credible scarcity",
+                    $total->{expected}, $total->{paired}, $pct->($total->{paired}, $total->{expected}),
+                    $total->{classified}, $pct->($total->{classified}, $total->{paired}), $total->{scarce});
+                push @out, sprintf("      Busy above %.2f       : %d minute(s) on %d day(s), %.2f core-minutes above the proposal",
+                    $tracker->{thresholds}[0]{value}, $p->[0], $total->{daysAbove}[0], $p->[1]);
+                if (defined $k_installed)
+                {
+                    my $i = $total->{exposure}[$k_installed];
+                    my $within_core = $p->[1] - $i->[1] - ($tracker->{thresholds}[$k_installed]{value} - $tracker->{thresholds}[0]{value}) * $i->[0];
+                    push @out, sprintf("        within installed    : %d minute(s), %.2f core-minutes; in credible scarcity %d (competition %d)  <- exposed by the cut",
+                        $p->[0] - $i->[0], max(0, $within_core), $p->[2] - $i->[2], $p->[3] - $i->[3]);
+                    push @out, sprintf("        above installed     : %d minute(s) (already above the guarantee); in credible scarcity %d (competition %d)",
+                        $i->[0], $i->[2], $i->[3]);
+                }
+                push @out, sprintf("      In credible scarcity  : %d minute(s) (competition %d, LPAR alone %d); longest joint run %d minute(s)",
+                    $p->[2], $p->[3], $p->[2] - $p->[3], $p->[6]);
+                push @out, sprintf("      At own width          : %d minute(s); unclassified: %d minute(s)", $p->[4], $p->[5]);
+                push @out, map { "      Reading: $_" } _exposure_reading($total, 0, $k_installed);
+            }
+        }
+    }
+    push @out, '';
+    print {$log_fh} join("\n", @out), "\n";
+    return \%summary;
 }
 
 # ==============================================================================
@@ -21116,8 +22055,16 @@ Model behaviour depends on the event configuration:
   --pool-history                            : With --update-history, add PoolHistory blocks when the cache holds pool
                                               observations: per pool, the concurrent busy cores per UTC day and the
                                               installed entitlement and VPs of its members. Observed values only;
-                                              pool scarcity is not evaluated. Stored months gain blocks without their
-                                              analysis changing.
+                                              pool scarcity is not evaluated there. When the cache also declares a
+                                              PhysB column, a MemberExposure block per LPAR state: daily busy minutes
+                                              above its installed entitlement and the month's lower profile values,
+                                              with the minutes in pool scarcity, competition and own width. Stored
+                                              months gain blocks without their analysis changing.
+
+  --pool-exposure                           : Standard runs: add an "Entitlement Cut Exposure" section to the
+                                              rationale for each LPAR whose planning-profile entitlement is below its
+                                              installed entitlement (needs pool observations and a PhysB column).
+                                              The CSV and the recommendations are unchanged.
 
   --min-history-days <N>                    : When updating history, allow partial months with at least N days of data
                                               (Default: 28 days).
