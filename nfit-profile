@@ -2036,6 +2036,11 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             print {$LOG_FH} "                         when capped): the limit is the LPAR's own width.\n";
             print {$LOG_FH} "                       - Longest joint run: the longest run of consecutive minutes above\n";
             print {$LOG_FH} "                         the proposal in credible scarcity.\n";
+            print {$LOG_FH} "                       - Review entitlement cut - pool competition (>>): busy covered by\n";
+            print {$LOG_FH} "                         the installed entitlement would have moved into borrowing in\n";
+            print {$LOG_FH} "                         minutes of credible scarcity with other LPARs' use meeting the\n";
+            print {$LOG_FH} "                         competition threshold. Shown as a count of the state's scarce\n";
+            print {$LOG_FH} "                         minutes. An advisory: the recommendation is unchanged.\n";
         }
         print {$LOG_FH} "======================================================================\n\n";
     }
@@ -2603,8 +2608,8 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             {
                 my $exposure_summary = _log_cut_exposure($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order,
                     \@profiles, \%vm_tier_overrides, $current_cache_path, $effective_start_date_obj, $effective_end_date_obj);
-                printf STDERR "  [INFO] Entitlement cut exposure: %d cut(s), %d evaluated (%s; see rationale)\n",
-                    $exposure_summary->{Cuts}, $exposure_summary->{Evaluated}, $exposure_summary->{Status};
+                printf STDERR "  [INFO] Entitlement cut exposure: %d cut(s), %d evaluated, %d advisory(ies) (%s; see rationale)\n",
+                    $exposure_summary->{Cuts}, $exposure_summary->{Evaluated}, $exposure_summary->{Advisories}, $exposure_summary->{Status};
             }
         }
     }
@@ -19563,6 +19568,7 @@ sub _build_pool_history
     my @windows = map { [ _pool_job_window($_->{start_obj}, $_->{end_obj}) ] } @$jobs_aref;
     my $tmp_dir = File::Temp::tempdir('nfit_pool_history_XXXXXX', TMPDIR => 1, CLEANUP => 1);
     my $started = time();
+    print STDERR "  • Reading pool observations\n";
     my ($day_files, $read_counts) = _pool_partition_observations($context->{path}, \@windows, $tmp_dir);
 
     # Member exposure: the CPU samples of every LPAR with a state in a pool.
@@ -19576,6 +19582,7 @@ sub _build_pool_history
         {
             $wanted{$vm} = 1 if grep { ref($_) eq 'HASH' && looks_like_number(($_->{metadata} // {})->{pool_id} // '') } @{ $states_db->{$vm} // [] };
         }
+        print STDERR "  • Reading CPU samples of " . scalar(keys %wanted) . " LPAR(s) for member exposure\n";
         ($cpu_files) = _exposure_partition_cpu($exposure->{context}{dataPath}, [ @windows[@exposure_jobs] ], $tmp_dir, \%wanted);
         $populations = _exposure_populations();
     }
@@ -20240,8 +20247,11 @@ sub _exposure_evaluate_window
     my ($pool_context, $exposure_context, $trackers_aref, $window_start, $window_end) = @_;
     my %wanted = map { $_->{vm} => 1 } @$trackers_aref;
     my $tmp_dir = File::Temp::tempdir('nfit_exposure_XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    _subtask('Reading pool observations');
     my ($pool_files, $pool_counts) = _pool_partition_observations($pool_context->{path}, [ [ $window_start, $window_end ] ], $tmp_dir);
+    _subtask(sprintf('Reading CPU samples of %d LPAR(s)', scalar(keys %wanted)));
     my ($cpu_files, $cpu_counts)   = _exposure_partition_cpu($exposure_context->{dataPath}, [ [ $window_start, $window_end ] ], $tmp_dir, \%wanted);
+    _subtask(sprintf('Classifying pool minutes and member busy (%d state(s))', scalar(@$trackers_aref)));
     my $physical_minutes = 0;
     foreach my $day (int($window_start / 86400) .. int(($window_end - 1) / 86400))
     {
@@ -20320,6 +20330,30 @@ sub _exposure_reading
     return @text;
 }
 
+# The planner advisory of one cut and configuration state, or (). It is given
+# when busy covered by the installed guarantee would have moved into borrowing
+# in minutes of credible pool scarcity in which other LPARs' use met the
+# competition threshold: newly exposed busy, scarcity and competition must all
+# coincide. Counts are exact differences between the proposal and the
+# installed entitlement, over the profile's hours in that state.
+sub _exposure_advisory
+{
+    my ($tracker, $total, $k_installed) = @_;
+    return () unless defined $k_installed;
+    my ($p, $i) = ($total->{exposure}[0], $total->{exposure}[$k_installed]);
+    my $newly_scarce      = $p->[2] - $i->[2];
+    my $newly_competition = $p->[3] - $i->[3];
+    return () unless ($newly_competition > 0);
+    return (
+        sprintf('%s, pool %s: Review entitlement cut - pool competition. Reducing %.2f to %.2f would have moved busy work covered by the current guarantee into borrowing in %d of %d minutes of credible pool scarcity (%s; state from %s).',
+            $tracker->{vm}, $tracker->{pool}, $tracker->{thresholds}[$k_installed]{value}, $tracker->{thresholds}[0]{value}, $newly_scarce, $total->{scarce},
+            _exposure_population_label($tracker->{population}), _pool_iso($tracker->{stateStart})),
+        sprintf('Other LPARs\' use met the competition threshold in %d of those %d. Longest run above the proposal in credible scarcity: %d minute(s).',
+            $newly_competition, $newly_scarce, $p->[6]),
+        'This measures the change in guarantee exposure, not whether work would have finished later. The recommendation is unchanged.',
+    );
+}
+
 # ==============================================================================
 # SUBROUTINE: _log_cut_exposure
 # PURPOSE:    Writes the "Entitlement Cut Exposure" section (--pool-exposure):
@@ -20333,7 +20367,7 @@ sub _exposure_reading
 sub _log_cut_exposure
 {
     my ($log_fh, $map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href, $cache_dir, $start_obj, $end_obj) = @_;
-    my %summary = (Cuts => 0, Evaluated => 0, Status => 'notEvaluated');
+    my %summary = (Cuts => 0, Evaluated => 0, Advisories => 0, Status => 'notEvaluated');
     return \%summary unless (defined $log_fh && ref($log_fh) && ref($map_ref) eq 'HASH' && ref($vm_order_aref) eq 'ARRAY');
     $tier_overrides_href //= {};
 
@@ -20399,7 +20433,12 @@ sub _log_cut_exposure
                 if (defined $installed && $installed > $cut->{proposed} + $STRUCTURAL_ENT_TOLERANCE);
             return \@thresholds;
         }, \%cut_of);
+        _step('Entitlement Cut Exposure');
+        _task(sprintf('Evaluating %d planning-profile cut(s) over %d UTC day(s), minute by minute',
+                      scalar(@cuts), ($window_end - $window_start) / 86400));
+        my $started = time();
         my $counts = _exposure_evaluate_window($pool_context, $exposure_context, $trackers, $window_start, $window_end);
+        _task(sprintf('Cut exposure evaluated (%s)', format_duration(time() - $started)));
         $summary{Status} = 'evaluated';
 
         push @out, sprintf("  Window: %s to %s (UTC days). Classifier %s; physical layer %s.",
@@ -20407,6 +20446,8 @@ sub _log_cut_exposure
             ($counts->{physicalColumns} ? 'from the shared pool idle cores' : 'unavailable (no shared pool fields in the pool observations)'));
         my %trackers_of;
         push @{ $trackers_of{ $_->{vm} } }, $_ for @$trackers;
+        my $advisory_summary_at = scalar @out;      # the advisory summary goes here, after the window line
+        my @advised;
         foreach my $cut (@cuts)
         {
             push @out, '', sprintf("  %s (planning profile %s; %s)", $cut->{vm}, $cut->{planning}, _exposure_population_label($cut->{population}));
@@ -20428,6 +20469,13 @@ sub _log_cut_exposure
                     _pool_iso($tracker->{stateStart}), $tracker->{pool},
                     (defined $tracker->{entitlement} ? sprintf('%.2f', $tracker->{entitlement}) : 'unknown'),
                     ($tracker->{vp} // 'unknown'), ($tracker->{capped} ? 'capped' : 'uncapped'));
+                my @advisory = _exposure_advisory($tracker, $total, $k_installed);
+                if (@advisory)
+                {
+                    $summary{Advisories}++;
+                    push @advised, $cut->{vm};
+                    push @out, "      >> $advisory[0]", map { "         $_" } @advisory[ 1 .. $#advisory ];
+                }
                 push @out, sprintf("      Minutes in window     : %d expected, %d paired (%s), %d pool-classified (%s of paired), %d in credible scarcity",
                     $total->{expected}, $total->{paired}, $pct->($total->{paired}, $total->{expected}),
                     $total->{classified}, $pct->($total->{classified}, $total->{paired}), $total->{scarce});
@@ -20451,6 +20499,9 @@ sub _log_cut_exposure
                 push @out, map { "      Reading: $_" } _exposure_reading($total, 0, $k_installed);
             }
         }
+        splice @out, $advisory_summary_at, 0,
+            sprintf("  Advisories (review entitlement cut - pool competition): %d state(s) of %d LPAR(s)%s", $summary{Advisories},
+                    scalar(uniq(@advised)), (@advised ? ' (' . join(', ', uniq(@advised)) . ')' : ''));
     }
     push @out, '';
     print {$log_fh} join("\n", @out), "\n";

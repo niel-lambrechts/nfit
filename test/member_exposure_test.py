@@ -91,7 +91,7 @@ def cpu(vm, t):
         return 1.0, '0.5'
     if vm == 'vmB':
         if between(t, W1, 30) or between(t, W3, 20):
-            return 1.0, '0.8'
+            return 1.0, '0.95'      # within its installed 1.0, above a cut, while vmA fills the pool
         return 0.9, '0.6'
     if vm == 'vmS':
         if between(t, W6, 20):
@@ -409,6 +409,33 @@ class MemberExposureTests(unittest.TestCase):
         self.assertGreater(tot[1] - excess_i, 0)
         self.assertNotIn('removes no guarantee', section)
         self.assertIn('Reading:', block)
+
+    def test_advisory_needs_newly_exposed_busy_scarcity_and_competition(self):
+        self.run_profile(self.root, '--pool-exposure')
+        with open(self.latest(self.root, '.log'), encoding='utf-8') as fh:
+            log = fh.read()
+        section = log[log.index('Entitlement Cut Exposure\n'):]
+        advised = []
+        for vm in ('vmA', 'vmB', 'vmS'):
+            hit = re.search(r'\n  ' + vm + r' \(planning profile (\S+); [^)]*\)\n    Proposed entitlement ([0-9.]+), installed ([0-9.]+)', section)
+            self.assertIsNotNone(hit, vm)
+            proposed, installed = float(hit.group(2)), float(hit.group(3))
+            ref = reference(vm, self.populations[hit.group(1)], [proposed, installed])
+            col = lambda k, i: sum(v[4][k][i] for v in ref.values())
+            scarce_total = sum(v[3] for v in ref.values())
+            newly_scarce, newly_comp = col(0, 2) - col(1, 2), col(0, 3) - col(1, 3)
+            block = section[hit.end():].split('\n  vm')[0]
+            if newly_comp > 0:
+                advised.append(vm)
+                self.assertIn(f'>> {vm}, pool {CONFIG[vm][2]}: Review entitlement cut - pool competition. Reducing {installed:.2f} to {proposed:.2f} would have moved '
+                              f'busy work covered by the current guarantee into borrowing in {newly_scarce} of {scarce_total} minutes', block)
+                self.assertIn(f"Other LPARs' use met the competition threshold in {newly_comp} of those {newly_scarce}.", block)
+            else:
+                self.assertNotIn('>> Review entitlement cut', block, vm)
+        # vmB is the positive case; vmA's exposed busy was already above its guarantee and
+        # vmS fills its own pool, so neither is advised.
+        self.assertEqual(advised, ['vmB'])
+        self.assertIn('Advisories (review entitlement cut - pool competition): 1 state(s) of 1 LPAR(s) (vmB)', section)
 
     @staticmethod
     def latest(r, suffix):
