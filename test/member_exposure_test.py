@@ -386,29 +386,30 @@ class MemberExposureTests(unittest.TestCase):
             option_rows = fh.read().splitlines()
         self.assertEqual(plain_rows, option_rows)
         self.assertIn('[INFO] Entitlement cut exposure:', with_option.stderr)
+        self.assertRegex(with_option.stderr, r'\[INFO\] Recommended actions: \d+')
         with open(self.latest(self.root, '.log'), encoding='utf-8') as fh:
             log = fh.read()
         section = log[log.index('Entitlement Cut Exposure\n'):]
-        hit = re.search(r'\n  vmA \(planning profile (\S+); [^)]*\)\n    Proposed entitlement ([0-9.]+), installed 2\.00', section)
+        hit = re.search(r'\n  vmA: reduce entitlement from 2\.00 to ([0-9.]+) cores \((\S+), [^)]*\)\n', section)
         self.assertIsNotNone(hit, section[:1500])
-        proposed = float(hit.group(2))
+        proposed = float(hit.group(1))
         self.assertLess(proposed, 2.0)
-        pop = self.populations[hit.group(1)]
-        ref = reference('vmA', pop, [proposed, 2.0])
+        ref = reference('vmA', self.populations[hit.group(2)], [proposed, 2.0])
         tot = [sum(v[4][0][i] for v in ref.values()) for i in range(6)]
-        inst = sum(v[4][1][0] for v in ref.values())
-        block = section[hit.end():].split('\n  vm')[0]
-        self.assertIn(f'Busy above {proposed:.2f}       : {tot[0]} minute(s)', block)
-        self.assertIn(f'within installed    : {tot[0] - inst} minute(s)', block)
-        self.assertIn(f'above installed     : {inst} minute(s)', block)
-        self.assertIn(f'In credible scarcity  : {tot[2]} minute(s) (competition {tot[3]}', block)
-        # Additional borrowing = excess above the proposal - excess above installed, which also
-        # counts minutes already above the installed entitlement (all of vmA's in this fixture).
-        excess_i = sum(v[4][1][1] for v in ref.values())
-        self.assertIn(f'Additional borrowing  : {tot[1] - excess_i:.2f} core-minutes', block)
-        self.assertGreater(tot[1] - excess_i, 0)
+        inst = [sum(v[4][1][i] for v in ref.values()) for i in range(6)]
+        paired = sum(v[1] for v in ref.values())
+        block = re.sub(r'\s+', ' ', section[hit.end():].split('\n  vm')[0])
+        self.assertIn(f'busy above {proposed:.2f} cores in {tot[0]:,} of {paired:,} measured minutes', block)
+        if inst[0] == tot[0]:
+            # Every minute above the proposal was already above 2.00: no guaranteed minute is lost,
+            # but the cut adds the difference in excess core-minutes (here all of vmA's minutes).
+            self.assertIn("today's 2.00 covered none of them", block)
+            self.assertIn(f"the cut adds {tot[1] - inst[1]:.2f} core-minutes of busy work above the guarantee", block)
+            self.assertGreater(tot[1] - inst[1], 0)
+        self.assertIn('Recommendation:', block)
         self.assertNotIn('removes no guarantee', section)
-        self.assertIn('Reading:', block)
+        for jargon in ('credible scarcity', 'paired', 'Classifier'):
+            self.assertNotIn(jargon, section.split('Recommended Actions')[0].split('Key Terminology')[0])
 
     def test_advisory_needs_newly_exposed_busy_scarcity_and_competition(self):
         self.run_profile(self.root, '--pool-exposure')
@@ -417,25 +418,28 @@ class MemberExposureTests(unittest.TestCase):
         section = log[log.index('Entitlement Cut Exposure\n'):]
         advised = []
         for vm in ('vmA', 'vmB', 'vmS'):
-            hit = re.search(r'\n  ' + vm + r' \(planning profile (\S+); [^)]*\)\n    Proposed entitlement ([0-9.]+), installed ([0-9.]+)', section)
+            hit = re.search(r'\n  ' + vm + r': reduce entitlement from ([0-9.]+) to ([0-9.]+) cores \((\S+), [^)]*\)\n', section)
             self.assertIsNotNone(hit, vm)
-            proposed, installed = float(hit.group(2)), float(hit.group(3))
-            ref = reference(vm, self.populations[hit.group(1)], [proposed, installed])
+            installed, proposed = float(hit.group(1)), float(hit.group(2))
+            ref = reference(vm, self.populations[hit.group(3)], [proposed, installed])
             col = lambda k, i: sum(v[4][k][i] for v in ref.values())
             scarce_total = sum(v[3] for v in ref.values())
-            newly_scarce, newly_comp = col(0, 2) - col(1, 2), col(0, 3) - col(1, 3)
-            block = section[hit.end():].split('\n  vm')[0]
+            newly_comp = col(0, 3) - col(1, 3)
+            block = re.sub(r'\s+', ' ', section[hit.end():].split('\n  vm')[0])
             if newly_comp > 0:
                 advised.append(vm)
-                self.assertIn(f'>> {vm}, pool {CONFIG[vm][2]}: Review entitlement cut - pool competition. Reducing {installed:.2f} to {proposed:.2f} would have moved '
-                              f'busy work covered by the current guarantee into borrowing in {newly_scarce} of {scarce_total} minutes', block)
-                self.assertIn(f"Other LPARs' use met the competition threshold in {newly_comp} of those {newly_scarce}.", block)
+                self.assertIn(f'>> Recommendation: review before applying. Reducing {installed:.2f} to {proposed:.2f} removes '
+                              f'the guarantee in {newly_comp} of the {scarce_total} minutes the pool was full while other LPARs were busy.', block)
             else:
-                self.assertNotIn('>> Review entitlement cut', block, vm)
+                self.assertNotIn('>> Recommendation', block, vm)
+                self.assertIn('Recommendation: no objection from the pool evidence', block, vm)
         # vmB is the positive case; vmA's exposed busy was already above its guarantee and
         # vmS fills its own pool, so neither is advised.
         self.assertEqual(advised, ['vmB'])
-        self.assertIn('Advisories (review entitlement cut - pool competition): 1 state(s) of 1 LPAR(s) (vmB)', section)
+        self.assertIn('Review before applying: 1 cut on 1 LPAR (vmB)', section)
+        actions = re.sub(r'\s+', ' ', log[log.index('Recommended Actions'):])
+        self.assertIn('vmB (pool 7): review the cut from 1.00 to 0.90 before applying it', actions)
+        self.assertIn('No additional action identified by the checks run.', actions)
 
     @staticmethod
     def latest(r, suffix):

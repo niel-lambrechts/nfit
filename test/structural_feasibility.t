@@ -25,6 +25,7 @@ my @names = qw(
     _structural_shown_value _structural_tactical_vp _describe_ent_vp_pair
     _collect_structural_findings _structural_csv_tags
     _log_structural_feasibility _resolve_vm_tier_pattern_policy
+    _pool_units_text _pool_shortfall_action _rationale_wrap _log_recommended_actions
 );
 my $code = '';
 for my $name (@names)
@@ -46,8 +47,15 @@ our \$MIN_ENT_PER_VP = $min_ent_per_vp;
 our \$STRUCTURAL_ENT_TOLERANCE = $tolerance;
 our \$MANDATORY_PEAK_PROFILE_FOR_HINT = 'Peak_P-99W1';
 our \$MISSION_CRITICAL_PROFILE_NAME = 'P-99W1';
+our \$verbose = 0;
 } . $code . "\n1;\n";
 eval $harness or die "harness eval failed: $@\n";
+
+sub flat
+{
+    (my $text = shift) =~ s/\s+/ /g;
+    return $text;
+}
 
 sub near
 {
@@ -214,23 +222,20 @@ is($summary->{PoolShortfalls}, 1, 'one pool shortfall counted');
 is($summary->{WidthMismatches}, 1, 'one LPAR with a width mismatch on its planning profile');
 is($summary->{OrderNotes}, 1, 'one LPAR with an order-of-change note on its planning profile');
 
-like($buffer, qr/^Structural Feasibility Checks$/m, 'section heading written');
-like($buffer, qr/Pool 25 - SHORTFALL/, 'pool verdict written');
-like($buffer, qr/Pool ceiling \(Pool Size\)\s+: 7\.00 cores/, 'ceiling written');
-like($buffer, qr/LPARs analysed in the pool\s+: 4 \(1 with a configured TIER, 3 on default tier 3\)/, 'tier mix written');
-like($buffer, qr/Installed entitlement \(sum\)\s+: 6\.50 cores \(0\.50 below the ceiling\)/, 'installed sum written');
-like($buffer, qr/Proposed entitlement \(sum\)\s+: 8\.20 cores/, 'proposed sum: 2.60 + 2.83 + 1.72 (configured G1) + 1.05');
-like($buffer, qr/Shortfall\s+: 1\.20 cores/, 'shortfall written');
-like($buffer, qr/Lowest sum across all profiles : 7\.32 cores \(a shortfall of 0\.32 remains/, 'lowest-profile sum written');
+like($buffer, qr/^Pool and VP Checks$/m, 'section heading written');
+like($buffer, qr/Pool 25 - the proposed entitlements do not fit\n\s+8\.20 cores proposed against a pool maximum of 7 \(installed today 6\.50; 4 LPARs analysed\)\./,
+    'pool verdict with proposed, maximum, installed and members (2.60 + 2.83 + 1.72 configured G1 + 1.05)');
+like(flat($buffer), qr/Action: defer at least 1\.20 cores of the proposed increases, or raise the pool maximum from 7 to at least 9 processing units\./,
+    'shortfall action: defer the shortfall, or a whole-unit pool maximum that holds the proposals');
+like($buffer, qr/Even each LPAR's lowest profile totals 7\.32 cores, so no TIER choice fits within 7\./, 'lowest-profile sum written');
 like($buffer, qr/lparC\s+G1-99W5\s+1\.50\s+1\.72\s+\+0\.22\s+Yes/, 'configured TIER selects the planning profile');
 like($buffer, qr/lparB\s+G3-95W15 \(default\)\s+2\.00\s+2\.83\s+\+0\.83\s+No \(7\.33\)/, 'default tier 3 is labelled; fits-alone verdict written');
 unlike($buffer, qr/Pool 0 /, 'the default pool is not assessed');
-like($buffer, qr/lparD \(planning profile G3-95W15\)\n\s+- ENTITLEMENT\/WIDTH MISMATCH: proposed ENT 1\.05 needs at least 2 VPs; the tactical VP recommendation is 1 \(current 1, strategic rVCPU 2\)\.\n\s+Raise VPs to 2 or more before the entitlement can be applied\./,
-    'width mismatch written for the planning profile');
-like($buffer, qr/lparD.*\n.*\n.*\n\s+- Other profiles \(alternative plans\): entitlement\/width mismatch in P-99W1$/m,
-    'the same finding in another profile is listed by name');
-like($buffer, qr/lparE \(planning profile G3-95W15\)\n\s+- ORDER OF CHANGE: proposed ENT 0\.60 carries at most 12 VPs and the LPAR has 16\.\n\s+Reduce VPs \(tactical recommendation 4\) before the entitlement\./,
+like(flat($buffer), qr/lparD \(G3-95W15\): The proposed 1\.05 cores needs at least 2 VPs \(entitlement cannot exceed the VP count\); the VP recommendation is 1 VP\. Action: Limit the entitlement to 1\.00 \(the most 1 VP can carry\), or set at least 2 VPs\./,
+    'width mismatch on the planning profile, the supported option first');
+like(flat($buffer), qr/lparE \(G3-95W15\): 16 VPs need at least 0\.80 cores of entitlement; the proposed 0\.60 cores can carry at most 12 VPs\. Action: Reduce VPs from 16 to 4 before lowering the entitlement to 0\.60\./,
     'order of change written when only the current VPs are in the way');
+unlike($buffer, qr/Other profiles \(alternative plans\)/, 'alternative profiles are not itemised for an LPAR with a planning finding');
 unlike($buffer, qr/^    lparA \(planning/m, 'a consistent LPAR is not listed');
 
 # Further renderings: a pool that fits, an unconfirmed ceiling, a shortfall
@@ -257,20 +262,19 @@ $summary = UUT::_log_structural_feasibility($log, \%map2, [qw(f1 f2 c1 c2 t1 t2 
 close $log;
 is($summary->{PoolsAssessed}, 3, 'three pools assessed');
 is($summary->{PoolShortfalls}, 1, 'only the pool above its ceiling is a shortfall');
-like($buffer, qr/Pool 34 - FITS \(among the LPARs analysed\)\n.*: 6\.00 cores\n.*\n.*: 5\.00 cores \(1\.00 below the ceiling\)\n.*: 5\.00 cores\n\n/,
-    'a pool that fits is reported with its sums and no member table');
-like($buffer, qr/Pool 12 - CEILING UNCONFIRMED\n\s+- Pool ceiling \(Pool Size\)\s+: members report different sizes \(5\.00, 7\.00\); no verdict is given/,
+like($buffer, qr/Pool 34 - fits: 5\.00 cores proposed against a maximum of 6 \(installed today 5\.00; 2 LPARs analysed\)\.\n    Pool 40/,
+    'a pool that fits is reported on one line with no member table');
+like($buffer, qr/Pool 12 - no verdict: its LPARs report different maximums \(5, 7\)\.\n\s+2\.00 cores proposed .*Confirm the pool maximum on the HMC\./,
     'conflicting pool sizes are reported without a verdict');
-like($buffer, qr/Pool 40 - SHORTFALL.*?Shortfall\s+: 1\.00 cores\n\s+- Lowest sum across all profiles : 1\.80 cores \(within the ceiling: the shortfall depends on the TIER selection\)/s,
+like($buffer, qr/Pool 40 - the proposed entitlements do not fit.*?defer at least 1\.00 cores.*?to at least 3\s+processing units\.\n\s+A lower TIER choice would fit: the lowest profiles total 1\.80 cores\./s,
     'a shortfall that another TIER selection avoids is described as such');
-like($buffer, qr/w1 \(planning profile G3-95W15\)\n\s+- ENTITLEMENT\/WIDTH MISMATCH: proposed ENT 0\.47 carries at most 9 VPs \(0\.05 cores per VP minimum\); the tactical VP recommendation is 12 \(current 16\)\.\n\s+Reduce VPs to 9 or fewer first, or hold the entitlement at 0\.60 or more\./,
-    'an entitlement below the minimum for the tactical VPs is a mismatch, with the entitlement that would hold');
+like(flat($buffer), qr/w1 \(G3-95W15\): The proposed 0\.47 cores is too little for 12 VPs: PowerVM needs at least 0\.05 per VP, so 12 VPs need 0\.60\. Action: Reduce VPs from 16 to 12 \(the VP recommendation\) - minimum entitlement 0\.60\. If 16 VPs stay, the minimum is 0\.80\./,
+    'below the VP minimum: the recommended VP count and its minimum, and the minimum if the VPs stay');
+unlike($buffer, qr/Reduce VPs to 9/, 'no VP cut beyond the VP recommendation is proposed');
 is($summary->{WidthMismatches}, 1, '  and is counted');
 
-like($buffer, qr/PowerVM requires 0\.05 x VPs <= entitlement <= VPs \(the 0\.05 minimum applies on supported\n\s+firmware and operating system levels\)/,
-    'the firmware condition on the minimum is stated');
-like($buffer, qr/The HMC counts the pool's reserved capacity and every member's entitlement\./, 'what FITS leaves out is stated');
-like($buffer, qr/It is not evidence that the pool ran\n\s+out of capacity/, 'a shortfall is distinguished from pool depletion');
+like($buffer, qr/PowerVM needs 0\.05 to 1\.00 cores of entitlement per VP\./, 'the per-VP range is stated');
+like($buffer, qr/Reserved pool capacity and\n\s+LPARs outside this analysis are not counted/, 'what a fit leaves out is stated');
 
 # --- _structural_csv_tags ---------------------------------------------------------
 my $tags = UUT::_structural_csv_tags(UUT::_collect_structural_findings(\%map, \@order, \@profiles, \%tiers));
@@ -302,8 +306,48 @@ $summary = UUT::_log_structural_feasibility($log, { solo => { Configuration => {
     Hinting => {}, CoreResults => { ProfileValues => { 'G3-95W15' => 1.2 }, Profile_rVCPU_Tactical => { 'G3-95W15' => 2 } } } }, ['solo'], \@profiles, {});
 close $log;
 like($buffer, qr/No LPAR in this analysis is in a user-defined pool\./, 'no user-defined pool: stated');
-like($buffer, qr/No inconsistency found\./, 'no inconsistency: stated');
+like($buffer, qr/No conflict on the planning profile\./, 'no inconsistency: stated');
 ok($summary->{PoolShortfalls} == 0 && $summary->{WidthMismatches} == 0 && $summary->{OrderNotes} == 0, 'no findings counted');
 is(UUT::_log_structural_feasibility(undef, {}, [], \@profiles, {})->{PoolsAssessed}, 0, 'empty analysis: nothing assessed');
+
+# --- Minimum entitlement per VP: retained VPs and a single VP -----------------------
+my ($f4, $a4) = UUT::_describe_ent_vp_pair(UUT::_assess_ent_vp_pair({ proposed_ent => 0.08, tactical_vp => 4, current_vp => 4 }), 1);
+is($a4, 'Retain 4 VPs - minimum entitlement 0.20.', 'four VPs kept: the minimum is 0.05 per VP (0.20)');
+my (undef, $a1) = UUT::_describe_ent_vp_pair(UUT::_assess_ent_vp_pair({ proposed_ent => 0.04, tactical_vp => 1, current_vp => 1 }), 1);
+is($a1, 'Minimum configurable entitlement: 0.05.', 'one VP below the minimum: the minimum configurable entitlement');
+my (undef, $a3) = UUT::_describe_ent_vp_pair(UUT::_assess_ent_vp_pair({ proposed_ent => 0.08, tactical_vp => 3, current_vp => 4 }), 1);
+is($a3, 'Reduce VPs from 4 to 3 (the VP recommendation) - minimum entitlement 0.15. If 4 VPs stay, the minimum is 0.20.',
+    'a VP cut only to the VP recommendation, with the minimum if the VPs stay');
+
+# --- Recommended Actions ---------------------------------------------------------
+my $structural = UUT::_log_structural_feasibility(undef, \%map, \@order, \@profiles, \%tiers);
+$buffer = '';
+open $log, '>', \$buffer or die;
+my $n_actions = UUT::_log_recommended_actions($log, $structural, {
+    Status => 'evaluated', AdvisedCuts => [
+        { vm => 'x1', pool => 44, installed => 0.50, proposed => 0.12, competition => 416, full => 423 },
+        { vm => 'x2', pool => 44, installed => 0.50, proposed => 0.11, competition => 398, full => 423 },
+        { vm => 'x3', pool => 46, installed => 1.00, proposed => 0.42, competition => 163, full => 390 } ],
+    PoolFull => { 0 => 9, 24 => 312, 44 => 423 }, FrameLow => 0 });
+close $log;
+is($n_actions, 5, 'actions: one pool shortfall, two VP findings, two cut reviews');
+like(flat($buffer), qr/Recommended Actions \(planning profile of each LPAR\)/, 'section heading written');
+like(flat($buffer), qr/1\. Pool 25: Defer at least 1\.20 cores of the proposed increases, or raise the pool maximum from 7 to at least 9 processing units\./,
+    'the pool shortfall leads the list');
+like(flat($buffer), qr/lparD: Limit the entitlement to 1\.00/, 'the width finding is an action');
+like(flat($buffer), qr/Pool 44: review these entitlement cuts together before applying them - x1 0\.50 to 0\.12 \(416 of 423 full-pool minutes\); x2 0\.50 to 0\.11 \(398 of 423/,
+    'cuts in one pool are reviewed together');
+like(flat($buffer), qr/x3 \(pool 46\): review the cut from 1\.00 to 0\.42 before applying it - it removes the guarantee in 163 of the 390 minutes/,
+    'a single cut is reviewed with its count and denominator');
+like(flat($buffer), qr/No additional action identified by the checks run\./, 'the list is closed');
+like(flat($buffer), qr/Observed \(no action\): - Pool 24 was at its maximum in 312 minutes of the period; no entitlement cut in it needs review\./,
+    'a pool at its maximum without a cut is an observation, not an action');
+unlike($buffer, qr/Pool 0 was at its maximum/, 'the default pool is not reported as a pool at its maximum');
+$buffer = '';
+open $log, '>', \$buffer or die;
+is(UUT::_log_recommended_actions($log, { Findings => { Valid => 1, Pools => [], VmFindings => [] } }, undef), 0, 'nothing to do: no actions');
+close $log;
+like(flat($buffer), qr/No action identified by the checks run\. Pool competition for entitlement cuts was not checked \(add --pool-exposure\)\./,
+    'without --pool-exposure the skipped check is named');
 
 done_testing();

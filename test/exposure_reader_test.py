@@ -9,16 +9,20 @@
 # between stored thresholds, support bounds below the lowest stored threshold,
 # a candidate above every threshold, a randomised property check that the
 # bounds always contain the true value, unavailable answers with reasons,
-# the as-of window, differences against the installed entitlement, and an
-# end-to-end check on history written by nfit-profile against an independent
-# minute-level reference.
+# the as-of window, differences against the installed entitlement, the
+# default profile window from TIER and hint (with the resolver and the TIER
+# file parser checked case by case against nfit-profile's own subroutines),
+# and an end-to-end check on history written by nfit-profile against an
+# independent minute-level reference.
 # ==============================================================================
 import glob
 import json
 import os
 import random
 import re
+import configparser
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -36,7 +40,8 @@ def load_reader():
     start = src.index('# Member exposure reader (member-exposure-reader-1)')
     start = src.rindex('# ====', 0, start)
     end = src.index('# --- End of member exposure reader ---')
-    ns = {'os': os, 'json': json, 'glob': glob, 'Path': Path, 'datetime': datetime, 'timedelta': timedelta, 're': re}
+    ns = {'os': os, 'json': json, 'glob': glob, 'Path': Path, 'datetime': datetime, 'timedelta': timedelta, 're': re,
+          'configparser': configparser, 'sys': sys}
     exec(compile(src[start:end], FORECAST, 'exec'), ns)
     return ns
 
@@ -80,7 +85,7 @@ def stored_day(date, minutes, thresholds):
             'exposure': rows}
 
 
-def write_history(root, days, thresholds, installed=0.5, vm='vmA', population='none', profiles=('G3-95W15',)):
+def write_history(root, days, thresholds, installed=0.5, vm='vmA', population='none', profiles=('G3-95W15',), hint=None):
     """A two-month history with one state; days = {date: minutes}."""
     hist = os.path.join(root, 'history', 'SYNRD')
     os.makedirs(hist, exist_ok=True)
@@ -96,6 +101,8 @@ def write_history(root, days, thresholds, installed=0.5, vm='vmA', population='n
                                      'populations': {population: {'profiles': list(profiles), 'thresholds': th, 'daily': daily}}}]},
             'Metadata': {'MemberExposureEvidence': {'projection': 'member-busy-exposure-1', 'columns': COLUMNS,
                                                     'status': 'complete', 'availableAt': '2026-11-12T00:00:00Z'}}}}
+        if hint:
+            doc[month]['MonthlyWorkloadAnalysis'] = {vm: {'Hint': hint}}
         with open(os.path.join(hist, f'nfit.hist.{month}.json'), 'w') as fh:
             json.dump(doc, fh)
     return hist
@@ -206,12 +213,12 @@ class ExposureReaderTests(unittest.TestCase):
         self.assertEqual(r['coverage'], {'windowDays': 2, 'daysWithHistory': 2, 'daysWithoutHistory': 0})
         late = self.query(hist, 0.12, as_of='2026-09-06', start='2026-09-01')
         self.assertEqual(late['coverage']['daysWithoutHistory'], 3)                 # 09-03 to 09-05 not stored
-        self.assertIn('the other 3 are not evaluated', '\n'.join(R['format_exposure_query'](late)))
+        self.assertIn('(5 days, 3 not yet in history and not counted)', '\n'.join(R['format_exposure_query'](late)))
         default = self.query(hist, 0.12)
         self.assertEqual(default['window']['toExclusive'], '2026-09-03')          # the day after the last stored day
         # The partitions were written after the window: flagged as a retrospective read.
         self.assertTrue(all(p['availableAfterAsOf'] is True for p in r['states'][0]['provenance']))
-        self.assertIn('retrospective read', '\n'.join(R['format_exposure_query'](r)))
+        self.assertNotIn('retrospective', '\n'.join(R['format_exposure_query'](r)))   # planner text: JSON only
 
     def test_unavailable_answers_carry_a_reason(self):
         self.assertEqual(self.query(os.path.join(self.root, 'none'), 0.1)['reason'], 'no history directory')
@@ -223,7 +230,109 @@ class ExposureReaderTests(unittest.TestCase):
         r = self.query(hist, 0.1, as_of='2026-10-02', start='2026-10-01')
         self.assertEqual((r['status'], r['reason']), ('unavailable', 'no stored day in the window'))
         text = '\n'.join(R['format_exposure_query'](r))
-        self.assertIn('Result: unavailable', text)
+        self.assertIn('No answer: history holds no day for this LPAR in the period asked.', text)
+
+
+    # -- planner text ------------------------------------------------------------------
+    def test_planner_text_states_a_recommendation_for_each_case(self):
+        day = lambda b, scarce, comp: [(b, scarce, comp, False, True)] * 20 + [(0.05, False, False, False, True)] * 20
+        cases = {
+            'competition': (day(0.3, True, True), 'Review before applying. The cut removes the guarantee in 20 of the 20 minutes'),
+            'open pool': (day(0.3, False, False), 'No objection from the pool evidence: the pool had spare capacity'),
+            'alone': (day(0.3, True, False), 'No objection from the pool evidence: the pool filled only when this LPAR filled it alone.'),
+        }
+        for name, (minutes, want) in cases.items():
+            root = tempfile.mkdtemp(prefix='exp-text-', dir=self.root)
+            hist = write_history(root, {'2026-09-01': minutes}, [0.5, 0.12])
+            text = '\n'.join(R['format_exposure_query'](self.query(hist, 0.12, as_of='2026-09-02', start='2026-09-01')))
+            self.assertIn('Proposal       : reduce entitlement from 0.50 to 0.12 cores', text, name)
+            self.assertIn(want, text, name)
+            for heading in ('  The LPAR\n', '  The pool\n', '  The LPAR and the pool together\n', '  Recommendation\n'):
+                self.assertIn(heading, text, name)
+            for jargon in ('credible scarcity', 'storedThresholds', 'paired', 'population'):
+                self.assertNotIn(jargon, text, name)
+
+    # -- default profile window from TIER and hint ------------------------------------
+    def test_default_profile_follows_tier_then_hint(self):
+        days = {'2026-09-01': random_minutes(self.rng)}
+        hist = write_history(self.root, days, [0.5, 0.12])
+        r = self.query(hist, 0.12)                                              # no TIER, no hint: G3, all hours
+        self.assertEqual((r['profile'], r['profileSelection']['policy']['PlanningPatternSource']), ('G3-95W15', 'DEFAULT_PATTERN_G'))
+        self.assertIn('Profile        : G3-95W15, all hours (tier 3, all-hours pattern by default', '\n'.join(R['format_exposure_query'](r)))
+        r = self.query(hist, 0.12, tier_overrides={'vmA': 'B2'})               # a configured TIER wins, even when not stored
+        self.assertEqual((r['profile'], r['status']), ('B2-98W10', 'unavailable'))
+        self.assertIn('profile B2-98W10 is not stored', r['reason'])
+        batch = tempfile.mkdtemp(prefix='exp-batch-', dir=self.root)
+        hist = write_history(batch, days, [0.5, 0.12], population='batch', profiles=('B2-98W10', 'B3-95W15'), hint='O3')
+        r = self.query(hist, 0.12, tier_overrides={'vmA': 'b2'}, tier_config='etc/nfit.vms.cfg')
+        self.assertEqual((r['profile'], r['status'], r['states'][0]['populationUsed']), ('B2-98W10', 'exact', 'batch'))
+        self.assertIn('configured TIER B2', '\n'.join(R['format_exposure_query'](r)))
+        r = self.query(hist, 0.12)                                              # hint O3 gives only the O pattern
+        self.assertEqual((r['profile'], r['profileSelection']['hint']), ('O3-95W15', 'O3'))
+        r = self.query(hist, 0.12, profile='B3-95W15')                          # an explicit profile overrides
+        self.assertEqual((r['profile'], r['profileSelection']['source'], r['status']), ('B3-95W15', 'requestedProfile', 'exact'))
+        r = self.query(hist, 0.12, population='batch')
+        self.assertEqual((r['profileSelection']['source'], r['status']), ('requestedPopulation', 'exact'))
+
+
+def perl_ready():
+    return (shutil.which('perl') is not None and
+            subprocess.run(['perl', '-MJSON::PP', '-e1'], capture_output=True).returncode == 0)
+
+
+PERL_PARITY = r'''
+use strict; use warnings; use JSON::PP qw(encode_json decode_json);
+my ($src_path, $cfg_path) = @ARGV;
+open my $fh, '<', $src_path or die; my $src = do { local $/; <$fh> }; close $fh;
+my $code = '';
+for my $name (qw(_resolve_vm_tier_pattern_policy parse_vm_tier_overrides)) {
+    $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "cannot extract $name\n";
+    $code .= "$1\n";
+}
+our $MISSION_CRITICAL_PROFILE_NAME = 'P-99W1';
+eval "no strict 'vars'; $code; 1" or die $@;
+my $in = decode_json(do { local $/; <STDIN> });
+my @profiles = map { { name => $_->[0], csv_output => $_->[1] } } @{ $in->{profiles} };
+my @out;
+for my $case (@{ $in->{cases} }) {
+    my $r = _resolve_vm_tier_pattern_policy($case->[0], $case->[1], \@profiles);
+    $r->{ResolvedPolicyTier} = "$r->{ResolvedPolicyTier}";
+    push @out, $r;
+}
+open my $save, '>&', \*STDERR; open STDERR, '>', '/dev/null';
+my $overrides = parse_vm_tier_overrides($cfg_path);
+open STDERR, '>&', $save;
+print encode_json({ resolved => \@out, overrides => $overrides });
+'''
+
+
+@unittest.skipUnless(R and perl_ready(), 'nfit-forecast source or perl with JSON unavailable')
+class TierResolutionParity(unittest.TestCase):
+    # The shared case table: both programs must resolve every case identically.
+    CONFIGURED = ['', 'G1', 'O2', 'B4', 'P', 'P-99W1', 'g2', ' o 1 ', 'G3-custom', 'X9', 'G5', 'O', 'B0', 'PX']
+    HINTS = ['', 'O3', 'B1', 'G2', 'P', 'VIO', 'o', '  b2 ', 'X1', None]
+
+    def test_resolver_and_tier_file_match_nfit_profile(self):
+        parser = configparser.ConfigParser(interpolation=None, strict=False)
+        parser.read(os.path.join(REPO, 'etc', 'nfit.profiles.cfg'), encoding='utf-8')
+        profiles = [[n, parser.get(n, 'csv_output', fallback='true').strip().lower() != 'false'] for n in parser.sections()]
+        profiles.append(['P-99W1', True])
+        cases = [[c, h or ''] for c in self.CONFIGURED for h in self.HINTS]
+        cfg = os.path.join(tempfile.mkdtemp(prefix='tier-cfg-'), 'nfit.vms.cfg')
+        with open(cfg, 'w') as fh:
+            fh.write('# comment\n[vmA]\ntier = g2   # trailing\n[ vm B ]\n; note\nTIER=O 3\n[vmC]\nother = 1\n'
+                     '[vmD]\ntier = P\ntier = B1\n[vmE]\n\ntier= b4-custom\n')
+        p = subprocess.run(['perl', '-e', PERL_PARITY, os.path.join(REPO, 'nfit-profile'), cfg],
+                           input=json.dumps({'profiles': profiles, 'cases': cases}), capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr[-800:])
+        perl = json.loads(p.stdout)
+        defs = [tuple(x) for x in profiles]
+        for (configured, hint), want in zip(cases, perl['resolved']):
+            got = R['resolve_vm_tier_pattern_policy'](configured, hint, defs)
+            got['ResolvedPolicyTier'] = str(got['ResolvedPolicyTier'])
+            self.assertEqual(got, want, (configured, hint))
+        self.assertEqual(R['parse_vm_tier_overrides'](cfg), perl['overrides'])
+        self.assertEqual(len(cases), 140)
 
 
 # -- end to end on history written by nfit-profile ----------------------------------------
@@ -258,13 +367,13 @@ class ExposureReaderEndToEnd(unittest.TestCase):
     def test_exact_at_stored_threshold_and_bounded_between(self):
         th = self.month['MemberExposure']['vmA'][0]['populations']['none']['thresholds']
         stored = th[1]['value']                                             # the highest stored profile value
-        exact = R['exposure_query'](self.hist, 'vmA', stored, as_of='2026-09-03', start='2026-09-01')['states'][0]
+        exact = R['exposure_query'](self.hist, 'vmA', stored, as_of='2026-09-03', start='2026-09-01', population='none')['states'][0]
         self.assertEqual(exact['status'], 'exact')
         want = self.reference_totals('vmA', 'none', stored)
         for k, c in enumerate(COLUMNS):
             self.assertAlmostEqual(exact['exposure'][c]['lower'], want[k], places=3, msg=c)
         between = round((th[1]['value'] + th[2]['value']) / 2, 4) if len(th) > 2 else round(stored - 0.05, 4)
-        r = R['exposure_query'](self.hist, 'vmA', between, as_of='2026-09-03', start='2026-09-01')['states'][0]
+        r = R['exposure_query'](self.hist, 'vmA', between, as_of='2026-09-03', start='2026-09-01', population='none')['states'][0]
         self.assertEqual(r['status'], 'bounded')
         want = self.reference_totals('vmA', 'none', between)
         for k, c in enumerate(COLUMNS):

@@ -122,7 +122,11 @@ class StructuralFeasibilityTests(unittest.TestCase):
         return next(h for h in self.header if h.startswith(label + '-') and '_rVCPU' not in h)
 
     def section(self):
-        return self.log[self.log.index('Structural Feasibility Checks'):]
+        return self.log[self.log.index('\nPool and VP Checks\n'):]
+
+    @staticmethod
+    def flat(text):
+        return re.sub(r'\s+', ' ', text)
 
     def test_run_succeeds(self):
         self.assertEqual(self.proc.returncode, 0, self.proc.stderr[-1500:])
@@ -147,57 +151,66 @@ class StructuralFeasibilityTests(unittest.TestCase):
                 if column != 'VM_Comments':
                     self.assertNotIn('SHORTFALL', value or '')
                     self.assertNotIn('MISMATCH', value or '')
-        self.assertNotIn('ORDER OF CHANGE', self.csv_text)     # order notes stay in the rationale
-        self.assertNotIn('Structural', self.csv_text)
+        for text in ('Raise VPs', 'Reduce VPs', 'Pool and VP', 'Recommended Actions'):
+            self.assertNotIn(text, self.csv_text)              # actions stay in the rationale
 
     def test_pool_sums_agree_with_the_csv(self):
         members = [vm for vm, v in VMS.items() if v[2] == POOL_ID]
         proposed = sum(float(self.rows[vm][self.planning_profile(vm)]) for vm in members)
         installed = sum(VMS[vm][0] for vm in members)
-        s = self.section()
-        self.assertRegex(s, rf'Pool ceiling \(Pool Size\)\s+: {POOL_SIZE:.2f} cores')
-        self.assertRegex(s, r'LPARs analysed in the pool\s+: 4 \(1 with a configured TIER, 3 on default tier 3\)')
-        self.assertRegex(s, rf'Installed entitlement \(sum\)\s+: {installed:.2f} cores')
-        self.assertRegex(s, rf'Proposed entitlement \(sum\)\s+: {proposed:.2f} cores')
+        raw = self.section()
+        s = self.flat(raw)
+        units = '%d' % POOL_SIZE if float(POOL_SIZE).is_integer() else '%.2f' % POOL_SIZE
         if proposed > POOL_SIZE + 0.005:
-            self.assertIn(f'Pool {POOL_ID} - SHORTFALL', s)
-            self.assertRegex(s, rf'Shortfall\s+: {proposed - POOL_SIZE:.2f} cores')
-            self.assertRegex(self.proc.stderr, r'\[WARN\] Structural checks: 1 pool\(s\) with an entitlement shortfall')
+            self.assertIn(f'Pool {POOL_ID} - the proposed entitlements do not fit', s)
+            self.assertIn(f'{proposed:.2f} cores proposed against a pool maximum of {units} '
+                          f'(installed today {installed:.2f}; 4 LPARs analysed).', s)
+            self.assertIn(f'Action: defer at least {proposed - POOL_SIZE:.2f} cores of the proposed increases, or raise the '
+                          f'pool maximum from {units} to at least {math.floor(proposed - 1e-9) + 1} processing units.', s)
+            self.assertRegex(self.proc.stderr, r'\[WARN\] Pool and VP checks: 1 pool\(s\) cannot hold the proposed entitlements')
             for vm in members:                                 # every member row shows the CSV figures
                 value = float(self.rows[vm][self.planning_profile(vm)])
                 change = re.escape(f'{value - VMS[vm][0]:+.2f}')
-                self.assertRegex(s, rf'{vm}\s+{re.escape(self.planning_profile(vm))}( \(default\))?\s+'
-                                    rf'{VMS[vm][0]:.2f}\s+{value:.2f}\s+{change}')
+                self.assertRegex(raw, rf'{vm}\s+{re.escape(self.planning_profile(vm))}( \(default\))?\s+'
+                                      rf'{VMS[vm][0]:.2f}\s+{value:.2f}\s+{change}')
+            actions = self.flat(self.log[self.log.index('Recommended Actions'):])
+            self.assertIn(f'Pool {POOL_ID}: Defer at least {proposed - POOL_SIZE:.2f} cores', actions)
         else:
-            self.assertIn(f'Pool {POOL_ID} - FITS', s)
+            self.assertIn(f'Pool {POOL_ID} - fits: {proposed:.2f} cores proposed against a maximum of {units}', s)
         self.assertNotIn('Pool 0 -', s)                        # the default pool is not assessed
 
     def test_ent_vp_findings_follow_from_the_csv(self):
         s = self.section()
+        actions = self.flat(self.log[self.log.index('Recommended Actions'):])
         for vm in VMS:
             profile = self.planning_profile(vm)
-            ent = float(self.rows[vm][profile])
+            ent = round(float(self.rows[vm][profile]), 2)
             tactical = int(self.rows[vm][profile + '_rVCPU_Tactical'])
             current = VMS[vm][1]
-            min_vps = math.ceil(round(ent, 2) - 1e-9)
-            max_vps = int(round(ent, 2) / MIN_ENT_PER_VP + 1e-6)
-            block = re.search(rf'^    {vm} \(planning profile {re.escape(profile)}\)\n(      .*\n)+', s, re.M)
-            text = block.group(0) if block else ''
-            if tactical < min_vps or tactical > max_vps:
-                self.assertIn('ENTITLEMENT/WIDTH MISMATCH', text, vm)
-                self.assertIn(f'proposed ENT {ent:.2f}', text)
-                self.assertIn(f'the tactical VP recommendation is {tactical}', text)
-            elif current < min_vps or current > max_vps:
-                self.assertIn('ORDER OF CHANGE', text, vm)
-                self.assertIn(f'the LPAR has {current}', text)
+            min_vps = math.ceil(ent - 1e-9)
+            max_vps = int(ent / MIN_ENT_PER_VP + 1e-6)
+            block = re.search(rf'^    {vm} \({re.escape(profile)}\): .*\n(      .*\n)+', s, re.M)
+            text = self.flat(block.group(0)) if block else ''
+            if tactical < min_vps:
+                self.assertIn(f'The proposed {ent:.2f} cores needs at least', text, vm)
+                self.assertIn(f'Action: Limit the entitlement to {tactical:.2f}', text, vm)
+            elif tactical > max_vps:
+                want = ('Minimum configurable entitlement: 0.05.' if tactical == 1
+                        else f'minimum entitlement {tactical * MIN_ENT_PER_VP:.2f}')
+                self.assertIn(want, text, vm)
+            elif current < min_vps:
+                self.assertIn(f'Action: Raise VPs from {current} to', text, vm)
+            elif current > max_vps:
+                self.assertIn(f'Action: Reduce VPs from {current} to', text, vm)
             else:
-                self.assertNotIn('MISMATCH', text.split('Other profiles')[0], vm)
-                self.assertNotIn('ORDER OF CHANGE', text.split('Other profiles')[0], vm)
+                self.assertEqual(text, '', vm)                 # nothing to do: not listed
+                continue
+            self.assertIn(f'{vm}: ', actions, vm)              # and the action is in the summary
 
     def test_terms_used_are_defined_in_the_terminology_reference(self):
-        reference = self.log[self.log.index('Key Terminology Reference'):self.log.index('Structural Feasibility Checks\n')]
-        for term in ('Planning Profile', 'Pool Entitlement', 'Entitlement/Width', 'Order of Change', 'Fits alone',
-                     'Lowest sum across all profiles', '[POOL_SHORTFALL]', '[VP_MISMATCH]'):
+        reference = self.log[self.log.index('Key Terminology Reference'):self.log.index('\nPool and VP Checks\n')]
+        for term in ('Planning profile', 'Pool entitlement', 'Entitlement and', 'Recommended', 'Raise/Reduce VPs first',
+                     '[POOL_SHORTFALL]', '[VP_MISMATCH]'):
             self.assertIn(term, reference)
 
 
