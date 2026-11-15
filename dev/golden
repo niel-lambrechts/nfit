@@ -47,7 +47,11 @@
 #            dev/golden compare <name> [--stage-dir DIR] [--frozen]
 #                                      [--systems S1,S2] [--runs R1,R2] [--single]
 #            --systems/--runs restrict a compare to a subset of the baseline;
-#            --single skips the cached repeat (roughly halves the runtime).
+#            --single skips the cached repeat (roughly halves the runtime);
+#            --classify sorts each difference into intended and unintended:
+#            CSV cells other than VM_Comments, VM_Comments beyond the leading
+#            [POOL_SHORTFALL]/[VP_MISMATCH] alerts, and rationale lines outside
+#            the sections named in INTENDED_SECTIONS are unintended.
 #            dev/golden list
 #            dev/golden determinism [--stage-dir DIR] --systems S [--runs R]
 #                                   [--enddate YYYY-MM-DD]
@@ -276,6 +280,85 @@ def execute(system: str, sysdir: Path, run: str, enddate: str, exe_src: Path, et
         return {'outputs': first}
 
 
+# Rationale sections whose text a release may change on purpose (--classify).
+INTENDED_SECTIONS = ('Key Terminology Reference', 'Pool and VP Checks', 'Structural Feasibility Checks',
+                     'Entitlement Cut Exposure', 'Recommended Actions')
+ALERT_TAG = re.compile(r'^(?:\[(?:POOL_SHORTFALL|VP_MISMATCH)\](?:;\s*)?)+')
+
+
+def _sections(lines: list) -> list:
+    """The rationale section each line belongs to (a '====' title block, or the
+    Key Terminology Reference); '' before the first."""
+    rule = '=' * 70
+    out, current = [], ''
+    for i, line in enumerate(lines):
+        if line.startswith('Key Terminology Reference'):
+            current = 'Key Terminology Reference'
+        elif (line == rule and i + 2 < len(lines) and lines[i + 2] == rule and lines[i + 1].strip()
+              and not lines[i + 1].startswith(' ')):
+            current = lines[i + 1].strip()
+        out.append(current)
+    return out
+
+
+def classify_log(base: str, cur: str) -> dict:
+    """Changed rationale lines by section: intended (INTENDED_SECTIONS) or other."""
+    import difflib
+    a, b = base.splitlines(), cur.splitlines()
+    sa, sb = _sections(a), _sections(b)
+    result = {'intended': 0, 'other': 0, 'other_lines': [], 'sections': {}}
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if tag == 'equal':
+            continue
+        changed = [('-', a[i], sa[i]) for i in range(i1, i2)] + [('+', b[j], sb[j]) for j in range(j1, j2)]
+        for sign, text, section in changed:
+            if not text.strip() or set(text.strip()) <= {'=', '-'}:
+                result['layout'] = result.get('layout', 0) + 1      # blank and rule lines carry no content
+                continue
+            intended = any(section.startswith(name) for name in INTENDED_SECTIONS)
+            key = section or '(start of log)'
+            result['sections'][key] = result['sections'].get(key, 0) + 1
+            if intended:
+                result['intended'] += 1
+            else:
+                result['other'] += 1
+                if len(result['other_lines']) < 20:
+                    result['other_lines'].append(f'{sign} [{key}] {text}')
+    return result
+
+
+def classify_csv(base: str, cur: str) -> dict:
+    """Changed CSV cells: VM_Comments alert tags only, other VM_Comments, other cells."""
+    import csv
+    import io
+    ra, rb = list(csv.reader(io.StringIO(base))), list(csv.reader(io.StringIO(cur)))
+    result = {'header': ra[:1] == rb[:1], 'rows': (len(ra), len(rb)), 'tags_only': 0, 'comments_other': 0,
+              'cells': 0, 'cell_lines': []}
+    if not ra or not rb or not result['header'] or len(ra) != len(rb):
+        result['cells'] = -1
+        return result
+    header = ra[0]
+    comments = header.index('VM_Comments') if 'VM_Comments' in header else None
+    for row_a, row_b in zip(ra[1:], rb[1:]):
+        for k in range(max(len(row_a), len(row_b))):
+            va = row_a[k] if k < len(row_a) else ''
+            vb = row_b[k] if k < len(row_b) else ''
+            if va == vb:
+                continue
+            if k == comments:
+                if ALERT_TAG.sub('', vb).strip(' ;') == va.strip(' ;'):
+                    result['tags_only'] += 1
+                else:
+                    result['comments_other'] += 1
+                    if len(result['cell_lines']) < 20:
+                        result['cell_lines'].append(f'{row_a[0]} VM_Comments: {va!r} -> {vb!r}')
+                continue
+            result['cells'] += 1
+            if len(result['cell_lines']) < 20:
+                result['cell_lines'].append(f'{row_a[0]} {header[k] if k < len(header) else k}: {va} -> {vb}')
+    return result
+
+
 def diff_lines(a: str, b: str, limit: int = 20, label_a: str = 'baseline', label_b: str = 'current') -> list:
     import difflib
     d = list(difflib.unified_diff(a.splitlines(), b.splitlines(), label_a, label_b, lineterm='', n=0))
@@ -361,6 +444,7 @@ def cmd_compare(a, out: RedactedOut) -> int:
     out.say(f'Comparing against baseline "{a.name}" (source: {"frozen copy" if a.frozen else "current tree"}, '
             f'enddate {meta["enddate"]})')
     differences = 0
+    unintended = 0
     wanted_systems = None
     if a.systems:
         by_alias = {pseudonym(name): name for name in meta['systems']}
@@ -402,9 +486,32 @@ def cmd_compare(a, out: RedactedOut) -> int:
             for kind in changed:
                 base_file = dest / 'results' / system / run / f'{run}.{kind}'
                 base = base_file.read_text(encoding='utf-8') if base_file.exists() else ''
-                for line in diff_lines(base, res['outputs'].get(kind, '')):
-                    out.say('      ' + line)
+                current = res['outputs'].get(kind, '')
+                if a.classify and kind == 'csv':
+                    c = classify_csv(base, current)
+                    verdict = 'UNINTENDED' if (c['cells'] or c['comments_other'] or not c['header']) else 'intended only'
+                    unintended += verdict == 'UNINTENDED'
+                    out.say(f'      csv: {verdict}: header {"same" if c["header"] else "CHANGED"}, rows {c["rows"][0]} -> {c["rows"][1]}, '
+                            f'other cells changed {c["cells"]}, VM_Comments alert tags only {c["tags_only"]}, '
+                            f'VM_Comments other {c["comments_other"]}')
+                    for line in c['cell_lines']:
+                        out.say('        ' + line)
+                elif a.classify and kind == 'log':
+                    c = classify_log(base, current)
+                    verdict = 'UNINTENDED' if c['other'] else 'intended only'
+                    unintended += verdict == 'UNINTENDED'
+                    out.say(f'      log: {verdict}: {c["intended"]} changed line(s) in intended sections, {c["other"]} elsewhere, '
+                            f'{c.get("layout", 0)} blank or rule line(s); '
+                            + ', '.join(f'{k}: {v}' for k, v in sorted(c['sections'].items())))
+                    for line in c['other_lines']:
+                        out.say('        ' + line)
+                else:
+                    for line in diff_lines(base, current):
+                        out.say('      ' + line)
     out.say(f'Summary: {differences} system/run combination(s) differ.')
+    if a.classify:
+        out.say(f'Classified: {unintended} output(s) with differences outside the intended changes.')
+        return 1 if unintended else 0
     return 1 if differences else 0
 
 
@@ -502,6 +609,8 @@ def main() -> int:
     k.add_argument('--systems', default=None, help='Subset of baseline systems (names or sys_ pseudonyms)')
     k.add_argument('--runs', default=None, help='Subset of baseline runs, e.g. decay-states')
     k.add_argument('--single', action='store_true', help='Skip the cached repeat run')
+    k.add_argument('--classify', action='store_true',
+                   help='Sort differences into intended (VM_Comments alert tags, INTENDED_SECTIONS) and unintended')
     sub.add_parser('list')
     d = sub.add_parser('determinism')
     d.add_argument('--stage-dir', default=str(REPO / 'stage'))
