@@ -2842,9 +2842,11 @@ sub parse_csv_line {
 # Subroutine to look up a result from the L2 cache file.
 # Returns: An array reference of result hashes, or undef if not found.
 # ==============================================================================
+# The optional $stats hashref receives the cache file's size and entry count
+# (NFIT_STAGE_TIMINGS reporting); it does not change the lookup.
 sub lookup_cached_result
 {
-    my ($key, $cache_file) = @_;
+    my ($key, $cache_file, $stats) = @_;
 
     return undef unless (-f $cache_file && -s $cache_file);
 
@@ -2872,6 +2874,11 @@ sub lookup_cached_result
         return undef;
     }
 
+    if ($stats)
+    {
+        $stats->{bytes}   = -s $cache_file;
+        $stats->{entries} = scalar keys %$cache_data;
+    }
     # The value is now an array reference of hashes.
     return $cache_data->{$key};
 }
@@ -2879,9 +2886,40 @@ sub lookup_cached_result
 # ==============================================================================
 # Subroutine to save a result to the L2 cache file under an exclusive lock.
 # ==============================================================================
+# ==============================================================================
+# SUBROUTINE: _report_results_cache_timings
+# PURPOSE:    With NFIT_STAGE_TIMINGS set, prints one line per engine call: the
+#             results cache's lookup time, file size and entry count, and on a
+#             miss the analysis time and the save time (lock wait, read, write).
+#             The line carries no identifiers.
+# ==============================================================================
+sub _report_results_cache_timings
+{
+    my ($t, $outcome) = @_;
+    my $lookup = $t->{lookup} // {};
+    my $line = sprintf("[TIMING] engine results cache %s: lookup %.2f s (file %.1f MB, %d entries)",
+        $outcome, $lookup->{s} // 0, ($lookup->{bytes} // 0) / 1_048_576, $lookup->{entries} // 0);
+    if ($outcome eq 'miss')
+    {
+        my $save = $t->{save} // {};
+        $line .= sprintf("; analysis %.2f s; save %.2f s (lock %.2f, read %.2f, write %.2f; file %.1f MB, %d entries)",
+            $t->{analysis_s} // 0, ($save->{lock_s} // 0) + ($save->{read_s} // 0) + ($save->{write_s} // 0),
+            $save->{lock_s} // 0, $save->{read_s} // 0, $save->{write_s} // 0,
+            ($save->{bytes} // 0) / 1_048_576, $save->{entries} // 0);
+    }
+    my $backend = eval { JSON->backend } // 'unknown';
+    print STDERR "$line; JSON $backend\n";
+    return;
+}
+
+# The optional $stats hashref receives the time spent waiting for the lock,
+# reading and decoding the existing file, and encoding and writing it again
+# (NFIT_STAGE_TIMINGS reporting); it does not change the save.
 sub save_result_to_cache
 {
-    my ($key, $result_objects_aref, $cache_file, $lock_file) = @_;
+    my ($key, $result_objects_aref, $cache_file, $lock_file, $stats) = @_;
+    my $clock = $stats ? sub { Time::HiRes::time() } : sub { 0 };
+    my $t0 = $clock->();
 
     # This subroutine now performs a safe read-modify-write of the entire JSON cache file.
     # Acquire an exclusive lock to prevent race conditions when writing.
@@ -2894,6 +2932,7 @@ sub save_result_to_cache
         close $lock_fh;
         return;
     };
+    my $t_locked = $clock->();
     # Read the existing cache file into a Perl hash.
     my $cache_data = {};
     if (-f $cache_file && -s $cache_file) {
@@ -2908,6 +2947,7 @@ sub save_result_to_cache
         $cache_data = $decoded if (ref($decoded) eq 'HASH');
     }
 
+    my $t_read = $clock->();
     # Add or update the result for the current key with the array of result objects.
     $cache_data->{$key} = $result_objects_aref;
 
@@ -2925,6 +2965,12 @@ sub save_result_to_cache
     print $write_fh $output_json;
     close $write_fh;
     close $lock_fh; # Releases the lock automatically on close.
+    if ($stats)
+    {
+        my $t_end = $clock->();
+        @$stats{qw(lock_s read_s write_s bytes entries)} =
+            ($t_locked - $t0, $t_read - $t_locked, $t_end - $t_read, length($output_json), scalar keys %$cache_data);
+    }
 }
 
 # Subroutine for the Hybrid State-Time Decay Model
@@ -3948,8 +3994,18 @@ sub run_single_pass_from_manifest {
     my $canonical_key = generate_manifest_key({ %$args_ref, data_identity => $data_identity }, $manifest);
     my $results_cache_path = File::Spec->catfile($nmon_dir, ".nfit.cache.results");
 
-    my $cached_result_aref = lookup_cached_result($canonical_key, $results_cache_path);
+    # NFIT_STAGE_TIMINGS=1: one [TIMING] line per engine call with the results
+    # cache's lookup and save times, apart from the analysis itself.
+    my $timings = $ENV{NFIT_STAGE_TIMINGS} ? do { require Time::HiRes; { lookup => {} } } : undef;
+    my $t_start = $timings ? Time::HiRes::time() : 0;
+    my $cached_result_aref = lookup_cached_result($canonical_key, $results_cache_path, $timings ? $timings->{lookup} : undef);
+    if ($timings)
+    {
+        $timings->{lookup}{s} = Time::HiRes::time() - $t_start;
+        $timings->{t_analysis} = Time::HiRes::time();
+    }
     if (defined $cached_result_aref) {
+        _report_results_cache_timings($timings, 'hit') if $timings;
         print STDERR "L2 Cache HIT. Returning cached result.\n" if $verbose;
         my $json_encoder = JSON->new->utf8;
         my @json_lines = map { $json_encoder->encode($_) } @$cached_result_aref;
@@ -4546,7 +4602,11 @@ sub run_single_pass_from_manifest {
 
     # 10. Save new result to L2 Cache and print to STDOUT
     my $lock_file = File::Spec->catfile($nmon_dir, $CACHE_LOCK_FILE);
-    save_result_to_cache($canonical_key, \@output_objects, $results_cache_path, $lock_file) if @output_objects;
+    $timings->{analysis_s} = Time::HiRes::time() - $timings->{t_analysis} if $timings;
+    $timings->{save} = {} if $timings;
+    save_result_to_cache($canonical_key, \@output_objects, $results_cache_path, $lock_file,
+                         $timings ? $timings->{save} : undef) if @output_objects;
+    _report_results_cache_timings($timings, 'miss') if $timings;
 
     my $json_encoder = JSON->new->utf8;
     foreach my $obj (@output_objects) {
