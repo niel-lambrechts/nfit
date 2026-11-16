@@ -297,7 +297,7 @@ class PoolHistoryTests(unittest.TestCase):
 
     def test_unrelated_history_is_as_without_the_option(self):
         plain = self.make_root()
-        self.update(plain, '--force')
+        self.update(plain, '--force', '--no-pool-history')              # pool history is automatic; switch it off
         without = json.loads(self.raw(plain))[MONTH]
         self.assertNotIn('PoolHistory', without)
         self.assertNotIn('PoolEvidence', without['Metadata'])

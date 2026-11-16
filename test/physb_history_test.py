@@ -330,7 +330,7 @@ class PhysBHistoryTests(unittest.TestCase):
     def test_backfill_adds_blocks_and_keeps_stored_physc(self):
         r = self.root()
         self.cache(r, '2026-09-01', '2026-09-30')
-        self.update(r)                                                     # history without PhysB
+        self.update(r, '--no-physb-history')                               # history without PhysB
         stored = self.partition(r)
         p = self.update(r, '--physb-history', force=False)
         self.assertIn('stored PhysC analysis is kept', p.stderr)
@@ -348,7 +348,7 @@ class PhysBHistoryTests(unittest.TestCase):
         self.update(r, '--physb-history')
         blk, marker = self.block(r), self.partition(r)[MONTH]['Metadata']['PhysB']
         self.cache(r, '2026-09-01', '2026-09-30')
-        self.update(r)                                                     # reanalysed, flag absent
+        self.update(r, '--no-physb-history')                               # reanalysed, PhysB history off
         self.assertEqual(self.block(r), blk)                               # carried, its window says so
         self.assertEqual(self.partition(r)[MONTH]['Metadata']['PhysB'], marker)
         p = self.update(r, '--physb-history', force=False)                 # now brought up to date
