@@ -56,6 +56,7 @@ def without_physb(partition):
         month.get('Metadata', {}).pop('LastUpdated', None)
         month.get('_metadata', {}).pop('last_updated', None)
         month.get('Metadata', {}).pop('PhysB', None)
+        month.get('Metadata', {}).pop('DailyPhysBUnavailable', None)
         month.get('Metadata', {}).pop('Features', None)
         for vm in month.get('MonthlyWorkloadAnalysis', {}).values():
             vm.pop('PhysBMetrics', None)
@@ -158,6 +159,18 @@ class PhysBHistoryTests(unittest.TestCase):
         self.assertNotIn('PhysB', self.partition(a)[MONTH]['Metadata'])
         self.assertEqual(without_physb(self.partition(a)), without_physb(self.partition(b)))
 
+        self.assertEqual(self.partition(a)[MONTH]['Metadata']['DailyPhysBUnavailable'], 'no_declared_physb_column')
+        self.assertNotIn('DailyPhysBUnavailable', self.partition(b)[MONTH]['Metadata'])
+        self.update(b, '--physb-history', force=False)
+        self.assertEqual(self.partition(b)[MONTH]['Metadata']['DailyPhysBUnavailable'], 'no_declared_physb_column')
+        before = self.raw(b)
+        self.update(b, '--physb-history', force=False)
+        self.assertEqual(self.raw(b), before)
+        self.cache(b, '2026-09-01', '2026-09-30', schema=2)
+        self.update(b, '--physb-history', force=False)
+        self.assertNotIn('DailyPhysBUnavailable', self.partition(b)[MONTH]['Metadata'])
+        self.assertTrue(self.block(b)['DailyProfileSeries'])
+
     def test_block_is_additive_and_physc_analysis_unchanged(self):
         a, b = self.root(), self.root()
         for r in (a, b):
@@ -193,6 +206,83 @@ class PhysBHistoryTests(unittest.TestCase):
         meta = self.partition(a)[MONTH]['Metadata']
         self.assertEqual(meta['Features'], ['PhysB-v1'])
         self.assertEqual((meta['PhysB']['windowStart'], meta['PhysB']['windowEnd']), ('2026-09-01', '2026-09-30'))
+
+    def test_daily_paired_profiles_match_a_one_day_engine_pass(self):
+        r = self.root()
+        self.cache(r, '2026-09-01', '2026-09-30')
+        self.update(r, '--physb-history')
+        blk = self.block(r)
+        series = blk['DailyProfileSeries']
+        self.assertEqual(blk['Source']['dailyProfileVersion'], 1)
+        self.assertIn('G3-95W15', series)
+        self.assertNotIn('Peak_P-99W1', series)
+        cache = os.path.join(r, 'stage', SERIAL)
+        date = '2026-09-14'
+        # Use the month manifest without the new daily directive. This is the
+        # original native paired calculation, with an independent daily origin.
+        manifest = os.path.join(cache, '.nfit.engine.last_manifest')
+        with open(manifest) as fh:
+            transforms = json.load(fh)
+        for entry in transforms.values():
+            if isinstance(entry, dict):
+                entry.pop('daily_paired_profiles', None)
+        oracle = os.path.join(r, 'single-day.json')
+        with open(oracle, 'w') as fh:
+            json.dump(transforms, fh)
+        cmd = ['perl', os.path.join(r, 'nfit'), '--nmondir', cache, '--manifest', oracle,
+               '--physb-paired', '--startdate', date, '--enddate', date, '-q']
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        obj = json.loads(result.stdout.strip())
+        for profile, rows in series.items():
+            row, = [d for d in rows if d['date'] == date]
+            ref = obj['metrics']['physb'][profile]
+            self.assertEqual(row['windows'], ref['smoothedWindows'])
+            self.assertEqual(row['pairedMinutes'], ref['coverage']['pairedMinutes'])
+            self.assertEqual(row['expectedMinutes'], ref['coverage']['expectedMinutes'])
+            if row['windows']:
+                self.assertIn(row['physB'], ref['profileValueB'].values())
+                self.assertIn(row['pairedPhysC'], [t['threshold'] for t in ref['tail'].values()])
+            else:
+                self.assertIsNone(row['physB'])
+                self.assertIsNone(row['pairedPhysC'])
+
+    def test_daily_series_keeps_both_states_and_missing_busy(self):
+        r = self.root()
+        self.cache(r, '2026-09-01', '2026-09-03')
+        cache = os.path.join(r, 'stage', SERIAL)
+        path = os.path.join(cache, '.nfit.cache.states')
+        with open(path) as fh:
+            states = json.load(fh)
+        first, = states['vmA']
+        second = copy.deepcopy(first)
+        boundary = day('2026-09-02') + 12 * 3600
+        first['end_epoch'] = boundary - 1
+        second['end_epoch'] = day('2026-09-04') - 1
+        second['start_epoch'] = boundary
+        second['metadata']['entitlement'] = 3
+        states['vmA'].append(second)
+        with open(path, 'w') as fh:
+            json.dump(states, fh)
+        path = os.path.join(cache, '.nfit.cache.data')
+        with open(path) as fh:
+            rows = fh.readlines()
+        with open(path, 'w') as fh:
+            for line in rows:
+                fields = line.rstrip('\n').split(',')
+                if fields[0].startswith('2026-09-03'):
+                    fields[4] = ''
+                fh.write(','.join(fields) + '\n')
+            fh.write('2026-09-03 23:59:59,vmA,1,1,,100\n')
+        self.update(r, '--physb-history')
+        series = self.block(r)['DailyProfileSeries']['G3-95W15']
+        self.assertEqual(max(d['date'] for d in series), '2026-09-03')
+        split = [d for d in series if d['date'] == '2026-09-02']
+        self.assertEqual(len({d['stateId'] for d in split}), 2)
+        self.assertEqual(sum(d['pairedMinutes'] for d in split), 1440)
+        last, = [d for d in series if d['date'] == '2026-09-03']
+        self.assertEqual((last['windows'], last['pairedMinutes']), (0, 0))
+        self.assertIsNone(last['physB'])
+        self.assertIsNone(last['pairedPhysC'])
 
     def test_partial_presence_keeps_window_period_and_support_apart(self):
         r = self.root()
@@ -279,6 +369,22 @@ class PhysBHistoryTests(unittest.TestCase):
         self.assertEqual(self.block(r), blk)
         marker = self.partition(r)[MONTH]['Metadata']['PhysB']
         self.assertEqual((marker['vmsKept'], marker['vmsWritten'], marker['windowStart']), (1, 0, '2026-09-11'))
+
+    def test_older_engine_cannot_overwrite_daily_history(self):
+        r = self.root()
+        self.cache(r, '2026-09-01', '2026-09-04')
+        self.update(r, '--physb-history')
+        before = self.raw(r)
+        engine = os.path.join(r, 'nfit')
+        with open(engine) as fh:
+            code = fh.read()
+        with open(engine, 'w') as fh:
+            fh.write(code.replace('daily_paired_profile_version => 1', 'daily_paired_profile_version => 0'))
+        result = subprocess.run(['perl', os.path.join(r, 'nfit-profile'), '--update-history', '--physb-history',
+                                 '--nmondir', os.path.join(r, 'stage', SERIAL)], capture_output=True, text=True, cwd=r)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('supports daily paired profiles', result.stderr)
+        self.assertEqual(self.raw(r), before)
 
     def test_changed_semantics_recompute_the_block(self):
         r = self.root()

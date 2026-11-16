@@ -122,7 +122,7 @@ my $CACHE_MANIFEST_FILE = ".nfit.cache.manifest";
 my $CACHE_STATES_FILE   = ".nfit.cache.states";
 my $CACHE_DATA_FILE     = ".nfit.cache.data";
 # Sample store (v10 milestone 1.1b): see _sample_store_open.
-my $SAMPLE_STORE_FORMAT = 2;                   # 2: per-day row and byte offsets (windowed reads)
+my $SAMPLE_STORE_FORMAT = 3;                   # 3: record whether exposure can reuse all input rows
 my $SAMPLE_STORE_DIR    = '.nfit.store';
 my $SAMPLE_STORE_FLUSH  = 32 * 1024 * 1024;   # bytes buffered before a flush
 my $SAMPLE_STORE_UNDEF  = "\x01";             # an optional cell the row did not have
@@ -264,6 +264,7 @@ if ($show_capabilities)
         version            => $VERSION,
         l1_schema_versions => [ @L1_SUPPORTED_SCHEMA_VERSIONS ],
         l2_cache_format    => $L2_CACHE_FORMAT_VERSION,
+        daily_paired_profile_version => 1,
         physb_derivation_version => $PAIRED_DERIVATION_VERSION,
         calendar_rules     => $CALENDAR_RULES_VERSION,
     }) . "\n";
@@ -2460,6 +2461,20 @@ sub _paired_update
 
     my $c_smooth = update_transform_state($c, $st->{c_state});
     my $b_smooth = update_transform_state($b, $st->{b_state});
+    # The daily history statistic has the origin of an independent one-day
+    # paired pass. Leave the monthly smoother and its tails continuous.
+    if ($entry->{daily_paired_profiles})
+    {
+        if (!$continuous || !defined $st->{daily_day} || $st->{daily_day} != $day)
+        {
+            $st->{daily_day} = $day;
+            $st->{daily_c} = initialise_transform_state($entry);
+            $st->{daily_b} = initialise_transform_state($entry);
+        }
+        my $dc = update_transform_state($c, $st->{daily_c});
+        my $db = update_transform_state($b, $st->{daily_b});
+        $daily->{windows} .= pack('f<f<', $dc, $db) if defined $dc && defined $db;
+    }
     if (defined $c_smooth && defined $b_smooth)
     {
         $acc->{packed} .= pack('f<f<L<', $c_smooth, $b_smooth, int($epoch / $PAIRED_SECONDS_PER_DAY));
@@ -2701,14 +2716,34 @@ sub _paired_finalize
                 }
                 $common{smoothedWindows} = scalar @rows;
 
-                # Daily sufficient statistics (additive; history derives no
-                # percentile from them). Days are UTC and limited to the period.
+                # Daily exposure totals and, when requested, native percentiles
+                # from that UTC day's independently warmed paired windows.
                 my %day_set = map { $_ => 1 } (keys %$expected_by_day, keys %{ $acc->{daily} });
                 my @daily_common;
                 foreach my $d (sort { $a <=> $b } keys %day_set)
                 {
                     my $dd = $acc->{daily}{$d} // {};
+                    my $series;
+                    # The expected-time allowance can spill past midnight after
+                    # the final sample. It must not create a new profile date.
+                    if ($entry->{daily_paired_profiles} && defined $p_end && $d <= int($p_end / $PAIRED_SECONDS_PER_DAY))
+                    {
+                        my @pairs = unpack('f<*', delete($dd->{windows}) // '');
+                        my (@c, @b);
+                        for (my $i = 0; $i < @pairs; $i += 2)
+                        {
+                            push @c, $pairs[$i];
+                            push @b, $pairs[$i+1];
+                        }
+                        $series = { windows => scalar @c };
+                        for my $metric (['PhysC', \@c], ['PhysB', \@b])
+                        {
+                            my @sorted = sort { $a <=> $b } @{ $metric->[1] };
+                            $series->{$metric->[0]} = _paired_profile_percentiles(\@sorted, $entry->{filter_perc}, \@p_list);
+                        }
+                    }
                     push @daily_common, {
+                        _series         => $series,
                         _day            => $d,
                         date            => gmtime($d * $PAIRED_SECONDS_PER_DAY)->ymd,
                         expectedMinutes => _paired_round(($expected_by_day->{$d} // 0) / 60, 1),
@@ -2730,6 +2765,18 @@ sub _paired_finalize
                     $per{daily} = [ map {
                         my %row = %$_;
                         my $d = delete $row{_day};
+                        my $series = delete $row{_series};
+                        if ($series && $entry->{daily_paired_profiles}{$profile_name})
+                        {
+                            $row{profileSeries} = {
+                                windows => $series->{windows},
+                                map {
+                                    my $metric = $_;
+                                    $metric => { map { ("P$_", _paired_round($series->{$metric}{$_}, 4)) }
+                                                 @{ $entry->{profiles}{$profile_name}{percentiles} } }
+                                } qw(PhysB PhysC)
+                            };
+                        }
                         my %t;
                         foreach my $pk (grep { exists $tail{$_} } @mine)
                         {
@@ -3457,6 +3504,7 @@ sub _sample_store_build
     my @columns = ('ep', 'pc', 'rq', (defined $b_index ? 'pb' : ()), (defined $f_index ? 'fq' : ()));
 
     my (%vms, %buffer, %day_epoch);
+    my $exposure_complete = 1;
     my ($next_id, $buffered, $unusable, $previous_date) = (0, 0, undef, undef);
     my $flush = sub {
         foreach my $vm (keys %buffer)
@@ -3493,7 +3541,13 @@ sub _sample_store_build
             $freqpct = $fields[$f_index] if defined $f_index;
         }
         # The text pass drops these rows before anything else.
-        next unless (defined $physc && defined $runq && looks_like_number($physc) && looks_like_number($runq));
+        unless (defined $physc && defined $runq && looks_like_number($physc) && looks_like_number($runq))
+        {
+            # Exposure admits rows independently of RunQ. Use its text reader if
+            # the engine dropped input; its sample counts must remain identical.
+            $exposure_complete = 0;
+            next;
+        }
 
         my $epoch;
         if (defined $ts_str && $ts_str =~ /^(\d{4}-\d\d-\d\d) (\d\d):(\d\d):(\d\d)$/ && $2 < 24 && $3 < 60 && $4 < 60)
@@ -3512,7 +3566,7 @@ sub _sample_store_build
             {
                 # The text pass decides with a full parse: skipped when it fails.
                 my $tp = eval { Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S") };
-                next unless $tp;
+                unless ($tp) { $exposure_complete = 0; next; }
                 $unusable = 'a timestamp is not canonical';
                 last;
             }
@@ -3523,10 +3577,11 @@ sub _sample_store_build
         else
         {
             my $tp = eval { Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S") };
-            next unless $tp;                   # the text pass skips an unparseable timestamp
+            unless ($tp) { $exposure_complete = 0; next; }
             $unusable = 'a timestamp is not canonical';
             last;
         }
+        $exposure_complete = 0 if $epoch < 0 || $epoch > 4294967295;
         if (!defined $vm || $vm =~ /\n/) { $unusable = 'a VM name cannot be stored'; last; }
         foreach my $cell ($physc, $runq, $physb, $freqpct)
         {
@@ -3583,6 +3638,7 @@ sub _sample_store_build
                 close $out;
             }
         }
+        $store{exposureComplete} = $exposure_complete;
         $store{vms}     = \%vms;
         $store{physb}   = defined $b_index ? 1 : 0;
         $store{freqpct} = defined $f_index ? 1 : 0;

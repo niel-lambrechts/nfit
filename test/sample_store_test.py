@@ -196,7 +196,7 @@ class SampleStoreTests(unittest.TestCase):
                    '--enable-windowed-decay', '--enable-growth-prediction'])
         with open(os.path.join(self.cache, STORE, 'store.json')) as fh:
             store = json.load(fh)
-        self.assertEqual(store['format'], 2)
+        self.assertEqual(store['format'], 3)
         days = store['vms']['vmA']['days']
         self.assertEqual(len(days['2026-09-03']), 7)          # first, last, row, then four column offsets
         self.assertEqual(days['2026-09-03'][2:], [0, 0, 0, 0, 0])

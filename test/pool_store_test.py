@@ -70,6 +70,7 @@ class PoolStoreTests(unittest.TestCase):
         env.pop('NFIT_POOL_STORE', None)
         if not store:
             env['NFIT_POOL_STORE'] = '0'
+            env['NFIT_SAMPLE_STORE'] = '0'
         p = subprocess.run(['perl', os.path.join(root, 'nfit-profile'), '--nmondir', os.path.join(root, 'stage', SERIAL)]
                            + list(flags), capture_output=True, text=True, timeout=280, cwd=root, env=env)
         assert p.returncode == 0, p.stderr[-1500:]
@@ -101,6 +102,8 @@ class PoolStoreTests(unittest.TestCase):
     def test_history_month_is_identical_with_and_without_the_store(self):
         off = self.pool_parts(self.month(self.off))
         self.assertTrue(off['PoolHistory'] and off['MemberExposure'])
+        self.assertIn('Member CPU samples from the sample store', self.cold_history.stderr)
+        self.assertNotIn('Member CPU samples from the sample store', self.off_history.stderr)
         self.assertEqual(off, self.pool_parts(self.cold_month), 'store written on the first run')
         self.assertEqual(off, self.pool_parts(self.warm_month), 'store read on the second run')
 
@@ -119,6 +122,27 @@ class PoolStoreTests(unittest.TestCase):
         self.assertRegex(self.warm_history.stderr, r' 0 row\(s\) read, 0 in the window\(s\); 2 day\(s\) from the pool evidence store, 0 reduced')
         off = os.path.join(self.off, 'stage', SERIAL, STORE)
         self.assertFalse(os.path.exists(off), 'NFIT_POOL_STORE=0 must not write a store')
+
+    def test_store_missing_an_invalid_runq_row_uses_original_exposure_population(self):
+        root = mx.MemberExposureTests.make_root()
+        self.roots.append(root)
+        data = os.path.join(root, 'stage', SERIAL, '.nfit.cache.data')
+        with open(data) as fh:
+            rows = fh.readlines()
+        fields = rows[1].split(',')
+        fields[3] = 'missing'
+        rows[1] = ','.join(fields)
+        with open(data, 'w') as fh:
+            fh.writelines(rows)
+        flags = ('--update-history', '--min-history-days', '1', '--pool-history', '--force')
+        enabled = self.nfp(root, flags)
+        self.assertNotIn('Member CPU samples from the sample store', enabled.stderr)
+        # PhysC and PhysB did not change. The missing RunQ must not discard
+        # a minute of observed exposure, even though the engine skips the row.
+        self.nfp(root, flags, store=False)
+        expected = self.month(root)['MemberExposure']
+        self.nfp(root, flags)
+        self.assertEqual(self.month(root)['MemberExposure'], expected)
 
     def test_missing_populated_day_is_rebuilt(self):
         root = mx.MemberExposureTests.make_root()

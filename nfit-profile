@@ -15660,12 +15660,12 @@ sub update_monthly_history {
         my $semantics = _engine_physb_semantics();
         if (!$identity) {
             print STDERR "  ↳  --physb-history: the cache declares no PhysB column; no PhysB blocks are written\n";
-        } elsif (!$semantics) {
-            die "[ERROR] --physb-history needs an nfit engine that reports its paired-derivation semantics "
+        } elsif (!$semantics || !$semantics->{dailyProfileVersion}) {
+            die "[ERROR] --physb-history needs an nfit engine that supports daily paired profiles "
               . "(nfit --capabilities). Upgrade nfit.\n";
         } else {
             $physb = { identity => $identity, semantics => $semantics,
-                       signature => _physb_history_signature($identity, $semantics, _physb_history_manifest()) };
+                       signature => _physb_history_signature($identity, $semantics, _physb_history_manifest($semantics)) };
         }
     }
 
@@ -15688,6 +15688,7 @@ sub update_monthly_history {
     # --- Step 1: Load existing history ONCE ---
     my $history_data = read_unified_history($system_cache_dir);
     my @months_to_process;
+    my @missing_physb_months;  # record explicit absence once, without running the paired engine
     my @physb_months;      # stored months whose PhysC analysis is kept; PhysB blocks only
 
     # --- Step 2: Planning Stage - Discover unprocessed months ---
@@ -15734,6 +15735,16 @@ sub update_monthly_history {
             print STDERR "  ↳  PhysB blocks absent or out of date for $month_key; stored PhysC analysis is kept\n";
             push @physb_months, { key => $month_key, start_obj => $effective_start_obj, end_obj => $effective_end_obj, days => $days_in_period };
         }
+        if ($physb_history_flag && !$physb && $days_in_period > 0)
+        {
+            my $month = $history_data->{$month_key};
+            my $meta = $month ? $month->{Metadata} // {} : {};
+            if (($should_process || ($month && ref($month->{MonthlyWorkloadAnalysis}) eq 'HASH')) &&
+                !$meta->{PhysB} && !exists $meta->{DailyPhysBUnavailable})
+            {
+                push @missing_physb_months, $month_key;
+            }
+        }
         if ($pool_context && $days_in_period > 0
             && ($should_process || ref(_safe_dig($history_data, $month_key, 'MonthlyWorkloadAnalysis')) eq 'HASH'))
         {
@@ -15760,7 +15771,7 @@ sub update_monthly_history {
         my $first_month_key = $months_to_process[0]{key};
         _validate_pre_update_conditions($system_cache_dir, $first_month_key, $force_flag);
     }
-    if (@months_to_process || @physb_months || @pool_months) {
+    if (@months_to_process || @physb_months || @missing_physb_months || @pool_months) {
         # Create checkpoint backup before any modifications
         print STDERR "  • Creating pre-tactical checkpoint backup\n";
         _create_checkpoint_backup($system_cache_dir, 'pre-tactical', 1);
@@ -15780,6 +15791,10 @@ sub update_monthly_history {
         );
     } else {
         print STDERR "  ✓ No new months to process. History is up to date\n";
+    }
+    foreach my $month (@missing_physb_months)
+    {
+        $history_data->{$month}{Metadata}{DailyPhysBUnavailable} = 'no_declared_physb_column';
     }
     if (@physb_months) {
         _backfill_physb_history($system_cache_dir, \@physb_months, $history_data, $adaptive_runq_saturation_thresh, $physb);
@@ -15808,7 +15823,7 @@ sub update_monthly_history {
 
     # --- Step 4: Final Write ---
     # The history file is written only ONCE at the end if any changes were made.
-    if (@months_to_process || @physb_months || $pool_months_written || $was_enriched) {
+    if (@months_to_process || @physb_months || @missing_physb_months || $pool_months_written || $was_enriched) {
         print "  ↳  Finalising updates to history cache.\n";
 
         _write_full_history($system_cache_dir, $history_data);
@@ -15929,6 +15944,10 @@ sub _generate_monthly_and_seasonal_history {
             # Stored blocks carried unchanged keep their marker and feature tag.
             $history_data_href->{$month_key}{Metadata}{$_} = $previous_metadata->{$_}
                 for grep { exists $previous_metadata->{$_} } qw(Features PhysB);
+        }
+        elsif (exists $previous_metadata->{DailyPhysBUnavailable})
+        {
+            $history_data_href->{$month_key}{Metadata}{DailyPhysBUnavailable} = $previous_metadata->{DailyPhysBUnavailable};
         }
         if (%new_physb || $physb_stats->{carried} || $physb_stats->{kept})
         {
@@ -18776,7 +18795,10 @@ sub _assemble_monthly_analysis {
 # statistics depend only on a transform's time-of-day and weekday filters,
 # so they are stored once per population ('none', 'online', 'batch', with
 # '+no-weekends'); tails and profile values depend on the profile and are
-# stored per profile with the population they belong to.
+# stored per profile with the population they belong to. DailyProfileSeries
+# stores native, UTC-day-origin smoothed percentiles for each actionable
+# profile and state. Paired B and C use the same valid window endpoints and
+# each uses its own activity filter. Missing support yields null values.
 #
 # Extension and re-runs: a block is always recomputed from L1 over the whole
 # window, never merged from stored parts, so non-additive values (percentiles,
@@ -18814,7 +18836,8 @@ sub _engine_physb_semantics
     return undef unless $? == 0 && defined $text && $text =~ /\S/;
     my $caps = eval { decode_json($text) };
     return undef unless ref($caps) eq 'HASH' && $caps->{physb_derivation_version};
-    return { derivationVersion => $caps->{physb_derivation_version}, calendarRules => $caps->{calendar_rules} };
+    return { derivationVersion => $caps->{physb_derivation_version}, calendarRules => $caps->{calendar_rules},
+             dailyProfileVersion => $caps->{daily_paired_profile_version} };
 }
 
 # Everything a stored block's validity depends on, apart from its window.
@@ -18823,6 +18846,7 @@ sub _physb_history_signature
     my ($identity, $semantics, $historical_manifest) = @_;
     require Digest::SHA;
     return {
+        ($semantics->{dailyProfileVersion} ? (dailyProfileVersion => $semantics->{dailyProfileVersion}) : ()),
         derivationVersion => $semantics->{derivationVersion},
         calendarRules     => $semantics->{calendarRules},
         dataRevision      => $identity->{dataRevision},
@@ -18834,7 +18858,19 @@ sub _physb_history_signature
 sub _physb_history_manifest
 {
     my $runq_behavior = $runq_perc_behavior_mode // 'none';
-    return _sanitise_manifest_for_history(build_transform_manifest(\@profiles, $nfit_runq_avg_method_str, $runq_behavior));
+    my ($semantics) = @_;
+    my $manifest = _sanitise_manifest_for_history(build_transform_manifest(\@profiles, $nfit_runq_avg_method_str, $runq_behavior));
+    if ($semantics && $semantics->{dailyProfileVersion})
+    {
+        my %visible = map { $_->{name} => 1 } grep { $_->{csv_output} && $_->{name} ne $MANDATORY_PEAK_PROFILE_FOR_HINT } @profiles;
+        foreach my $entry (values %$manifest)
+        {
+            next unless ref($entry) eq 'HASH' && ($entry->{metric} // '') eq 'PhysC';
+            my @names = grep { $visible{$_} } keys %{ $entry->{profiles} };
+            $entry->{daily_paired_profiles} = { map { $_ => 1 } @names } if @names;
+        }
+    }
+    return $manifest;
 }
 
 sub _physb_population_key
@@ -18910,7 +18946,7 @@ sub _assemble_physb_metrics
         next unless @objects;
         my $provenance = $objects[-1]{physbProvenance} // {};
 
-        my (%populations, %profiles_out);
+        my (%populations, %profiles_out, %daily_series);
         foreach my $object (@objects)
         {
             my $state_id = $object->{state}{id};
@@ -18970,6 +19006,16 @@ sub _assemble_physb_metrics
 
                 # Profile quantities: newest state with an available result.
                 my $po = $profiles_out{$profile} //= { population => $key, statesAvailable => 0, states => 0 };
+                foreach my $day (@{ $r->{daily} // [] })
+                {
+                    my $series = $day->{profileSeries} or next;
+                    push @{ $daily_series{$profile} }, {
+                        date => $day->{date}, stateId => $state_id, windows => 0 + $series->{windows},
+                        expectedMinutes => $day->{expectedMinutes}, physcMinutes => $day->{physcMinutes},
+                        pairedMinutes => $day->{pairedMinutes},
+                        physB => $pick->($profile, $series->{PhysB}), pairedPhysC => $pick->($profile, $series->{PhysC}),
+                    };
+                }
                 $po->{states}++;
                 next unless ($r->{status} // '') eq 'available';
                 $po->{statesAvailable}++;
@@ -19021,7 +19067,9 @@ sub _assemble_physb_metrics
 
         $blocks{$vm} = {
             schemaVersion => $PHYSB_HISTORY_SCHEMA_VERSION,
+            ($signature->{dailyProfileVersion} ? (DailyProfileSeries => \%daily_series) : ()),
             Source => {
+                ($signature->{dailyProfileVersion} ? (dailyProfileVersion => $signature->{dailyProfileVersion}) : ()),
                 physbSource       => $provenance->{source},
                 derivationVersion => $provenance->{derivationVersion},
                 calendarRules     => $provenance->{calendarRules},
@@ -19093,6 +19141,7 @@ sub _physb_mark_month
 {
     my ($metadata, $signature, $window, $stats) = @_;
     my %features = map { $_ => 1 } @{ $metadata->{Features} // [] };
+    delete $metadata->{DailyPhysBUnavailable};
     $features{$PHYSB_HISTORY_FEATURE} = 1;
     $metadata->{Features} = [ sort keys %features ];
     $metadata->{PhysB} = {
@@ -19949,7 +19998,7 @@ sub _build_pool_history
             $wanted{$vm} = 1 if grep { ref($_) eq 'HASH' && looks_like_number(($_->{metadata} // {})->{pool_id} // '') } @{ $states_db->{$vm} // [] };
         }
         print STDERR "  • Reading CPU samples of " . scalar(keys %wanted) . " LPAR(s) for member exposure\n";
-        ($cpu_files) = _exposure_partition_cpu($exposure->{context}{dataPath}, [ @windows[@exposure_jobs] ], $tmp_dir, \%wanted);
+        ($cpu_files) = _exposure_cpu_sources($exposure->{context}, [ @windows[@exposure_jobs] ], $tmp_dir, \%wanted);
         $populations = _exposure_populations();
     }
 
@@ -20285,6 +20334,62 @@ sub _pool_state_span
 }
 
 # ==============================================================================
+# Return day descriptors for a complete, current engine sample store. Partial
+# days and stores built from a different input population use the text reader.
+sub _exposure_sample_days
+{
+    my ($context, $windows, $wanted) = @_;
+    return if defined $ENV{NFIT_SAMPLE_STORE} && $ENV{NFIT_SAMPLE_STORE} eq '0';
+    return if grep { $_->[0] % 86400 || $_->[1] % 86400 } @$windows;
+    my $dir = File::Spec->catdir(dirname($context->{dataPath}), '.nfit.store', 'samples');
+    open my $fh, '<:raw', File::Spec->catfile($dir, 'store.json') or return;
+    my $store = eval { local $/; decode_json(<$fh>) };
+    close $fh;
+    return unless ref($store) eq 'HASH' && ref($store->{vms}) eq 'HASH' && ($store->{format} // 0) == 3 && $store->{exposureComplete} && $store->{physb};
+    my $identity = eval { decode_json($store->{identity}) };
+    return unless ref($identity) eq 'HASH' && ($identity->{data} // '') eq 'rev:' . $context->{signature}{dataRevision};
+
+    my %days;
+    my $samples = 0;
+    foreach my $vm (sort keys %$wanted)
+    {
+        my $entry = $store->{vms}{$vm} or next;
+        return unless ref($entry) eq 'HASH' && ($entry->{id} // '') =~ /^\d+$/ && ref($entry->{days}) eq 'HASH'
+                   && ref($entry->{bytes}) eq 'ARRAY' && @{ $entry->{bytes} } >= 3;
+        my $base = File::Spec->catfile($dir, $entry->{id});
+        my @bytes = @{ $entry->{bytes} };
+        return unless -f "$base.ep" && -s _ == 4 * $entry->{n}
+                   && -f "$base.pc" && -s _ == $bytes[0]
+                   && -f "$base.pb" && -s _ == $bytes[2];
+        # Offsets are the start of each day's rows; the next day (or EOF)
+        # gives the exclusive upper bound, even across gaps in collection.
+        my @dates = sort keys %{ $entry->{days} };
+        foreach my $i (0 .. $#dates)
+        {
+            my $from = $entry->{days}{$dates[$i]};
+            next unless grep { $from->[0] >= $_->[0] && $from->[1] < $_->[1] } @$windows;
+            my $to = $i < $#dates ? $entry->{days}{$dates[$i+1]} : [undef, undef, $entry->{n}, @bytes];
+            my $day = int($from->[0] / 86400);
+            $days{$day}{$vm} = [$base, $from, $to];
+            $samples += $to->[2] - $from->[2];
+        }
+    }
+    return (\%days, { samplesInWindow => $samples });
+}
+
+sub _exposure_cpu_sources
+{
+    my ($context, $windows, $tmp_dir, $wanted) = @_;
+    my @stored = _exposure_sample_days($context, $windows, $wanted);
+    if (@stored)
+    {
+        print STDERR "  [INFO] Member CPU samples from the sample store.\n";
+        return @stored;
+    }
+    return _exposure_partition_cpu($context->{dataPath}, $windows, $tmp_dir, $wanted);
+}
+
+# ==============================================================================
 # SUBROUTINE: _exposure_partition_cpu
 # PURPOSE:    One pass over the CPU cache: samples of the wanted LPARs inside
 #             any window are written as (epoch, LPAR, PhysC, PhysB) to one
@@ -20350,15 +20455,11 @@ sub _exposure_read_cpu_day
 {
     my ($file) = @_;
     my %minutes;
-    return \%minutes unless (defined $file && -f $file);
     my $tolerance = $MEMBER_EXPOSURE_RULES{pairToleranceCores};
-    open my $in, '<', $file or die "[ERROR] Cannot read '$file': $!\n";
-    while (my $line = <$in>)
-    {
-        chomp $line;
-        my ($seconds, $vm, $c, $b) = split /\t/, $line, -1;
+    my $add = sub {
+        my ($seconds, $vm, $c, $b) = @_;
         my ($c_value, $c_problem) = _pool_number($c);
-        next if defined $c_problem;
+        return if defined $c_problem;
         my $acc = $minutes{$vm}{ $seconds - ($seconds % 60) } //= [ 0, 0, 0, 0 ];
         $acc->[0]++;
         $acc->[1] += $c_value;
@@ -20368,6 +20469,39 @@ sub _exposure_read_cpu_day
             $acc->[2]++;
             $acc->[3] += $b_value;
         }
+    };
+    if (ref($file) eq 'HASH')
+    {
+        foreach my $vm (keys %$file)
+        {
+            my ($base, $from, $to) = @{ $file->{$vm} };
+            my $n = $to->[2] - $from->[2];
+            my @cols;
+            foreach my $range (['ep', 4*$from->[2], 4*$n], ['pc', $from->[3], $to->[3]-$from->[3]],
+                               ['pb', $from->[5], $to->[5]-$from->[5]])
+            {
+                my ($suffix, $offset, $length) = @$range;
+                open my $col, '<:raw', "$base.$suffix" or die "Cannot open sample column: $!";
+                seek($col, $offset, 0) or die "Cannot seek in sample column: $!";
+                my $got = read($col, my $buf, $length);
+                close $col;
+                die "Incomplete exposure sample column" unless defined $got && $got == $length;
+                my @values = $suffix eq 'ep' ? unpack('L<*', $buf) : split(/\n/, $buf, -1);
+                pop @values unless $suffix eq 'ep';
+                die "Inconsistent exposure sample column" unless @values == $n;
+                push @cols, \@values;
+            }
+            for my $i (0 .. $n-1) { $add->($cols[0][$i], $vm, $cols[1][$i], $cols[2][$i]); }
+        }
+        return \%minutes;
+    }
+    return \%minutes unless (defined $file && -f $file);
+    open my $in, '<', $file or die "[ERROR] Cannot read '$file': $!\n";
+    while (my $line = <$in>)
+    {
+        chomp $line;
+        my ($seconds, $vm, $c, $b) = split /\t/, $line, -1;
+        $add->($seconds, $vm, $c, $b);
     }
     close $in;
     return \%minutes;
@@ -20638,7 +20772,7 @@ sub _exposure_evaluate_window
     _subtask('Reading pool observations');
     my ($pool_files, $pool_counts) = _pool_day_sources($pool_context, [ [ $window_start, $window_end ] ], $tmp_dir);
     _subtask(sprintf('Reading CPU samples of %d LPAR(s)', scalar(keys %wanted)));
-    my ($cpu_files, $cpu_counts)   = _exposure_partition_cpu($exposure_context->{dataPath}, [ [ $window_start, $window_end ] ], $tmp_dir, \%wanted);
+    my ($cpu_files, $cpu_counts)   = _exposure_cpu_sources($exposure_context, [ [ $window_start, $window_end ] ], $tmp_dir, \%wanted);
     _subtask(sprintf('Classifying pool minutes and member busy (%d state(s))', scalar(@$trackers_aref)));
     my $physical_minutes = 0;
     my (%pool_full, $frame_low);
@@ -21054,23 +21188,8 @@ sub _generate_monthly_workload_analysis {
     }
 
     # ======================================================================
-    # STEP 1: Build the tactical manifest
-    # ======================================================================
-    # Use the existing, battle-tested build_transform_manifest function.
-    # This function handles all the complexity of profile parameter extraction,
-    # transform key generation, and percentile de-duplication.
-    # ======================================================================
-    my $runq_behavior = $runq_perc_behavior_mode // 'none';
-    my $tactical_manifest = build_transform_manifest(\@profiles, $nfit_runq_avg_method_str, $runq_behavior);
-
-    # ======================================================================
-    # STEP 2: Create the PURE HISTORICAL manifest
-    # ======================================================================
-    # The sanitisation function is the primary data purity guardrail.
-    # It strips all predictive elements (growth, decay) whilst preserving
-    # the profile's fundamental measurement definition.
-    # ======================================================================
-    my $historical_manifest = _sanitise_manifest_for_history($tactical_manifest);
+    # Use the exact manifest fingerprinted by the history scheduler.
+    my $historical_manifest = _physb_history_manifest($physb ? $physb->{semantics} : undef);
 
     # ======================================================================
     # STEP 3: Write manifest to temporary file
@@ -22607,7 +22726,8 @@ Model behaviour depends on the event configuration:
                                               and records workload and forecasting snapshots for advanced analysis and adaptive scoring.
 
   --physb-history                           : With --update-history, add PhysBMetrics blocks (paired PhysC/PhysB
-                                              exposure, coverage and tails) when the cache declares a PhysB column.
+                                              exposure, coverage, tails and daily profile values by state). A cache without
+                                              a declared PhysB column is marked unavailable in monthly metadata.
                                               Stored months gain blocks without their PhysC analysis changing.
 
   --pool-history                            : With --update-history, add PoolHistory blocks when the cache holds pool
