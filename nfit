@@ -33,6 +33,7 @@ use Cwd 'abs_path';
 use Digest::SHA qw(sha256_hex);
 use Storable qw(freeze dclone);
 use File::Copy;
+use File::Path qw(make_path remove_tree);
 
 # Canonical name for the mandatory peak helper profile (used for peak analysis and as the
 # source of RunQ evidence for credibility checks in downstream tools).
@@ -120,6 +121,11 @@ my $DEFAULT_MAX_GROWTH_INFLATION_PERCENT   = 25;
 my $CACHE_MANIFEST_FILE = ".nfit.cache.manifest";
 my $CACHE_STATES_FILE   = ".nfit.cache.states";
 my $CACHE_DATA_FILE     = ".nfit.cache.data";
+# Sample store (v10 milestone 1.1b): see _sample_store_open.
+my $SAMPLE_STORE_FORMAT = 1;
+my $SAMPLE_STORE_DIR    = '.nfit.store';
+my $SAMPLE_STORE_FLUSH  = 32 * 1024 * 1024;   # bytes buffered before a flush
+my $SAMPLE_STORE_UNDEF  = "\x01";             # an optional cell the row did not have
 my $CACHE_INDEX_FILE    = ".nfit.cache.idx";
 my $CACHE_LOCK_FILE     = ".nfit.cache.lock";
 
@@ -3283,6 +3289,552 @@ sub apply_growth_prediction_to_metrics {
 #                      Single-Pass Engine Subroutines
 # ==============================================================================
 
+# ==============================================================================
+# SAMPLE STORE (v10 milestone 1.1b)
+# The L1 text cache converted once into per-VM columns beside the cache:
+#   <cache dir>/.nfit.store/samples/store.json      manifest (written last)
+#   <cache dir>/.nfit.store/samples/<id>.ep         epochs, packed 'L<'
+#   <cache dir>/.nfit.store/samples/<id>.pc|.rq     PhysC and RunQ cells, as text
+#   <cache dir>/.nfit.store/samples/<id>.pb|.fq     PhysB and FreqPct cells (schema 2)
+# The numeric cells are kept as the text the L1 file holds, one per line, so
+# every later calculation starts from exactly the value the text pass parses.
+# The store depends only on the L1 data (its identity is the data part of
+# _l1_data_identity) and is rebuilt when that changes. It is used only when it
+# reproduces the text pass exactly: timestamps must be canonical
+# (YYYY-MM-DD HH:MM:SS) and dates must not go backwards; otherwise the store is
+# marked unusable and the text pass runs as before.
+# NFIT_SAMPLE_STORE=0 disables the store (the text pass is then used).
+# ==============================================================================
+# (Constants are declared with the other engine constants near the top.)
+
+sub _sample_store_dir
+{
+    my ($nmon_dir) = @_;
+    return File::Spec->catdir($nmon_dir, $SAMPLE_STORE_DIR, 'samples');
+}
+
+sub _sample_store_identity
+{
+    my ($nmon_dir, $meta) = @_;
+    my $id = _l1_data_identity($nmon_dir, $meta);
+    return JSON->new->canonical->encode({ format => $SAMPLE_STORE_FORMAT, schema => $id->{schema}, data => $id->{data} });
+}
+
+sub _sample_store_slurp
+{
+    my ($path) = @_;
+    open my $fh, '<:raw', $path or die "Cannot open $path: $!";
+    local $/;
+    my $content = <$fh>;
+    close $fh;
+    return $content // '';
+}
+
+# Returns the store manifest (with {dir}) when a usable store exists or could be
+# built; undef when the text pass must be used.
+sub _sample_store_open
+{
+    my ($nmon_dir, $data_file, $layout, $meta, $verbose) = @_;
+    return undef if defined $ENV{NFIT_SAMPLE_STORE} && $ENV{NFIT_SAMPLE_STORE} eq '0';
+    my $dir      = _sample_store_dir($nmon_dir);
+    my $identity = _sample_store_identity($nmon_dir, $meta);
+    my $manifest_path = File::Spec->catfile($dir, 'store.json');
+    if (-f $manifest_path)
+    {
+        my $store = eval { decode_json(_sample_store_slurp($manifest_path)) };
+        if (ref($store) eq 'HASH' && ($store->{identity} // '') eq $identity)
+        {
+            return undef if $store->{unusable};
+            $store->{dir} = $dir;
+            return $store if _sample_store_intact($store);
+        }
+    }
+    my $store = eval { _sample_store_build($nmon_dir, $data_file, $layout, $identity, $verbose) };
+    if ($@)
+    {
+        print STDERR "  Sample store not built ($@); using the text pass.\n" if $verbose;
+        return undef;
+    }
+    return undef if !$store || $store->{unusable};
+    $store->{dir} = $dir;
+    return $store;
+}
+
+# Every column file of every VM has the size its row count implies.
+sub _sample_store_intact
+{
+    my ($store) = @_;
+    foreach my $entry (values %{ $store->{vms} // {} })
+    {
+        my $ep = File::Spec->catfile($store->{dir}, "$entry->{id}.ep");
+        return 0 unless (-f $ep && -s _ == 4 * $entry->{n});
+        foreach my $column ('pc', 'rq', ($store->{physb} ? 'pb' : ()), ($store->{freqpct} ? 'fq' : ()))
+        {
+            return 0 unless -f File::Spec->catfile($store->{dir}, "$entry->{id}.$column");
+        }
+    }
+    return 1;
+}
+
+sub _sample_store_build
+{
+    my ($nmon_dir, $data_file, $layout, $identity, $verbose) = @_;
+    my $dir = _sample_store_dir($nmon_dir);
+    my $tmp = "$dir.tmp.$$";
+    remove_tree($tmp) if -d $tmp;
+    make_path($tmp);
+
+    my $legacy  = $layout->{legacy};
+    my $b_index = $legacy ? undef : $layout->{index}{PhysB};
+    my $f_index = $legacy ? undef : $layout->{index}{FreqPct};
+    my @columns = ('ep', 'pc', 'rq', (defined $b_index ? 'pb' : ()), (defined $f_index ? 'fq' : ()));
+
+    my (%vms, %buffer, %day_epoch);
+    my ($next_id, $buffered, $unusable, $previous_date) = (0, 0, undef, undef);
+    my $flush = sub {
+        foreach my $vm (keys %buffer)
+        {
+            foreach my $column (@columns)
+            {
+                next unless length($buffer{$vm}{$column} // '');
+                my $path = File::Spec->catfile($tmp, "$vms{$vm}{id}.$column");
+                open my $out, '>>:raw', $path or die "Cannot write $path: $!";
+                print {$out} $buffer{$vm}{$column} or die "Cannot write $path: $!";
+                close $out or die "Cannot write $path: $!";
+            }
+        }
+        %buffer = ();
+        $buffered = 0;
+    };
+
+    print STDERR "  Building the sample store (once per data revision) ...\n" if ($verbose && !$quiet);
+    open my $fh, '<:raw', $data_file or die "Cannot open $data_file: $!";
+    my $header = <$fh>;
+    while (my $line = <$fh>)
+    {
+        chomp $line;
+        my ($ts_str, $vm, $physc, $runq, $physb, $freqpct);
+        if ($legacy)
+        {
+            ($ts_str, $vm, $physc, $runq) = split ',', $line, 4;
+        }
+        else
+        {
+            my @fields = split ',', $line, -1;
+            ($ts_str, $vm, $physc, $runq) = @fields[0 .. 3];
+            $physb   = $fields[$b_index] if defined $b_index;
+            $freqpct = $fields[$f_index] if defined $f_index;
+        }
+        # The text pass drops these rows before anything else.
+        next unless (defined $physc && defined $runq && looks_like_number($physc) && looks_like_number($runq));
+
+        my $epoch;
+        if (defined $ts_str && $ts_str =~ /^(\d{4}-\d\d-\d\d) (\d\d):(\d\d):(\d\d)$/ && $2 < 24 && $3 < 60 && $4 < 60)
+        {
+            my ($date, $h, $m, $s) = ($1, $2, $3, $4);
+            my $day_start = $day_epoch{$date};
+            if (!defined $day_start)
+            {
+                my $tp = eval { Time::Piece->strptime($date, "%Y-%m-%d") };
+                if (!$tp)                   { $day_start = 'invalid'; }
+                elsif ($tp->ymd ne $date)   { $unusable = 'a date is not a calendar date'; last; }
+                else                        { $day_start = $tp->epoch; }
+                $day_epoch{$date} = $day_start;
+            }
+            if ($day_start eq 'invalid')
+            {
+                # The text pass decides with a full parse: skipped when it fails.
+                my $tp = eval { Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S") };
+                next unless $tp;
+                $unusable = 'a timestamp is not canonical';
+                last;
+            }
+            if (defined $previous_date && $date lt $previous_date) { $unusable = 'dates are not in order'; last; }
+            $previous_date = $date;
+            $epoch = $day_start + $h * 3600 + $m * 60 + $s;
+        }
+        else
+        {
+            my $tp = eval { Time::Piece->strptime($ts_str, "%Y-%m-%d %H:%M:%S") };
+            next unless $tp;                   # the text pass skips an unparseable timestamp
+            $unusable = 'a timestamp is not canonical';
+            last;
+        }
+        if (!defined $vm || $vm =~ /\n/) { $unusable = 'a VM name cannot be stored'; last; }
+        foreach my $cell ($physc, $runq, $physb, $freqpct)
+        {
+            next unless defined $cell;
+            if ($cell =~ /[\n\x01]/) { $unusable = 'a cell cannot be stored'; last; }
+        }
+        last if $unusable;
+
+        my $entry = $vms{$vm} //= { id => sprintf('%06d', ++$next_id), n => 0, days => {} };
+        $entry->{n}++;
+        my $date = substr($ts_str, 0, 10);
+        my $span = $entry->{days}{$date} //= [ $epoch, $epoch ];
+        $span->[0] = $epoch if $epoch < $span->[0];
+        $span->[1] = $epoch if $epoch > $span->[1];
+
+        my $b = $buffer{$vm} //= {};
+        $b->{ep} .= pack('L<', $epoch);
+        $b->{pc} .= $physc . "\n";
+        $b->{rq} .= $runq . "\n";
+        $b->{pb} .= (defined $physb   ? $physb   : $SAMPLE_STORE_UNDEF) . "\n" if defined $b_index;
+        $b->{fq} .= (defined $freqpct ? $freqpct : $SAMPLE_STORE_UNDEF) . "\n" if defined $f_index;
+        $buffered += 24 + length($physc) + length($runq) + length($physb // '') + length($freqpct // '');
+        $flush->() if $buffered >= $SAMPLE_STORE_FLUSH;
+    }
+    close $fh;
+
+    my %store = (identity => $identity, format => $SAMPLE_STORE_FORMAT);
+    if ($unusable)
+    {
+        %buffer = ();
+        remove_tree($tmp);
+        make_path($tmp);
+        $store{unusable} = $unusable;
+        print STDERR "  Sample store not used: $unusable; using the text pass.\n" if $verbose;
+    }
+    else
+    {
+        $flush->();
+        # A VM always has both text columns, even when a flush never wrote one.
+        foreach my $entry (values %vms)
+        {
+            foreach my $column (@columns)
+            {
+                my $path = File::Spec->catfile($tmp, "$entry->{id}.$column");
+                next if -f $path;
+                open my $out, '>:raw', $path or die "Cannot write $path: $!";
+                close $out;
+            }
+        }
+        $store{vms}     = \%vms;
+        $store{physb}   = defined $b_index ? 1 : 0;
+        $store{freqpct} = defined $f_index ? 1 : 0;
+    }
+    my $manifest_path = File::Spec->catfile($tmp, 'store.json');
+    open my $out, '>:raw', $manifest_path or die "Cannot write $manifest_path: $!";
+    print {$out} JSON->new->canonical->encode(\%store) or die "Cannot write $manifest_path: $!";
+    close $out or die "Cannot write $manifest_path: $!";
+    remove_tree($dir) if -d $dir;
+    rename($tmp, $dir) or die "Cannot publish the sample store in $dir: $!";
+    return \%store;
+}
+
+# One VM's columns: (\@epoch, \@physc, \@runq, \@physb|undef, \@freqpct|undef).
+sub _sample_store_load
+{
+    my ($store, $vm) = @_;
+    my $entry = $store->{vms}{$vm} or return;
+    my $base  = File::Spec->catfile($store->{dir}, $entry->{id});
+    my @epoch = unpack('L<*', _sample_store_slurp("$base.ep"));
+    my @out   = (\@epoch);
+    foreach my $column ('pc', 'rq', ($store->{physb} ? 'pb' : undef), ($store->{freqpct} ? 'fq' : undef))
+    {
+        if (!defined $column) { push @out, undef; next; }
+        my @cells = split /\n/, _sample_store_slurp("$base.$column"), -1;
+        pop @cells;                                    # the final newline
+        die "Sample store for this cache is damaged ($column of $entry->{id}); delete "
+            . _sample_store_dir('<cache dir>') . " and rerun.\n" unless @cells == @epoch;
+        if ($column eq 'pb' || $column eq 'fq')
+        {
+            foreach my $cell (@cells) { $cell = undef if $cell eq $SAMPLE_STORE_UNDEF; }
+        }
+        push @out, \@cells;
+    }
+    return @out;
+}
+
+# ==============================================================================
+# SUBROUTINE: _columnar_pass
+# PURPOSE:    The single pass, driven from the sample store: one VM at a time,
+#             and within a VM one transform at a time. It fills exactly the
+#             structures the text pass fills (process_data_point), from the same
+#             samples in the same order per VM and transform, so every
+#             downstream result is identical. What it avoids is the per-sample
+#             timestamp parse and the per-sample loop over every transform.
+# ==============================================================================
+sub _columnar_pass
+{
+    my ($store, $c) = @_;
+    my $manifest       = $c->{manifest};
+    my $states_by_vm   = $c->{states_by_vm};
+    my $start_date_str = $c->{start_date_str};
+    my $end_date_str   = $c->{end_date_str};
+    my $global_excl    = $c->{global_exclusions};
+    my $vm_excl        = $c->{vm_exclusions};
+    my $paired_ctx     = $c->{paired_ctx};
+    my $windowed       = $c->{enable_windowed_decay};
+    my $windows_aref   = $c->{time_windows_aref};
+    my $clipping       = $c->{enable_clipping_detection};
+    my $daily_peak_ref = $c->{daily_peak_raw_data_ref};
+    my $peak_ts_ref    = $c->{peak_transform_ts_tracker};
+
+    # The date filters of the text pass, per calendar date and VM.
+    my $date_admitted = sub {
+        my ($date, $vm) = @_;
+        return 0 if (defined $end_date_str && $date gt $end_date_str);
+        return 0 if (defined $start_date_str && $date lt $start_date_str);
+        return 0 if exists $global_excl->{$date};
+        return 0 if (exists $vm_excl->{$vm} && exists $vm_excl->{$vm}{$date});
+        return 1;
+    };
+
+    # Observed range of the cache within the analysis window (all VMs).
+    if ($paired_ctx)
+    {
+        foreach my $vm (keys %{ $store->{vms} })
+        {
+            my $days = $store->{vms}{$vm}{days};
+            foreach my $date (keys %$days)
+            {
+                next unless $date_admitted->($date, $vm);
+                my ($lo, $hi) = @{ $days->{$date} };
+                $paired_ctx->{range_min} = $lo if !defined $paired_ctx->{range_min} || $lo < $paired_ctx->{range_min};
+                $paired_ctx->{range_max} = $hi if !defined $paired_ctx->{range_max} || $hi > $paired_ctx->{range_max};
+            }
+        }
+    }
+
+    # The filter classes the manifest uses: weekday rule x time-of-day rule.
+    my %classes;
+    foreach my $key (keys %$manifest)
+    {
+        my $entry = $manifest->{$key};
+        my $time_filter = $entry->{time_filter} // '';
+        $classes{ ($entry->{no_weekends} ? 1 : 0) . '|' . $time_filter } //= [ ($entry->{no_weekends} ? 1 : 0), $time_filter ];
+    }
+
+    my %day_info;      # day number -> [ 'YYYY-MM-DD', is weekend ]
+    my @vm_names = sort grep { exists $c->{vms_to_process}{$_} && exists $states_by_vm->{$_} } keys %{ $store->{vms} };
+    my $vm_count = 0;
+    my $show_progress = ($c->{show_progress} && !$quiet);
+    foreach my $vm (@vm_names)
+    {
+        $vm_count++;
+        printf STDERR "\r  ↳  Processing sample store: VM %d of %d", $vm_count, scalar(@vm_names) if $show_progress;
+        my ($epoch, $physc_col, $runq_col, $physb_col, $freq_col) = _sample_store_load($store, $vm);
+        next unless $epoch;
+        my $states  = $states_by_vm->{$vm};
+        my @state_span = map { [ $_->{start_time}->epoch, $_->{end_time}->epoch ] } @$states;
+        my $ceiling = $paired_ctx ? _paired_ceiling($paired_ctx, $vm, $states) : undef;
+
+        # --- Per sample: date filters, raw peak, bin and filter classes ---
+        my (%admitted, @bin, @smt, @day, %class_list, @class_rules);
+        foreach my $class (keys %classes)
+        {
+            my $list = $class_list{$class} = [];
+            push @class_rules, [ @{ $classes{$class} }, $list ];
+        }
+        my $n = scalar @$epoch;
+        for (my $i = 0; $i < $n; $i++)
+        {
+            my $ts_epoch = $epoch->[$i];
+            my $day = int($ts_epoch / 86400);
+            my $info = $day_info{$day} //= do {
+                my @g = gmtime($day * 86400);
+                [ sprintf('%04d-%02d-%02d', $g[5] + 1900, $g[4] + 1, $g[3]), (($g[6] == 0 || $g[6] == 6) ? 1 : 0) ];
+            };
+            my $admit = $admitted{$day} //= ($date_admitted->($info->[0], $vm) ? 1 : -1);
+            next if $admit < 0;
+            $day[$i] = $day;
+
+            # True raw peak and its timestamp (before the state lookup, as in the text pass).
+            my $physc = $physc_col->[$i];
+            if (looks_like_number($physc) && $physc > ($c->{raw_peak_tracker}{$vm} // 0))
+            {
+                $c->{raw_peak_tracker}{$vm} = $physc;
+                my $second = $ts_epoch % 86400;
+                $c->{raw_peak_timestamp_tracker}{$vm} = sprintf('%sT%02d:%02d:%02d', $info->[0],
+                    int($second / 3600), int(($second % 3600) / 60), $second % 60);
+            }
+
+            # Bin: the time window (windowed decay) or the configuration state.
+            my ($bin_key, $state_index);
+            if ($windowed)
+            {
+                $bin_key = _binary_search_window_index($ts_epoch, $windows_aref);
+                if (defined $bin_key)
+                {
+                    for (my $s = 0; $s < @state_span; $s++)
+                    {
+                        if ($ts_epoch >= $state_span[$s][0] && $ts_epoch <= $state_span[$s][1]) { $state_index = $s; last; }
+                    }
+                }
+            }
+            else
+            {
+                for (my $s = 0; $s < @state_span; $s++)
+                {
+                    if ($ts_epoch >= $state_span[$s][0] && $ts_epoch <= $state_span[$s][1]) { $state_index = $s; $bin_key = $s; last; }
+                }
+            }
+            next unless (defined $bin_key && defined $state_index);
+            $bin[$i] = $bin_key;
+            $smt[$i] = $states->[$state_index]{metadata}{smt} // $c->{smt_fallback};
+
+            my $minute = int(($ts_epoch % 86400) / 60);
+            foreach my $rule (@class_rules)
+            {
+                next if ($rule->[0] && $info->[1]);
+                my $time_filter = $rule->[1];
+                next unless ($time_filter eq 'none'
+                    || ($time_filter eq 'online' && $minute >= 480 && $minute < 1020)
+                    || ($time_filter eq 'batch' && ($minute >= 1080 || $minute < 360)));
+                push @{ $rule->[2] }, $i;
+            }
+        }
+
+        # --- Per transform: the samples its filters admit, in time order ---
+        foreach my $key (keys %$manifest)
+        {
+            my $entry = $manifest->{$key};
+            my $list  = $class_list{ ($entry->{no_weekends} ? 1 : 0) . '|' . ($entry->{time_filter} // '') };
+            next unless @$list;
+            my $metric    = $entry->{metric};
+            my $is_physc  = ($metric eq 'PhysC');
+            my $is_absrq  = ($metric eq 'AbsRunQ');
+            my $is_normrq = ($metric eq 'NormRunQ');
+            my $paired    = ($paired_ctx && $is_physc);
+            my $want_daily_peak = (defined $daily_peak_ref && $is_physc);
+            my $want_peak_ts    = (defined $peak_ts_ref && $is_physc);
+            my $want_raw        = ($clipping && $is_physc);
+            my $p_state = $c->{persistent_transform_states}{$vm}{$key} //= initialise_transform_state($entry);
+            my (%packed, %raw_physc, %raw_runq, %daily, %daily_peak, $peak_ts);
+            $peak_ts = $peak_ts_ref->{$vm}{$key} if $want_peak_ts;
+
+            # The smoothing state, as update_transform_state keeps it. The
+            # arithmetic below is that function's, statement for statement.
+            my $method = $p_state->{method};
+            my $window = $p_state->{window};
+            my $is_sma = ($method eq 'SMA');
+            my $is_ema = ($method eq 'EMA');
+            my $queue  = $is_sma ? $p_state->{queue} : undef;
+            my $warmup = $is_ema ? $p_state->{warmup_queue} : undef;
+            my $alpha  = $is_ema ? $p_state->{alpha} : undef;
+
+            # The bin and the day change rarely, so their targets are looked up
+            # only when they change.
+            my ($current_bin, $t_state, $packed_ref, $raw_physc_ref, $raw_runq_ref);
+            my ($current_day, $daily_ref);
+            $current_day = -1;
+
+            foreach my $i (@$list)
+            {
+                my $bin_key = $bin[$i];
+                my $physc   = $physc_col->[$i];
+                if ($paired)
+                {
+                    _paired_update($paired_ctx, $vm, $bin_key, $key, $entry, $epoch->[$i], $physc,
+                                   ($physb_col ? $physb_col->[$i] : undef), $ceiling, ($freq_col ? $freq_col->[$i] : undef));
+                }
+                if (!defined $current_bin || $bin_key ne $current_bin)
+                {
+                    $current_bin   = $bin_key;
+                    $t_state       = ($c->{transform_states}{$vm}{$bin_key}{$key} //= initialise_transform_state($entry));
+                    $packed_ref    = \$packed{$bin_key};
+                    $raw_physc_ref = \$raw_physc{$bin_key};
+                    $raw_runq_ref  = \$raw_runq{$bin_key};
+                }
+
+                my $value;
+                if ($is_physc)      { $value = $physc; }
+                elsif ($is_absrq)   { $value = $runq_col->[$i]; }
+                elsif ($is_normrq)
+                {
+                    my $smt = $smt[$i];
+                    $value = (defined $physc && $physc > $ACTIVE_PHYSC_THRESHOLD && $smt > 0)
+                           ? ($runq_col->[$i] / ($physc * $smt)) : undef;
+                }
+
+                my $rolling_avg;
+                if (defined $value)
+                {
+                    if ($is_sma)
+                    {
+                        push @$queue, $value;
+                        shift @$queue while @$queue > $window;
+                        $rolling_avg = (scalar @$queue == $window) ? (sum0(@$queue) / $window) : undef;
+                    }
+                    elsif ($is_ema)
+                    {
+                        if (!defined $p_state->{prev_value})
+                        {
+                            push @$warmup, $value;
+                            if (@$warmup == $window)
+                            {
+                                $p_state->{prev_value} = sum0(@$warmup) / $window;
+                                $rolling_avg = $p_state->{prev_value};
+                            }
+                        }
+                        else
+                        {
+                            $p_state->{prev_value} = ($value * $alpha) + ($p_state->{prev_value} * (1 - $alpha));
+                            $rolling_avg = $p_state->{prev_value};
+                        }
+                    }
+                    else
+                    {
+                        $rolling_avg = $value;
+                    }
+                }
+
+                if (defined $rolling_avg)
+                {
+                    # A smoothed value is always numeric here: the store admits
+                    # only numeric PhysC and RunQ cells.
+                    $t_state->{peak_value} = $rolling_avg
+                        if (!defined $t_state->{peak_value} || $rolling_avg > $t_state->{peak_value});
+                    my $cell = pack('f<', $rolling_avg);
+                    $$packed_ref .= $cell;
+                    if ($is_physc)
+                    {
+                        if ($day[$i] != $current_day) { $current_day = $day[$i]; $daily_ref = \$daily{$current_day}; }
+                        $$daily_ref .= $cell;
+                    }
+                }
+                if ($is_physc)
+                {
+                    if ($want_daily_peak)
+                    {
+                        my $d = $day[$i];
+                        $daily_peak{$d} = $physc if (!defined $daily_peak{$d} || $physc > $daily_peak{$d});
+                    }
+                    if ($want_peak_ts && (!defined $peak_ts || $physc > $peak_ts->{value}))
+                    {
+                        my $second = $epoch->[$i] % 86400;
+                        $peak_ts = { value => $physc, timestamp => sprintf('%sT%02d:%02d:%02d', $day_info{ $day[$i] }[0],
+                            int($second / 3600), int(($second % 3600) / 60), $second % 60) };
+                    }
+                    if ($want_raw)
+                    {
+                        $$raw_physc_ref .= pack('f<', $physc);
+                        $$raw_runq_ref  .= pack('f<', $runq_col->[$i]);
+                    }
+                }
+            }
+
+            # A bin or day that was entered but received no value has no entry.
+            delete $packed{$_} for grep { !defined $packed{$_} } keys %packed;
+            delete $raw_physc{$_} for grep { !defined $raw_physc{$_} } keys %raw_physc;
+            delete $raw_runq{$_} for grep { !defined $raw_runq{$_} } keys %raw_runq;
+            delete $daily{$_} for grep { !defined $daily{$_} } keys %daily;
+            $c->{analysis_data}{$vm}{$_}{$key} = $packed{$_} for keys %packed;
+            $c->{daily_raw_data}{$vm}{$key}{ $day_info{$_}[0] } = $daily{$_} for keys %daily;
+            $daily_peak_ref->{$vm}{$key}{ $day_info{$_}[0] } = $daily_peak{$_} for keys %daily_peak;
+            $peak_ts_ref->{$vm}{$key} = $peak_ts if ($want_peak_ts && defined $peak_ts);
+            if ($want_raw)
+            {
+                $c->{raw_data}{$vm}{$_}{ $key . "_raw_physc" } = $raw_physc{$_} for keys %raw_physc;
+                $c->{raw_data}{$vm}{$_}{ $key . "_raw_runq" }  = $raw_runq{$_}  for keys %raw_runq;
+            }
+        }
+    }
+    printf STDERR "\r%-60s\r", '' if $show_progress;
+    return;
+}
+
 sub run_single_pass_from_manifest {
     my ($args_ref) = @_;
 
@@ -3641,7 +4193,39 @@ sub run_single_pass_from_manifest {
         print STDERR "  Exclusions loaded: $global_count global date(s), $vm_count VM rule(s)\n" if $verbose;
     }
 
-    while (my $line = <$data_fh>) {
+    # Sample store (v10 milestone 1.1b): when the store reproduces the text pass
+    # exactly, the pass runs from it, one VM and one transform at a time, and
+    # the text loop below is skipped. Otherwise the text loop runs as before.
+    my $sample_store = _sample_store_open($nmon_dir, $data_cache_file, $l1_layout, $l1_manifest_meta, $verbose);
+    if ($sample_store)
+    {
+        _columnar_pass($sample_store, {
+            manifest                    => $manifest,
+            states_by_vm                => $states_by_vm,
+            vms_to_process              => \%vms_to_process,
+            start_date_str              => $start_date_str,
+            end_date_str                => $end_date_str,
+            global_exclusions           => \%global_exclusion_lookup,
+            vm_exclusions               => \%vm_exclusion_lookup,
+            paired_ctx                  => $paired_ctx,
+            smt_fallback                => $smt_value,
+            enable_windowed_decay       => $enable_windowed_decay,
+            time_windows_aref           => $time_windows_aref,
+            enable_clipping_detection   => $enable_clipping_detection,
+            analysis_data               => \%analysis_data,
+            raw_data                    => \%raw_data,
+            transform_states            => \%transform_states,
+            persistent_transform_states => \%persistent_transform_states,
+            daily_raw_data              => \%daily_raw_data,
+            daily_peak_raw_data_ref     => \%daily_peak_raw_data,
+            raw_peak_tracker            => \%raw_peak_tracker,
+            raw_peak_timestamp_tracker  => \%raw_peak_timestamp_tracker,
+            peak_transform_ts_tracker   => \%peak_transform_ts_tracker,
+            show_progress               => $show_progress,
+        });
+    }
+
+    while (!$sample_store && defined(my $line = <$data_fh>)) {
         $record_counter++;
 
         chomp $line;
@@ -3973,15 +4557,19 @@ sub process_data_point {
     return unless (defined $bin_key && defined $state_obj);
 
     # 4. Iterate through all required transforms for this data point.
+    # The time of day, weekday and date are properties of the sample, so they
+    # are computed once here and not once per transform.
+    my $line_time = substr($tp->hms(':'), 0, 5);
+    my $date_key  = $tp->ymd;
+    my $is_weekend;
     foreach my $key (keys %$manifest) {
         my $entry = $manifest->{$key};
 
         # --- COMPLETE PER-TRANSFORM TIME FILTER LOGIC ---
         # This block applies the specific time filters for THIS transform.
-        my $line_time = substr($tp->hms(':'), 0, 5);
 
         # 4a. Check for --no-weekends filter.
-        next if ($entry->{no_weekends} && _transform_excludes_day($tp));
+        next if ($entry->{no_weekends} && ($is_weekend //= (_transform_excludes_day($tp) ? 1 : 0)));
 
         # 4b. Check for time-of-day filters (online/batch).
         my $time_filter_type = $entry->{time_filter};
@@ -4022,7 +4610,6 @@ sub process_data_point {
             # --- NEW: Out-of-Band Daily Bucketing ---
             # We store this in a completely separate structure to avoid polluting the main analysis hash.
             if ($entry->{metric} eq 'PhysC') {
-                my $date_key = $tp->ymd;
                 # Store directly: VM -> TransformKey -> Date -> PackedData
                 $daily_raw_data_ref->{$vm}{$key}{$date_key} //= '';
                 $daily_raw_data_ref->{$vm}{$key}{$date_key} .= pack('f<', $rolling_avg);
@@ -4036,7 +4623,6 @@ sub process_data_point {
         # is defined — raw peaks are captured even during EMA warm-up periods.
         # $physc is guaranteed numeric by the outer data-loop guard (line ~2875).
         if (defined $daily_peak_raw_data_ref && $entry->{metric} eq 'PhysC') {
-            my $date_key = $tp->ymd;
             if (!defined $daily_peak_raw_data_ref->{$vm}{$key}{$date_key}
                     || $physc > $daily_peak_raw_data_ref->{$vm}{$key}{$date_key}) {
                 $daily_peak_raw_data_ref->{$vm}{$key}{$date_key} = $physc;
