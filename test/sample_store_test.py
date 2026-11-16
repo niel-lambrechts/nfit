@@ -60,6 +60,7 @@ def manifest(exclusions=None):
     ])
     if exclusions:
         m['_exclusions'] = exclusions
+        m['_exclusion_fingerprint'] = 'f' * 32      # nfit-profile sends this string beside the exclusions
     return m
 
 
