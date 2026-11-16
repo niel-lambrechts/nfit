@@ -46,6 +46,9 @@ class PoolStoreTests(unittest.TestCase):
     def setUpClass(cls):
         mx.MemberExposureTests.roots = []
         cls.off, cls.on = mx.MemberExposureTests.make_root(), mx.MemberExposureTests.make_root()
+        # The history signature includes the compressed source bytes (gzip timestamp included).
+        pool_file = os.path.join('stage', SERIAL, '.nfit.cache.pool.observations.csv.gz')
+        shutil.copyfile(os.path.join(cls.off, pool_file), os.path.join(cls.on, pool_file))
         cls.roots = list(mx.MemberExposureTests.roots)
         history = ('--update-history', '--min-history-days', '1', '--pool-history', '--force')
         cls.off_history = cls.nfp(cls.off, history, store=False)
@@ -117,6 +120,21 @@ class PoolStoreTests(unittest.TestCase):
         off = os.path.join(self.off, 'stage', SERIAL, STORE)
         self.assertFalse(os.path.exists(off), 'NFIT_POOL_STORE=0 must not write a store')
 
+    def test_missing_populated_day_is_rebuilt(self):
+        root = mx.MemberExposureTests.make_root()
+        self.roots.append(root)
+        flags = ('--update-history', '--min-history-days', '1', '--pool-history', '--force')
+        self.nfp(root, flags, store=False)
+        expected = self.pool_parts(self.month(root))
+        self.nfp(root, flags)
+        store_dir = os.path.join(root, 'stage', SERIAL, STORE)
+        day_file = sorted(glob.glob(os.path.join(store_dir, '*.tsv')))[0]
+        os.remove(day_file)
+        repaired = self.nfp(root, flags)
+        self.assertRegex(repaired.stderr, r'1 day\(s\) from the pool evidence store, 1 reduced')
+        self.assertTrue(os.path.isfile(day_file))
+        self.assertEqual(self.pool_parts(self.month(root)), expected)
+
     def test_new_pool_observations_rebuild_the_store(self):
         root = mx.MemberExposureTests.make_root()
         self.roots.append(root)
@@ -130,6 +148,11 @@ class PoolStoreTests(unittest.TestCase):
             fh.write('\n'.join(lines[: 1 + (len(lines) - 1) // 2]) + '\n')
         p = self.nfp(root, flags)
         self.assertRegex(p.stderr, r'0 day\(s\) from the pool evidence store, 2 reduced')
+        with open(os.path.join(d, STORE, 'store.json')) as fh:
+            days = json.load(fh)['days']
+        self.assertCountEqual(days.values(), ['stored', 'empty'])
+        warm = self.nfp(root, flags)
+        self.assertRegex(warm.stderr, r' 0 row\(s\) read, 0 in the window\(s\); 2 day\(s\) from the pool evidence store, 0 reduced')
         rebuilt = self.month(root)
         control = mx.MemberExposureTests.make_root()
         self.roots.append(control)
