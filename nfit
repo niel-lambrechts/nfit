@@ -122,7 +122,7 @@ my $CACHE_MANIFEST_FILE = ".nfit.cache.manifest";
 my $CACHE_STATES_FILE   = ".nfit.cache.states";
 my $CACHE_DATA_FILE     = ".nfit.cache.data";
 # Sample store (v10 milestone 1.1b): see _sample_store_open.
-my $SAMPLE_STORE_FORMAT = 1;
+my $SAMPLE_STORE_FORMAT = 2;                   # 2: per-day row and byte offsets (windowed reads)
 my $SAMPLE_STORE_DIR    = '.nfit.store';
 my $SAMPLE_STORE_FLUSH  = 32 * 1024 * 1024;   # bytes buffered before a flush
 my $SAMPLE_STORE_UNDEF  = "\x01";             # an optional cell the row did not have
@@ -3312,6 +3312,8 @@ sub apply_growth_prediction_to_metrics {
 #   <cache dir>/.nfit.store/samples/<id>.ep         epochs, packed 'L<'
 #   <cache dir>/.nfit.store/samples/<id>.pc|.rq     PhysC and RunQ cells, as text
 #   <cache dir>/.nfit.store/samples/<id>.pb|.fq     PhysB and FreqPct cells (schema 2)
+# The manifest records, per VM and calendar date, where that date's rows start
+# in each column file, so a pass over a date window reads only its own days.
 # The numeric cells are kept as the text the L1 file holds, one per line, so
 # every later calculation starts from exactly the value the text pass parses.
 # The store depends only on the L1 data (its identity is the data part of
@@ -3384,9 +3386,12 @@ sub _sample_store_intact
     {
         my $ep = File::Spec->catfile($store->{dir}, "$entry->{id}.ep");
         return 0 unless (-f $ep && -s _ == 4 * $entry->{n});
-        foreach my $column ('pc', 'rq', ($store->{physb} ? 'pb' : ()), ($store->{freqpct} ? 'fq' : ()))
+        my @columns = ('pc', 'rq', ($store->{physb} ? 'pb' : ()), ($store->{freqpct} ? 'fq' : ()));
+        return 0 unless ref($entry->{bytes}) eq 'ARRAY';
+        for my $k (0 .. $#columns)
         {
-            return 0 unless -f File::Spec->catfile($store->{dir}, "$entry->{id}.$column");
+            my $path = File::Spec->catfile($store->{dir}, "$entry->{id}.$columns[$k]");
+            return 0 unless (-f $path && -s _ == ($entry->{bytes}[$k] // -1));
         }
     }
     return 1;
@@ -3484,19 +3489,26 @@ sub _sample_store_build
         }
         last if $unusable;
 
-        my $entry = $vms{$vm} //= { id => sprintf('%06d', ++$next_id), n => 0, days => {} };
-        $entry->{n}++;
+        my $entry = $vms{$vm} //= { id => sprintf('%06d', ++$next_id), n => 0, days => {}, bytes => [ (0) x (@columns - 1) ] };
         my $date = substr($ts_str, 0, 10);
-        my $span = $entry->{days}{$date} //= [ $epoch, $epoch ];
+        # Per date: [ first epoch, last epoch, first row, then the byte offset of
+        # that row in each text column ]. Dates never go backwards, so a VM's
+        # rows of one date are contiguous.
+        my $span = $entry->{days}{$date} //= [ $epoch, $epoch, $entry->{n}, @{ $entry->{bytes} } ];
         $span->[0] = $epoch if $epoch < $span->[0];
         $span->[1] = $epoch if $epoch > $span->[1];
+        $entry->{n}++;
 
         my $b = $buffer{$vm} //= {};
+        my @cells = ($physc, $runq);
+        push @cells, (defined $physb   ? $physb   : $SAMPLE_STORE_UNDEF) if defined $b_index;
+        push @cells, (defined $freqpct ? $freqpct : $SAMPLE_STORE_UNDEF) if defined $f_index;
         $b->{ep} .= pack('L<', $epoch);
-        $b->{pc} .= $physc . "\n";
-        $b->{rq} .= $runq . "\n";
-        $b->{pb} .= (defined $physb   ? $physb   : $SAMPLE_STORE_UNDEF) . "\n" if defined $b_index;
-        $b->{fq} .= (defined $freqpct ? $freqpct : $SAMPLE_STORE_UNDEF) . "\n" if defined $f_index;
+        for my $k (0 .. $#cells)
+        {
+            $b->{ $columns[$k + 1] } .= $cells[$k] . "\n";
+            $entry->{bytes}[$k] += length($cells[$k]) + 1;
+        }
         $buffered += 24 + length($physc) + length($runq) + length($physb // '') + length($freqpct // '');
         $flush->() if $buffered >= $SAMPLE_STORE_FLUSH;
     }
@@ -3538,18 +3550,56 @@ sub _sample_store_build
     return \%store;
 }
 
-# One VM's columns: (\@epoch, \@physc, \@runq, \@physb|undef, \@freqpct|undef).
+# One VM's columns for a date window: (\@epoch, \@physc, \@runq, \@physb|undef,
+# \@freqpct|undef). Only the rows of the dates the window admits are read. The
+# window is tested as the text pass tests it (a date after $end_date_str or
+# before $start_date_str is outside); exclusions are applied later, per sample.
+sub _sample_store_read
+{
+    my ($path, $offset, $length) = @_;
+    return '' unless $length > 0;
+    open my $fh, '<:raw', $path or die "Cannot open $path: $!";
+    seek($fh, $offset, 0) or die "Cannot seek in $path: $!";
+    my $content = '';
+    my $got = read($fh, $content, $length);
+    close $fh;
+    die "Sample store for this cache is damaged (short read of $path); delete "
+        . _sample_store_dir('<cache dir>') . " and rerun.\n" unless (defined $got && $got == $length);
+    return $content;
+}
+
 sub _sample_store_load
 {
-    my ($store, $vm) = @_;
+    my ($store, $vm, $start_date_str, $end_date_str) = @_;
     my $entry = $store->{vms}{$vm} or return;
     my $base  = File::Spec->catfile($store->{dir}, $entry->{id});
-    my @epoch = unpack('L<*', _sample_store_slurp("$base.ep"));
+    my @columns = ('pc', 'rq', ($store->{physb} ? 'pb' : undef), ($store->{freqpct} ? 'fq' : undef));
+
+    my @dates = sort keys %{ $entry->{days} };
+    my ($first, $last);
+    for my $d (0 .. $#dates)
+    {
+        next if (defined $end_date_str && $dates[$d] gt $end_date_str);
+        next if (defined $start_date_str && $dates[$d] lt $start_date_str);
+        $first //= $d;
+        $last = $d;
+    }
+    return ([], [], [], ($columns[2] ? [] : undef), ($columns[3] ? [] : undef)) unless defined $first;
+
+    # Row and byte range: from the first admitted date to the start of the date
+    # after the last admitted one (or the end of the VM's data).
+    my $from = $entry->{days}{ $dates[$first] };
+    my $to   = ($last < $#dates) ? $entry->{days}{ $dates[$last + 1] } : [ undef, undef, $entry->{n}, @{ $entry->{bytes} } ];
+    my $rows = $to->[2] - $from->[2];
+
+    my @epoch = unpack('L<*', _sample_store_read("$base.ep", 4 * $from->[2], 4 * $rows));
     my @out   = (\@epoch);
-    foreach my $column ('pc', 'rq', ($store->{physb} ? 'pb' : undef), ($store->{freqpct} ? 'fq' : undef))
+    my $k = 0;
+    foreach my $column (@columns)
     {
         if (!defined $column) { push @out, undef; next; }
-        my @cells = split /\n/, _sample_store_slurp("$base.$column"), -1;
+        my @cells = split /\n/, _sample_store_read("$base.$column", $from->[3 + $k], $to->[3 + $k] - $from->[3 + $k]), -1;
+        $k++;
         pop @cells;                                    # the final newline
         die "Sample store for this cache is damaged ($column of $entry->{id}); delete "
             . _sample_store_dir('<cache dir>') . " and rerun.\n" unless @cells == @epoch;
@@ -3630,7 +3680,7 @@ sub _columnar_pass
     {
         $vm_count++;
         printf STDERR "\r  ↳  Processing sample store: VM %d of %d", $vm_count, scalar(@vm_names) if $show_progress;
-        my ($epoch, $physc_col, $runq_col, $physb_col, $freq_col) = _sample_store_load($store, $vm);
+        my ($epoch, $physc_col, $runq_col, $physb_col, $freq_col) = _sample_store_load($store, $vm, $start_date_str, $end_date_str);
         next unless $epoch;
         my $states  = $states_by_vm->{$vm};
         my @state_span = map { [ $_->{start_time}->epoch, $_->{end_time}->epoch ] } @$states;

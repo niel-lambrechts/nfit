@@ -183,6 +183,25 @@ class SampleStoreTests(unittest.TestCase):
                    '--enable-clipping-detection', '--physb-paired'])
         self.same(['--manifest', 'mx.json', '--enddate', '2026-09-11', '--decay-over-states'])
 
+    def test_date_windows_read_only_their_days(self):
+        # A single day, a window that starts before the data and one that ends
+        # after it, a start alone and an end alone.
+        for window in (['--startdate', '2026-09-08', '--enddate', '2026-09-08'],
+                       ['--startdate', '2026-08-01', '--enddate', '2026-09-05'],
+                       ['--startdate', '2026-09-12', '--enddate', '2026-12-31'],
+                       ['--startdate', '2026-09-09'],
+                       ['--enddate', '2026-09-06']):
+            self.same(['--manifest', 'm.json', '--enable-clipping-detection', '--physb-paired'] + window)
+        self.same(['--manifest', 'mx.json', '--startdate', '2026-09-06', '--enddate', '2026-09-11',
+                   '--enable-windowed-decay', '--enable-growth-prediction'])
+        with open(os.path.join(self.cache, STORE, 'store.json')) as fh:
+            store = json.load(fh)
+        self.assertEqual(store['format'], 2)
+        days = store['vms']['vmA']['days']
+        self.assertEqual(len(days['2026-09-03']), 7)          # first, last, row, then four column offsets
+        self.assertEqual(days['2026-09-03'][2:], [0, 0, 0, 0, 0])
+        self.assertGreater(days['2026-09-04'][2], 0)
+
     def test_vm_filters(self):
         self.same(['--manifest', 'm.json', '--vm', 'vmA,vmD', '--enable-clipping-detection'])
         self.same(['--manifest', 'm.json', '--exclude-vms', 'vmB', '--enable-windowed-decay'])
