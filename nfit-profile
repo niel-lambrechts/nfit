@@ -12,7 +12,7 @@ use Getopt::Long qw(GetOptions :config bundling);
 use Cwd qw(abs_path);
 use File::Basename qw(dirname basename);
 use File::Spec qw(catfile);
-use File::Path qw(make_path);
+use File::Path qw(make_path remove_tree);
 use File::Temp qw(tempfile);
 use Time::Piece;
 use Time::Seconds;
@@ -598,6 +598,9 @@ my $pool_history_flag = 0;
 my $POOL_HISTORY_PROJECTION = 'observed-pool-busy-1';   # what a reader may expect in the block
 my $POOL_HISTORY_FEATURE    = 'PoolBusy-observed-1';
 my $POOL_OBSERVATIONS_FILE  = '.nfit.cache.pool.observations.csv.gz';
+# Pool evidence store (v10 milestone 1.1d): see _pool_day_sources.
+my $POOL_STORE_DIR    = File::Spec->catdir('.nfit.store', 'pool');
+my $POOL_STORE_FORMAT = 1;
 # The mechanical reduction of pool observations. Any change here changes the
 # reduction hash, so stored blocks are recomputed.
 my %POOL_REDUCTION = (
@@ -19458,6 +19461,227 @@ sub _pool_reduce_day
 }
 
 # ==============================================================================
+# POOL EVIDENCE STORE (v10 milestone 1.1d)
+# The reduced pool minutes of each UTC day, kept beside the cache so the pool
+# history, member exposure and cut exposure stop re-reading and re-reducing
+# the pool observations on every run:
+#   <cache dir>/.nfit.store/pool/store.json     identity, covered days, whether
+#                                               the shared-pool columns exist
+#   <cache dir>/.nfit.store/pool/<day>.tsv      one day's reduction:
+#     P <pool> <minute> <value> <reporters> <size> <ambiguous> <invalid> <duplicates> <noBusy> <sizeConflict>
+#     F <minute> <idle> <size> <reporters>
+# A day is the reduction of all of its observations, which is what every caller
+# asks for: their windows are whole UTC days. Numbers are written with 17
+# significant digits, so every value reads back as the same double. The store's
+# identity is the pool observations' revision, the reduction rules and the store
+# format; a different identity empties it. A covered day without observations
+# has no file, as before. NFIT_POOL_STORE=0 disables the store.
+# ==============================================================================
+sub _pool_store_identity
+{
+    my ($context) = @_;
+    my $sig = $context->{signature} // {};
+    return JSON->new->canonical->encode({ format => $POOL_STORE_FORMAT, projection => $sig->{projection},
+        reductionHash => $sig->{reductionHash}, poolRevision => $sig->{poolRevision} });
+}
+
+sub _pool_store_number
+{
+    my ($x) = @_;
+    return defined $x ? sprintf('%.17g', $x) : '';
+}
+
+sub _pool_store_write_day
+{
+    my ($path, $minutes, $physical) = @_;
+    my $tmp = "$path.tmp.$$";
+    open my $out, '>', $tmp or die "[ERROR] Cannot write '$tmp': $!\n";
+    foreach my $pool (sort keys %$minutes)
+    {
+        foreach my $minute (sort { $a <=> $b } keys %{ $minutes->{$pool} })
+        {
+            my $r = $minutes->{$pool}{$minute};
+            print {$out} join("\t", 'P', $pool, $minute, _pool_store_number($r->{value}), $r->{reporters},
+                _pool_store_number($r->{size}), map { $r->{$_} // 0 } qw(ambiguous invalid duplicates noBusy sizeConflict)), "\n";
+        }
+    }
+    foreach my $minute (sort { $a <=> $b } keys %$physical)
+    {
+        my $f = $physical->{$minute};
+        print {$out} join("\t", 'F', $minute, _pool_store_number($f->{idle}), _pool_store_number($f->{size}), $f->{reporters}), "\n";
+    }
+    close $out or die "[ERROR] Cannot write '$tmp': $!\n";
+    rename($tmp, $path) or die "[ERROR] Cannot publish '$path': $!\n";
+    return;
+}
+
+sub _pool_store_read_day
+{
+    my ($path) = @_;
+    my (%minutes, %physical);
+    open my $in, '<', $path or die "[ERROR] Cannot read '$path': $!\n";
+    while (my $line = <$in>)
+    {
+        chomp $line;
+        my @f = split /\t/, $line, -1;
+        if ($f[0] eq 'P' && @f == 11)
+        {
+            # The pool key is the text of the observations, as when reduced.
+            $minutes{ $f[1] }{ $f[2] + 0 } = {
+                value => ($f[3] eq '' ? undef : $f[3] + 0), reporters => $f[4] + 0,
+                size => ($f[5] eq '' ? undef : $f[5] + 0), ambiguous => $f[6] + 0, invalid => $f[7] + 0,
+                duplicates => $f[8] + 0, noBusy => $f[9] + 0, sizeConflict => $f[10] + 0,
+            };
+        }
+        elsif ($f[0] eq 'F' && @f == 5)
+        {
+            $physical{ $f[1] + 0 } = { idle => ($f[2] eq '' ? undef : $f[2] + 0),
+                size => ($f[3] eq '' ? undef : $f[3] + 0), reporters => $f[4] + 0 };
+        }
+        else
+        {
+            close $in;
+            die "[ERROR] The pool evidence store file '$path' is damaged.\n";
+        }
+    }
+    close $in;
+    return (\%minutes, \%physical);
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_day_sources
+# PURPOSE:    The pool minutes of every day in the windows: from the store where
+#             a day is covered; otherwise the observations are read once for
+#             the missing days, each day is reduced and written to the store.
+#             Without a usable store, the observations are partitioned as before.
+# ARGS:       $context (from _pool_history_context), $windows_aref of whole UTC
+#             days [start, end), $tmp_dir.
+# RETURNS:    (hashref day number => source for _pool_day_reduction, hashref of
+#             counts: rowsRead, rowsInWindow, physicalColumns, storeDays,
+#             reducedDays)
+# ==============================================================================
+sub _pool_day_sources
+{
+    my ($context, $windows_aref, $tmp_dir) = @_;
+    my @days;
+    foreach my $w (@$windows_aref)
+    {
+        push @days, int($w->[0] / 86400) .. int(($w->[1] - 1) / 86400);
+    }
+    my %wanted = map { $_ => 1 } @days;
+    my $day_aligned = !grep { $_->[0] % 86400 || $_->[1] % 86400 } @$windows_aref;
+    my $dir = File::Spec->catdir(dirname($context->{path}), $POOL_STORE_DIR);
+
+    my $store;
+    if ($day_aligned && !(defined $ENV{NFIT_POOL_STORE} && $ENV{NFIT_POOL_STORE} eq '0'))
+    {
+        my $identity = _pool_store_identity($context);
+        my $manifest = File::Spec->catfile($dir, 'store.json');
+        if (-f $manifest)
+        {
+            $store = eval {
+                open my $fh, '<', $manifest or die;
+                my $text = do { local $/; <$fh> };
+                close $fh;
+                decode_json($text);
+            };
+            $store = undef unless (ref($store) eq 'HASH' && ($store->{identity} // '') eq $identity && ref($store->{days}) eq 'HASH');
+        }
+        if (!$store)
+        {
+            eval { remove_tree($dir) if -d $dir; make_path($dir); 1 }
+                or do { print STDERR "  [WARN] Pool evidence store not usable ($@); reading the observations.\n"; $dir = undef };
+            $store = { identity => $identity, format => $POOL_STORE_FORMAT, days => {}, physicalColumns => undef } if $dir;
+        }
+    }
+
+    my %sources;
+    my %counts = (rowsRead => 0, rowsInWindow => 0, storeDays => 0, reducedDays => 0);
+    my @missing = $store ? grep { !$store->{days}{$_} } sort { $a <=> $b } keys %wanted : sort { $a <=> $b } keys %wanted;
+    if ($store)
+    {
+        foreach my $day (grep { $store->{days}{$_} } keys %wanted)
+        {
+            my $file = File::Spec->catfile($dir, "$day.tsv");
+            $sources{$day} = { store => $file } if -f $file;
+            $counts{storeDays}++;
+        }
+        $counts{physicalColumns} = $store->{physicalColumns} if defined $store->{physicalColumns};
+    }
+    return (\%sources, \%counts) unless @missing;
+
+    # The missing days as merged whole-day windows, read in one pass.
+    my @ranges;
+    foreach my $day (@missing)
+    {
+        if (@ranges && $ranges[-1][1] == $day * 86400) { $ranges[-1][1] += 86400; }
+        else                                            { push @ranges, [ $day * 86400, ($day + 1) * 86400 ]; }
+    }
+    my ($files, $read_counts) = _pool_partition_observations($context->{path}, $store ? \@ranges : $windows_aref, $tmp_dir);
+    $counts{$_} = $read_counts->{$_} for qw(rowsRead rowsInWindow badTime physicalColumns);
+    if (!$store)
+    {
+        $sources{$_} = { file => $files->{$_} } for keys %$files;
+        return (\%sources, \%counts);
+    }
+
+    foreach my $day (@missing)
+    {
+        if ($files->{$day})
+        {
+            my $path = File::Spec->catfile($dir, "$day.tsv");
+            $sources{$day} = { file => $files->{$day}, save => $path };
+        }
+        $counts{reducedDays}++;
+    }
+    # The days are recorded as covered once their files are written; see
+    # _pool_day_reduction. Days without observations are covered now.
+    $store->{physicalColumns} = $read_counts->{physicalColumns} ? 1 : 0;
+    $store->{days}{$_} = 1 for grep { !$files->{$_} } @missing;
+    $store->{_dir} = $dir;
+    $sources{$_}{store_manifest} = $store for grep { $sources{$_} && $sources{$_}{save} } @missing;
+    _pool_store_save_manifest($store);
+    return (\%sources, \%counts);
+}
+
+sub _pool_store_save_manifest
+{
+    my ($store) = @_;
+    my $dir = $store->{_dir} or return;
+    my $path = File::Spec->catfile($dir, 'store.json');
+    my $tmp  = "$path.tmp.$$";
+    my %copy = map { $_ => $store->{$_} } grep { $_ ne '_dir' } keys %$store;
+    if (open my $out, '>', $tmp)
+    {
+        print {$out} JSON->new->canonical->encode(\%copy);
+        close $out;
+        rename($tmp, $path);
+    }
+    return;
+}
+
+# One day's pool minutes from its source: (minutes, physical) as _pool_reduce_day
+# returns them. A day reduced from the observations is written to the store.
+sub _pool_day_reduction
+{
+    my ($source) = @_;
+    return ({}, {}) unless ($source && ($source->{store} || $source->{file}));
+    return _pool_store_read_day($source->{store}) if $source->{store};
+    my ($minutes, $physical) = _pool_reduce_day($source->{file});
+    if ($source->{save})
+    {
+        my $ok = eval { _pool_store_write_day($source->{save}, $minutes, $physical); 1 };
+        if ($ok && $source->{store_manifest})
+        {
+            my ($day) = $source->{save} =~ /(\d+)\.tsv$/;
+            $source->{store_manifest}{days}{$day} = 1;
+            _pool_store_save_manifest($source->{store_manifest});
+        }
+    }
+    return ($minutes, $physical);
+}
+
+# ==============================================================================
 # SUBROUTINE: _pool_segments
 # PURPOSE:    The segments of each pool within [window_start, window_end): the
 #             intervals over which the pool's roster and its members'
@@ -19549,7 +19773,7 @@ sub _pool_build_month
     $days{$_} = 1 for @{ ($options // {})->{days} // [] };
     foreach my $day (sort { $a <=> $b } grep { $_ * 86400 < $window_end && ($_ + 1) * 86400 > $window_start } keys %days)
     {
-        my ($minutes, $physical) = $day_files->{$day} ? _pool_reduce_day($day_files->{$day}) : ({}, {});
+        my ($minutes, $physical) = _pool_day_reduction($day_files->{$day});
         $options->{on_day}->($day, $minutes, $physical) if ($options && $options->{on_day});
         foreach my $pool (keys %$minutes)
         {
@@ -19700,7 +19924,7 @@ sub _build_pool_history
     my $tmp_dir = File::Temp::tempdir('nfit_pool_history_XXXXXX', TMPDIR => 1, CLEANUP => 1);
     my $started = time();
     print STDERR "  • Reading pool observations\n";
-    my ($day_files, $read_counts) = _pool_partition_observations($context->{path}, \@windows, $tmp_dir);
+    my ($day_files, $read_counts) = _pool_day_sources($context, \@windows, $tmp_dir);
 
     # Member exposure: the CPU samples of every LPAR with a state in a pool.
     my $with_exposure = ($exposure && $exposure->{context}) ? 1 : 0;
@@ -19830,7 +20054,9 @@ sub _build_pool_history
                    . "$counts->{segments} segment(s), $counts->{supportedMinutes} supported pool-minute(s).\n";
     }
     print STDERR "  [INFO] Pool observations: " . ($read_counts->{rowsRead} // 0) . " row(s) read, "
-               . ($read_counts->{rowsInWindow} // 0) . " in the window(s), " . (time() - $started) . "s.\n";
+               . ($read_counts->{rowsInWindow} // 0) . " in the window(s); " . ($read_counts->{storeDays} // 0)
+               . " day(s) from the pool evidence store, " . ($read_counts->{reducedDays} // 0) . " reduced; "
+               . (time() - $started) . "s.\n";
     return $written;
 }
 
@@ -20399,7 +20625,7 @@ sub _exposure_evaluate_window
     my %wanted = map { $_->{vm} => 1 } @$trackers_aref;
     my $tmp_dir = File::Temp::tempdir('nfit_exposure_XXXXXX', TMPDIR => 1, CLEANUP => 1);
     _subtask('Reading pool observations');
-    my ($pool_files, $pool_counts) = _pool_partition_observations($pool_context->{path}, [ [ $window_start, $window_end ] ], $tmp_dir);
+    my ($pool_files, $pool_counts) = _pool_day_sources($pool_context, [ [ $window_start, $window_end ] ], $tmp_dir);
     _subtask(sprintf('Reading CPU samples of %d LPAR(s)', scalar(keys %wanted)));
     my ($cpu_files, $cpu_counts)   = _exposure_partition_cpu($exposure_context->{dataPath}, [ [ $window_start, $window_end ] ], $tmp_dir, \%wanted);
     _subtask(sprintf('Classifying pool minutes and member busy (%d state(s))', scalar(@$trackers_aref)));
@@ -20409,7 +20635,7 @@ sub _exposure_evaluate_window
     $frame_low = 0;
     foreach my $day (int($window_start / 86400) .. int(($window_end - 1) / 86400))
     {
-        my ($minutes, $physical) = $pool_files->{$day} ? _pool_reduce_day($pool_files->{$day}) : ({}, {});
+        my ($minutes, $physical) = _pool_day_reduction($pool_files->{$day});
         $physical_minutes += scalar keys %$physical;
         # Minutes each pool was at its maximum, and minutes the frame had no spare cores.
         foreach my $pool (keys %$minutes)
