@@ -74,3 +74,40 @@ different scopes and results coexist. New snapshots are published by atomic rena
 These files contain local VM names and command arguments. They are derived tactical
 results and can be regenerated from the matching inputs. Monthly history has a
 separate lifecycle.
+
+### Shadow entitlement candidate test
+
+Add `--candidate-test` to a tactical run to add the candidate table to its
+rationale. Supply the VM configuration CSV for role information. The rows
+replay measured busy CPU at the installed VP width. Each actionable profile
+uses its own eligible hours. Cuts and holds are evaluated at the installed
+entitlement, the feasible proposal, their midpoint, and one 10% lower trial
+where feasible. Thresholds are rounded to 0.01 core, with a minimum of 0.05
+per installed VP. A proposal below that minimum is labelled `widthFloor`.
+Multiple labels on one row mean they resolve to the same threshold.
+
+For a later-period test, set the tactical `--enddate` to the training cutoff
+and give `--candidate-window YYYY-MM-DD/YYYY-MM-DD` (inclusive UTC dates).
+Alternatively, `--candidate-proposals FILE` with `--nmondir` replays a saved
+2.1 snapshot and prints the table to standard output. It checks the file
+fingerprint, system, data and state revisions, and profile definitions.
+Use the original VM configuration for the role check. The saved file supplies
+the model, sizing dates and VM scope. The optional later window must lie in
+the same capture. For example, a snapshot fitted through 2026-10-02 can use
+`--candidate-window 2026-10-03/2026-11-05`.
+
+The comparison uses only the configuration state present at the proposal date.
+A later change ends that comparison. Capped LPARs, recognised VIOS, standby
+or failover reserves, and unknown roles are excluded. A separate VP change
+would require fresh observations. A run breaks at a missing or ineligible
+minute; consecutive eligible minutes across UTC midnight stay in one run.
+
+**Above** measures minutes, excess core-minutes, longest run and distinct days.
+**Full** gives the same measures during observed pool scarcity. The table also
+counts episodes and newly contested minutes (busy covered by the installed
+guarantee with competing use). A/B/C are illustrative budgets, ordered by
+full-pool minutes, longest consecutive run and excess core-minutes. The limits
+are printed with the results. A partial-coverage result applies only to the
+classified minutes. These figures describe borrowing exposure and do not
+predict lost throughput. Candidate testing is opt-in and writes no sizing
+change to the CSV or monthly history.

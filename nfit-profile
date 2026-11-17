@@ -622,6 +622,7 @@ my %POOL_REDUCTION = (
 # Member busy exposure: a MemberExposure block with --pool-history, and the
 # "Entitlement Cut Exposure" rationale section (--[no-]pool-exposure).
 my $pool_exposure_flag;
+my ($candidate_test, $candidate_window, $candidate_snapshot);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
 # The rules of the evaluation. Any change here changes the rules hash, so
@@ -692,6 +693,9 @@ GetOptions(
     'update-history'             => \$update_history_flag,
     'physb-history!'             => \$physb_history_flag,
     'pool-history!'              => \$pool_history_flag,
+    'candidate-proposals=s' => \$candidate_snapshot,
+    'candidate-test' => \$candidate_test,
+    'candidate-window=s' => \$candidate_window,
     'pool-exposure!'             => \$pool_exposure_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
@@ -1523,6 +1527,22 @@ my $LOG_FH;
 my %open_log_files;
 
 my $is_seasonal_run = $apply_seasonality_event || $update_history_flag;
+$candidate_test = 1 if defined $candidate_snapshot;
+die "--candidate-proposals takes one system and uses the saved model, VM scope and sizing dates\n"
+    if defined $candidate_snapshot && (@target_systems_to_process != 1 || defined $start_date_str || defined $end_date_str ||
+        defined $target_vm_name || $nfit_enable_windowed_decay || $nfit_decay_over_states || defined $enddate_clamp_str);
+die "--candidate-window requires --candidate-test\n" if defined $candidate_window && !$candidate_test;
+die "--candidate-test requires a tactical run with pool exposure enabled\n"
+    if $candidate_test && ($is_seasonal_run || (defined $pool_exposure_flag && !$pool_exposure_flag));
+my ($replay_from, $replay_to);
+if (defined $candidate_window)
+{
+    my @dates = $candidate_window =~ /^(\d{4}-\d\d-\d\d)\/(\d{4}-\d\d-\d\d)$/;
+    die "Expected --candidate-window YYYY-MM-DD/YYYY-MM-DD\n" unless @dates == 2;
+    my @parsed = map { Time::Piece->strptime($_, '%Y-%m-%d') } @dates;
+    die "Invalid candidate window\n" if $parsed[0]->ymd ne $dates[0] || $parsed[1]->ymd ne $dates[1] || $dates[1] lt $dates[0];
+    ($replay_from, $replay_to) = ($parsed[0]->epoch, $parsed[1]->epoch + 86400);
+}
 my $o_nfit_analysis_reference_date_str = $nfit_analysis_reference_date_str;
 my $o_start_date_str = $start_date_str;
 my $o_end_date_str = $end_date_str;
@@ -1648,6 +1668,32 @@ foreach my $system_serial (@target_systems_to_process)
     ($effective_start_date_obj, $effective_end_date_obj) =
         _resolve_effective_window($start_date, $end_date, $cli_start_obj, $cli_end_obj);
 
+    my $saved;
+    if (defined $candidate_snapshot)
+    {
+        $saved = _load_candidate_snapshot($current_cache_path, $candidate_snapshot);
+        $effective_start_date_obj = Time::Piece->strptime($saved->{window}{start}, '%Y-%m-%d');
+        $effective_end_date_obj = Time::Piece->strptime($saved->{window}{end}, '%Y-%m-%d');
+    }
+    if (defined $replay_from)
+    {
+        die "Held-out candidate window must follow the sizing window and lie inside the capture\n"
+            unless gmtime($replay_from)->ymd gt $effective_end_date_obj->ymd && gmtime($replay_to-1)->ymd le $end_date->ymd;
+    }
+    if ($saved)
+    {
+        my $asof = $effective_end_date_obj->epoch + 86400;
+        my ($from, $to) = ($replay_from // $effective_start_date_obj->epoch, $replay_to // $asof);
+        my $pool = _pool_history_context($current_cache_path);
+        my ($exposure, $why) = _exposure_context($current_cache_path, $pool);
+        print "Proposal model $saved->{model}, sizing window $saved->{window}{start} through $saved->{window}{end}\n";
+        if (!$exposure) { print "Shadow entitlement candidates: unavailable ($why).\n"; exit 0; }
+        my @notes;
+        my $tracks = _candidate_trackers(_exposure_load_states($current_cache_path), $saved->{members}, $asof, $from, $to, \@notes);
+        _exposure_evaluate_window($pool, $exposure, $tracks, $from, $to) if @$tracks;
+        print join("\n", _candidate_report($tracks, \@notes, $from, $to)), "\n";
+        exit 0;
+    }
     # Initialise the run end date to the effective end date by default
     my $run_end_date_obj = $effective_end_date_obj;
 
@@ -2599,14 +2645,14 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             {
                 $exposure_summary = { Status => 'disabled' };
             }
-            elsif (!_pool_exposure_wanted($current_cache_path))
+            elsif (!$candidate_test && !_pool_exposure_wanted($current_cache_path))
             {
                 $exposure_summary = { Status => 'unavailable', Reason => _pool_exposure_reason($current_cache_path) };
             }
             elsif ($effective_start_date_obj && $effective_end_date_obj)
             {
                 $exposure_summary = _log_cut_exposure($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order,
-                    \@profiles, \%vm_tier_overrides, $current_cache_path, $effective_start_date_obj, $effective_end_date_obj);
+                    \@profiles, \%vm_tier_overrides, $current_cache_path, $effective_start_date_obj, $effective_end_date_obj, $candidate_test ? \%proposals : undef);
                 printf STDERR "  [INFO] Entitlement cut exposure: %d cut(s), %d evaluated, %d to review (%s; see rationale)\n",
                     $exposure_summary->{Cuts}, $exposure_summary->{Evaluated}, $exposure_summary->{Advisories}, $exposure_summary->{Status};
             }
@@ -13127,10 +13173,9 @@ sub _write_standard_csv_report {
 # Derived L2 proposals belong to one system and one completed tactical run.
 # An immutable whole-run snapshot keeps different windows, models and VM
 # selections apart. A retry of identical content reuses the same file.
-sub _publish_tactical_proposals
+sub _proposal_revision
 {
-    my ($cache, $model, $start, $end, $members) = @_;
-    require Digest::SHA;
+    my ($cache) = @_;
     my %meta;
     if (open my $fh, '<', File::Spec->catfile($cache, '.nfit.cache.manifest'))
     {
@@ -13145,6 +13190,32 @@ sub _publish_tactical_proposals
         $revision{$source} = defined($rev) && length($rev) ? "rev:$rev"
                            : @st ? "stat:$st[7]:$st[9]" : 'absent';
     }
+    return \%revision;
+}
+
+sub _load_candidate_snapshot
+{
+    my ($cache, $path) = @_;
+    require Digest::SHA;
+    open my $fh, '<:raw', $path or die "Cannot open saved proposals: $!";
+    my $bytes = do { local $/; <$fh> };
+    close $fh;
+    die "Proposal fingerprint mismatch\n" unless basename($path) eq Digest::SHA::sha256_hex($bytes) . '.json';
+    my $record = decode_json($bytes);
+    my $rev = _proposal_revision($cache);
+    die "Proposal system, format or data generation mismatch\n" unless $record->{schemaVersion} == 1
+        && $record->{system} eq basename($cache) && ref($record->{members}) eq 'HASH'
+        && !grep { ($record->{inputRevision}{$_} // '') ne $rev->{$_} } keys %$rev;
+    die "Profile definitions differ from the proposal run\n" unless
+        $record->{settings}{filesSHA256}{profiles} eq Digest::SHA->new(256)->addfile($profiles_config_path_to_load, 'b')->hexdigest;
+    return $record;
+}
+
+sub _publish_tactical_proposals
+{
+    my ($cache, $model, $start, $end, $members) = @_;
+    require Digest::SHA;
+    my $revision = _proposal_revision($cache);
     my %files = (engine => $nfit_script_path, profiler => abs_path($0),
                  profiles => $profiles_config_path_to_load, tiers => "$script_dir/etc/nfit.vms.cfg",
                  vmConfig => $vm_config_file_path, seasonality => $seasonality_config_path);
@@ -13153,7 +13224,7 @@ sub _publish_tactical_proposals
     } keys %files;
     my $payload = JSON->new->utf8->canonical->encode({
         schemaVersion => 1, system => basename($cache), model => $model, window => {start => $start, end => $end},
-        inputRevision => \%revision, settings => { argv => \@original_argv, filesSHA256 => \%hashes,
+        inputRevision => $revision, settings => { argv => \@original_argv, filesSHA256 => \%hashes,
             analysisReferenceDate => $nfit_analysis_reference_date_str, vmFilter => $target_vm_name },
         members => $members,
     });
@@ -20781,6 +20852,23 @@ sub _exposure_process_day
                 my $e = $acc->{exposure}[$k];
                 $e->[0]++;
                 $e->[1] += $b - $thresholds[$k];
+                if ($tracker->{candidateStats})
+                {
+                    my $s = $tracker->{candidateStats}[$k] //= {};
+                    $s->{run} = defined $s->{last} && $minute == $s->{last} + 60 ? $s->{run} + 1 : 1;
+                    $s->{runCount}++ if $s->{run} == 1;
+                    $s->{last} = $minute;
+                    $s->{longest} = max($s->{longest} // 0, $s->{run});
+                    if ($scarce)
+                    {
+                        $s->{fullRuns}++ unless defined $s->{lastFull} && $minute == $s->{lastFull} + 60;
+                        $s->{lastFull} = $minute;
+                        $s->{fullExcess} += $b - $thresholds[$k];
+                        $s->{newContested}++ if $competition && $b <= $ent + $eps;
+                        $s->{fullDays}++ unless defined $s->{lastFullDay} && $s->{lastFullDay} == $day;
+                        $s->{lastFullDay} = $day;
+                    }
+                }
                 $e->[4]++ if $own_width;
                 $e->[5]++ unless $classified;
                 if ($scarce)
@@ -21125,9 +21213,121 @@ sub _exposure_cut_lines
 #             the LPAR's own width. Nothing is changed.
 # RETURNS:    hashref { Cuts, Evaluated, Status }
 # ==============================================================================
+# Shadow candidate values are in hundredths of a core. Round the 90% trial
+# to the nearest legal step, bounded by the minimum for the installed width.
+sub _candidate_levels
+{
+    my ($ent, $vp, $proposal) = @_;
+    return () unless defined $proposal && $proposal > 0 && $vp > 0 && $vp == int($vp);
+    my ($installed, $base, $floor) = map { int($_ * 100 + 0.5) } ($ent, $proposal, $MIN_ENT_PER_VP * $vp);
+    return () if $base > $installed || $installed < $floor || $installed > 100 * $vp;
+    my $feasible = max($base, $floor);
+    my %levels = (installed => $installed, ($base < $floor ? 'widthFloor' : 'proposal') => $feasible,
+                  midpoint => int(($installed + $feasible + 1) / 2));
+    $levels{lower} = max($floor, int((9 * $feasible + 5) / 10)) if $feasible > $floor;
+    return %levels;
+}
+
+sub _candidate_trackers
+{
+    my ($db, $members, $asof, $from, $to, $notes) = @_;
+    my (%states, %bounds);
+    foreach my $vm (sort keys %$members)
+    {
+        my $role = $vm_config_data{$vm}{systemtype} // '';
+        my @states = sort { $a->{start_epoch} <=> $b->{start_epoch} }
+            grep { defined $_->{start_epoch} && defined $_->{end_epoch} && $_->{start_epoch} < $asof } @{ $db->{$vm} // [] };
+        my $s = $states[-1];
+        my $m = $s ? $s->{metadata} : {};
+        my $p = $members->{$vm};
+        my $reason;
+        if ($role !~ /\S/ || $role =~ /^\s*(?:unknown|N\/A)\s*$/i) { $reason = 'role unknown'; }
+        elsif ($role =~ /vio(?:s|\s*server)|virtual\s+i\/o|standby|failover\s+reserve/i || ($p->{hint} // '') eq 'P')
+            { $reason = 'protected role'; }
+        elsif (!$s || $s->{end_epoch} < $asof - 86400) { $reason = 'no configuration state at the proposal date'; }
+        elsif ((defined $m->{shared_enabled} && !$m->{shared_enabled}) || !defined $m->{capped} || "$m->{capped}" ne '0' || !defined $m->{pool_id}) { $reason = 'uncapped shared state unverified'; }
+        elsif (!defined $m->{virtual_cpus} || !defined $m->{entitlement} || !defined $p->{installedVPs} ||
+               !defined $p->{installedEntitlement} || !defined $p->{poolId} ||
+               $p->{installedVPs} != $m->{virtual_cpus} || abs($p->{installedEntitlement} - $m->{entitlement}) > 1e-6 ||
+               $p->{poolId} ne $m->{pool_id}) { $reason = 'proposal and configuration differ'; }
+        elsif ($s->{end_epoch} < $from || $s->{start_epoch} >= $to) { $reason = 'proposal state outside replay'; }
+        if ($reason) { push @$notes, "$vm: $reason"; next; }
+        # A minute spanning a change can contain both configurations. Count it
+        # in neither state, including when the next state starts after sizing.
+        my @later = sort { $a <=> $b } map { $_->{start_epoch} } grep {
+            defined $_->{start_epoch} && $_->{start_epoch} > $s->{start_epoch}
+        } @{ $db->{$vm} };
+        my $begin = @states > 1 ? 60 * int(($s->{start_epoch}+59)/60) : $from;
+        my $end = @later ? min($to, 60 * int($later[0]/60)) : $to;
+        if ($end <= max($from, $begin)) { push @$notes, "$vm: no comparable whole minute"; next; }
+        $bounds{$vm} = [$begin, $end];
+        $states{$vm} = [$s];
+    }
+    my $trackers = _exposure_trackers(\%states, $from, $to, _exposure_populations(), sub {
+        my ($vm, $meta, $population, $profiles) = @_;
+        my %points;
+        foreach my $profile (@$profiles)
+        {
+            my $proposal = $members->{$vm}{profiles}{$profile}{entitlement};
+            my %levels = _candidate_levels($meta->{entitlement}, $meta->{virtual_cpus}, $proposal);
+            foreach my $label (sort keys %levels)
+            {
+                my $cents = $levels{$label};
+                my $point = $points{$cents} //= { value => $cents / 100, labels => [] };
+                push @{ $point->{labels} }, "$profile/$label";
+            }
+        }
+        return [ map { $points{$_} } sort { $a <=> $b } keys %points ];
+    });
+    for my $t (@$trackers)
+    {
+        my ($begin, $end) = @{ $bounds{$t->{vm}} };
+        $t->{from} = max($t->{from}, $begin);
+        $t->{to} = min($t->{to}, $end);
+        $t->{candidateStats} = [];
+    }
+    return $trackers;
+}
+
+sub _candidate_report
+{
+    my ($trackers, $notes, $from, $to) = @_;
+    my @lines = ('', 'Shadow entitlement candidates', sprintf('  %s through %s UTC; installed VP width held fixed.',
+        gmtime($from)->ymd, gmtime($to-1)->ymd),
+        '  Above and Full show minutes / excess core-min / longest consecutive minutes / distinct UTC days.',
+        '  New contested counts busy previously covered by installed entitlement, with competing use while full.',
+        '  Illustrative full-pool budgets (minutes / longest run / core-min): A 0/0/0, B 15/3/2, C 60/10/10.',
+        '  N = observed excess over budget; Y = within budget with full coverage; Y* = within on classified minutes only; ? = no classified minutes.');
+    push @lines, map { "  $_" } @$notes;
+    push @lines, '  No eligible candidates.' unless @$trackers;
+    foreach my $t (@$trackers)
+    {
+        my $total = _exposure_totals($t);
+        push @lines, sprintf('  %s pool %d, %s, state %s, paired/classified/expected minutes %d/%d/%d, full %d:',
+            $t->{vm}, $t->{pool}, _exposure_population_label($t->{population}), gmtime($t->{stateStart})->datetime,
+            @$total{qw(paired classified expected scarce)});
+        foreach my $i (0 .. $#{ $t->{thresholds} })
+        {
+            my $p = $t->{thresholds}[$i];
+            my $e = $total->{exposure}[$i];
+            my $s = $t->{candidateStats}[$i] // {};
+            my $excess = $s->{fullExcess} // 0;
+            my @budgets = map {
+                $e->[2] > $_->[0] || $e->[6] > $_->[1] || $excess > $_->[2]+1e-9 ? 'N'
+                    : $total->{expected} && $total->{classified} == $total->{expected} ? 'Y' : $total->{classified} ? 'Y*' : '?'
+            } ([0,0,0], [15,3,2], [60,10,10]);
+            push @lines, sprintf('    %.2f %s | Above %d/%.2f/%d/%d | Full %d/%.2f/%d/%d | Runs above/full %d/%d | New contested %d | A/B/C %s',
+                $p->{value}, join(',', @{ $p->{labels} }), $e->[0], $e->[1], $s->{longest} // 0,
+                $total->{daysAbove}[$i], $e->[2], $excess, $e->[6], $s->{fullDays} // 0,
+                $s->{runCount} // 0, $s->{fullRuns} // 0, $s->{newContested} // 0, join('/', @budgets));
+        }
+    }
+    return @lines;
+}
+
 sub _log_cut_exposure
 {
-    my ($log_fh, $map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href, $cache_dir, $start_obj, $end_obj) = @_;
+    my ($log_fh, $map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href, $cache_dir, $start_obj, $end_obj, $candidates) = @_;
     my %summary = (Cuts => 0, Evaluated => 0, Advisories => 0, Status => 'notEvaluated', AdvisedCuts => [], Reason => '');
     return \%summary unless (defined $log_fh && ref($log_fh) && ref($map_ref) eq 'HASH' && ref($vm_order_aref) eq 'ARRAY');
     $tier_overrides_href //= {};
@@ -21165,7 +21365,8 @@ sub _log_cut_exposure
 
     my $pool_context = _pool_history_context($cache_dir);
     my ($exposure_context, $reason) = _exposure_context($cache_dir, $pool_context);
-    if (!@cuts)
+    my @shadow;
+    if (!@cuts && !$candidates)
     {
         push @out, "  No planning-profile entitlement cut in this analysis.";
         $summary{Status} = 'noCuts';
@@ -21184,7 +21385,8 @@ sub _log_cut_exposure
         my %populations;
         push @{ $populations{ $_->{population} } }, $_->{planning} for @cuts;
         @$_ = uniq(@$_) for values %populations;
-        my $trackers = _exposure_trackers(_exposure_load_states($cache_dir), $window_start, $window_end, \%populations, sub
+        my $states = _exposure_load_states($cache_dir);
+        my $trackers = _exposure_trackers($states, $window_start, $window_end, \%populations, sub
         {
             my ($vm, $meta, $population, $profiles) = @_;
             my $cut = $cut_of{$vm};
@@ -21199,7 +21401,13 @@ sub _log_cut_exposure
         _task(sprintf('Evaluating %d planning-profile cut(s) over %d UTC day(s), minute by minute',
                       scalar(@cuts), ($window_end - $window_start) / 86400));
         my $started = time();
-        my $counts = _exposure_evaluate_window($pool_context, $exposure_context, $trackers, $window_start, $window_end);
+        my @notes;
+        my ($from, $to) = ($replay_from // $window_start, $replay_to // $window_end);
+        my $shadow = $candidates ? _candidate_trackers($states, $candidates, $window_end, $from, $to, \@notes) : [];
+        my @same_window = (@$trackers, defined $replay_from ? () : @$shadow);
+        my $counts = @same_window ? _exposure_evaluate_window($pool_context, $exposure_context, \@same_window, $window_start, $window_end) : {};
+        _exposure_evaluate_window($pool_context, $exposure_context, $shadow, $from, $to) if defined $replay_from && @$shadow;
+        @shadow = _candidate_report($shadow, \@notes, $from, $to) if $candidates;
         _task(sprintf('Cut exposure evaluated (%s)', format_duration(time() - $started)));
         $summary{Status} = 'evaluated';
 
@@ -21258,7 +21466,8 @@ sub _log_cut_exposure
         $summary{FrameLow} = $counts->{frameLow};
     }
     push @out, '';
-    print {$log_fh} join("\n", @out), "\n";
+    push @shadow, '', "Shadow entitlement candidates: unavailable ($reason)." if $candidates && !$exposure_context;
+    print {$log_fh} join("\n", @out, @shadow), "\n";
     return \%summary;
 }
 
@@ -22869,6 +23078,10 @@ Model behaviour depends on the event configuration:
                                               above its installed entitlement and the month's lower profile values,
                                               with the minutes in pool scarcity, competition and own width. Stored
                                               months gain blocks without their analysis changing.
+
+  --candidate-test                          : Replay feasible entitlement cuts at installed VP width in the rationale.
+  --candidate-proposals FILE                 : Replay one saved proposal snapshot without repeating tactical sizing.
+  --candidate-window YYYY-MM-DD/YYYY-MM-DD  : Optional held-out UTC dates after the tactical analysis end date.
 
   --[no-]pool-exposure                      : Standard runs: add an "Entitlement Cut Exposure" section to the
                                               rationale for each LPAR whose planning-profile entitlement is below its
