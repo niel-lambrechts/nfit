@@ -144,17 +144,24 @@ each paired minute in which its busy cores were above its installed entitlement
 (work that depended on borrowing) is classified by what limited it: its VP width
 (PhysC at 95% of its VPs, pool open), the pool full with other LPARs busy
 (contested), the pool full with no other LPAR busy (alone), both, open (no limit
-observed) or unknown (pool state not observed). An LPAR with at least 15 limited
-minutes gets one remedy:
+observed) or unknown (pool state not observed).
+
+The remedy is decided where the sizing is: on the minutes at or above the
+LPAR's **planning level**, its busy cores at the planning profile's percentile
+over the period (for G3-95W15, P95 of its minute busy). An LPAR is listed when
+that level is above its installed entitlement and at least 15 of those minutes
+were limited. Borrowing that met a limit only above the planning level is
+counted in one closing line, because the guarantee does not size for it.
 
 - **review the VP width**: mostly at its VPs while the pool had room;
 - **review the guarantee**: mostly contested, and the pool's installed
-  guarantees leave room for the busy work above this LPAR's guarantee (median
-  over its contested minutes);
+  guarantees leave room for what its contested LPARs need together; each needs
+  the larger of its proposal and its planning level, less its installed
+  entitlement;
 - **review the pool**: competing guarantees or the pool maximum, when that room
   is missing, or the LPAR alone filled the pool;
 - **review the VP width and the pool together**: both limits, or each at least a
-  quarter of the limited minutes.
+  quarter of the limited minutes at the planning level.
 
 The pool's guarantees are its members' installed entitlements at the end of the
 period; reserved capacity is not collected. A full pool is not proof of lost

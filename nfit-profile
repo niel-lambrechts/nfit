@@ -20845,13 +20845,14 @@ sub _exposure_process_day
             $acc->{classified}++ if $classified;
             $acc->{scarce}++     if $scarce;
             $tracker->{joint}{$minute} = [ $b, $competition ] if ($scarce && $tracker->{joint});
+            $tracker->{pressure}{all}{ int($b * 100 + 1e-6) }++ if $tracker->{pressure};
             if ((my $pr = $tracker->{pressure}) && defined $ent && $b > $ent + $eps)
             {
                 my $kind = $scarce ? ($own_width ? 'both' : $competition ? 'contested' : 'alone')
                          : $own_width ? ($classified ? 'vpWidth' : 'unknown') : ($classified ? 'open' : 'unknown');
-                $pr->{counts}{$kind}++;
-                $pr->{coreMinutes}{$kind} += $b - $ent;
-                push @{ $pr->{contestedExcess} }, $b - $ent if $kind eq 'contested';
+                my $h = $pr->{hist}{$kind}{ int($b * 100 + 1e-6) } //= [ 0, 0 ];
+                $h->[0]++;
+                $h->[1] += $b - $ent;
                 if ($kind ne 'open' && $kind ne 'unknown')
                 {
                     $pr->{run} = (defined $pr->{last} && $pr->{last} == $minute - 60) ? $pr->{run} + 1 : 1;
@@ -21460,15 +21461,20 @@ sub _reconcile_report
 #   both       the pool full and PhysC at the own-width limit
 #   open       neither: the borrowing met no limit that was observed
 #   unknown    the pool state was not observed (and not at the own-width limit)
-# An LPAR with at least $PRESSURE_MIN_MINUTES limited minutes gets one remedy:
-#   "VP width"           mostly vpWidth
+# The remedy is decided where the sizing is: on the minutes at or above the
+# LPAR's planning level, the busy cores at its planning profile's percentile
+# (G3-95W15: P95 of its minute busy over the period, 0.01-core bins). An LPAR
+# is listed when that level is above its installed entitlement and at least
+# $PRESSURE_MIN_MINUTES of those minutes were limited. Remedies:
+#   "VP width"           mostly vpWidth at the planning level
 #   "guarantee"          mostly contested, and the pool's installed guarantees
-#                        leave room for the busy above this LPAR's guarantee
-#                        (median over its contested minutes)
+#                        leave room for what the pool's contested LPARs need
+#                        together: each needs the larger of its proposal and its
+#                        planning level, less its installed entitlement
 #   "pool"               mostly contested without that room, or mostly alone:
 #                        competing guarantees or the pool maximum
 #   "VP width and pool"  both, or VP-width and pool minutes each at least a
-#                        quarter of the limited minutes
+#                        quarter of the limited minutes at the planning level
 # The pool's guarantees are its members' installed entitlements at the end of
 # the period, from the configuration states; reserved capacity is not
 # collected. A full pool is not proof of lost work, and the size of a change
@@ -21496,7 +21502,14 @@ sub _pressure_trackers
         return [] unless looks_like_number($meta->{entitlement} // '');
         return [ { value => $meta->{entitlement} + 0, labels => [ 'installed' ] } ];
     });
-    $_->{pressure} = { counts => {}, coreMinutes => {}, contestedExcess => [], longest => 0, run => 0, last => undef } for @$trackers;
+    foreach my $t (@$trackers)
+    {
+        my $m = $eligible{ $t->{vm} };
+        my ($pct) = ($m->{planningProfile} =~ /-(\d+(?:\.\d+)?)W\d+/);
+        $t->{pressure} = { all => {}, hist => {}, longest => 0, run => 0, last => undef,
+                           planning => $m->{planningProfile}, percentile => $pct // 95,
+                           proposal => $m->{profiles}{ $m->{planningProfile} }{entitlement} };
+    }
     return $trackers;
 }
 
@@ -21517,11 +21530,33 @@ sub _pressure_pool_guarantees
     return \%sum;
 }
 
-sub _pressure_median
+# One LPAR's figures at its planning level: the level (cores), the counts and
+# busy core-minutes above the guarantee by kind for minutes at or above it.
+sub _pressure_at_level
 {
-    my @v = sort { $a <=> $b } @_;
-    return undef unless @v;
-    return @v % 2 ? $v[$#v / 2] : ($v[@v / 2 - 1] + $v[@v / 2]) / 2;
+    my ($t) = @_;
+    my $p = $t->{pressure};
+    my $total = sum0(values %{ $p->{all} });
+    return undef unless $total;
+    my ($cumulative, $level_bin) = (0, undef);
+    foreach my $bin (sort { $a <=> $b } keys %{ $p->{all} })
+    {
+        $cumulative += $p->{all}{$bin};
+        if ($cumulative >= $p->{percentile} / 100 * $total - 1e-9) { $level_bin = $bin; last; }
+    }
+    my (%n, %core);
+    foreach my $kind (qw(vpWidth contested alone both open unknown))
+    {
+        foreach my $bin (keys %{ $p->{hist}{$kind} // {} })
+        {
+            next if $bin < $level_bin;
+            $n{$kind}    += $p->{hist}{$kind}{$bin}[0];
+            $core{$kind} += $p->{hist}{$kind}{$bin}[1];
+        }
+        $n{$kind} //= 0;
+        $core{$kind} //= 0;
+    }
+    return { level => $level_bin / 100, n => \%n, core => \%core, paired => $total };
 }
 
 sub _pressure_report
@@ -21533,63 +21568,96 @@ sub _pressure_report
         '  (borrowing), by what limited them: VP width (PhysC at 95% of its VPs, pool open), pool',
         '  contested (pool full, other LPARs busy), pool alone (pool full, no other LPAR busy), both',
         '  (pool full at VP width), open (no limit observed), unknown (pool state not observed).',
-        sprintf('  Listed: LPARs with at least %d limited minutes. A full pool is not proof of lost work, and the', $PRESSURE_MIN_MINUTES),
-        '  size of a change that would clear the pressure is not measured.');
+        '  The remedy is decided on the minutes at or above the LPAR\'s planning level: its busy cores',
+        '  at the planning profile\'s percentile over the period. Listed: LPARs whose planning level is',
+        sprintf('  above the installed entitlement, with at least %d limited minutes at that level. A full pool', $PRESSURE_MIN_MINUTES),
+        '  is not proof of lost work, and the size of a change that would clear the pressure is not measured.');
     push @lines, map { "  $_" } @{ $notes // [] };
-    my @listed;
+
+    # First pass: each LPAR's figures, its leading limit and what it would need.
+    my (@listed, %contested_need, $below_level);
     foreach my $t (sort { $a->{pool} <=> $b->{pool} || $a->{vm} cmp $b->{vm} } @$trackers)
     {
-        my $p = $t->{pressure};
-        my %n = map { $_ => ($p->{counts}{$_} // 0) } qw(vpWidth contested alone both open unknown);
+        my $f = _pressure_at_level($t) or next;
+        my $ent = $t->{entitlement};
+        my %n = %{ $f->{n} };
         my $pool_minutes = $n{contested} + $n{alone};
         my $limited = $n{vpWidth} + $pool_minutes + $n{both};
-        next if $limited < $PRESSURE_MIN_MINUTES;
+        if ($f->{level} <= $ent + 1e-9 || $limited < $PRESSURE_MIN_MINUTES)
+        {
+            my $any = sum0(map { sum0(map { $_->[0] } values %{ $t->{pressure}{hist}{$_} // {} }) } qw(vpWidth contested alone both));
+            $below_level++ if $any >= $PRESSURE_MIN_MINUTES;
+            next;
+        }
+        my $proposal = $t->{pressure}{proposal};
+        my $need = max(0, (defined $proposal ? $proposal : 0) - $ent, $f->{level} - $ent);
+        my $kind = ($n{both} >= $PRESSURE_BOTH_SHARE * $limited
+                    || ($n{vpWidth} >= $PRESSURE_BOTH_SHARE * $limited && $pool_minutes >= $PRESSURE_BOTH_SHARE * $limited)) ? 'both'
+                 : ($n{vpWidth} >= $pool_minutes + $n{both}) ? 'vpWidth'
+                 : ($n{alone} > $n{contested}) ? 'alone' : 'contested';
+        $contested_need{ $t->{pool} } += $need if $kind eq 'contested';
+        push @listed, { t => $t, f => $f, limited => $limited, need => $need, kind => $kind };
+    }
+
+    # Second pass: the remedy, with the pool's room shared among its contested LPARs.
+    foreach my $r (@listed)
+    {
+        my ($t, $f) = @$r{qw(t f)};
+        my $p = $t->{pressure};
         my $ceiling = $t->{ceiling};
         my $installed = $guarantees->{ $t->{pool} };
         my $headroom = (defined $ceiling && defined $installed) ? $ceiling - $installed : undef;
-        my $need = _pressure_median(@{ $p->{contestedExcess} });
+        my $frame = ($t->{pool} == 0);
         my ($remedy, $why);
-        if ($n{both} >= $PRESSURE_BOTH_SHARE * $limited
-            || ($n{vpWidth} >= $PRESSURE_BOTH_SHARE * $limited && $pool_minutes >= $PRESSURE_BOTH_SHARE * $limited))
+        if ($r->{kind} eq 'both')
         {
             ($remedy, $why) = ('review the VP width and the pool together',
-                'its busy work reached its VPs and the pool was full; changing one alone would leave the other limit');
+                'at its planning level its busy work reached its VPs and the pool was full; changing one alone would leave the other limit');
         }
-        elsif ($n{vpWidth} >= $pool_minutes + $n{both})
+        elsif ($r->{kind} eq 'vpWidth')
         {
-            ($remedy, $why) = ('review the VP width', 'its busy work reached its VPs while the pool had room');
+            ($remedy, $why) = ('review the VP width', 'at its planning level its busy work reached its VPs while the pool had room');
         }
-        elsif ($n{alone} > $n{contested})
+        elsif ($r->{kind} eq 'alone')
         {
-            ($remedy, $why) = (($t->{pool} == 0 ? "review the frame's shared processor pool capacity" : 'review the pool maximum'),
-                'this LPAR alone filled the pool, below its VP width');
-        }
-        elsif (defined $headroom && defined $need && $headroom >= $need - 1e-9)
-        {
-            ($remedy, $why) = ('review the guarantee', sprintf('the pool was full while other LPARs were busy; its installed guarantees leave %.2f cores, '
-                . 'enough for the %.2f cores of busy work above this guarantee (median in those minutes)', $headroom, $need));
+            ($remedy, $why) = (($frame ? "review the frame's shared processor pool capacity" : 'review the pool maximum'),
+                'at its planning level this LPAR alone filled the pool, below its VP width');
         }
         else
         {
-            ($remedy, $why) = (($t->{pool} == 0 ? "review the frame's shared processor pool: competing guarantees or its capacity"
-                                                : 'review the pool: competing guarantees or the pool maximum'),
-                defined $headroom && defined $need
-                    ? sprintf('the pool was full while other LPARs were busy; its installed guarantees leave %.2f cores, less than the %.2f '
-                        . 'cores of busy work above this guarantee (median in those minutes)', $headroom, $need)
-                    : 'the pool was full while other LPARs were busy; the room for a higher guarantee is not known');
+            my $together = $contested_need{ $t->{pool} };
+            my $shared = ($together > $r->{need} + 1e-9) ? sprintf(' (%.2f cores for the pool\'s contested LPARs together)', $together) : '';
+            if (defined $headroom && $headroom >= $together - 1e-9)
+            {
+                ($remedy, $why) = ('review the guarantee', sprintf('at its planning level the pool was full while other LPARs were busy; '
+                    . 'its installed guarantees leave %.2f cores, enough for the %.2f cores this LPAR needs%s', $headroom, $r->{need}, $shared));
+            }
+            else
+            {
+                ($remedy, $why) = (($frame ? "review the frame's shared processor pool: competing guarantees or its capacity"
+                                           : 'review the pool: competing guarantees or the pool maximum'),
+                    defined $headroom
+                        ? sprintf('at its planning level the pool was full while other LPARs were busy; its installed guarantees leave %.2f cores, '
+                            . 'less than the %.2f cores this LPAR needs%s', $headroom, $r->{need}, $shared)
+                        : 'at its planning level the pool was full while other LPARs were busy; the room for a higher guarantee is not known');
+            }
         }
-        push @listed, $t;
+        my %n = %{ $f->{n} };
         push @lines, '', sprintf('  %s: pool %s (maximum %s; installed guarantees %s), %s, entitlement %.2f',
             $t->{vm}, $t->{pool}, _pool_units_text($ceiling), (defined $installed ? sprintf('%.2f', $installed) : 'unknown'),
             (defined $t->{vp} ? ($t->{vp} == 1 ? '1 VP' : "$t->{vp} VPs") : 'VPs unknown'), $t->{entitlement});
-        push @lines, sprintf('    Borrowing minutes: VP width %d, pool contested %d, pool alone %d, both %d, open %d, unknown %d.',
+        push @lines, sprintf('    Planning level (%s, P%s of minute busy): %.2f cores; proposal %s.', $p->{planning}, $p->{percentile}, $f->{level},
+            (defined $p->{proposal} ? sprintf('%.2f', $p->{proposal}) : 'unknown'));
+        push @lines, sprintf('    Minutes at or above it: VP width %d, pool contested %d, pool alone %d, both %d, open %d, unknown %d.',
             @n{qw(vpWidth contested alone both open unknown)});
-        push @lines, sprintf('    Busy core-minutes above the guarantee while limited: %.2f; longest limited run %d minute%s.',
-            (sum0(map { $p->{coreMinutes}{$_} // 0 } qw(vpWidth contested alone both))), $p->{longest}, ($p->{longest} == 1 ? '' : 's'));
+        push @lines, sprintf('    Busy core-minutes above the guarantee in its limited minutes: %.2f; longest limited run (any level) %d minute%s.',
+            sum0(map { $f->{core}{$_} } qw(vpWidth contested alone both)), $p->{longest}, ($p->{longest} == 1 ? '' : 's'));
         push @lines, _rationale_wrap("Remedy: $remedy - $why.", '    ', '      ');
         $t->{pressureRemedy} = $remedy;
     }
-    push @lines, '', '  No LPAR with limited borrowing minutes.' unless @listed;
+    push @lines, '', '  No LPAR with limited borrowing at its planning level.' unless @listed;
+    push @lines, '', sprintf('  %d more LPAR%s borrowed against a limit only above %s planning level, which the guarantee does not size for.',
+        $below_level, ($below_level == 1 ? '' : 's'), ($below_level == 1 ? 'its' : 'their')) if $below_level;
     return @lines;
 }
 
