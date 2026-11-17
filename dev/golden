@@ -261,8 +261,49 @@ def run_profile(scratch: Path, sdir: Path, run: str, enddate: str, env: dict):
     return r.returncode, r.stderr, collected
 
 
+def check_proposals(sdir, run, baseline_csv):
+    """Compare the delivered L2 values with the saved planner CSV, before scratch cleanup."""
+    import csv
+    import io
+    import math
+    models = {'forensic': 'state-based', 'decay-states': 'hybrid-state-decay', 'windowed': 'windowed-decay'}
+    files = list((sdir / '.nfit.store/proposals/v1' / models[run]).glob('*.json'))
+    if len(files) != 1:
+        return 'expected one proposal snapshot'
+    snapshot = json.loads(files[0].read_bytes())
+    if snapshot['model'] != models[run] or snapshot['system'] != sdir.name:
+        return 'proposal source mismatch'
+    reader = csv.reader(io.StringIO(baseline_csv))
+    header = next(reader)
+    fields = {'entitlement': '', 'recommendedVPs': '_rVCPU', 'entitlementBoundedVPs': '_rVCPU_EntBounded',
+              'tacticalVPs': '_rVCPU_Tactical'}
+    profiles = {c[:-len('_rVCPU_Tactical')] for c in header if c.endswith('_rVCPU_Tactical')}
+    members = snapshot['members']
+    seen = set()
+    for record in reader:
+        if not record:  # spreadsheet footer starts after the first blank line
+            break
+        row = dict(zip(header, record))
+        vm = row['VM']
+        if vm in seen or vm not in members or set(members[vm]['profiles']) != profiles:
+            return 'proposal member or profile set mismatch'
+        seen.add(vm)
+        for name in profiles:
+            for field, suffix in fields.items():
+                try:
+                    value = float(row[name + suffix])
+                    value = value if math.isfinite(value) else None
+                except ValueError:
+                    value = None
+                if members[vm]['profiles'][name][field] != value:
+                    return 'proposal value differs from baseline CSV'
+    if not profiles or not seen or seen != set(members):
+        return 'incomplete proposal snapshot'
+    return None
+
+
 def execute(system: str, sysdir: Path, run: str, enddate: str, exe_src: Path, etc_src: Path, env: dict,
-            repeat: bool = True):
+            repeat: bool = True, proposal_csv=None):
     """Run uncached then cached in one scratch tree; return canonical outputs."""
     with tempfile.TemporaryDirectory(prefix='nfit-golden-') as tmp:
         scratch = Path(tmp)
@@ -270,11 +311,19 @@ def execute(system: str, sysdir: Path, run: str, enddate: str, exe_src: Path, et
         rc1, err1, first = run_profile(scratch, sdir, run, enddate, env)
         if rc1 != 0:
             return {'error': f'uncached run failed rc={rc1}', 'stderr_tail': err1[-4000:]}
+        if proposal_csv is not None:
+            problem = check_proposals(sdir, run, proposal_csv)
+            if problem:
+                return {'error': problem}
         if not repeat:
             return {'outputs': first}
         rc2, err2, second = run_profile(scratch, sdir, run, enddate, env)
         if rc2 != 0:
             return {'error': f'cached run failed rc={rc2}', 'stderr_tail': err2[-4000:], 'outputs': first}
+        if proposal_csv is not None:
+            problem = check_proposals(sdir, run, proposal_csv)
+            if problem:
+                return {'error': problem}
         if first != second:
             return {'error': 'uncached and cached runs disagree', 'outputs': first, 'cached': second}
         return {'outputs': first}
@@ -468,9 +517,12 @@ def cmd_compare(a, out: RedactedOut) -> int:
             if wanted_runs is not None and run not in wanted_runs:
                 continue
             res = execute(system, sysdir, run, meta['enddate'], exe_src, exe_src / 'etc', env,
-                          repeat=not a.single)
+                          repeat=not a.single,
+                          proposal_csv=(dest / 'results' / system / run / f'{run}.csv').read_text()
+                          if a.check_proposals else None)
             if 'error' in res:
                 differences += 1
+                unintended += 1
                 out.say(f'  {system} {run:<13} FAILED: {res["error"]}')
                 continue
             changed = []
@@ -608,6 +660,7 @@ def main() -> int:
     k.add_argument('--frozen', action='store_true', help='Re-run the frozen executables (reproducibility check)')
     k.add_argument('--systems', default=None, help='Subset of baseline systems (names or sys_ pseudonyms)')
     k.add_argument('--runs', default=None, help='Subset of baseline runs, e.g. decay-states')
+    k.add_argument('--check-proposals', action='store_true', help='Also compare each stored tactical proposal with the baseline CSV')
     k.add_argument('--single', action='store_true', help='Skip the cached repeat run')
     k.add_argument('--classify', action='store_true',
                    help='Sort differences into intended (VM_Comments alert tags, INTENDED_SECTIONS) and unintended')

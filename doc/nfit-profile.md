@@ -51,3 +51,26 @@ Refer to the program's help output (`nfit-profile -h`) for detailed command-line
 - Perl 5.x
 - Core Perl Modules: `Getopt::Long`, `Cwd`, `File::Basename`, `Time::Piece`, `List::Util`, `IO::File`, `version`.
 - The `nfit` program (must be executable and findable by path or via `--nfit-path`) at the corresponding version than `nfit-profile`.
+
+### Tactical proposal store
+
+Each standard report publishes one private JSON snapshot under the system cache in
+`.nfit.store/proposals/v1/<model>/<sha256>.json`. The model directory matches the
+report type (`state-based`, `hybrid-state-decay` or `windowed-decay`). The file
+contains the LPARs evaluated together. Each LPAR has its installed entitlement,
+installed VPs, pool ID, resolved planning profile and all actionable CSV profiles.
+Each profile records the displayed entitlement, recommended VPs, entitlement-bounded
+VPs and tactical VPs as numbers. An unavailable numeric cell is JSON null.
+
+Use the snapshot's system, input revisions, effective dates, model and settings
+to select a run. Check the VM filter and actual membership before assessing a
+whole pool. File modification time does not identify a compatible run. The
+settings include the invocation and fingerprints of the programs and configuration
+files. Legacy data and state files use size and modification time for their revisions,
+as in the engine results cache.
+
+The filename hashes the UTF-8 JSON bytes. Identical retries reuse one file, while
+different scopes and results coexist. New snapshots are published by atomic rename.
+These files contain local VM names and command arguments. They are derived tactical
+results and can be regenerated from the matching inputs. Monthly history has a
+separate lifecycle.

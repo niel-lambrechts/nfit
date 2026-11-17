@@ -2579,7 +2579,8 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         # This is the standard, non-seasonal run path. It now generates one report
         # per system before proceeding to the next.
         if (@vm_order) {
-            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef);
+            my %proposals;
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef, \%proposals);
 
             # Structural feasibility checks on the completed set of
             # recommendations (rationale only; nothing is changed).
@@ -2613,6 +2614,9 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             # Recommended Actions: what the checks above ask of the planner.
             my $action_count = _log_recommended_actions($open_log_files{$system_identifier}, $structural_summary, $exposure_summary);
             printf STDERR "  [INFO] Recommended actions: %d (see rationale)\n", $action_count;
+            _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
+                $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals);
+
         }
     }
 
@@ -11889,7 +11893,7 @@ sub _log_recommended_actions
 #             its data from the final, fully populated assimilation map.
 # ==============================================================================
 sub _write_standard_csv_report {
-    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, $anchor_bucket) = @_;
+    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, $anchor_bucket, $proposals) = @_;
 
     # Ensure we have data to process before creating a file.
     # The @vm_order array is still used to control the iteration order.
@@ -11959,6 +11963,9 @@ sub _write_standard_csv_report {
     # of the whole set of recommendations, so its VM_Comments alert can only be
     # added once every row has been built.
     my @pending_csv_rows;
+    my %column;
+    @column{@header_for_this_report} = (0 .. $#header_for_this_report);
+
 
     foreach my $vm_name (@vm_order) {
         $excel_row_num_counter++;
@@ -13052,6 +13059,35 @@ sub _write_standard_csv_report {
             push @data_row_csv, $nett_user_formula_str, $nett_perc_user_formula_str;
         }
 
+        if (defined $proposals)
+        {
+            # The planner sees rounded entitlements and three distinct VP choices.
+            # Take the actual cells after all modifiers and display fallbacks.
+            my $numeric_cell = sub {
+                my ($label) = @_;
+                my $v = $data_row_csv[$column{$label}];
+                return defined($v) && looks_like_number($v) && $v !~ /nan|inf/i ? 0 + $v : undef;
+            };
+            my %by_profile;
+            for my $profile (@csv_visible_profiles)
+            {
+                my $name = $profile->{name};
+                next unless exists $column{"${name}_rVCPU_Tactical"};
+                $by_profile{$name} = {
+                    entitlement => $numeric_cell->($name),
+                    recommendedVPs => $numeric_cell->("${name}_rVCPU"),
+                    entitlementBoundedVPs => $numeric_cell->("${name}_rVCPU_EntBounded"),
+                    tacticalVPs => $numeric_cell->("${name}_rVCPU_Tactical"),
+                };
+            }
+            $proposals->{$vm_name} = {
+                planningProfile => $policy_resolution->{ResolvedPlanningProfile},
+                installedEntitlement => $numeric_cell->('Current - ENT'),
+                installedVPs => $numeric_cell->('Current - VCPU'), poolId => $cfg->{pool_id},
+                tier => $data_row_csv[$column{TIER}], hint => $hint_type_tier,
+                profiles => \%by_profile,
+            };
+        }
         push @pending_csv_rows, [ $vm_name, [ @data_row_csv ] ];
     }
 
@@ -13085,7 +13121,51 @@ sub _write_standard_csv_report {
         print_csv_footer($out_fh, $excel_row_num_counter, $physc_data_file, scalar(@csv_visible_profiles), \@sorted_serials, $formula_col_offset);
     }
 
-    close $out_fh;
+    close $out_fh or die "Cannot finish CSV '$output_filename': $!";
+}
+
+# Derived L2 proposals belong to one system and one completed tactical run.
+# An immutable whole-run snapshot keeps different windows, models and VM
+# selections apart. A retry of identical content reuses the same file.
+sub _publish_tactical_proposals
+{
+    my ($cache, $model, $start, $end, $members) = @_;
+    require Digest::SHA;
+    my %meta;
+    if (open my $fh, '<', File::Spec->catfile($cache, '.nfit.cache.manifest'))
+    {
+        while (<$fh>) { $meta{$1} = $2 if /^\s*(\w+)\s*:\s*(.*?)\s*$/; }
+        close $fh;
+    }
+    my %revision;
+    for my $source (qw(data states))
+    {
+        my $rev = $meta{"${source}_revision"};
+        my @st = stat(File::Spec->catfile($cache, ".nfit.cache.$source"));
+        $revision{$source} = defined($rev) && length($rev) ? "rev:$rev"
+                           : @st ? "stat:$st[7]:$st[9]" : 'absent';
+    }
+    my %files = (engine => $nfit_script_path, profiler => abs_path($0),
+                 profiles => $profiles_config_path_to_load, tiers => "$script_dir/etc/nfit.vms.cfg",
+                 vmConfig => $vm_config_file_path, seasonality => $seasonality_config_path);
+    my %hashes = map { my $f = $files{$_};
+        $_ => (defined($f) && -f $f ? Digest::SHA->new(256)->addfile($f, 'b')->hexdigest : undef)
+    } keys %files;
+    my $payload = JSON->new->utf8->canonical->encode({
+        schemaVersion => 1, system => basename($cache), model => $model, window => {start => $start, end => $end},
+        inputRevision => \%revision, settings => { argv => \@original_argv, filesSHA256 => \%hashes,
+            analysisReferenceDate => $nfit_analysis_reference_date_str, vmFilter => $target_vm_name },
+        members => $members,
+    });
+    my $dir = File::Spec->catdir($cache, '.nfit.store', 'proposals', 'v1', $model);
+    make_path($dir, {mode => 0700});
+    my $path = File::Spec->catfile($dir, Digest::SHA::sha256_hex($payload) . '.json');
+    return if -f $path;
+    my ($fh, $tmp) = tempfile('.pending-XXXXXXXX', DIR => $dir, UNLINK => 1);
+    binmode $fh;
+    print {$fh} $payload or die "Cannot write proposal snapshot: $!";
+    close $fh or die "Cannot close proposal snapshot: $!";
+    rename $tmp, $path or die "Cannot publish proposal snapshot: $!";
 }
 
 # ==============================================================================
