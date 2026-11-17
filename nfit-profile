@@ -6438,6 +6438,235 @@ sub _compute_entbounded_and_tactical
     };
 }
 
+# ==============================================================================
+# SUBROUTINE: _resolve_current_cycle_pair
+# PURPOSE:    The entitlement and VP pair to configure in the current cycle for
+#             one profile (v10 stage 3.1). The target entitlement and the VP
+#             step computed upstream are inputs; this routine only makes the
+#             pair valid and stages it. It never changes the target.
+#
+#             VPs:  the existing rate-limited, safety-gated step (Tactical).
+#                   Raised only where the target entitlement cannot be carried
+#                   otherwise (at most one core per VP), up to a verified VP
+#                   limit when one is known. nFit does not collect the HMC
+#                   profile maximum today; the configured MaxCPU is the LPAR's
+#                   consumption ceiling (its VPs, or a smaller pool), which a VP
+#                   increase raises, so it is not a limit here. A VP
+#                   increase that only the run-queue or peak evidence asks for
+#                   is returned as a review, not applied.
+#             ENT:  the target, held within PowerVM's 0.05 to 1.00 processing
+#                   units per VP and within a user pool's size. While a VP
+#                   reduction is still being staged, the pair may carry no more
+#                   VPs per entitlement core than today's configuration or the
+#                   2:1 envelope, whichever is looser (the same ceil(ENT x
+#                   ratio) rounding as the envelope maximum), so that a deep
+#                   cut does not leave many VPs on a thin guarantee.
+#
+#             Entitlements are compared and returned at the CSV's two-decimal
+#             precision; staged values are rounded up to the next 0.01.
+# ARGUMENTS:  hashref:
+#               target_ent     - target entitlement for the profile
+#               target_vp      - strategic VP destination (rVCPU), may be undef
+#               step_vp        - Tactical VP step for the current entitlement
+#               current_ent    - installed entitlement
+#               current_vp     - installed VP count
+#               vp_limit       - verified maximum VP count (HMC profile
+#                                maximum), undef when unknown
+#               pool_size      - size of a user-defined pool, undef for the
+#                                default pool or when unknown
+#               hold_reason    - non-empty: keep the installed pair (excluded
+#                                role or other reason supplied by the caller)
+# RETURNS:    hashref: Ent, VP (the current-cycle pair), Status (HOLD,
+#             NO_CHANGE, APPLY, STAGED or BLOCKED), Order (VP_FIRST, ENT_FIRST,
+#             EITHER, COMBINED or NONE), Binding (array of the limits that
+#             shaped the pair: PLATFORM_MINIMUM, RATIO_GUARD, VP_WIDTH,
+#             VP_LIMIT, POOL_SIZE), NeedVP, ReviewVP (evidence-only VP increase
+#             to review, or undef), TargetEnt, TargetVP, Reason.
+# ==============================================================================
+sub _resolve_current_cycle_pair
+{
+    my ($terms) = @_;
+    $terms = {} unless (defined $terms && ref($terms) eq 'HASH');
+
+    my $number = sub
+    {
+        my ($v) = @_;
+        return (defined $v && looks_like_number($v) && $v !~ /nan|inf/i) ? $v + 0 : undef;
+    };
+    my $shown = sub
+    {
+        my ($v) = @_;
+        return defined $v ? sprintf('%.2f', $v) + 0 : undef;
+    };
+    # Smallest multiple of 0.01 at or above $v (guarding against binary noise).
+    my $up = sub
+    {
+        my ($v) = @_;
+        my $cents = int(($v * 100) - 1e-6);
+        $cents++ if (($cents / 100) < $v - 1e-9);
+        return $cents / 100;
+    };
+
+    my $target_ent  = $shown->($number->($terms->{target_ent}));
+    my $target_vp   = $number->($terms->{target_vp});
+    my $step_vp     = $number->($terms->{step_vp});
+    my $current_ent = $shown->($number->($terms->{current_ent}));
+    my $current_vp  = $number->($terms->{current_vp});
+    my $vp_limit    = $number->($terms->{vp_limit});
+    my $pool_size   = $number->($terms->{pool_size});
+    my $hold_reason = $terms->{hold_reason} // '';
+
+    $target_vp  = int($target_vp)  if (defined $target_vp);
+    $step_vp    = int($step_vp)    if (defined $step_vp);
+    $current_vp = int($current_vp) if (defined $current_vp);
+    $vp_limit   = int($vp_limit)   if (defined $vp_limit);
+    $vp_limit   = undef            if (defined $vp_limit && $vp_limit < 1);
+    $pool_size  = undef            if (defined $pool_size && $pool_size <= 0);
+
+    my %out = (
+        Ent       => $current_ent,
+        VP        => $current_vp,
+        Status    => 'HOLD',
+        Order     => 'NONE',
+        Binding   => [],
+        NeedVP    => undef,
+        ReviewVP  => undef,
+        TargetEnt => $target_ent,
+        TargetVP  => $target_vp,
+        Reason    => '',
+    );
+
+    if ($hold_reason ne '')
+    {
+        $out{Reason} = $hold_reason;
+        return \%out;
+    }
+    unless (defined $current_ent && $current_ent > 0 && defined $current_vp && $current_vp >= 1)
+    {
+        $out{Reason} = 'installed entitlement or VP count unknown';
+        return \%out;
+    }
+    unless (defined $target_ent && $target_ent > 0)
+    {
+        $out{Reason} = 'no target entitlement';
+        return \%out;
+    }
+
+    my @binding;
+
+    # --- VPs ---------------------------------------------------------------
+    my $vp = (defined $step_vp && $step_vp >= 1) ? $step_vp : $current_vp;
+    my $need_vp = int($target_ent);
+    $need_vp++ if ($target_ent - $need_vp > $FLOAT_EPSILON);
+    $need_vp = 1 if ($need_vp < 1);
+    $out{NeedVP} = $need_vp;
+    my $blocked = 0;
+    if ($need_vp > $vp)
+    {
+        $vp = $need_vp;
+        push @binding, 'VP_WIDTH';
+        if (defined $vp_limit && $vp > $vp_limit)
+        {
+            $vp = ($vp_limit > $current_vp) ? $vp_limit : $current_vp;
+            push @binding, 'VP_LIMIT';
+            $blocked = 1;
+        }
+    }
+    if (defined $target_vp && $target_vp > $vp)
+    {
+        $out{ReviewVP} = $target_vp;
+    }
+
+    # --- Entitlement -------------------------------------------------------
+    my $ent = $target_ent;
+    my $minimum = $up->($MIN_ENT_PER_VP * $vp);
+    if ($ent < $minimum - $FLOAT_EPSILON)
+    {
+        $ent = $minimum;
+        push @binding, 'PLATFORM_MINIMUM';
+    }
+    my $staging_reduction = ($vp < $current_vp) && (!defined $target_vp || $vp > $target_vp);
+    if ($staging_reduction)
+    {
+        my $ratio = $current_vp / $current_ent;
+        $ratio = $VCPU_RATIO_MAX if ($ratio < $VCPU_RATIO_MAX);
+        # Smallest ENT (0.01 steps) for which ceil(ENT x ratio) >= VPs.
+        my $guard = $up->((($vp - 1) / $ratio) + 0.001);
+        $guard = $up->($guard + 0.01) while (_ceil_ratio($guard, $ratio) < $vp);
+        if ($ent < $guard - $FLOAT_EPSILON)
+        {
+            $ent = $guard;
+            push @binding, 'RATIO_GUARD';
+        }
+    }
+    if ($ent > $vp + $FLOAT_EPSILON)
+    {
+        $ent = $vp;
+        push @binding, 'VP_WIDTH' unless (grep { $_ eq 'VP_WIDTH' } @binding);
+        $blocked = 1;
+    }
+    if (defined $pool_size && $ent > $pool_size + $FLOAT_EPSILON)
+    {
+        $ent = $pool_size;
+        push @binding, 'POOL_SIZE';
+        $blocked = 1;
+    }
+    $ent = $shown->($ent);
+
+    # --- Status and order --------------------------------------------------
+    $out{Ent} = $ent;
+    $out{VP} = $vp;
+    $out{Binding} = \@binding;
+    if (abs($ent - $current_ent) < 0.005 && $vp == $current_vp)
+    {
+        $out{Status} = $blocked ? 'BLOCKED' : 'NO_CHANGE';
+    }
+    elsif ($blocked)
+    {
+        $out{Status} = 'BLOCKED';
+    }
+    elsif (abs($ent - $target_ent) >= 0.005 || (defined $target_vp && $vp != $target_vp))
+    {
+        $out{Status} = 'STAGED';
+    }
+    else
+    {
+        $out{Status} = 'APPLY';
+    }
+
+    my $valid = sub
+    {
+        my ($e, $v) = @_;
+        return ($e <= $v + $FLOAT_EPSILON && $e >= $MIN_ENT_PER_VP * $v - $FLOAT_EPSILON) ? 1 : 0;
+    };
+    my $ent_changes = (abs($ent - $current_ent) >= 0.005) ? 1 : 0;
+    my $vp_changes  = ($vp != $current_vp) ? 1 : 0;
+    if ($ent_changes && $vp_changes)
+    {
+        my $vp_first  = $valid->($current_ent, $vp);
+        my $ent_first = $valid->($ent, $current_vp);
+        $out{Order} = ($vp_first && $ent_first) ? 'EITHER'
+                    : $vp_first                 ? 'VP_FIRST'
+                    : $ent_first                ? 'ENT_FIRST'
+                    :                             'COMBINED';
+    }
+    elsif ($ent_changes || $vp_changes)
+    {
+        $out{Order} = 'EITHER';
+    }
+    return \%out;
+}
+
+# ceil(ENT x ratio) with tolerance for binary noise (helper for the VP:ENT guard).
+sub _ceil_ratio
+{
+    my ($ent, $ratio) = @_;
+    my $product = $ent * $ratio;
+    my $whole = int($product);
+    $whole++ if ($product - $whole > 1e-6);
+    return $whole;
+}
+
 # --- calculate_runq_modified_physc (with enhanced efficiency logic and detailed debug output) ---
 # Calculates the final PhysC value for a profile after applying efficiency factors
 # and RunQ-driven additive CPU adjustments.
