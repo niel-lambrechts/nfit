@@ -92,6 +92,7 @@ class StructuralFeasibilityTests(unittest.TestCase):
     def setUpClass(cls):
         cls.root = tempfile.mkdtemp(prefix='structural-')
         cache, last = build_root(cls.root)
+        cls.cache = cache
         cls.proc = subprocess.run(['perl', os.path.join(cls.root, 'nfit-profile'), '--runq-perc-behavior=match',
                                    '--enddate', last, '--nmondir', cache],
                                   capture_output=True, text=True, timeout=300, cwd=cls.root)
@@ -119,7 +120,7 @@ class StructuralFeasibilityTests(unittest.TestCase):
         if label is None:
             hint = self.rows[vm]['Hint']
             label = (hint[0] if hint[:1] in ('O', 'B') else 'G') + '3'
-        return next(h for h in self.header if h.startswith(label + '-') and '_rVCPU' not in h)
+        return next(h for h in self.header if h.startswith(label + '-') and '_r' not in h)
 
     def section(self):
         return self.log[self.log.index('\nPool and VP Checks\n'):]
@@ -137,11 +138,14 @@ class StructuralFeasibilityTests(unittest.TestCase):
         proposed = sum(float(self.rows[vm][self.planning_profile(vm)]) for vm in members)
         short = proposed > POOL_SIZE + 0.005
         for vm in VMS:
+            # The CSV shows the current-cycle pair (v10 stage 3.1), which is
+            # always one PowerVM accepts, so [VP_MISMATCH] is never expected.
             profile = self.planning_profile(vm)
-            ent = round(float(self.rows[vm][profile]), 2)
-            tactical = int(self.rows[vm][profile + '_rVCPU_Tactical'])
-            mismatch = tactical < math.ceil(ent - 1e-9) or tactical > int(ent / MIN_ENT_PER_VP + 1e-6)
-            expected = (['[POOL_SHORTFALL]'] if short and vm in members else []) + (['[VP_MISMATCH]'] if mismatch else [])
+            ent = round(float(self.rows[vm][profile + '_rENT_Tactical']), 2)
+            vps = int(self.rows[vm][profile + '_rVCPU_Tactical'])
+            mismatch = vps < math.ceil(ent - 1e-9) or vps > int(ent / MIN_ENT_PER_VP + 1e-6)
+            self.assertFalse(mismatch, vm)
+            expected = ['[POOL_SHORTFALL]'] if short and vm in members else []
             comments = self.rows[vm]['VM_Comments']
             found = re.findall(r'\[(?:POOL_SHORTFALL|VP_MISMATCH)\]', comments)
             self.assertEqual(found, expected, vm)
@@ -151,8 +155,12 @@ class StructuralFeasibilityTests(unittest.TestCase):
                 if column != 'VM_Comments':
                     self.assertNotIn('SHORTFALL', value or '')
                     self.assertNotIn('MISMATCH', value or '')
-        for text in ('Raise VPs', 'Reduce VPs', 'Pool and VP', 'Recommended Actions'):
-            self.assertNotIn(text, self.csv_text)              # actions stay in the rationale
+        for text in ('Pool and VP', 'Recommended Actions'):
+            self.assertNotIn(text, self.csv_text)              # the checks stay in the rationale
+        for vm in VMS:                                         # the LPAR's own action is in NFIT - Action only
+            for column, value in self.rows[vm].items():
+                if column != 'NFIT - Action':
+                    self.assertNotIn('VPs ', value or '', (vm, column))
 
     def test_pool_sums_agree_with_the_csv(self):
         members = [vm for vm, v in VMS.items() if v[2] == POOL_ID]
@@ -179,33 +187,54 @@ class StructuralFeasibilityTests(unittest.TestCase):
             self.assertIn(f'Pool {POOL_ID} - fits: {proposed:.2f} cores proposed against a maximum of {units}', s)
         self.assertNotIn('Pool 0 -', s)                        # the default pool is not assessed
 
-    def test_ent_vp_findings_follow_from_the_csv(self):
+    def test_current_cycle_pair_and_nfit_columns(self):
+        """The current-cycle pair of every profile is one PowerVM accepts; the
+        NFIT columns carry the planning profile's pair and its action; the
+        entitlement/VP check therefore lists no LPAR (v10 stage 3.1)."""
         s = self.section()
-        actions = self.flat(self.log[self.log.index('Recommended Actions'):])
         for vm in VMS:
+            row = self.rows[vm]
+            current_ent, current_vp = VMS[vm][0], VMS[vm][1]
+            for column in self.header:
+                if not column.endswith('_rENT_Tactical'):
+                    continue
+                name = column[:-len('_rENT_Tactical')]
+                ent, vps = float(row[column]), int(row[name + '_rVCPU_Tactical'])
+                self.assertLessEqual(ent, vps + 1e-9, (vm, name))
+                self.assertGreaterEqual(ent, MIN_ENT_PER_VP * vps - 1e-9, (vm, name))
+                # VPs rise only where the target entitlement needs them.
+                if vps > current_vp:
+                    self.assertEqual(vps, math.ceil(float(row[name]) - 1e-9), (vm, name))
             profile = self.planning_profile(vm)
-            ent = round(float(self.rows[vm][profile]), 2)
-            tactical = int(self.rows[vm][profile + '_rVCPU_Tactical'])
-            current = VMS[vm][1]
-            min_vps = math.ceil(ent - 1e-9)
-            max_vps = int(ent / MIN_ENT_PER_VP + 1e-6)
-            block = re.search(rf'^    {vm} \({re.escape(profile)}\): .*\n(      .*\n)+', s, re.M)
-            text = self.flat(block.group(0)) if block else ''
-            if tactical < min_vps:
-                self.assertIn(f'The proposed {ent:.2f} cores needs at least', text, vm)
-                self.assertIn(f'Action: Limit the entitlement to {tactical:.2f}', text, vm)
-            elif tactical > max_vps:
-                want = ('Minimum configurable entitlement: 0.05.' if tactical == 1
-                        else f'minimum entitlement {tactical * MIN_ENT_PER_VP:.2f}')
-                self.assertIn(want, text, vm)
-            elif current < min_vps:
-                self.assertIn(f'Action: Raise VPs from {current} to', text, vm)
-            elif current > max_vps:
-                self.assertIn(f'Action: Reduce VPs from {current} to', text, vm)
-            else:
-                self.assertEqual(text, '', vm)                 # nothing to do: not listed
-                continue
-            self.assertIn(f'{vm}: ', actions, vm)              # and the action is in the summary
+            self.assertEqual(row['Planning Profile'], profile, vm)
+            self.assertEqual(row['NFIT - ENT'], row[profile + '_rENT_Tactical'], vm)
+            self.assertEqual(row['NFIT - VCPU'], row[profile + '_rVCPU_Tactical'], vm)
+            ent, vps, action = float(row['NFIT - ENT']), int(row['NFIT - VCPU']), row['NFIT - Action']
+            if abs(ent - current_ent) >= 0.005:
+                self.assertIn(f'entitlement {current_ent:.2f} to {ent:.2f}', action, vm)
+            if vps != current_vp:
+                self.assertIn(f'VPs {current_vp} to {vps}', action, vm)
+                self.assertIn('re-measure', action, vm)
+            if vps > current_vp and ent > current_vp:          # VPs must rise before the entitlement
+                self.assertRegex(action, rf'^Raise VPs {current_vp} to {vps}, then raise entitlement', vm)
+            if abs(ent - current_ent) < 0.005 and vps == current_vp:
+                self.assertTrue(action.startswith('No change'), vm)
+            self.assertIsNone(re.search(rf'^    {vm} \(', s, re.M), vm)   # nothing to list
+
+    def test_retired_columns_and_option(self):
+        for column in ('RunQ_Tactical', 'RunQ_Strategic', 'RunQ_Potential', 'RunQ_Source', 'VCPU_Constraints',
+                       'NETT', 'NETT%'):
+            self.assertNotIn(column, self.header)
+        self.assertFalse([c for c in self.header if c.endswith('_rVCPU') or c.endswith('_rVCPU_EntBounded')])
+        self.assertEqual(len(self.header), 21 + 3 * 13)
+        self.assertEqual(self.header[:21], [
+            'VM', 'TIER', 'Hint', 'Planning Profile', 'Pattern', 'SMT', 'Serial', 'SystemType', 'Pool Name',
+            'Pool ID', 'Pool Size', 'Current - ENT', 'Current - VCPU', 'NFIT - ENT', 'NFIT - VCPU', 'NFIT - Action',
+            'VM_Comments', 'Pressure', 'PressureDetail', 'Peak', 'Peak_P-99W1'])
+        p = subprocess.run(['perl', os.path.join(self.root, 'nfit-profile'), '--nmondir', self.cache,
+                            '--excel-formulas', 'true'], capture_output=True, text=True, cwd=self.root)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('--excel-formulas was retired', p.stderr)
 
     def test_terms_used_are_defined_in_the_terminology_reference(self):
         reference = self.log[self.log.index('Key Terminology Reference'):self.log.index('\nPool and VP Checks\n')]

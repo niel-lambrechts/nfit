@@ -51,7 +51,10 @@
 #            --classify sorts each difference into intended and unintended:
 #            CSV cells other than VM_Comments, VM_Comments beyond the leading
 #            [POOL_SHORTFALL]/[VP_MISMATCH] alerts, and rationale lines outside
-#            the sections named in INTENDED_SECTIONS are unintended.
+#            the sections named in INTENDED_SECTIONS are unintended. A change
+#            to the v10 planner layout (LAYOUT_RETIRED/LAYOUT_ADDED) is compared
+#            by column name; NFIT - ENT and the current-cycle VP cells are
+#            counted and listed separately for review.
 #            dev/golden list
 #            dev/golden determinism [--stage-dir DIR] --systems S [--runs R]
 #                                   [--enddate YYYY-MM-DD]
@@ -275,8 +278,15 @@ def check_proposals(sdir, run, baseline_csv):
         return 'proposal source mismatch'
     reader = csv.reader(io.StringIO(baseline_csv))
     header = next(reader)
-    fields = {'entitlement': '', 'recommendedVPs': '_rVCPU', 'entitlementBoundedVPs': '_rVCPU_EntBounded',
-              'tacticalVPs': '_rVCPU_Tactical'}
+    if any(c.endswith('_rENT_Tactical') for c in header):
+        # v10 layout: the target entitlement and the current-cycle pair.
+        fields = {'': lambda p: p['entitlement'],
+                  '_rENT_Tactical': lambda p: (p.get('currentCycle') or {}).get('entitlement'),
+                  '_rVCPU_Tactical': lambda p: (p.get('currentCycle') or {}).get('VPs')}
+    else:
+        fields = {'': lambda p: p['entitlement'], '_rVCPU': lambda p: p['recommendedVPs'],
+                  '_rVCPU_EntBounded': lambda p: p['entitlementBoundedVPs'],
+                  '_rVCPU_Tactical': lambda p: p['tacticalVPs']}
     profiles = {c[:-len('_rVCPU_Tactical')] for c in header if c.endswith('_rVCPU_Tactical')}
     members = snapshot['members']
     seen = set()
@@ -289,13 +299,13 @@ def check_proposals(sdir, run, baseline_csv):
             return 'proposal member or profile set mismatch'
         seen.add(vm)
         for name in profiles:
-            for field, suffix in fields.items():
+            for suffix, stored in fields.items():
                 try:
                     value = float(row[name + suffix])
                     value = value if math.isfinite(value) else None
                 except ValueError:
                     value = None
-                if members[vm]['profiles'][name][field] != value:
+                if stored(members[vm]['profiles'][name]) != value:
                     return 'proposal value differs from baseline CSV'
     if not profiles or not seen or seen != set(members):
         return 'incomplete proposal snapshot'
@@ -333,6 +343,12 @@ def execute(system: str, sysdir: Path, run: str, enddate: str, exe_src: Path, et
 INTENDED_SECTIONS = ('Key Terminology Reference', 'Pool and VP Checks', 'Structural Feasibility Checks',
                      'Entitlement Cut Exposure', 'Recommended Actions')
 ALERT_TAG = re.compile(r'^(?:\[(?:POOL_SHORTFALL|VP_MISMATCH)\](?:;\s*)?)+')
+# v10 planner CSV layout (stage 3.1): columns moved to the rationale, columns
+# added, and cells whose meaning the current-cycle pair completes.
+LAYOUT_RETIRED = re.compile(r'^(?:RunQ_Tactical|RunQ_Strategic|RunQ_Potential|RunQ_Source|VCPU_Constraints|NETT%?'
+                            r'|.+_rVCPU|.+_rVCPU_EntBounded)$')
+LAYOUT_ADDED = re.compile(r'^(?:Planning Profile|NFIT - VCPU|NFIT - Action|.+_rENT_Tactical)$')
+LAYOUT_COMPLETED = re.compile(r'^(?:NFIT - ENT|.+_rVCPU_Tactical)$')
 
 
 def _sections(lines: list) -> list:
@@ -382,20 +398,37 @@ def classify_csv(base: str, cur: str) -> dict:
     import io
     ra, rb = list(csv.reader(io.StringIO(base))), list(csv.reader(io.StringIO(cur)))
     result = {'header': ra[:1] == rb[:1], 'rows': (len(ra), len(rb)), 'tags_only': 0, 'comments_other': 0,
-              'cells': 0, 'cell_lines': []}
+              'cells': 0, 'cell_lines': [], 'layout': None, 'completed': 0}
+    if ra and rb and not result['header']:
+        # A change of layout is intended only when every removed column moved to
+        # the rationale and every new column is a v10 planner column. Cells are
+        # then compared by column name and by VM.
+        removed, added = set(ra[0]) - set(rb[0]), set(rb[0]) - set(ra[0])
+        if all(LAYOUT_RETIRED.match(c) for c in removed) and all(LAYOUT_ADDED.match(c) for c in added):
+            result['header'] = True
+            result['layout'] = (len(removed), len(added))
     if not ra or not rb or not result['header'] or len(ra) != len(rb):
         result['cells'] = -1
         return result
-    header = ra[0]
-    comments = header.index('VM_Comments') if 'VM_Comments' in header else None
+    header = [c for c in ra[0] if c in set(rb[0])]
+    index_a = {c: i for i, c in enumerate(ra[0])}
+    index_b = {c: i for i, c in enumerate(rb[0])}
     for row_a, row_b in zip(ra[1:], rb[1:]):
-        for k in range(max(len(row_a), len(row_b))):
-            va = row_a[k] if k < len(row_a) else ''
-            vb = row_b[k] if k < len(row_b) else ''
+        for name in header:
+            ia, ib = index_a[name], index_b[name]
+            va = row_a[ia] if ia < len(row_a) else ''
+            vb = row_b[ib] if ib < len(row_b) else ''
             if va == vb:
                 continue
-            if k == comments:
-                if ALERT_TAG.sub('', vb).strip(' ;') == va.strip(' ;'):
+            if result['layout'] is not None and name == 'NFIT - ENT' and va == '':
+                continue                                     # blank before v10 unless formulas were on
+            if result['layout'] is not None and LAYOUT_COMPLETED.match(name):
+                result['completed'] += 1
+                if len(result['cell_lines']) < 20:
+                    result['cell_lines'].append(f'{row_a[0]} {name} (current-cycle pair): {va} -> {vb}')
+                continue
+            if name == 'VM_Comments':
+                if ALERT_TAG.sub('', vb).strip(' ;') == ALERT_TAG.sub('', va).strip(' ;'):
                     result['tags_only'] += 1
                 else:
                     result['comments_other'] += 1
@@ -404,7 +437,7 @@ def classify_csv(base: str, cur: str) -> dict:
                 continue
             result['cells'] += 1
             if len(result['cell_lines']) < 20:
-                result['cell_lines'].append(f'{row_a[0]} {header[k] if k < len(header) else k}: {va} -> {vb}')
+                result['cell_lines'].append(f'{row_a[0]} {name}: {va} -> {vb}')
     return result
 
 
@@ -543,7 +576,10 @@ def cmd_compare(a, out: RedactedOut) -> int:
                     c = classify_csv(base, current)
                     verdict = 'UNINTENDED' if (c['cells'] or c['comments_other'] or not c['header']) else 'intended only'
                     unintended += verdict == 'UNINTENDED'
-                    out.say(f'      csv: {verdict}: header {"same" if c["header"] else "CHANGED"}, rows {c["rows"][0]} -> {c["rows"][1]}, '
+                    header_text = ('same' if c['layout'] is None else
+                                   f'v10 layout ({c["layout"][0]} column(s) moved to the rationale, {c["layout"][1]} added; '
+                                   f'{c["completed"]} current-cycle cell(s) changed)') if c['header'] else 'CHANGED'
+                    out.say(f'      csv: {verdict}: header {header_text}, rows {c["rows"][0]} -> {c["rows"][1]}, '
                             f'other cells changed {c["cells"]}, VM_Comments alert tags only {c["tags_only"]}, '
                             f'VM_Comments other {c["comments_other"]}')
                     for line in c['cell_lines']:

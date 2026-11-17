@@ -350,4 +350,20 @@ close $log;
 like(flat($buffer), qr/No action identified by the checks run\. Pool competition for entitlement cuts was not checked \(add --pool-exposure\)\./,
     'without --pool-exposure the skipped check is named');
 
+# v10 stage 3.1: with the current-cycle pair resolved, the check reads that
+# pair. The target (0.47) against the Tactical step (12 VPs) is not a finding
+# when the pair the CSV shows (1.50 entitlement on 12 VPs) can be configured;
+# an invalid pair would still be.
+my %map3 = (
+    w2 => { Configuration => { entitlement => 4.0, virtual_cpus => 16, pool_id => 0, pool_cpu => 64 }, Hinting => {},
+            CoreResults => { ProfileValues => { 'G3-95W15' => 0.47 }, Profile_rVCPU_Tactical => { 'G3-95W15' => 12 },
+                             Profile_CurrentCycle => { 'G3-95W15' => { Ent => 1.50, VP => 12, Status => 'STAGED' } } } },
+    w3 => { Configuration => { entitlement => 4.0, virtual_cpus => 16, pool_id => 0, pool_cpu => 64 }, Hinting => {},
+            CoreResults => { ProfileValues => { 'G3-95W15' => 0.47 }, Profile_rVCPU_Tactical => { 'G3-95W15' => 12 },
+                             Profile_CurrentCycle => { 'G3-95W15' => { Ent => 0.47, VP => 12, Status => 'STAGED' } } } },
+);
+my $f3 = UUT::_collect_structural_findings(\%map3, [qw(w2 w3)], \@profiles, {});
+is($f3->{Summary}{WidthMismatches}, 1, 'current-cycle pair: only the invalid pair is counted');
+is_deeply([ map { $_->{vm} } @{ $f3->{VmFindings} } ], ['w3'], 'current-cycle pair: the valid pair is not listed');
+
 done_testing();
