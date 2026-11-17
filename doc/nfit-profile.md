@@ -111,3 +111,28 @@ are printed with the results. A partial-coverage result applies only to the
 classified minutes. These figures describe borrowing exposure and do not
 predict lost throughput. Candidate testing is opt-in and writes no sizing
 change to the CSV or monthly history.
+
+### Shadow pool reconciliation
+
+With `--candidate-test` (or `--candidate-proposals`), the rationale also gains a
+**Pool reconciliation** section. The planning-profile cuts of the LPARs in one
+pool are replayed together at the same minutes, at all hours: a configured
+entitlement applies in every minute, whatever the planning profile's own hours.
+The eligibility rules and candidate entitlements are those of the candidate test.
+
+Only full-pool minutes in which every cut member has a paired sample are counted.
+A member is **exposed** in such a minute when its busy cores exceed the candidate
+while other LPARs are busy; the guarantee lost is the busy work between the
+candidate and the installed entitlement. At the proposals the section gives the
+minutes in which all, some or none of the members were exposed together, the
+longest run with all exposed, and the per-LPAR counts. Joint counts cannot be
+derived from the per-LPAR ones. The candidate test's "new contested" counts,
+which also require busy within the installed entitlement, are printed beside
+them for comparison; that rule alone would treat a cut on an LPAR already above
+its guarantee as free.
+
+For each illustrative budget (minutes any member is exposed / longest run /
+excess core-minutes), the section names the combination of candidate
+entitlements that releases the most guarantee within it. Up to six cuts in one
+pool are searched exhaustively. The section writes nothing to the CSV or to
+monthly history.

@@ -625,6 +625,11 @@ my $pool_exposure_flag;
 my ($candidate_test, $candidate_window, $candidate_snapshot);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
+# Pool reconciliation (v10 milestone 2.3): illustrative budgets on minutes any
+# member is exposed / longest run / excess core-minutes (those of the candidate
+# test), and the most cuts in one pool searched exhaustively (four levels each).
+my @RECONCILE_BUDGETS  = ([ 'A', 0, 0, 0 ], [ 'B', 15, 3, 2 ], [ 'C', 60, 10, 10 ]);
+my $RECONCILE_MAX_CUTS = 6;
 # The rules of the evaluation. Any change here changes the rules hash, so
 # stored blocks are recomputed.
 my %MEMBER_EXPOSURE_RULES = (
@@ -1689,9 +1694,13 @@ foreach my $system_serial (@target_systems_to_process)
         print "Proposal model $saved->{model}, sizing window $saved->{window}{start} through $saved->{window}{end}\n";
         if (!$exposure) { print "Shadow entitlement candidates: unavailable ($why).\n"; exit 0; }
         my @notes;
-        my $tracks = _candidate_trackers(_exposure_load_states($current_cache_path), $saved->{members}, $asof, $from, $to, \@notes);
-        _exposure_evaluate_window($pool, $exposure, $tracks, $from, $to) if @$tracks;
-        print join("\n", _candidate_report($tracks, \@notes, $from, $to)), "\n";
+        my $db = _exposure_load_states($current_cache_path);
+        my $tracks = _candidate_trackers($db, $saved->{members}, $asof, $from, $to, \@notes);
+        my @reconcile_notes;
+        my $joint = _reconcile_trackers($db, $saved->{members}, $asof, $from, $to, \@reconcile_notes);
+        _exposure_evaluate_window($pool, $exposure, [ @$tracks, @$joint ], $from, $to) if (@$tracks || @$joint);
+        print join("\n", _candidate_report($tracks, \@notes, $from, $to),
+                   _reconcile_report($joint, \@reconcile_notes, $from, $to)), "\n";
         exit 0;
     }
     # Initialise the run end date to the effective end date by default
@@ -20827,6 +20836,7 @@ sub _exposure_process_day
                 : ((defined $vp && $vp > 0 && $c >= $rule{nearVp} * $vp - $eps) ? 1 : 0);
             $acc->{classified}++ if $classified;
             $acc->{scarce}++     if $scarce;
+            $tracker->{joint}{$minute} = [ $b, $competition ] if ($scarce && $tracker->{joint});
             if ($scarce)
             {
                 $acc->{localFull}++ if ($local eq 'scarce');
@@ -21204,6 +21214,219 @@ sub _exposure_cut_lines
 }
 
 # ==============================================================================
+# Pool reconciliation (shadow, v10 milestone 2.3)
+# ------------------------------------------------------------------------------
+# The planning-profile cuts of the LPARs in one pool, tested together at the
+# same timestamps. Each member's candidate entitlements are those of the
+# candidate test (_candidate_levels: installed, proposal or width floor,
+# midpoint, 10% lower). A configured entitlement applies in every minute, so
+# the replay covers all hours, whatever the planning profile's own hours.
+#
+# In a full-pool minute (local or frame scarcity, every member paired), a
+# member is exposed at level L when its busy cores exceed L while other LPARs
+# were busy. The work the cut moves into borrowing is min(busy, installed
+# entitlement) - L: it was guaranteed before. This rule drives the budgets.
+# The candidate test's "new contested" rule also requires busy within the
+# installed entitlement; its counts are given beside, for comparison. It
+# would treat a cut on an LPAR already above its guarantee as free.
+#
+# Per pool the section gives the minutes in which all, some or none of the cut
+# members were exposed at their proposals, and, for each illustrative budget,
+# the combination of candidate entitlements that releases the most guarantee
+# within it. Budgets apply to minutes in which any member is exposed, the
+# longest run of such minutes, and their excess core-minutes. Nothing is
+# written to the CSV or to history.
+# ==============================================================================
+# (@RECONCILE_BUDGETS and $RECONCILE_MAX_CUTS are declared with the member exposure constants.)
+
+# Trackers for the cut members: one per LPAR, all hours, planning profile only.
+sub _reconcile_trackers
+{
+    my ($db, $members, $asof, $from, $to, $notes) = @_;
+    my (%cut, %profiles);
+    foreach my $vm (sort keys %{ $members // {} })
+    {
+        my $m = $members->{$vm};
+        my $planning = $m->{planningProfile} // '';
+        my $p = ($m->{profiles} // {})->{$planning};
+        next unless (ref($p) eq 'HASH' && defined $p->{entitlement} && defined $m->{installedEntitlement}
+                     && $p->{entitlement} < $m->{installedEntitlement} - 0.005);
+        $cut{$vm} = { %$m, profiles => { $planning => $p } };
+        $profiles{$planning} = 1;
+    }
+    return [] unless %cut;
+    my $trackers = _candidate_trackers($db, \%cut, $asof, $from, $to, $notes, { none => [ sort keys %profiles ] });
+    $_->{joint} = {} for @$trackers;
+    return $trackers;
+}
+
+# Longest run of set bits in a bit string.
+sub _reconcile_longest
+{
+    my ($bits) = @_;
+    my $longest = 0;
+    foreach my $run (unpack('b*', $bits) =~ /(1+)/g)
+    {
+        $longest = length($run) if length($run) > $longest;
+    }
+    return $longest;
+}
+
+sub _reconcile_report
+{
+    my ($trackers, $notes, $from, $to) = @_;
+    my $eps = 1e-9;
+    my @lines = ('', 'Pool reconciliation (shadow; the CSV is unchanged)',
+        sprintf('  %s through %s UTC, all hours; installed VP width held fixed. The planning-profile cuts of', gmtime($from)->ymd, gmtime($to - 1)->ymd),
+        '  each pool are replayed together at the same minutes. Exposed: in a full-pool minute, busy',
+        '  work above the candidate while other LPARs were busy; the guarantee lost is the busy work',
+        '  between the candidate and the installed entitlement.',
+        sprintf('  Budgets on minutes any member is exposed / longest run / excess core-min: %s.',
+            join(', ', map { sprintf('%s %d/%d/%d', @$_) } @RECONCILE_BUDGETS)));
+    push @lines, map { "  $_" } @{ $notes // [] };
+    my %by_pool;
+    push @{ $by_pool{ $_->{pool} } }, $_ for grep { $_->{pool} } @$trackers;
+    push @lines, '  No pool with an eligible planning-profile cut.' unless %by_pool;
+
+    foreach my $pool (sort { $a <=> $b } keys %by_pool)
+    {
+        my @t = sort { $a->{vm} cmp $b->{vm} } @{ $by_pool{$pool} };
+        my $n = scalar @t;
+        push @lines, '', sprintf('  Pool %s (maximum %s): %s.', $pool, _pool_units_text($t[0]{ceiling}),
+            ($n == 1 ? 'one planning-profile cut' : "$n planning-profile cuts tested together"));
+
+        # Full-pool minutes in which every member was paired.
+        my %seen;
+        $seen{$_}++ for map { keys %{ $_->{joint} } } @t;
+        my @minutes = sort { $a <=> $b } grep { $seen{$_} == $n } keys %seen;
+        my $excluded = scalar(keys %seen) - scalar(@minutes);
+        my $unclassified = 0;
+        $unclassified += $_->{paired} - $_->{classified} for map { _exposure_totals($_) } @t;
+        push @lines, sprintf('    Full-pool minutes with every member paired: %d%s.', scalar(@minutes),
+            ($excluded ? sprintf(' (%d more without a paired sample for every member are left out)', $excluded) : ''));
+        push @lines, sprintf('    %d paired member-minute%s could not be classified; results apply to classified minutes only.',
+            $unclassified, ($unclassified == 1 ? '' : 's')) if $unclassified;
+        next unless @minutes;
+
+        # Bit positions, with a gap bit between non-consecutive minutes so runs never join across a gap.
+        my (@position, $p);
+        $p = 0;
+        foreach my $j (0 .. $#minutes)
+        {
+            $p++ if ($j && $minutes[$j] != $minutes[$j - 1] + 60);
+            $position[$j] = $p++;
+        }
+        my $width = $p;
+
+        # Per member and level: exposed minutes (bit string), excess core-minutes;
+        # and the alternative count at the proposal.
+        my (@levels, @proposal_index);
+        foreach my $i (0 .. $#t)
+        {
+            my $tr  = $t[$i];
+            my $ent = $tr->{entitlement};
+            my @lv;
+            foreach my $k (0 .. $#{ $tr->{thresholds} })
+            {
+                my $th = $tr->{thresholds}[$k];
+                my $level = $th->{value};
+                my ($bits, $within, $excess, $count, $count_within) = ('', '', 0, 0, 0);
+                vec($bits,   $width - 1, 1) = 0;
+                vec($within, $width - 1, 1) = 0;
+                foreach my $j (0 .. $#minutes)
+                {
+                    my ($b, $competition) = @{ $tr->{joint}{ $minutes[$j] } };
+                    next unless ($competition && $b > $level + $eps && $ent > $level + $eps);
+                    vec($bits, $position[$j], 1) = 1;
+                    $excess += min($b, $ent) - $level;
+                    $count++;
+                    next unless ($b <= $ent + $eps);
+                    vec($within, $position[$j], 1) = 1;
+                    $count_within++;
+                }
+                my @labels = map { (split m{/}, $_)[1] } @{ $th->{labels} // [] };
+                push @lv, { value => $level, labels => \@labels, bits => $bits, within => $within, excess => $excess,
+                            count => $count, countWithin => $count_within, released => max(0, $ent - $level) };
+                $proposal_index[$i] = $#lv if grep { $_ eq 'proposal' || $_ eq 'widthFloor' } @labels;
+            }
+            push @levels, \@lv;
+        }
+
+        # At the proposals: how many members were exposed together, minute by minute.
+        my %together;
+        my ($all, $within_all) = (undef, undef);
+        foreach my $i (0 .. $#t)
+        {
+            my $lv = $levels[$i][ $proposal_index[$i] // 0 ];
+            $all        = defined $all        ? ($all & $lv->{bits})          : $lv->{bits};
+            $within_all = defined $within_all ? ($within_all & $lv->{within}) : $lv->{within};
+        }
+        foreach my $j (0 .. $#minutes)
+        {
+            my $k = grep { vec($levels[$_][ $proposal_index[$_] // 0 ]{bits}, $position[$j], 1) } 0 .. $#t;
+            $together{$k}++;
+        }
+        push @lines, sprintf('    At the proposals (%s):', join(', ', map {
+            sprintf('%s %.2f to %.2f', $t[$_]{vm}, $t[$_]{entitlement}, $levels[$_][ $proposal_index[$_] // 0 ]{value}) } 0 .. $#t));
+        push @lines, '      Exposed together: ' . join('; ', map {
+            sprintf('%s: %d', ($_ == $n ? ($n == 1 ? 'exposed' : "all $n") : $_ == 0 ? 'none' : "exactly $_"), $together{$_} // 0)
+        } reverse 0 .. $n) . sprintf(' (of %d full-pool minutes).', scalar(@minutes));
+        push @lines, sprintf('      Longest run with all exposed: %d minute%s.', _reconcile_longest($all), (_reconcile_longest($all) == 1 ? '' : 's'));
+        push @lines, '      Per LPAR: ' . join(', ', map { sprintf('%s %d', $t[$_]{vm}, $levels[$_][ $proposal_index[$_] // 0 ]{count}) } 0 .. $#t) . '.';
+        push @lines, sprintf('      Busy within the installed entitlement only (the candidate test\'s new contested): all exposed in %d; per LPAR %s.',
+            unpack('%32b*', $within_all),
+            join(', ', map { sprintf('%s %d', $t[$_]{vm}, $levels[$_][ $proposal_index[$_] // 0 ]{countWithin}) } 0 .. $#t));
+
+        # Combinations: the most guarantee released within each budget.
+        if ($n > $RECONCILE_MAX_CUTS)
+        {
+            push @lines, sprintf('    Combinations not searched: more than %d cuts in one pool.', $RECONCILE_MAX_CUTS);
+            next;
+        }
+        my %best;
+        my @choice = (0) x $n;
+        while (1)
+        {
+            my ($union, $released, $excess) = ('', 0, 0);
+            vec($union, $width - 1, 1) = 0;
+            foreach my $i (0 .. $#t)
+            {
+                my $lv = $levels[$i][ $choice[$i] ];
+                $union    |= $lv->{bits};
+                $released += $lv->{released};
+                $excess   += $lv->{excess};
+            }
+            my ($count, $longest) = (unpack('%32b*', $union), _reconcile_longest($union));
+            foreach my $budget (@RECONCILE_BUDGETS)
+            {
+                my ($name, $max_minutes, $max_run, $max_excess) = @$budget;
+                next if ($count > $max_minutes || $longest > $max_run || $excess > $max_excess + $eps);
+                my $b = $best{$name};
+                if (!$b || $released > $b->{released} + $eps
+                    || (abs($released - $b->{released}) <= $eps && ($count < $b->{count} || ($count == $b->{count} && $excess < $b->{excess} - $eps))))
+                {
+                    $best{$name} = { released => $released, count => $count, longest => $longest, excess => $excess, choice => [ @choice ] };
+                }
+            }
+            my $i = 0;
+            while ($i < $n && ++$choice[$i] > $#{ $levels[$i] }) { $choice[$i] = 0; $i++; }
+            last if $i == $n;
+        }
+        push @lines, '    Most guarantee released within each budget (entitlement per LPAR; released cores; exposed minutes / longest run / excess core-min):';
+        foreach my $budget (@RECONCILE_BUDGETS)
+        {
+            my $b = $best{ $budget->[0] };
+            next unless $b;
+            push @lines, sprintf('      %s: %s - releases %.2f; %d/%d/%.2f', $budget->[0],
+                join(', ', map { sprintf('%s %.2f (%s)', $t[$_]{vm}, $levels[$_][ $b->{choice}[$_] ]{value},
+                    join(',', @{ $levels[$_][ $b->{choice}[$_] ]{labels} })) } 0 .. $#t),
+                $b->{released}, $b->{count}, $b->{longest}, $b->{excess});
+        }
+    }
+    return @lines;
+}
+
+# ==============================================================================
 # SUBROUTINE: _log_cut_exposure
 # PURPOSE:    Writes the "Entitlement Cut Exposure" section (--pool-exposure):
 #             for each LPAR whose planning-profile entitlement is below its
@@ -21230,7 +21453,7 @@ sub _candidate_levels
 
 sub _candidate_trackers
 {
-    my ($db, $members, $asof, $from, $to, $notes) = @_;
+    my ($db, $members, $asof, $from, $to, $notes, $populations) = @_;
     my (%states, %bounds);
     foreach my $vm (sort keys %$members)
     {
@@ -21263,7 +21486,7 @@ sub _candidate_trackers
         $bounds{$vm} = [$begin, $end];
         $states{$vm} = [$s];
     }
-    my $trackers = _exposure_trackers(\%states, $from, $to, _exposure_populations(), sub {
+    my $trackers = _exposure_trackers(\%states, $from, $to, $populations // _exposure_populations(), sub {
         my ($vm, $meta, $population, $profiles) = @_;
         my %points;
         foreach my $profile (@$profiles)
@@ -21404,10 +21627,16 @@ sub _log_cut_exposure
         my @notes;
         my ($from, $to) = ($replay_from // $window_start, $replay_to // $window_end);
         my $shadow = $candidates ? _candidate_trackers($states, $candidates, $window_end, $from, $to, \@notes) : [];
+        my @reconcile_notes;
+        push @$shadow, @{ _reconcile_trackers($states, $candidates, $window_end, $from, $to, \@reconcile_notes) } if $candidates;
         my @same_window = (@$trackers, defined $replay_from ? () : @$shadow);
         my $counts = @same_window ? _exposure_evaluate_window($pool_context, $exposure_context, \@same_window, $window_start, $window_end) : {};
         _exposure_evaluate_window($pool_context, $exposure_context, $shadow, $from, $to) if defined $replay_from && @$shadow;
-        @shadow = _candidate_report($shadow, \@notes, $from, $to) if $candidates;
+        if ($candidates)
+        {
+            @shadow = (_candidate_report([ grep { !$_->{joint} } @$shadow ], \@notes, $from, $to),
+                       _reconcile_report([ grep { $_->{joint} } @$shadow ], \@reconcile_notes, $from, $to));
+        }
         _task(sprintf('Cut exposure evaluated (%s)', format_duration(time() - $started)));
         $summary{Status} = 'evaluated';
 
