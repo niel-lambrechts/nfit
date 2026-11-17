@@ -32,9 +32,9 @@ class CandidateTest(unittest.TestCase):
 
     def test_exact_counts_and_roles(self):
         text = self.replay()
-        self.assertIn('vmB: protected role', text)
-        self.assertIn('vmS: protected role', text)
-        self.assertIn('vmX: role unknown', text)
+        self.assertIn('vmB: excluded from automatic change: VIOS', text)
+        self.assertIn('vmS: excluded from automatic change: standby LPAR', text)
+        self.assertIn('vmX: role not known in the VM configuration', text)
         line, = [l for l in text.splitlines() if 'G3-95W15/lower' in l]
         threshold = float(line.split()[0])
         def stats(full):
@@ -83,7 +83,7 @@ class CandidateTest(unittest.TestCase):
         states['vmA'].append(second)
         f.write_text(json.dumps(states))
         text = self.replay('--enddate','2026-09-01','--candidate-window','2026-09-02/2026-09-02')
-        self.assertIn('vmA: proposal state outside replay',text)
+        self.assertIn('vmA: its configuration changed before the replay period',text)
         self.assertNotIn('G3-95W15/lower',text)
 
     def test_mixed_transition_minute_is_not_replayed(self):
@@ -107,7 +107,7 @@ class CandidateTest(unittest.TestCase):
         f.write_text(json.dumps(states))
         text = self.replay('--enddate','2026-09-01','--candidate-window','2026-09-02/2026-09-02')
         self.assertIn('2026-09-02 through 2026-09-02', text)
-        self.assertIn('vmA: uncapped shared state unverified', text)
+        self.assertIn('vmA: not confirmed as an uncapped shared-processor LPAR', text)
         self.assertIn('No eligible candidates', text)
 
 

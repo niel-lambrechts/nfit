@@ -140,33 +140,48 @@ monthly history.
 ### Shadow pressure and remedy
 
 The same runs add a **Pressure and remedy** section. For every eligible LPAR,
-each paired minute in which its busy cores were above its installed entitlement
-(work that depended on borrowing) is classified by what limited it: its VP width
-(PhysC at 95% of its VPs, pool open), the pool full with other LPARs busy
-(contested), the pool full with no other LPAR busy (alone), both, open (no limit
-observed) or unknown (pool state not observed).
+each paired minute in which its busy cores (PhysB) were above its installed
+entitlement, work that depended on borrowing, is classified by what limited it:
+its VPs (PhysC at 95% of its VPs, pool with room), the pool (full while other
+LPARs were busy, or full with this LPAR alone), both at once, nothing observed,
+or an unobserved pool state.
 
-The remedy is decided where the sizing is: on the minutes at or above the
-LPAR's **planning level**, its busy cores at the planning profile's percentile
-over the period (for G3-95W15, P95 of its minute busy). An LPAR is listed when
-that level is above its installed entitlement and at least 15 of those minutes
-were limited. Borrowing that met a limit only above the planning level is
-counted in one closing line, because the guarantee does not size for it.
+The remedy is decided where the sizing is. The **planning level** is the
+LPAR's planning profile applied to PhysB exactly as nFit applies it to PhysC:
+the profile's hours and weekday rule, its smoothing (for example a 15-minute
+EMA, restarted after a gap or an invalid sample), its `--filter-above-perc`
+rule and its percentile. It equals the PhysB profile value the engine writes
+to monthly history. The **qualifying minutes** are those of the profile's hours
+whose smoothed busy is at or above that level and whose busy is above the
+entitlement. An LPAR is listed when its planning level is above its
+entitlement and at least 15 qualifying minutes were limited. Borrowing that met
+a limit only above the planning level is counted in one closing line, because
+the guarantee does not size for it.
 
 - **review the VP width**: mostly at its VPs while the pool had room;
-- **review the guarantee**: mostly contested, and the pool's installed
-  guarantees leave room for what its contested LPARs need together; each needs
-  the larger of its proposal and its planning level, less its installed
-  entitlement;
+- **review the guarantee**: mostly a full pool with other LPARs busy, and the
+  room left by the pool's observed member entitlements holds what applying the
+  proposal (or covering the planning level, if higher) adds for this LPAR and
+  the other LPARs of the pool that met the same limit;
 - **review the pool**: competing guarantees or the pool maximum, when that room
-  is missing, or the LPAR alone filled the pool;
+  is missing (review the proposal alongside the other guarantees before
+  applying it), or the LPAR alone filled the pool;
 - **review the VP width and the pool together**: both limits, or each at least a
-  quarter of the limited minutes at the planning level.
+  quarter of the limited qualifying minutes.
 
-The pool's guarantees are its members' installed entitlements at the end of the
-period; reserved capacity is not collected. A full pool is not proof of lost
-work, and the size of a change that would clear the pressure is not measured.
-The section writes nothing to the CSV or to monthly history.
+Each LPAR shows the pool's reported size and the total of its observed member
+entitlements; an HMC pool reserve is not collected. A VP-width remedy is marked
+**weak evidence** when busy work at the planning level is under half the VPs:
+PhysC reached the VPs, the busy work did not, and a sustained run queue in the
+same minutes would be needed to confirm the limit. A full pool is not proof of
+lost work, and the change that would clear the pressure is not measured. The
+section writes nothing to the CSV or to monthly history.
+
+LPARs the shadow checks do not assess are named with the reason: excluded from
+automatic change (VIOS, standby LPAR, failover reserve), a peak-profile workload
+(hint P) for planner review, a role not known in the VM configuration, not
+confirmed as an uncapped shared-processor LPAR, or a configuration that differs
+from the proposal's or changed before the replay period.
 
 ### Shadow decision table and estate summary
 

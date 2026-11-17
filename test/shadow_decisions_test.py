@@ -66,7 +66,7 @@ class ShadowDecisionsTest(unittest.TestCase):
         path, rows = table(root)
         self.assertRegex(path.name, r'^nfit-profile\.SYNEX\.state-based\.decisions\.\d{8}.*\.csv$')
         self.assertEqual(sorted(rows), ['vmA', 'vmB', 'vmS', 'vmX'])
-        self.assertEqual(rows['vmX']['status'], 'not assessed: role unknown')
+        self.assertEqual(rows['vmX']['status'], 'not assessed: role not known in the VM configuration')
         text = ' '.join(log_text(root).split())
         for vm in ('vmA', 'vmB', 'vmS'):
             r = rows[vm]
