@@ -630,6 +630,11 @@ my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
 # test), and the most cuts in one pool searched exhaustively (four levels each).
 my @RECONCILE_BUDGETS  = ([ 'A', 0, 0, 0 ], [ 'B', 15, 3, 2 ], [ 'C', 60, 10, 10 ]);
 my $RECONCILE_MAX_CUTS = 6;
+# Pressure and remedy (v10 milestone 2.4): the fewest limited borrowing minutes
+# for an LPAR to be listed, and the share of them at which two limits count as
+# acting together.
+my $PRESSURE_MIN_MINUTES = 15;
+my $PRESSURE_BOTH_SHARE  = 0.25;
 # The rules of the evaluation. Any change here changes the rules hash, so
 # stored blocks are recomputed.
 my %MEMBER_EXPOSURE_RULES = (
@@ -1698,9 +1703,12 @@ foreach my $system_serial (@target_systems_to_process)
         my $tracks = _candidate_trackers($db, $saved->{members}, $asof, $from, $to, \@notes);
         my @reconcile_notes;
         my $joint = _reconcile_trackers($db, $saved->{members}, $asof, $from, $to, \@reconcile_notes);
-        _exposure_evaluate_window($pool, $exposure, [ @$tracks, @$joint ], $from, $to) if (@$tracks || @$joint);
+        my @pressure_notes;
+        my $pressure = _pressure_trackers($db, $saved->{members}, $asof, $from, $to, \@pressure_notes);
+        _exposure_evaluate_window($pool, $exposure, [ @$tracks, @$joint, @$pressure ], $from, $to) if (@$tracks || @$joint || @$pressure);
         print join("\n", _candidate_report($tracks, \@notes, $from, $to),
-                   _reconcile_report($joint, \@reconcile_notes, $from, $to)), "\n";
+                   _reconcile_report($joint, \@reconcile_notes, $from, $to),
+                   _pressure_report($pressure, $db, \@pressure_notes, $from, $to)), "\n";
         exit 0;
     }
     # Initialise the run end date to the effective end date by default
@@ -20837,6 +20845,20 @@ sub _exposure_process_day
             $acc->{classified}++ if $classified;
             $acc->{scarce}++     if $scarce;
             $tracker->{joint}{$minute} = [ $b, $competition ] if ($scarce && $tracker->{joint});
+            if ((my $pr = $tracker->{pressure}) && defined $ent && $b > $ent + $eps)
+            {
+                my $kind = $scarce ? ($own_width ? 'both' : $competition ? 'contested' : 'alone')
+                         : $own_width ? ($classified ? 'vpWidth' : 'unknown') : ($classified ? 'open' : 'unknown');
+                $pr->{counts}{$kind}++;
+                $pr->{coreMinutes}{$kind} += $b - $ent;
+                push @{ $pr->{contestedExcess} }, $b - $ent if $kind eq 'contested';
+                if ($kind ne 'open' && $kind ne 'unknown')
+                {
+                    $pr->{run} = (defined $pr->{last} && $pr->{last} == $minute - 60) ? $pr->{run} + 1 : 1;
+                    $pr->{last} = $minute;
+                    $pr->{longest} = $pr->{run} if $pr->{run} > $pr->{longest};
+                }
+            }
             if ($scarce)
             {
                 $acc->{localFull}++ if ($local eq 'scarce');
@@ -21427,6 +21449,151 @@ sub _reconcile_report
 }
 
 # ==============================================================================
+# Pressure and remedy (shadow, v10 milestone 2.4)
+# ------------------------------------------------------------------------------
+# For every eligible LPAR (the candidate test's rules), each paired minute in
+# which its busy cores were above its installed entitlement - work that
+# depended on borrowing - is classified by what limited it:
+#   vpWidth    PhysC at the own-width limit (95% of the VPs) and the pool open
+#   contested  the pool full and other LPARs busy, below the own-width limit
+#   alone      the pool full with no other LPAR busy, below the own-width limit
+#   both       the pool full and PhysC at the own-width limit
+#   open       neither: the borrowing met no limit that was observed
+#   unknown    the pool state was not observed (and not at the own-width limit)
+# An LPAR with at least $PRESSURE_MIN_MINUTES limited minutes gets one remedy:
+#   "VP width"           mostly vpWidth
+#   "guarantee"          mostly contested, and the pool's installed guarantees
+#                        leave room for the busy above this LPAR's guarantee
+#                        (median over its contested minutes)
+#   "pool"               mostly contested without that room, or mostly alone:
+#                        competing guarantees or the pool maximum
+#   "VP width and pool"  both, or VP-width and pool minutes each at least a
+#                        quarter of the limited minutes
+# The pool's guarantees are its members' installed entitlements at the end of
+# the period, from the configuration states; reserved capacity is not
+# collected. A full pool is not proof of lost work, and the size of a change
+# that would clear the pressure is not measured. Nothing is written to the CSV
+# or to history.
+# ==============================================================================
+# ($PRESSURE_MIN_MINUTES and $PRESSURE_BOTH_SHARE are declared with the member exposure constants.)
+
+sub _pressure_trackers
+{
+    my ($db, $members, $asof, $from, $to, $notes) = @_;
+    my (%eligible, %profiles);
+    foreach my $vm (sort keys %{ $members // {} })
+    {
+        my $m = $members->{$vm};
+        my $planning = $m->{planningProfile} // '';
+        next unless (defined $m->{installedEntitlement} && ref(($m->{profiles} // {})->{$planning}) eq 'HASH');
+        $eligible{$vm} = { %$m, profiles => { $planning => $m->{profiles}{$planning} } };
+        $profiles{$planning} = 1;
+    }
+    return [] unless %eligible;
+    my $trackers = _candidate_trackers($db, \%eligible, $asof, $from, $to, $notes, { none => [ sort keys %profiles ] }, sub
+    {
+        my ($vm, $meta) = @_;
+        return [] unless looks_like_number($meta->{entitlement} // '');
+        return [ { value => $meta->{entitlement} + 0, labels => [ 'installed' ] } ];
+    });
+    $_->{pressure} = { counts => {}, coreMinutes => {}, contestedExcess => [], longest => 0, run => 0, last => undef } for @$trackers;
+    return $trackers;
+}
+
+# Installed guarantees per pool at the end of the period (epoch $at).
+sub _pressure_pool_guarantees
+{
+    my ($db, $at) = @_;
+    my %sum;
+    foreach my $vm (keys %{ $db // {} })
+    {
+        my ($s) = grep { defined $_->{start_epoch} && defined $_->{end_epoch} && $_->{start_epoch} <= $at && $_->{end_epoch} >= $at - 86400 }
+                  @{ $db->{$vm} // [] };
+        next unless $s;
+        my $m = $s->{metadata} // {};
+        next unless (looks_like_number($m->{pool_id} // '') && looks_like_number($m->{entitlement} // ''));
+        $sum{ $m->{pool_id} + 0 } += $m->{entitlement};
+    }
+    return \%sum;
+}
+
+sub _pressure_median
+{
+    my @v = sort { $a <=> $b } @_;
+    return undef unless @v;
+    return @v % 2 ? $v[$#v / 2] : ($v[@v / 2 - 1] + $v[@v / 2]) / 2;
+}
+
+sub _pressure_report
+{
+    my ($trackers, $db, $notes, $from, $to) = @_;
+    my $guarantees = _pressure_pool_guarantees($db, $to - 60);
+    my @lines = ('', 'Pressure and remedy (shadow; the CSV is unchanged)',
+        sprintf('  %s through %s UTC, all hours. Minutes of busy work above the installed entitlement', gmtime($from)->ymd, gmtime($to - 1)->ymd),
+        '  (borrowing), by what limited them: VP width (PhysC at 95% of its VPs, pool open), pool',
+        '  contested (pool full, other LPARs busy), pool alone (pool full, no other LPAR busy), both',
+        '  (pool full at VP width), open (no limit observed), unknown (pool state not observed).',
+        sprintf('  Listed: LPARs with at least %d limited minutes. A full pool is not proof of lost work, and the', $PRESSURE_MIN_MINUTES),
+        '  size of a change that would clear the pressure is not measured.');
+    push @lines, map { "  $_" } @{ $notes // [] };
+    my @listed;
+    foreach my $t (sort { $a->{pool} <=> $b->{pool} || $a->{vm} cmp $b->{vm} } @$trackers)
+    {
+        my $p = $t->{pressure};
+        my %n = map { $_ => ($p->{counts}{$_} // 0) } qw(vpWidth contested alone both open unknown);
+        my $pool_minutes = $n{contested} + $n{alone};
+        my $limited = $n{vpWidth} + $pool_minutes + $n{both};
+        next if $limited < $PRESSURE_MIN_MINUTES;
+        my $ceiling = $t->{ceiling};
+        my $installed = $guarantees->{ $t->{pool} };
+        my $headroom = (defined $ceiling && defined $installed) ? $ceiling - $installed : undef;
+        my $need = _pressure_median(@{ $p->{contestedExcess} });
+        my ($remedy, $why);
+        if ($n{both} >= $PRESSURE_BOTH_SHARE * $limited
+            || ($n{vpWidth} >= $PRESSURE_BOTH_SHARE * $limited && $pool_minutes >= $PRESSURE_BOTH_SHARE * $limited))
+        {
+            ($remedy, $why) = ('review the VP width and the pool together',
+                'its busy work reached its VPs and the pool was full; changing one alone would leave the other limit');
+        }
+        elsif ($n{vpWidth} >= $pool_minutes + $n{both})
+        {
+            ($remedy, $why) = ('review the VP width', 'its busy work reached its VPs while the pool had room');
+        }
+        elsif ($n{alone} > $n{contested})
+        {
+            ($remedy, $why) = (($t->{pool} == 0 ? "review the frame's shared processor pool capacity" : 'review the pool maximum'),
+                'this LPAR alone filled the pool, below its VP width');
+        }
+        elsif (defined $headroom && defined $need && $headroom >= $need - 1e-9)
+        {
+            ($remedy, $why) = ('review the guarantee', sprintf('the pool was full while other LPARs were busy; its installed guarantees leave %.2f cores, '
+                . 'enough for the %.2f cores of busy work above this guarantee (median in those minutes)', $headroom, $need));
+        }
+        else
+        {
+            ($remedy, $why) = (($t->{pool} == 0 ? "review the frame's shared processor pool: competing guarantees or its capacity"
+                                                : 'review the pool: competing guarantees or the pool maximum'),
+                defined $headroom && defined $need
+                    ? sprintf('the pool was full while other LPARs were busy; its installed guarantees leave %.2f cores, less than the %.2f '
+                        . 'cores of busy work above this guarantee (median in those minutes)', $headroom, $need)
+                    : 'the pool was full while other LPARs were busy; the room for a higher guarantee is not known');
+        }
+        push @listed, $t;
+        push @lines, '', sprintf('  %s: pool %s (maximum %s; installed guarantees %s), %s, entitlement %.2f',
+            $t->{vm}, $t->{pool}, _pool_units_text($ceiling), (defined $installed ? sprintf('%.2f', $installed) : 'unknown'),
+            (defined $t->{vp} ? ($t->{vp} == 1 ? '1 VP' : "$t->{vp} VPs") : 'VPs unknown'), $t->{entitlement});
+        push @lines, sprintf('    Borrowing minutes: VP width %d, pool contested %d, pool alone %d, both %d, open %d, unknown %d.',
+            @n{qw(vpWidth contested alone both open unknown)});
+        push @lines, sprintf('    Busy core-minutes above the guarantee while limited: %.2f; longest limited run %d minute%s.',
+            (sum0(map { $p->{coreMinutes}{$_} // 0 } qw(vpWidth contested alone both))), $p->{longest}, ($p->{longest} == 1 ? '' : 's'));
+        push @lines, _rationale_wrap("Remedy: $remedy - $why.", '    ', '      ');
+        $t->{pressureRemedy} = $remedy;
+    }
+    push @lines, '', '  No LPAR with limited borrowing minutes.' unless @listed;
+    return @lines;
+}
+
+# ==============================================================================
 # SUBROUTINE: _log_cut_exposure
 # PURPOSE:    Writes the "Entitlement Cut Exposure" section (--pool-exposure):
 #             for each LPAR whose planning-profile entitlement is below its
@@ -21453,7 +21620,7 @@ sub _candidate_levels
 
 sub _candidate_trackers
 {
-    my ($db, $members, $asof, $from, $to, $notes, $populations) = @_;
+    my ($db, $members, $asof, $from, $to, $notes, $populations, $levels_cb) = @_;
     my (%states, %bounds);
     foreach my $vm (sort keys %$members)
     {
@@ -21486,7 +21653,7 @@ sub _candidate_trackers
         $bounds{$vm} = [$begin, $end];
         $states{$vm} = [$s];
     }
-    my $trackers = _exposure_trackers(\%states, $from, $to, $populations // _exposure_populations(), sub {
+    my $trackers = _exposure_trackers(\%states, $from, $to, $populations // _exposure_populations(), $levels_cb // sub {
         my ($vm, $meta, $population, $profiles) = @_;
         my %points;
         foreach my $profile (@$profiles)
@@ -21629,13 +21796,16 @@ sub _log_cut_exposure
         my $shadow = $candidates ? _candidate_trackers($states, $candidates, $window_end, $from, $to, \@notes) : [];
         my @reconcile_notes;
         push @$shadow, @{ _reconcile_trackers($states, $candidates, $window_end, $from, $to, \@reconcile_notes) } if $candidates;
+        my @pressure_notes;
+        push @$shadow, @{ _pressure_trackers($states, $candidates, $window_end, $from, $to, \@pressure_notes) } if $candidates;
         my @same_window = (@$trackers, defined $replay_from ? () : @$shadow);
         my $counts = @same_window ? _exposure_evaluate_window($pool_context, $exposure_context, \@same_window, $window_start, $window_end) : {};
         _exposure_evaluate_window($pool_context, $exposure_context, $shadow, $from, $to) if defined $replay_from && @$shadow;
         if ($candidates)
         {
-            @shadow = (_candidate_report([ grep { !$_->{joint} } @$shadow ], \@notes, $from, $to),
-                       _reconcile_report([ grep { $_->{joint} } @$shadow ], \@reconcile_notes, $from, $to));
+            @shadow = (_candidate_report([ grep { !$_->{joint} && !$_->{pressure} } @$shadow ], \@notes, $from, $to),
+                       _reconcile_report([ grep { $_->{joint} } @$shadow ], \@reconcile_notes, $from, $to),
+                       _pressure_report([ grep { $_->{pressure} } @$shadow ], $states, \@pressure_notes, $from, $to));
         }
         _task(sprintf('Cut exposure evaluated (%s)', format_duration(time() - $started)));
         $summary{Status} = 'evaluated';

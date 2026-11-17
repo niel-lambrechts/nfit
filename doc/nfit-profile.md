@@ -136,3 +136,27 @@ excess core-minutes), the section names the combination of candidate
 entitlements that releases the most guarantee within it. Up to six cuts in one
 pool are searched exhaustively. The section writes nothing to the CSV or to
 monthly history.
+
+### Shadow pressure and remedy
+
+The same runs add a **Pressure and remedy** section. For every eligible LPAR,
+each paired minute in which its busy cores were above its installed entitlement
+(work that depended on borrowing) is classified by what limited it: its VP width
+(PhysC at 95% of its VPs, pool open), the pool full with other LPARs busy
+(contested), the pool full with no other LPAR busy (alone), both, open (no limit
+observed) or unknown (pool state not observed). An LPAR with at least 15 limited
+minutes gets one remedy:
+
+- **review the VP width**: mostly at its VPs while the pool had room;
+- **review the guarantee**: mostly contested, and the pool's installed
+  guarantees leave room for the busy work above this LPAR's guarantee (median
+  over its contested minutes);
+- **review the pool**: competing guarantees or the pool maximum, when that room
+  is missing, or the LPAR alone filled the pool;
+- **review the VP width and the pool together**: both limits, or each at least a
+  quarter of the limited minutes.
+
+The pool's guarantees are its members' installed entitlements at the end of the
+period; reserved capacity is not collected. A full pool is not proof of lost
+work, and the size of a change that would clear the pressure is not measured.
+The section writes nothing to the CSV or to monthly history.
