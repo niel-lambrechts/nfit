@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/estate-impact
+# PURPOSE  : Combines the shadow decision tables (nfit-profile --candidate-test,
+#            output/nfit-profile.<system>.<model>.decisions.<date>.csv) of
+#            several systems into one estate table and a short summary for
+#            scoring (v10 milestone 2.5). It reads only those tables and changes
+#            nothing. The newest table per system and model is used; replay
+#            tables (--candidate-proposals) only with --replay.
+#            The summary carries system and LPAR names as the tables do: pipe it
+#            through dev/nfit-redact before sharing it.
+# USAGE    : dev/estate-impact [--output-dir DIR] [--model MODEL] [--replay]
+#                              [--expect SYS1,SYS2,...] [--out FILE]
+# ==============================================================================
+import argparse
+import csv
+import os
+import re
+import sys
+from collections import Counter, defaultdict
+
+NAME = re.compile(r'^nfit-profile\.(?P<system>[^.]+)\.(?P<model>[^.]+)\.decisions\.(?P<tag>.+)\.csv$')
+REMEDIES = ('review the VP width', 'review the guarantee', 'review the pool: competing guarantees or the pool maximum',
+            'review the pool maximum', 'review the VP width and the pool together')
+
+
+def number(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def tables(directory, model, replay):
+    newest = {}
+    for name in os.listdir(directory):
+        m = NAME.match(name)
+        if not m or (model and m['model'] != model) or (m['tag'].startswith('replay-') != replay):
+            continue
+        path = os.path.join(directory, name)
+        key = (m['system'], m['model'])
+        if key not in newest or os.path.getmtime(path) > os.path.getmtime(newest[key]):
+            newest[key] = path
+    return newest
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Combine nfit-profile shadow decision tables into an estate summary.')
+    ap.add_argument('--output-dir', default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'output'))
+    ap.add_argument('--model', help='only this model (e.g. hybrid-state-decay)')
+    ap.add_argument('--replay', action='store_true', help='use the replay tables instead of the tactical ones')
+    ap.add_argument('--expect', default='', help='comma-separated systems that should be present')
+    ap.add_argument('--out', help='write the combined estate table here')
+    a = ap.parse_args()
+
+    found = tables(a.output_dir, a.model, a.replay)
+    rows = []
+    for (system, model), path in sorted(found.items()):
+        with open(path, newline='') as fh:
+            rows += list(csv.DictReader(fh))
+    if a.out:
+        with open(a.out, 'w', newline='') as fh:
+            columns = list(rows[0].keys()) if rows else []
+            w = csv.DictWriter(fh, fieldnames=columns)
+            w.writeheader()
+            w.writerows(rows)
+
+    out = ['nFit estate impact (shadow decisions; no recommendation is changed)']
+    models = sorted({m for _, m in found})
+    out.append(f"Tables: {len({s for s, _ in found})} system(s), model(s) {', '.join(models) or 'none'}"
+               + (' (replay)' if a.replay else '') + '.')
+    expected = [s for s in a.expect.split(',') if s]
+    missing = [s for s in expected if s not in {s for s, _ in found}]
+    if missing:
+        out.append('Expected but without a table: ' + ', '.join(missing) + '.')
+
+    by_system = defaultdict(list)
+    for r in rows:
+        by_system[(r['system'], r['model'])].append(r)
+    unassessed = []
+    for key, rs in sorted(by_system.items()):
+        if not any(r['status'] == 'assessed' for r in rs):
+            reasons = Counter(r['status'].removeprefix('not assessed: ') for r in rs)
+            unassessed.append(f"{key[0]} ({key[1]}): {', '.join(sorted(reasons))}")
+    if unassessed:
+        out.append('Systems not assessed: ' + '; '.join(unassessed) + '.')
+
+    assessed = [r for r in rows if r['status'] == 'assessed']
+    reasons = Counter(r['status'].removeprefix('not assessed: ') for r in rows if r['status'] != 'assessed')
+    out.append(f'LPARs: {len(rows)}; assessed {len(assessed)}; not assessed {len(rows) - len(assessed)}'
+               + (' (' + ', '.join(f'{k} {v}' for k, v in sorted(reasons.items())) + ')' if reasons else '') + '.')
+
+    def release(r, level):
+        inst, value = number(r['installedEntitlement']), number(level)
+        return max(0.0, inst - value) if inst is not None and value is not None else None
+
+    cuts = [r for r in assessed if (number(r['change']) or 0) < -0.005]
+    rises = [r for r in assessed if (number(r['change']) or 0) > 0.005]
+    out.append('')
+    out.append('Entitlement cuts (planning-profile proposal below the installed entitlement), assessed LPARs:')
+    out.append(f"  {len(cuts)} cut(s); guarantee released at the proposals: {sum(-number(r['change']) for r in cuts):.2f} cores.")
+    joint = [r for r in cuts if (number(r['poolAllExposedMinutes']) or 0) > 0]
+    out.append(f"  In pools where the cuts were exposed together: {len(joint)} LPAR(s), "
+               f"{sum(-number(r['change']) for r in joint):.2f} cores.")
+    reconciled = [r for r in cuts if r['budgetA'] or r['budgetB'] or r['budgetC']]
+    for budget in ('A', 'B', 'C'):
+        values = [release(r, r[f'budget{budget}']) for r in reconciled]
+        deeper = sum(1 for r in reconciled if number(r[f'budget{budget}']) is not None
+                     and number(r[f'budget{budget}']) < number(r['proposedEntitlement']) - 0.005)
+        out.append(f"  Released within budget {budget}: {sum(v for v in values if v is not None):.2f} cores "
+                   f"on {len(reconciled)} reconciled cut(s)" + (f' (at the proposals: {sum(-number(r["change"]) for r in reconciled):.2f})' if reconciled else '')
+                   + (f'; {deeper} deeper than the proposal' if deeper else '') + '.')
+    out.append(f"  Increases proposed: {len(rises)}, {sum(number(r['change']) for r in rises):.2f} cores.")
+
+    out.append('')
+    out.append('Pressure at the planning level, assessed LPARs:')
+    for remedy in REMEDIES:
+        group = [r for r in assessed if r['remedy'] == remedy]
+        if not group:
+            continue
+        weak = sum(r['evidence'] == 'weak' for r in group)
+        need = sum(number(r['need']) or 0 for r in group)
+        out.append(f'  {remedy}: {len(group)}' + (f', of which weak evidence {weak}' if weak else '')
+                   + (f'; needs {need:.2f} cores' if need else '') + '.')
+    other = Counter(r['remedy'] for r in assessed if r['remedy'] not in REMEDIES and r['remedy'])
+    for status, n in sorted(other.items()):
+        out.append(f'  {status}: {n}.')
+
+    out.append('')
+    out.append('Per system and model: assessed / cuts / released at proposals / within B / remedies (weak).')
+    for key, rs in sorted(by_system.items()):
+        ok = [r for r in rs if r['status'] == 'assessed']
+        c = [r for r in ok if (number(r['change']) or 0) < -0.005]
+        b = sum(v for v in (release(r, r['budgetB']) for r in c if r['budgetB']) if v is not None)
+        remedies = [r for r in ok if r['remedy'] in REMEDIES]
+        weak = sum(r['evidence'] == 'weak' for r in remedies)
+        out.append(f"  {key[0]} {key[1]}: {len(ok)} / {len(c)} / {sum(-number(r['change']) for r in c):.2f} / {b:.2f} / "
+                   f"{len(remedies)} ({weak})")
+    print('\n'.join(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

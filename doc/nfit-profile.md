@@ -167,3 +167,24 @@ The pool's guarantees are its members' installed entitlements at the end of the
 period; reserved capacity is not collected. A full pool is not proof of lost
 work, and the size of a change that would clear the pressure is not measured.
 The section writes nothing to the CSV or to monthly history.
+
+### Shadow decision table and estate summary
+
+With `--candidate-test`, a run also writes
+`output/nfit-profile.<system>.<model>.decisions.<date>.csv` beside its CSV
+report; `--candidate-proposals` writes `...decisions.replay-<from>_<to>.csv`.
+There is one row per LPAR: the installed and proposed entitlement for its
+planning profile, the candidate test at that proposal, the pool
+reconciliation's entitlement within each budget, and the pressure remedy with
+its need and evidence. An LPAR the shadow checks could not assess carries the
+reason in `status`. Evidence is `weak` for a VP-width remedy when busy work at
+the planning level is under half the VPs: PhysC reached the VPs, the busy work
+did not, and a sustained run queue would be needed to confirm the limit.
+
+`dev/estate-impact` combines the newest table per system and model in `output/`
+(`--replay` for replay tables, `--expect SYS1,SYS2` to name missing systems,
+`--out FILE` for the combined table) and prints a summary: LPARs assessed and
+not, guarantee released at the proposals and within each budget, increases
+proposed, and remedies with their evidence. The tables and the summary carry
+system and LPAR names; pipe the summary through `dev/nfit-redact` before
+sharing it. Neither changes a recommendation.

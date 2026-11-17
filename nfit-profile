@@ -635,6 +635,17 @@ my $RECONCILE_MAX_CUTS = 6;
 # acting together.
 my $PRESSURE_MIN_MINUTES = 15;
 my $PRESSURE_BOTH_SHARE  = 0.25;
+# A VP-width finding is marked weak when busy work at the planning level is below
+# this share of the VPs: PhysC reached the VPs, the busy work did not.
+my $PRESSURE_WEAK_VP_SHARE = 0.5;
+# Shadow decision table (v10 milestone 2.5): its columns, in order.
+my @SHADOW_DECISION_COLUMNS = qw(
+    system model sizingStart sizingEnd replayStart replayEnd vm status pool poolMaximum
+    installedEntitlement installedVPs tier planningProfile proposedEntitlement change
+    aboveMinutes fullMinutesAbove newContested longestFullRun fullExcessCoreMinutes classifiedMinutes pairedMinutes
+    poolFullMinutes poolAllExposedMinutes budgetA budgetB budgetC
+    planningLevel limitedMinutes vpWidthMinutes contestedMinutes aloneMinutes bothMinutes remedy need evidence
+);
 # The rules of the evaluation. Any change here changes the rules hash, so
 # stored blocks are recomputed.
 my %MEMBER_EXPOSURE_RULES = (
@@ -1697,7 +1708,7 @@ foreach my $system_serial (@target_systems_to_process)
         my $pool = _pool_history_context($current_cache_path);
         my ($exposure, $why) = _exposure_context($current_cache_path, $pool);
         print "Proposal model $saved->{model}, sizing window $saved->{window}{start} through $saved->{window}{end}\n";
-        if (!$exposure) { print "Shadow entitlement candidates: unavailable ($why).\n"; exit 0; }
+        if (!$exposure) { print "Shadow entitlement candidates: unavailable ($why).\n"; exit 0; }       # no decision table without evidence
         my @notes;
         my $db = _exposure_load_states($current_cache_path);
         my $tracks = _candidate_trackers($db, $saved->{members}, $asof, $from, $to, \@notes);
@@ -1709,6 +1720,13 @@ foreach my $system_serial (@target_systems_to_process)
         print join("\n", _candidate_report($tracks, \@notes, $from, $to),
                    _reconcile_report($joint, \@reconcile_notes, $from, $to),
                    _pressure_report($pressure, $db, \@pressure_notes, $from, $to)), "\n";
+        my $rows = _shadow_decision_rows({ members => $saved->{members}, trackers => [ @$tracks, @$joint, @$pressure ],
+            notes => [ @pressure_notes, @notes ], from => $from, to => $to, model => $saved->{model},
+            sizingStart => $saved->{window}{start}, sizingEnd => $saved->{window}{end}, system => basename($current_cache_path) });
+        my ($sys_name, $model_name) = map { s/[^a-zA-Z0-9_.-]//gr } (basename($current_cache_path), $saved->{model});
+        my $path = _write_shadow_decisions(File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.decisions.replay-%s_%s.csv',
+            $sys_name, $model_name, gmtime($from)->ymd, gmtime($to - 1)->ymd)), $rows);
+        print "Decision table: $path\n";
         exit 0;
     }
     # Initialise the run end date to the effective end date by default
@@ -2672,6 +2690,15 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                     \@profiles, \%vm_tier_overrides, $current_cache_path, $effective_start_date_obj, $effective_end_date_obj, $candidate_test ? \%proposals : undef);
                 printf STDERR "  [INFO] Entitlement cut exposure: %d cut(s), %d evaluated, %d to review (%s; see rationale)\n",
                     $exposure_summary->{Cuts}, $exposure_summary->{Evaluated}, $exposure_summary->{Advisories}, $exposure_summary->{Status};
+            }
+
+            # Shadow decision table (v10 milestone 2.5): one row per LPAR beside the CSV.
+            if ($exposure_summary && $exposure_summary->{DecisionRows})
+            {
+                my ($sys_name, $model_name) = map { s/[^a-zA-Z0-9_.-]//gr } ($system_identifier || 'standard', $report_type_for_filename);
+                $_->{model} = $model_name for @{ $exposure_summary->{DecisionRows} };
+                push @generated_files, _write_shadow_decisions(File::Spec->catfile($output_dir,
+                    "nfit-profile.$sys_name.$model_name.decisions.$unique_date_suffix.csv"), $exposure_summary->{DecisionRows});
             }
 
             # Recommended Actions: what the checks above ask of the planner.
@@ -21329,6 +21356,7 @@ sub _reconcile_report
             ($excluded ? sprintf(' (%d more without a paired sample for every member are left out)', $excluded) : ''));
         push @lines, sprintf('    %d paired member-minute%s could not be classified; results apply to classified minutes only.',
             $unclassified, ($unclassified == 1 ? '' : 's')) if $unclassified;
+        $_->{reconcile} = { poolMinutes => scalar(@minutes) } for @t;
         next unless @minutes;
 
         # Bit positions, with a gap bit between non-consecutive minutes so runs never join across a gap.
@@ -21434,6 +21462,11 @@ sub _reconcile_report
             my $i = 0;
             while ($i < $n && ++$choice[$i] > $#{ $levels[$i] }) { $choice[$i] = 0; $i++; }
             last if $i == $n;
+        }
+        foreach my $i (0 .. $#t)
+        {
+            $t[$i]{reconcile}{allExposed} = $together{$n} // 0;
+            $t[$i]{reconcile}{budgets}{$_} = $levels[$i][ $best{$_}{choice}[$i] ]{value} for grep { $best{$_} } keys %best;
         }
         push @lines, '    Most guarantee released within each budget (entitlement per LPAR; released cores; exposed minutes / longest run / excess core-min):';
         foreach my $budget (@RECONCILE_BUDGETS)
@@ -21587,6 +21620,9 @@ sub _pressure_report
         {
             my $any = sum0(map { sum0(map { $_->[0] } values %{ $t->{pressure}{hist}{$_} // {} }) } qw(vpWidth contested alone both));
             $below_level++ if $any >= $PRESSURE_MIN_MINUTES;
+            $t->{pressureResult} = { level => $f->{level}, n => \%n, limited => $limited,
+                status => ($f->{level} <= $ent + 1e-9 ? ($any >= $PRESSURE_MIN_MINUTES ? 'limited only above the planning level' : 'within its guarantee at the planning level')
+                                                      : 'too few limited minutes at the planning level') };
             next;
         }
         my $proposal = $t->{pressure}{proposal};
@@ -21653,12 +21689,125 @@ sub _pressure_report
         push @lines, sprintf('    Busy core-minutes above the guarantee in its limited minutes: %.2f; longest limited run (any level) %d minute%s.',
             sum0(map { $f->{core}{$_} } qw(vpWidth contested alone both)), $p->{longest}, ($p->{longest} == 1 ? '' : 's'));
         push @lines, _rationale_wrap("Remedy: $remedy - $why.", '    ', '      ');
+        my $evidence = 'measured';
+        if (($r->{kind} eq 'vpWidth' || $r->{kind} eq 'both') && defined $t->{vp} && $t->{vp} > 0
+            && $f->{level} < $PRESSURE_WEAK_VP_SHARE * $t->{vp} - 1e-9)
+        {
+            $evidence = 'weak';
+            push @lines, _rationale_wrap(sprintf('Evidence: weak - PhysC reached its %s, but busy work at the planning level is %.2f cores. '
+                . 'A low busy share can still be busy threads; a sustained run queue would confirm the VP limit.',
+                ($t->{vp} == 1 ? 'VP' : "$t->{vp} VPs"), $f->{level}), '    ', '      ');
+        }
         $t->{pressureRemedy} = $remedy;
+        $t->{pressureResult} = { level => $f->{level}, n => \%n, limited => $r->{limited}, need => $r->{need},
+                                 kind => $r->{kind}, remedy => $remedy, evidence => $evidence };
     }
     push @lines, '', '  No LPAR with limited borrowing at its planning level.' unless @listed;
     push @lines, '', sprintf('  %d more LPAR%s borrowed against a limit only above %s planning level, which the guarantee does not size for.',
         $below_level, ($below_level == 1 ? '' : 's'), ($below_level == 1 ? 'its' : 'their')) if $below_level;
     return @lines;
+}
+
+# ==============================================================================
+# Shadow decision table (v10 milestone 2.5)
+# ------------------------------------------------------------------------------
+# With --candidate-test (or --candidate-proposals), one CSV row per LPAR of the
+# run beside the CSV report: what the incumbent proposes, how its planning-
+# profile proposal fared against measured busy work and pool scarcity, what
+# the pool reconciliation chose within each budget, and the pressure remedy
+# with the strength of its evidence. An LPAR the shadow checks could not assess
+# carries the reason. The table changes no recommendation; dev/estate-impact
+# combines the tables of several systems for scoring.
+# ==============================================================================
+# (@SHADOW_DECISION_COLUMNS is declared with the member exposure constants.)
+
+sub _shadow_decision_rows
+{
+    my ($args) = @_;
+    my $members = $args->{members} // {};
+    my %note;
+    foreach my $line (@{ $args->{notes} // [] })
+    {
+        my ($vm, $reason) = $line =~ /^(.+?): (.+)$/ or next;
+        $note{$vm} //= $reason;
+    }
+    my $population_of = _exposure_profile_populations();
+    my (%candidate, %joint, %pressure);
+    foreach my $t (@{ $args->{trackers} // [] })
+    {
+        if    ($t->{pressure}) { $pressure{ $t->{vm} } = $t; }
+        elsif ($t->{joint})    { $joint{ $t->{vm} }    = $t; }
+        else                   { push @{ $candidate{ $t->{vm} } }, $t; }
+    }
+    my $fmt = sub { my ($x) = @_; return defined $x ? sprintf('%.2f', $x) : ''; };
+    my @rows;
+    foreach my $vm (sort keys %$members)
+    {
+        my $m = $members->{$vm};
+        my $planning = $m->{planningProfile} // '';
+        my $proposal = (($m->{profiles} // {})->{$planning} // {})->{entitlement};
+        my %row = (
+            system => $args->{system}, model => $args->{model}, sizingStart => $args->{sizingStart}, sizingEnd => $args->{sizingEnd},
+            replayStart => gmtime($args->{from})->ymd, replayEnd => gmtime($args->{to} - 1)->ymd, vm => $vm,
+            pool => $m->{poolId}, installedEntitlement => $fmt->($m->{installedEntitlement}), installedVPs => $m->{installedVPs},
+            tier => $m->{tier}, planningProfile => $planning, proposedEntitlement => $fmt->($proposal),
+            change => (defined $proposal && defined $m->{installedEntitlement}) ? $fmt->($proposal - $m->{installedEntitlement}) : '',
+        );
+        my $p = $pressure{$vm};
+        if ($args->{unavailable})          { $row{status} = "not assessed: $args->{unavailable}"; }
+        elsif (!$p)                        { $row{status} = 'not assessed: ' . ($note{$vm} // 'no configuration state in the replay'); }
+        else                               { $row{status} = 'assessed'; }
+        if ($p)
+        {
+            $row{poolMaximum} = defined $p->{ceiling} ? $p->{ceiling} : '';
+            my $total = _exposure_totals($p);
+            @row{qw(classifiedMinutes pairedMinutes)} = @$total{qw(classified paired)};
+            my $r = $p->{pressureResult} // {};
+            $row{planningLevel}  = $fmt->($r->{level});
+            $row{limitedMinutes} = $r->{limited} // '';
+            @row{qw(vpWidthMinutes contestedMinutes aloneMinutes bothMinutes)} = map { ($r->{n} // {})->{$_} // '' } qw(vpWidth contested alone both);
+            $row{remedy}   = $r->{remedy} // ($r->{status} // '');
+            $row{need}     = $fmt->($r->{need});
+            $row{evidence} = $r->{evidence} // '';
+        }
+        # The candidate test at the planning-profile proposal (cuts only).
+        my $population = $population_of->{$planning} // 'none';
+        foreach my $t (grep { $_->{population} eq $population } @{ $candidate{$vm} // [] })
+        {
+            my ($k) = grep { grep { $_ eq "$planning/proposal" || $_ eq "$planning/widthFloor" } @{ $t->{thresholds}[$_]{labels} // [] } }
+                      0 .. $#{ $t->{thresholds} };
+            next unless defined $k;
+            my $e = _exposure_totals($t)->{exposure}[$k];
+            my $s = $t->{candidateStats}[$k] // {};
+            @row{qw(aboveMinutes fullMinutesAbove longestFullRun)} = ($e->[0], $e->[2], $e->[6]);
+            $row{newContested} = $s->{newContested} // 0;
+            $row{fullExcessCoreMinutes} = $fmt->($s->{fullExcess} // 0);
+        }
+        if (my $j = $joint{$vm})
+        {
+            my $rc = $j->{reconcile} // {};
+            $row{poolFullMinutes}       = $rc->{poolMinutes} // '';
+            $row{poolAllExposedMinutes} = $rc->{allExposed} // '';
+            $row{"budget$_"} = $fmt->(($rc->{budgets} // {})->{$_}) for qw(A B C);
+        }
+        push @rows, \%row;
+    }
+    return \@rows;
+}
+
+sub _write_shadow_decisions
+{
+    my ($path, $rows) = @_;
+    my $cell = sub {
+        my ($v) = @_;
+        $v //= '';
+        return ($v =~ /[",\n]/) ? '"' . ($v =~ s/"/""/gr) . '"' : $v;
+    };
+    open my $fh, '>', $path or die "[ERROR] Cannot write '$path': $!\n";
+    print {$fh} join(',', @SHADOW_DECISION_COLUMNS), "\n";
+    print {$fh} join(',', map { $cell->($_) } @{$_}{@SHADOW_DECISION_COLUMNS}), "\n" for @$rows;
+    close $fh or die "[ERROR] Cannot write '$path': $!\n";
+    return $path;
 }
 
 # ==============================================================================
@@ -21874,6 +22023,9 @@ sub _log_cut_exposure
             @shadow = (_candidate_report([ grep { !$_->{joint} && !$_->{pressure} } @$shadow ], \@notes, $from, $to),
                        _reconcile_report([ grep { $_->{joint} } @$shadow ], \@reconcile_notes, $from, $to),
                        _pressure_report([ grep { $_->{pressure} } @$shadow ], $states, \@pressure_notes, $from, $to));
+            $summary{DecisionRows} = _shadow_decision_rows({ members => $candidates, trackers => $shadow,
+                notes => [ @pressure_notes, @notes ], from => $from, to => $to,
+                sizingStart => $start_obj->ymd, sizingEnd => $end_obj->ymd, system => basename($cache_dir) });
         }
         _task(sprintf('Cut exposure evaluated (%s)', format_duration(time() - $started)));
         $summary{Status} = 'evaluated';
@@ -21934,6 +22086,9 @@ sub _log_cut_exposure
     }
     push @out, '';
     push @shadow, '', "Shadow entitlement candidates: unavailable ($reason)." if $candidates && !$exposure_context;
+    $summary{DecisionRows} //= _shadow_decision_rows({ members => $candidates, unavailable => ($reason || 'not evaluated'),
+        from => $start_obj->epoch, to => $end_obj->epoch + 86400, sizingStart => $start_obj->ymd, sizingEnd => $end_obj->ymd,
+        system => basename($cache_dir) }) if $candidates;
     print {$log_fh} join("\n", @out, @shadow), "\n";
     return \%summary;
 }
