@@ -119,7 +119,7 @@ class PowerHARoleTests(unittest.TestCase):
     def test_handover_across_systems_is_reported(self):
         s = self.section()
         self.assertIn('hanodeA, hanodeB (compared on PhysC)', s)
-        self.assertIn('Possible workload handover from hanodeA to hanodeB: 13 Sep', s)
+        self.assertIn('Possible workload handover from hanodeA to hanodeB: 13 Sep 2026', s)
         self.assertIn('the new levels hold to the end of the period. PowerHA ownership not confirmed.', s)
         self.assertIn('hanodeB active-like, its peer standby-like', s)
         self.assertIn('Role of hanodeA: standby (inferred)', s)

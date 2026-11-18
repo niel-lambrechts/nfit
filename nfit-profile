@@ -13013,9 +13013,10 @@ sub _ha_role_evidence
                     return _exposure_population_admits($key, ($day + 4) % 7, int(($t % 86400) / 60));
                 };
             }
-            $c{Detection} = _ha_detect_pair($node_a, $node_b,
-                _ha_blocks($minutes{$node_a}, $from, $to, $states_of{$node_a}), _ha_blocks($minutes{$node_b}, $from, $to, $states_of{$node_b}),
-                $from, \%windows);
+            my @blocks = (_ha_blocks($minutes{$node_a}, $from, $to, $states_of{$node_a}),
+                          _ha_blocks($minutes{$node_b}, $from, $to, $states_of{$node_b}));
+            $c{Detection} = _ha_detect_pair($node_a, $node_b, @blocks, $from, \%windows);
+            $c{Blocks} = \@blocks;                    # for the calibration detail only
             $c{Metric} = $c{Detection}{Metric};
         }
         $c{Roles} = _ha_resolve_roles($members, $c{Detection}, $c{Reason}, \&_vms_config_settings, sub
@@ -13026,6 +13027,31 @@ sub _ha_role_evidence
         push @result, \%c;
     }
     return \@result;
+}
+
+# Calibration detail (NFIT_HA_DETAIL): the hourly medians of both nodes for
+# six hours either side of a transition.
+sub _ha_detail_levels
+{
+    my ($cluster, $start_block, $metric) = @_;
+    my $rules = _ha_role_rules();
+    my ($blocks_a, $blocks_b) = @{ $cluster->{Blocks} };
+    my $key = ($metric // '') eq 'PhysB' ? 'b_med' : 'c_med';
+    my @members = @{ $cluster->{Members} };
+    my $per_hour = int(3600 / $rules->{blockSeconds});
+    my @lines = (sprintf('        %-17s %10s %10s', 'hour (UTC)', $members[0], $members[1]));
+    foreach my $h (-6 .. 5)
+    {
+        my $first = $start_block + $h * $per_hour;
+        next if ($first < 0);
+        my @a = grep { defined } map { $blocks_a->[$_] ? $blocks_a->[$_]{$key} : undef } ($first .. $first + $per_hour - 1);
+        my @b = grep { defined } map { $blocks_b->[$_] ? $blocks_b->[$_]{$key} : undef } ($first .. $first + $per_hour - 1);
+        my ($ma) = _ha_median_mad(@a);
+        my ($mb) = _ha_median_mad(@b);
+        push @lines, sprintf('        %-17s %10s %10s', gmtime($cluster->{Window}[0] + $first * $rules->{blockSeconds})->strftime('%d %b %Y %H:00'),
+            (defined $ma ? sprintf('%.2f', $ma) : '-'), (defined $mb ? sprintf('%.2f', $mb) : '-'));
+    }
+    return @lines;
 }
 
 # ==============================================================================
@@ -13042,7 +13068,11 @@ sub _log_powerha_roles
     my ($log_fh, $evidence_aref, $proposals) = @_;
     return 0 unless (ref($evidence_aref) eq 'ARRAY' && @$evidence_aref);
     my $rules = _ha_role_rules();
-    my $when = sub { return gmtime($_[0])->strftime('%d %b %H:%M'); };
+    my $when = sub { return gmtime($_[0])->strftime('%d %b %Y %H:%M'); };
+    my $day  = sub { return gmtime($_[0])->strftime('%d %b %Y'); };
+    # NFIT_HA_DETAIL=1: calibration detail (every short candidate, the segment
+    # statistics and the hourly levels around each sustained transition).
+    my $detail = $ENV{NFIT_HA_DETAIL} ? 1 : 0;
     my $span = sub
     {
         my ($blocks) = @_;
@@ -13058,14 +13088,23 @@ sub _log_powerha_roles
     {
         my @members = @{ $cluster->{Members} };
         push @out, '', sprintf('    %s%s', join(', ', @members), (defined $cluster->{Metric} ? " (compared on $cluster->{Metric})" : ''));
+        push @out, sprintf('      Period: %s to %s UTC.', $day->($cluster->{Window}[0]), $day->($cluster->{Window}[1] - 1));
         push @out, "      $cluster->{Reason}." if (($cluster->{Reason} // '') ne '');
         my $detection = $cluster->{Detection};
         if (ref($detection) eq 'HASH')
         {
             my @all = @{ $detection->{Transitions} };
+            my @short = grep { !$_->{Sustained} } @all;
+            if (@short && !$detail)
+            {
+                push @out, _rationale_wrap(sprintf('%d short handover candidate%s (under one hour), %s to %s UTC.', scalar(@short),
+                    (@short == 1 ? '' : 's'), $when->($short[0]{To} - $rules->{blockSeconds}),
+                    $when->($short[-1]{To} - $rules->{blockSeconds})), '      ', '        ');
+            }
             foreach my $i (0 .. $#all)
             {
                 my $t = $all[$i];
+                next if (!$t->{Sustained} && !$detail);
                 my ($next) = grep { $_->{Sustained} } @all[ $i + 1 .. $#all ];
                 my $until = defined $next ? 'until ' . $when->($next->{From}) . ' UTC' : 'to the end of the period';
                 my $text = $t->{Sustained}
@@ -13077,15 +13116,31 @@ sub _log_powerha_roles
                 $text .= ' A configuration change coincides with it.' if ($t->{Ambiguous});
                 $text .= ' PowerHA ownership not confirmed.' if ($t->{Sustained});
                 push @out, _rationale_wrap($text, '      ', '        ');
+                if ($detail && $t->{Sustained} && ref($cluster->{Blocks}) eq 'ARRAY')
+                {
+                    push @out, _ha_detail_levels($cluster, $t->{StartBlock}, $detection->{Metric});
+                }
             }
-            push @out, '      No workload handover detected in this period.' unless (@{ $detection->{Transitions} });
-            my $latest = $detection->{Segments}[-1];
-            if ($latest)
+            push @out, '      No sustained workload handover detected in this period.' unless (grep { $_->{Sustained} } @all);
+            my @segments = @{ $detection->{Segments} };
+            foreach my $i (0 .. $#segments)
             {
-                my $verdict = ($latest->{Outcome} eq 'ACTIVE_STANDBY') ? "$latest->{Active} active-like, its peer standby-like"
-                            : ($latest->{Outcome} eq 'MULTIPLE_ACTIVE') ? 'more than one node active-like'
-                            : "unresolved ($latest->{Reason})";
-                push @out, sprintf('      Latest period from %s: %s.', $when->($latest->{From}), $verdict);
+                my $seg = $segments[$i];
+                my $verdict = ($seg->{Outcome} eq 'ACTIVE_STANDBY') ? "$seg->{Active} active-like, its peer standby-like"
+                            : ($seg->{Outcome} eq 'MULTIPLE_ACTIVE') ? 'more than one node active-like'
+                            : "unresolved ($seg->{Reason})";
+                push @out, sprintf('      %s %s: %s.', ($i == $#segments ? 'Latest period from' : 'Period from'),
+                    ($i == 0 ? $day->($seg->{From}) : $when->($seg->{From}) . ' UTC'), $verdict);
+                if ($detail)
+                {
+                    foreach my $key (sort keys %{ $seg->{Windows} // {} })
+                    {
+                        my $w = $seg->{Windows}{$key};
+                        push @out, sprintf('        window %s: %d supported blocks, %d separated; %s leads %.2f, %s leads %.2f (%s)',
+                            $key, $w->{Blocks} // 0, $w->{Separated} // 0, $members[0], $w->{LeadA} // 0, $members[1],
+                            $w->{LeadB} // 0, $w->{Outcome});
+                    }
+                }
             }
         }
         foreach my $name (@members)
