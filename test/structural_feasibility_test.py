@@ -199,6 +199,9 @@ class StructuralFeasibilityTests(unittest.TestCase):
                 if not column.endswith('_rENT_Tactical'):
                     continue
                 name = column[:-len('_rENT_Tactical')]
+                if row[column] == '' or row[name] == '':           # no result: no pair is stated
+                    self.assertEqual((row[column], row[name + '_rVCPU_Tactical']), ('', ''), (vm, name))
+                    continue
                 ent, vps = float(row[column]), int(row[name + '_rVCPU_Tactical'])
                 self.assertLessEqual(ent, vps + 1e-9, (vm, name))
                 self.assertGreaterEqual(ent, MIN_ENT_PER_VP * vps - 1e-9, (vm, name))

@@ -133,9 +133,10 @@ $r = pair(target_ent => 0.50, target_vp => 1, step_vp => 1, current_ent => 1.00,
           hold_reason => 'excluded from automatic change: VIOS');
 check('held role', $r, Status => 'HOLD', Ent => 1.00, VP => 2, Reason => 'excluded from automatic change: VIOS');
 $r = pair(target_ent => 0.50, target_vp => 1, step_vp => 1, current_vp => 2);
-check('unknown installed entitlement', $r, Status => 'HOLD', Reason => 'installed entitlement or VP count unknown');
+check('unknown installed entitlement', $r, Status => 'HOLD', Reason => 'installed entitlement or VP count unknown',
+      Ent => undef, VP => undef);
 $r = pair(target_ent => undef, step_vp => 1, current_ent => 1.00, current_vp => 2);
-check('no target', $r, Status => 'HOLD', Reason => 'no target entitlement');
+check('no target', $r, Status => 'HOLD', Reason => 'no result for this profile', Ent => undef, VP => undef);
 
 # The guard never raises the entitlement above today's while VPs fall, and the
 # result is always a valid pair: a sweep over small configurations.
