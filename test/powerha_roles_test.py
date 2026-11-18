@@ -140,7 +140,7 @@ class PowerHARoleTests(unittest.TestCase):
         self.assertIn('roleEvidence', doc['members']['hanodeA'])
         self.assertNotIn('roleEvidence', doc['members']['app1'])
         evidence = doc['members']['hanodeA']['roleEvidence']
-        self.assertEqual(evidence['detector'], 'ha-role-1')
+        self.assertEqual(evidence['detector'], 'ha-role-2')
         self.assertEqual(set(evidence['caches']), {'SYSHA1', 'SYSHA2'})
         self.assertEqual(evidence['role']['effective'], 'standby')
         self.assertTrue(any(t['sustained'] for t in evidence['transitions']))

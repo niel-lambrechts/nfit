@@ -12424,7 +12424,7 @@ sub _log_vios_pairs
 sub _ha_role_rules
 {
     return {
-        detector         => 'ha-role-1',
+        detector         => 'ha-role-2',
         blockSeconds     => 900,     # 15-minute UTC blocks
         minCoverage      => 0.80,    # share of a block's minutes that must hold a sample
         refBlocks        => 24,      # local noise: the latest six supported hours
@@ -12436,6 +12436,9 @@ sub _ha_role_rules
         leaderShare      => 0.95,    # segment: share of the separated blocks one node leads
         multiple         => 0.20,    # each leads at least this share: multiple-active-like
         minSeparated     => 24,      # separated blocks (six hours) needed for any verdict
+        flipShare        => 0.75,    # a handover flips the lead: the falling node led before,
+        minLeadBlocks    => 4,       # ... the rising node leads during (shares of separated blocks)
+        relativeDrop     => 0.50,    # the falling node drops to at most half its usual level
         minSegmentBlocks => 96,      # supported blocks in profile hours for a segment verdict
     };
 }
@@ -12526,7 +12529,9 @@ sub _ha_blocks
 #             2. transitions over all hours: a reciprocal displacement (one
 #                node above, the other below its own level at the same time of
 #                day on previous days, each by more than max(0.05 cores, 3 x
-#                MAD)); sustained after four consecutive supported blocks,
+#                MAD)) that moves the workload: the lead flips and the falling
+#                node drops to at most half its usual level (ha-role-2);
+#                sustained after four consecutive supported blocks,
 #                otherwise a short handover candidate; a sustained one that
 #                ends in a reciprocal return is followed by a switch back; the
 #                boundary is an interval; a coincident configuration change
@@ -12651,6 +12656,37 @@ sub _ha_detect_pair
         $end++ while (($displaced->($end + 1) // '') eq $who);
         my $length = $end - $start + 1;
         my ($rises, $falls) = ($who eq 'A') ? ($name_a, $name_b) : ($name_b, $name_a);
+
+        # Calibration round 1 (ha-role-2): a reciprocal displacement is a
+        # handover only when it moves the workload. The lead flips (the falling
+        # node led the blocks before; the rising node leads during), and the
+        # falling node drops to at most half its usual level for the time of
+        # day. Otherwise the blocks are a workload change, not a handover.
+        my ($rise_blocks, $fall_blocks) = ($who eq 'A') ? ($blocks_a, $blocks_b) : ($blocks_b, $blocks_a);
+        my ($rise_i, $fall_i) = ($who eq 'A') ? (0, 1) : (1, 0);
+        my ($led_before, $separated_before) = (0, 0);
+        foreach my $pair (@recent)
+        {
+            my $margin_fall = $threshold->($local_mad->($fall_i));
+            my $margin_rise = $threshold->($local_mad->($rise_i));
+            if ($pair->[$fall_i] - $pair->[$rise_i] > $margin_rise) { $led_before++; $separated_before++; }
+            elsif ($pair->[$rise_i] - $pair->[$fall_i] > $margin_fall) { $separated_before++; }
+        }
+        my ($led_during, $dropped) = (0, 0);
+        foreach my $j ($start .. $end)
+        {
+            my ($lr, $lf) = ($level->($rise_blocks, $j), $level->($fall_blocks, $j));
+            $led_during++ if ($lr - $lf > $threshold->($local_mad->($fall_i)));
+            my $usual = $same_time->($fall_blocks, $j);
+            $dropped++ if ($usual && $lf <= $rules->{relativeDrop} * $usual->[0]);
+        }
+        my $moves = ($separated_before >= $rules->{minLeadBlocks} && $led_before >= $rules->{flipShare} * $separated_before
+                     && $led_during >= $rules->{flipShare} * $length && $dropped >= $rules->{flipShare} * $length) ? 1 : 0;
+        if (!$moves)
+        {
+            $k = $end + 1;                                # a workload change: not a reference block either
+            next;
+        }
         # The same displacement again, with no switch back since (after missing
         # blocks, or the next day of a daily schedule until the same-time
         # reference has caught up): one transition.
@@ -13029,6 +13065,35 @@ sub _ha_role_evidence
     return \@result;
 }
 
+# Calibration probe (NFIT_HA_PROBE="YYYY-MM-DDTHH:MM/hours,..."): the 15-minute
+# levels of both nodes in each probe window that falls in the period.
+sub _ha_probe_levels
+{
+    my ($cluster, $metric) = @_;
+    return () unless (ref($cluster->{Blocks}) eq 'ARRAY');
+    require Time::Local;
+    my $rules = _ha_role_rules();
+    my ($blocks_a, $blocks_b) = @{ $cluster->{Blocks} };
+    my $key = ($metric // '') eq 'PhysB' ? 'b_med' : 'c_med';
+    my @members = @{ $cluster->{Members} };
+    my @lines;
+    foreach my $probe (split /,/, $ENV{NFIT_HA_PROBE})
+    {
+        my ($y, $mo, $d, $h, $mi, $hours) = $probe =~ /^\s*(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})\/(\d+)\s*$/ or next;
+        my $start = Time::Local::timegm(0, $mi, $h, $d, $mo - 1, $y);
+        my $first = int(($start - $cluster->{Window}[0]) / $rules->{blockSeconds});
+        my $last  = $first + $hours * int(3600 / $rules->{blockSeconds}) - 1;
+        next if ($last < 0 || $first > $#$blocks_a);
+        push @lines, sprintf('        probe %s UTC, %d hours: %s / %s', gmtime($start)->strftime('%d %b %Y %H:%M'), $hours, @members);
+        foreach my $k (($first < 0 ? 0 : $first) .. ($last > $#$blocks_a ? $#$blocks_a : $last))
+        {
+            my ($la, $lb) = map { ($_->[$k] && defined $_->[$k]{$key}) ? sprintf('%.2f', $_->[$k]{$key}) : '-' } ($blocks_a, $blocks_b);
+            push @lines, sprintf('          %s  %6s %6s', gmtime($cluster->{Window}[0] + $k * $rules->{blockSeconds})->strftime('%d %b %H:%M'), $la, $lb);
+        }
+    }
+    return @lines;
+}
+
 # Calibration detail (NFIT_HA_DETAIL): the hourly medians of both nodes for
 # six hours either side of a transition.
 sub _ha_detail_levels
@@ -13143,6 +13208,7 @@ sub _log_powerha_roles
                 }
             }
         }
+        push @out, _ha_probe_levels($cluster, $detection->{Metric}) if ($ENV{NFIT_HA_PROBE} && ref($detection) eq 'HASH');
         foreach my $name (@members)
         {
             my $r = $cluster->{Roles}{$name} or next;

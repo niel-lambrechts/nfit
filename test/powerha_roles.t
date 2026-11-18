@@ -2,7 +2,7 @@
 # ==============================================================================
 # TEST FILE: test/powerha_roles.t
 # PURPOSE:   Regression cover for the PowerHA role detector (v10 stage 3.1b
-#            step 6c, detector ha-role-1): 15-minute blocks, reciprocal
+#            step 6c, detector ha-role-2): 15-minute blocks, reciprocal
 #            transitions with persistence, short handovers, segment dominance
 #            and the role precedence. Synthetic series only. The live
 #            subroutines are extracted from nfit-profile.
@@ -153,6 +153,26 @@ is($r->{Segments}[-1]{Reason}, 'the profile windows disagree', 'profile windows 
 $r = detect(sub { my $h = $hour->($_[0]); ($h >= 8 && $h < 17) ? 1.0 : 0.15 },
             sub { my $h = $hour->($_[0]); ($h >= 1 && $h < 3) ? 0.9 : 0.10 });
 is($r->{Segments}[-1]{Outcome}, 'UNKNOWN', 'standby with a nightly backup: unresolved, not a confirmed standby');
+
+# 14. Calibration round 1 (ha-role-2): a reciprocal change that does not move the
+#     workload is no handover. The node that already leads rises while its peer
+#     skips its usual bump: the lead does not flip.
+my $bump = sub { my $h = $hour->($_[0]); $h >= 16 && $h < 18 };
+my $odd_day = sub { int(($_[0] - $T0) / $DAY) == 4 };
+$r = detect(sub { ($odd_day->($_[0]) && $bump->($_[0])) ? 0.60 : 0.28 },
+            sub { ($bump->($_[0]) && !$odd_day->($_[0])) ? 0.50 : 0.18 });
+is(scalar @{ $r->{Transitions} }, 0, 'no lead flip: no handover (the leader only grew)');
+
+# 15. The falling node keeps most of its level: a workload change, not a handover.
+$sw = $at->(3, 10);
+$r = detect(sub { $_[0] < $sw ? 1.0 : 0.70 }, sub { $_[0] < $sw ? 0.1 : 1.6 });
+is(scalar(grep { $_->{Sustained} } @{ $r->{Transitions} }), 0, 'falling node keeps 70% of its level: no handover');
+
+# 16. A maintenance round trip of 45 minutes that moves the workload: a short candidate.
+($out, $back) = ($at->(4, 1), $at->(4, 1, 45));
+$r = detect(sub { ($_[0] >= $out && $_[0] < $back) ? 0.05 : 1.0 }, sub { ($_[0] >= $out && $_[0] < $back) ? 1.0 : 0.1 });
+is(scalar @{ $r->{Transitions} }, 1, 'round trip: one candidate');
+is_deeply([ @{ $r->{Transitions}[0] }{qw(Rises Sustained Blocks)} ], ['nodeB', 0, 3], 'round trip: to B, short, three blocks');
 
 # --- Role precedence ------------------------------------------------------------------
 my $latest = { Segments => [ { Outcome => 'ACTIVE_STANDBY', Active => 'nodeA', Reason => '' } ] };
