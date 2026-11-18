@@ -39,7 +39,7 @@ def level(vm, t):
     return 1.2 if active else 0.08
 
 
-def build(root, with_peer):
+def build(root, with_peer, extra=''):
     os.makedirs(os.path.join(root, 'etc'))
     os.makedirs(os.path.join(root, 'output'))
     for prog in ('nfit', 'nfit-profile'):
@@ -50,7 +50,7 @@ def build(root, with_peer):
             shutil.copy(src, os.path.join(root, 'etc', name))
     open(os.path.join(root, 'etc', 'nfit.seasonality.cfg'), 'w').close()
     with open(os.path.join(root, 'etc', 'nfit.vms.cfg'), 'w') as fh:
-        fh.write('[hanodeA]\ntier = G2\n' + ('ha_peer = hanodeB\n' if with_peer else '') + '[hanodeB]\ntier = G2\n')
+        fh.write('[hanodeA]\ntier = G2\n' + ('ha_peer = hanodeB\n' if with_peer else '') + '[hanodeB]\ntier = G2\n' + extra)
     last = time.strftime('%Y-%m-%d', time.gmtime(FIRST + DAYS * 86400 - 60))
     for serial, vms in SYSTEMS.items():
         cache = os.path.join(root, 'stage', serial)
@@ -76,12 +76,17 @@ def build(root, with_peer):
     return os.path.join(root, 'stage', 'SYSHA1'), last
 
 
-def run(with_peer):
+def run(with_peer, extra='', systems=('SYSHA1',)):
+    """Runs nfit-profile on each system in turn in one tree; returns the outputs of the last."""
     root = tempfile.mkdtemp(prefix='powerha-')
-    cache, last = build(root, with_peer)
-    proc = subprocess.run(['perl', os.path.join(root, 'nfit-profile'), '--runq-perc-behavior=match',
-                           '--enddate', last, '--nmondir', cache], capture_output=True, text=True, timeout=300, cwd=root)
+    cache, last = build(root, with_peer, extra)
     out = os.path.join(root, 'output')
+    for serial in systems:
+        for f in glob.glob(os.path.join(out, '*')):
+            os.remove(f)
+        cache = os.path.join(root, 'stage', serial)
+        proc = subprocess.run(['perl', os.path.join(root, 'nfit-profile'), '--runq-perc-behavior=match',
+                               '--enddate', last, '--nmondir', cache], capture_output=True, text=True, timeout=300, cwd=root)
     csvs = [f for f in glob.glob(os.path.join(out, '*.csv')) if '.decisions.' not in f]
     logs = glob.glob(os.path.join(out, '*.log'))
     result = {'root': root, 'cache': cache, 'proc': proc, 'csv': '', 'log': ''}
@@ -97,10 +102,21 @@ def run(with_peer):
 @unittest.skipUnless(perl_ready(), 'perl with JSON and List::MoreUtils needed')
 class PowerHARoleTests(unittest.TestCase):
 
+    _without_csv = None
+
     @classmethod
     def setUpClass(cls):
         cls.with_peer = run(True)
         cls.without = run(False)
+        PowerHARoleTests._without_csv = cls.without['csv']
+
+    @classmethod
+    def without_csv(cls):
+        if cls._without_csv is None:
+            r = run(False)
+            cls._without_csv = r['csv']
+            shutil.rmtree(r['root'], ignore_errors=True)
+        return cls._without_csv
 
     @classmethod
     def tearDownClass(cls):
@@ -144,6 +160,55 @@ class PowerHARoleTests(unittest.TestCase):
         self.assertEqual(set(evidence['caches']), {'SYSHA1', 'SYSHA2'})
         self.assertEqual(evidence['role']['effective'], 'standby')
         self.assertTrue(any(t['sustained'] for t in evidence['transitions']))
+
+
+def rows(text):
+    import csv as _csv
+    return {r['VM']: r for r in _csv.DictReader(text.splitlines())}
+
+
+@unittest.skipUnless(perl_ready(), 'perl with JSON and List::MoreUtils needed')
+class PowerHASizingTests(unittest.TestCase):
+    """Step 6d: the sizing applied to the roles."""
+
+    @classmethod
+    def setUpClass(cls):
+        share = '[GLOBAL]\nha_sizing = standby_share\n'
+        cls.fallback = run(True, share)                              # the primary's system has not run
+        cls.ordered = run(True, share, systems=('SYSHA2', 'SYSHA1'))  # it has: its proposal is used
+        cls.took_over = run(True, '', systems=('SYSHA2',))           # independent; the node that took over
+
+    @classmethod
+    def tearDownClass(cls):
+        for r in (cls.fallback, cls.ordered, cls.took_over):
+            shutil.rmtree(r['root'], ignore_errors=True)
+
+    def test_standby_floor_with_the_primary_installed_as_fallback(self):
+        r = rows(self.fallback['csv'])['hanodeA']
+        self.assertTrue(r['NFIT - Action'].startswith('PowerHA standby for hanodeB (inferred): 25% of its 1.50 target '
+                                                      '(not sized: its installed entitlement, a fallback)'), r['NFIT - Action'])
+        self.assertIn('takeover capacity not verified', r['NFIT - Action'])
+        self.assertGreaterEqual(float(r['NFIT - ENT']), 0.38 - 1e-9)
+
+    def test_standby_floor_from_the_primary_proposal(self):
+        r = rows(self.ordered['csv'])['hanodeA']
+        # hanodeB took over in the period: its reductions were held, so its
+        # held pair (1.50 on 4 VPs), not its diluted target, is the reference.
+        self.assertTrue(r['NFIT - Action'].startswith('PowerHA standby for hanodeB (inferred): 25% of its 1.50 target '
+                                                      '(its proposal for data ending 2026-09-21)'), r['NFIT - Action'])
+        self.assertIn('At failover it needs up to 1.50 entitlement and 4 VPs; takeover capacity not verified.', r['NFIT - Action'])
+        self.assertIn('Standby share sensitivity', self.ordered['log'])
+
+    def test_profile_columns_keep_own_figures(self):
+        self.assertEqual(rows(self.fallback['csv'])['hanodeA']['G2-98W10'], rows(PowerHARoleTests.without_csv())['hanodeA']['G2-98W10'])
+
+    def test_node_that_took_over_has_reductions_held(self):
+        r = rows(self.took_over['csv'])['hanodeB']
+        own = float(r['G2-98W10'])
+        self.assertLess(own, 1.5)                                    # its own target would reduce it
+        self.assertEqual((r['NFIT - ENT'], r['NFIT - VCPU']), ('1.50', '4'))
+        self.assertTrue(r['NFIT - Action'].startswith('Reductions held: a possible workload handover to this node on 13 Sep 2026'),
+                        r['NFIT - Action'])
 
 
 if __name__ == '__main__':

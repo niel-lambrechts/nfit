@@ -18,7 +18,8 @@ open my $fh, '<', $SRC or die "cannot open $SRC: $!";
 my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
-for my $name (qw(_ha_role_rules _ha_median_mad _ha_percentile _ha_blocks _ha_detect_pair _ha_resolve_roles))
+for my $name (qw(_ha_role_rules _ha_median_mad _ha_percentile _ha_blocks _ha_detect_pair _ha_resolve_roles
+                 _ha_cluster_policy _ha_standby_target _ha_sizing_plan))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
@@ -204,5 +205,41 @@ $roles = UUT::_ha_resolve_roles([qw(n1 n2 n3)], undef, 'three or more nodes: rol
 is($roles->{n2}{Effective}, 'unknown', 'three nodes: unresolved');
 $roles = UUT::_ha_resolve_roles([qw(nodeA nodeB)], undef, 'no samples for nodeB in this period', $settings_of, $type_of);
 is_deeply([ @{ $roles->{nodeA} }{qw(Effective Note)} ], ['unknown', 'no samples for nodeB in this period'], 'missing peer: unresolved, with the reason');
+
+# --- Sizing (step 6d) --------------------------------------------------------------------
+my %set6 = (n1 => { ha_sizing => 'standby_share' }, n2 => { standby_share => 0.30 }, n3 => { ha_sizing => 'independent' });
+my $so6 = sub { $set6{ $_[0] } // {} };
+my $pol = UUT::_ha_cluster_policy([qw(x y)], $so6, {});
+is_deeply([ @$pol{qw(Sizing Share Conflict)} ], ['independent', 0.25, 0], 'policy: independent and 0.25 by default');
+$pol = UUT::_ha_cluster_policy([qw(n1 n2)], $so6, {});
+is_deeply([ @$pol{qw(Sizing Share)} ], ['standby_share', 0.30], 'policy: set on either node, for the cluster');
+$pol = UUT::_ha_cluster_policy([qw(n1 n3)], $so6, {});
+is_deeply([ @$pol{qw(Sizing Conflict)} ], ['standby_share', 1], 'policy: disagreement - standby_share (a floor), reported');
+is(UUT::_ha_cluster_policy([qw(x y)], $so6, { ha_sizing => 'standby_share', standby_share => 0.2 })->{Share}, 0.2, 'policy: [GLOBAL]');
+
+my $st = UUT::_ha_standby_target(0.12, 1, 2.40, 0.25);
+is_deeply([ @$st{qw(Floor TargetEnt TargetVP FloorBinds)} ], [0.60, 0.60, 1, 1], 'standby: 25% of 2.40 is the floor above own 0.12');
+$st = UUT::_ha_standby_target(0.90, 2, 2.40, 0.25);
+is_deeply([ @$st{qw(TargetEnt TargetVP FloorBinds)} ], [0.90, 2, 0], 'standby: own workload above the share wins (never reduced by the share)');
+is(UUT::_ha_standby_target(0.10, 1, 3.33, 0.25)->{Floor}, 0.84, 'standby: the floor is rounded up to 0.01 (0.8325)');
+is(UUT::_ha_standby_target(0.10, 1, 5.00, 0.25)->{TargetVP}, 2, 'standby: VPs carry the floor');
+
+my $roles_as = sub { my (%r) = @_; return { map { $_ => { Effective => $r{$_} } } keys %r }; };
+my $cl = { Members => [qw(pa pb)], Roles => $roles_as->(pa => 'active', pb => 'standby'), Detection => { Transitions => [] } };
+my $plan = UUT::_ha_sizing_plan($cl, { Sizing => 'standby_share' });
+is_deeply($plan, { pb => { Treatment => 'standby_floor', Primary => 'pa' } }, 'plan: standby_share floors the standby');
+is_deeply(UUT::_ha_sizing_plan($cl, { Sizing => 'independent' }), {}, 'plan: independent changes nothing without a handover');
+$cl->{Detection}{Transitions} = [ { Sustained => 1, Rises => 'pa', From => 1000 } ];
+$plan = UUT::_ha_sizing_plan($cl, { Sizing => 'independent' });
+is_deeply($plan, { pa => { Treatment => 'hold_reductions', Since => 1000, Reason => 'took_over' } }, 'plan: the node that took over has its reductions held');
+$cl->{Roles} = $roles_as->(pa => 'unknown', pb => 'unknown');
+$plan = UUT::_ha_sizing_plan($cl, { Sizing => 'standby_share' });
+is_deeply([ sort keys %$plan ], [qw(pa pb)], 'plan: a handover with unresolved roles holds both');
+is($plan->{pa}{Reason}, 'unresolved', 'plan: and says why');
+$cl->{Detection}{Transitions} = [];
+is_deeply(UUT::_ha_sizing_plan($cl, { Sizing => 'standby_share' }), {}, 'plan: unresolved without a handover - independent, no share');
+$cl->{Roles} = $roles_as->(pa => 'multiple', pb => 'multiple');
+is_deeply(UUT::_ha_sizing_plan($cl, { Sizing => 'standby_share' }), {}, 'plan: multiple active - independent');
+is_deeply(UUT::_ha_sizing_plan({ Members => [qw(a b c)], Roles => {} }, { Sizing => 'standby_share' }), {}, 'plan: three nodes - independent');
 
 done_testing();

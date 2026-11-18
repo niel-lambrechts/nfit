@@ -2110,7 +2110,9 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  PowerHA Roles      Roles of the nodes named by ha_peer, from their workload on the same\n";
         print {$LOG_FH} "                     timestamps. An inferred role is evidence, not proof of PowerHA\n";
-        print {$LOG_FH} "                     ownership; an unclear case is unresolved. Report only.\n";
+        print {$LOG_FH} "                     ownership; an unclear case is unresolved. ha_sizing = standby_share\n";
+        print {$LOG_FH} "                     gives a standby a share of its primary's target as a floor under its\n";
+        print {$LOG_FH} "                     own workload; after a handover the new active node's reductions are held.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
@@ -2693,7 +2695,16 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         # per system before proceeding to the next.
         if (@vm_order) {
             my %proposals;
-            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef, \%proposals);
+            # PowerHA role evidence (v10 stage 3.1b, steps 6c/6d): worked out
+            # before the CSV, because the role-aware sizing is applied there.
+            my $role_evidence = [];
+            if ($effective_start_date_obj && $effective_end_date_obj)
+            {
+                my $role_from = $effective_start_date_obj->epoch - ($effective_start_date_obj->epoch % 86400);
+                my $role_to   = $effective_end_date_obj->epoch - ($effective_end_date_obj->epoch % 86400) + 86400;
+                $role_evidence = _ha_role_evidence($current_cache_path, \@vm_order, $assimilation_map_ref, $role_from, $role_to);
+            }
+            _write_standard_csv_report($assimilation_map_ref, $report_type_for_filename, $system_identifier, $unique_date_suffix, 0, 0, 0, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, undef, \%proposals, $role_evidence);
 
             # Structural feasibility checks on the completed set of
             # recommendations (rationale only; nothing is changed).
@@ -2712,16 +2723,11 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             # VIOS pairs aligned by the CSV writer (rationale; v10 stage 3.1b).
             _log_vios_pairs($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order);
 
-            # PowerHA roles (v10 stage 3.1b step 6c): evidence and inferred
-            # roles of the clusters named by ha_peer; report only.
-            if ($effective_start_date_obj && $effective_end_date_obj)
-            {
-                my $role_from = $effective_start_date_obj->epoch - ($effective_start_date_obj->epoch % 86400);
-                my $role_to   = $effective_end_date_obj->epoch - ($effective_end_date_obj->epoch % 86400) + 86400;
-                my $role_evidence = _ha_role_evidence($current_cache_path, \@vm_order, $assimilation_map_ref, $role_from, $role_to);
-                my $clusters = _log_powerha_roles($open_log_files{$system_identifier}, $role_evidence, \%proposals);
-                printf STDERR "  [INFO] PowerHA roles: %d cluster(s) (see rationale)\n", $clusters if ($clusters);
-            }
+            # PowerHA roles and the sizing applied to them (rationale; v10
+            # stage 3.1b steps 6c/6d).
+            my $clusters = _log_powerha_roles($open_log_files{$system_identifier}, $role_evidence, \%proposals, $assimilation_map_ref);
+            printf STDERR "  [INFO] PowerHA roles: %d cluster(s) (see rationale)\n", $clusters if ($clusters);
+            my %ha_role_of = map { my $c = $_; map { ($_ => ($c->{Roles}{$_}{Effective} // '')) } @{ $c->{Here} // [] } } @$role_evidence;
 
             # Entitlement totals for the system (rationale only). A VIOS is
             # recognised from lpar_type, else the SystemType; a standby from
@@ -2729,10 +2735,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             my %lpar_roles = map {
                 my $vm = $_;
                 my $hint = _lpar_role_hint(exists $vm_config_data{$vm} ? $vm_config_data{$vm}{systemtype} : undef);
-                ($vm => ((_vm_lpar_type($vm) eq 'vios') ? 'vios' : ($hint eq 'standby' ? 'standby' : '')))
+                ($vm => ((_vm_lpar_type($vm) eq 'vios') ? 'vios'
+                         : ($ha_role_of{$vm} // '') eq 'standby' ? 'standby'
+                         : ($ha_role_of{$vm} // '') ne '' ? ''
+                         : ($hint eq 'standby' ? 'standby' : '')))
             } @vm_order;
             _log_entitlement_totals($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order, \@profiles,
-                \%vm_tier_overrides, \%lpar_roles, $vm_config_loaded);
+                \%vm_tier_overrides, \%lpar_roles, ($vm_config_loaded || %ha_role_of ? 1 : 0));
 
             # Entitlement cut exposure (automatic when the cache has pool
             # observations and PhysB; rationale only; nothing is changed).
@@ -13027,6 +13036,8 @@ sub _ha_role_evidence
         my %c = (Members => [ @$members ], Here => [ grep { $here{$_} } @$members ], Window => [ $from, $to ],
                  Caches => { map { my $vm = $_; map { (basename($_) => $revision{ basename($_) }) } @{ $dirs_of{$vm} // [] } } @$members },
                  Reason => '');
+        $c{DirsOf}   = { map { $_ => ($dirs_of{$_} // []) } @$members };
+        $c{StatesOf} = { map { $_ => ($states_of{$_} // []) } @$members };
         my @missing = grep { !$minutes{$_} } @$members;
         if (@$members > 2)
         {
@@ -13063,6 +13074,306 @@ sub _ha_role_evidence
         push @result, \%c;
     }
     return \@result;
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_cluster_policy
+# PURPOSE:    How one PowerHA cluster is sized (v10 stage 3.1b step 6d):
+#             ha_sizing and standby_share from the members' sections, then
+#             [GLOBAL], then the built-in defaults (independent, 0.25). Members
+#             that disagree get the more protective value: standby_share (the
+#             share is only ever a floor under a standby's own workload) and
+#             the larger share; the conflict is reported.
+# ARGUMENTS:  1. member names (arrayref)  2. code ref: name -> settings hashref
+#             3. [GLOBAL] settings (hashref)
+# RETURNS:    hashref { Sizing, Share, Conflict (0/1) }
+# ==============================================================================
+sub _ha_cluster_policy
+{
+    my ($names_aref, $settings_of, $global_href) = @_;
+    $global_href = {} unless (ref($global_href) eq 'HASH');
+    my (%sizing, %shares);
+    foreach my $name (@{ $names_aref // [] })
+    {
+        my $settings = (ref($settings_of) eq 'CODE') ? ($settings_of->($name) // {}) : {};
+        $sizing{ $settings->{ha_sizing} } = 1 if (defined $settings->{ha_sizing});
+        $shares{ $settings->{standby_share} } = 1 if (defined $settings->{standby_share});
+    }
+    my $mode = %sizing ? ($sizing{standby_share} ? 'standby_share' : 'independent') : ($global_href->{ha_sizing} // 'independent');
+    my $share = %shares ? (sort { $b <=> $a } keys %shares)[0] : ($global_href->{standby_share} // 0.25);
+    return { Sizing => $mode, Share => $share + 0, Conflict => (((keys %sizing) > 1 || (keys %shares) > 1) ? 1 : 0) };
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_standby_target
+# PURPOSE:    The target of a standby under ha_sizing = standby_share: the
+#             larger of its own workload target and the share of its
+#             primary's target (rounded up to 0.01); VPs enough to carry it.
+#             The share is a floor, never a reduction below own workload.
+# ARGUMENTS:  1. own target entitlement  2. own target VPs
+#             3. primary target entitlement  4. share (fraction)
+# RETURNS:    hashref { Floor, TargetEnt, TargetVP, FloorBinds (0/1) }
+# ==============================================================================
+sub _ha_standby_target
+{
+    my ($own_ent, $own_vp, $primary_ent, $share) = @_;
+    my $scaled = ($primary_ent // 0) * ($share // 0) * 100;
+    my $cents = int($scaled);
+    $cents++ if ($scaled - $cents > 1e-6);
+    my $floor = $cents / 100;
+    my $own = (defined $own_ent && $own_ent > 0) ? $own_ent : 0;
+    my $target = ($floor > $own) ? $floor : $own;
+    my $whole = int($target);
+    $whole++ if ($target - $whole > 1e-9);
+    $whole = 1 if ($whole < 1);
+    my $vp = (defined $own_vp && $own_vp > $whole) ? int($own_vp) : $whole;
+    return { Floor => $floor, TargetEnt => $target, TargetVP => $vp, FloorBinds => ($floor > $own + 0.005 ? 1 : 0) };
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_sizing_plan
+# PURPOSE:    What the sizing does with one cluster's roles (v10 stage 3.1b
+#             step 6d; design "Phase 3.1b Role-Aware Sizing" section 5):
+#             - standby_share and one active and one standby node: the standby
+#               takes the share of its primary's target as a floor;
+#             - a resolved active node that took over in the period: its
+#               reductions are held, because its period still includes its
+#               time as the quiet node (raise only);
+#             - a sustained handover with the roles unresolved: reductions of
+#               both nodes are held.
+#             Clusters of three or more nodes and unresolved roles without a
+#             handover are sized independently. Pure.
+# ARGUMENTS:  1. cluster (hashref from _ha_role_evidence)  2. policy
+# RETURNS:    hashref { name => { Treatment (standby_floor | hold_reductions),
+#             Primary, Since, Reason } }
+# ==============================================================================
+sub _ha_sizing_plan
+{
+    my ($cluster, $policy) = @_;
+    my %plan;
+    return \%plan unless (ref($cluster) eq 'HASH' && ref($cluster->{Members}) eq 'ARRAY' && @{ $cluster->{Members} } == 2);
+    my @members = @{ $cluster->{Members} };
+    my $roles = (ref($cluster->{Roles}) eq 'HASH') ? $cluster->{Roles} : {};
+    my @active  = grep { ($roles->{$_}{Effective} // '') eq 'active' } @members;
+    my @standby = grep { ($roles->{$_}{Effective} // '') eq 'standby' } @members;
+    my $detection = (ref($cluster->{Detection}) eq 'HASH') ? $cluster->{Detection} : {};
+    my ($last) = reverse grep { $_->{Sustained} } @{ $detection->{Transitions} // [] };
+    if (@active == 1 && @standby == 1)
+    {
+        $plan{ $standby[0] } = { Treatment => 'standby_floor', Primary => $active[0] }
+            if (($policy->{Sizing} // '') eq 'standby_share');
+        $plan{ $active[0] } = { Treatment => 'hold_reductions', Since => $last->{From}, Reason => 'took_over' }
+            if ($last && $last->{Rises} eq $active[0]);
+    }
+    elsif ($last && !@active && !@standby)
+    {
+        $plan{$_} = { Treatment => 'hold_reductions', Since => $last->{From}, Reason => 'unresolved' } foreach (@members);
+    }
+    return \%plan;
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_peer_target
+# PURPOSE:    A primary's planning-profile target from its own system's stored
+#             proposals, read only: the snapshot of the same model whose
+#             period ends latest on or before this run's period end. Without
+#             one, the primary's installed entitlement from its states, marked
+#             as a fallback (not a measured requirement).
+# ARGUMENTS:  1. cache directories of the primary (arrayref)  2. primary name
+#             3. model  4. this run's period end (epoch, exclusive)
+#             5. the primary's states (arrayref)
+# RETURNS:    hashref { Ent, VP, Profile, Source (proposal | installed),
+#             WindowEnd, Snapshot } or undef
+# ==============================================================================
+sub _ha_peer_target
+{
+    my ($dirs_aref, $vm, $model, $end_epoch, $states_aref) = @_;
+    my $end_ymd = gmtime($end_epoch - 1)->ymd;
+    my @candidates;
+    foreach my $dir (@{ $dirs_aref // [] })
+    {
+        my $store = File::Spec->catdir($dir, '.nfit.store', 'proposals', 'v1', $model);
+        next unless (-d $store);
+        foreach my $file (glob(File::Spec->catfile($store, '*.json')))
+        {
+            my $doc = eval
+            {
+                open my $fh, '<', $file or die;
+                local $/;
+                my $text = <$fh>;
+                close $fh;
+                decode_json($text);
+            };
+            next unless (ref($doc) eq 'HASH' && ref($doc->{members}) eq 'HASH' && ref($doc->{members}{$vm}) eq 'HASH');
+            my $window_end = (ref($doc->{window}) eq 'HASH') ? ($doc->{window}{end} // '') : '';
+            next unless ($window_end ne '' && $window_end le $end_ymd);
+            push @candidates, [ $window_end, basename($file), $doc->{members}{$vm} ];
+        }
+    }
+    if (@candidates)
+    {
+        my ($best) = sort { $b->[0] cmp $a->[0] || $a->[1] cmp $b->[1] } @candidates;
+        my $member = $best->[2];
+        my $profile = $member->{planningProfile};
+        my $p = (defined $profile && ref($member->{profiles}) eq 'HASH') ? $member->{profiles}{$profile} : undef;
+        if (ref($p) eq 'HASH' && defined $p->{entitlement} && looks_like_number($p->{entitlement}) && $p->{entitlement} > 0)
+        {
+            my %target = (Ent => $p->{entitlement} + 0, VP => (looks_like_number($p->{recommendedVPs} // '') ? $p->{recommendedVPs} + 0 : undef),
+                          Profile => $profile, Source => 'proposal', WindowEnd => $best->[0], Snapshot => $best->[1]);
+            # A primary whose reductions were held after it took over: its
+            # target is diluted, so the held pair is the reference.
+            my $role = $member->{role};
+            if (ref($role) eq 'HASH' && ($role->{type} // '') eq 'haHold')
+            {
+                $target{Ent} = $role->{entitlement} + 0 if (looks_like_number($role->{entitlement} // '') && $role->{entitlement} > $target{Ent});
+                $target{VP}  = $role->{VPs} + 0 if (looks_like_number($role->{VPs} // '') && $role->{VPs} > ($target{VP} // 0));
+            }
+            return \%target;
+        }
+    }
+    my ($latest) = sort { ($b->{start_epoch} // 0) <=> ($a->{start_epoch} // 0) } grep { ref($_) eq 'HASH' } @{ $states_aref // [] };
+    my $meta = ($latest && ref($latest->{metadata}) eq 'HASH') ? $latest->{metadata} : {};
+    return undef unless (looks_like_number($meta->{entitlement} // '') && $meta->{entitlement} > 0);
+    return { Ent => $meta->{entitlement} + 0, VP => (looks_like_number($meta->{virtual_cpus} // '') ? $meta->{virtual_cpus} + 0 : undef),
+             Source => 'installed' };
+}
+
+# ==============================================================================
+# SUBROUTINE: _apply_ha_sizing
+# PURPOSE:    Applies the PowerHA sizing plan to the held CSV rows of one
+#             system (v10 stage 3.1b step 6d). The profile columns keep each
+#             node's own figures; NFIT - ENT, NFIT - VCPU and NFIT - Action
+#             carry the result. A standby's floor states the takeover
+#             requirement separately ("takeover capacity not verified"); a
+#             hold keeps the installed pair where the current-cycle pair would
+#             reduce it. Recorded in CoreResults{RoleResult} and the stored
+#             proposal (role). A VIOS (already aligned) is left alone.
+# ARGUMENTS:  1. assimilation map  2. held rows  3. column index
+#             4. event-window run (0/1)  5. proposals (hashref or undef)
+#             6. role evidence (arrayref from _ha_role_evidence)  7. model
+# RETURNS:    number of nodes changed
+# ==============================================================================
+sub _apply_ha_sizing
+{
+    my ($map_ref, $pending_aref, $column_href, $event_window, $proposals, $evidence_aref, $model) = @_;
+    return 0 unless (ref($evidence_aref) eq 'ARRAY' && @$evidence_aref);
+    my %row_of = map { $_->[0] => $_ } @$pending_aref;
+    my $cell = sub
+    {
+        my ($row, $label) = @_;
+        return undef unless (exists $column_href->{$label});
+        my $v = $row->[ $column_href->{$label} ];
+        return (defined $v && looks_like_number($v) && $v !~ /nan|inf/i) ? 0 + $v : undef;
+    };
+    my $day = sub { return gmtime($_[0])->strftime('%d %b %Y %H:%M'); };
+    my $changed = 0;
+    foreach my $cluster (@$evidence_aref)
+    {
+        my $policy = _ha_cluster_policy($cluster->{Members}, \&_vms_config_settings, _vms_config_global());
+        printf STDERR "    [WARN] PowerHA cluster %s: members set different ha_sizing or standby_share; %s with share %.2f applies\n",
+            join(', ', @{ $cluster->{Members} }), $policy->{Sizing}, $policy->{Share} if ($policy->{Conflict});
+        my $plan = _ha_sizing_plan($cluster, $policy);
+        $cluster->{Policy} = $policy;
+        $cluster->{Plan} = $plan;
+        foreach my $vm (sort keys %$plan)
+        {
+            next unless (exists $row_of{$vm});
+            my $core = $map_ref->{$vm}{CoreResults} //= {};
+            next if (ref($core->{RoleResult}) eq 'HASH');      # a VIOS already sized with its group
+            my ($row, $cells) = @{ $row_of{$vm} }[1, 2];
+            my $profile = $cells->{'Planning Profile'};
+            next unless (defined $profile);
+            my ($current_ent, $current_vp) = ($cell->($row, 'Current - ENT'), $cell->($row, 'Current - VCPU'));
+            my $cfg = (ref($map_ref->{$vm}{Configuration}) eq 'HASH') ? $map_ref->{$vm}{Configuration} : {};
+            my $pool_size = (defined $cfg->{pool_id} && looks_like_number($cfg->{pool_id}) && $cfg->{pool_id} != 0) ? $cfg->{pool_cpu} : undef;
+            my ($own_ent, $own_vp, $step) = ($cell->($row, $profile), $cell->($row, "${profile}_rVCPU"), $cell->($row, "${profile}_rVCPU_Tactical"));
+            my $entry = $plan->{$vm};
+            my ($pair, @action, %result);
+            if ($entry->{Treatment} eq 'standby_floor')
+            {
+                my $primary = $entry->{Primary};
+                my $target;
+                if (exists $row_of{$primary})
+                {
+                    my ($prow, $pcells) = @{ $row_of{$primary} }[1, 2];
+                    my $pprofile = $pcells->{'Planning Profile'};
+                    $target = { Ent => $cell->($prow, $pprofile), VP => $cell->($prow, "${pprofile}_rVCPU"), Profile => $pprofile,
+                                Source => 'run' } if (defined $pprofile);
+                    # A primary that took over in the period has its reductions
+                    # held: its target is diluted, so the held pair is the reference.
+                    my $prr = $map_ref->{$primary}{CoreResults}{RoleResult};
+                    if ($target && ref($prr) eq 'HASH' && ($prr->{Source} // '') eq 'HA_HOLD' && ref($prr->{Pair}) eq 'HASH')
+                    {
+                        $target->{Ent} = $prr->{Pair}{Ent} if (($prr->{Pair}{Ent} // 0) > ($target->{Ent} // 0));
+                        $target->{VP}  = $prr->{Pair}{VP}  if (($prr->{Pair}{VP} // 0) > ($target->{VP} // 0));
+                    }
+                }
+                else
+                {
+                    $target = _ha_peer_target($cluster->{DirsOf}{$primary}, $primary, $model, $cluster->{Window}[1],
+                        $cluster->{StatesOf}{$primary});
+                }
+                if (!$target || !defined $target->{Ent} || $target->{Ent} <= 0)
+                {
+                    $entry->{Note} = "no target for $primary is available: sized on its own workload";
+                    next;
+                }
+                my $st = _ha_standby_target($own_ent, $own_vp, $target->{Ent}, $policy->{Share});
+                $pair = _resolve_current_cycle_pair({ target_ent => $st->{TargetEnt}, target_vp => $st->{TargetVP}, step_vp => $step,
+                    current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
+                my $source = ($target->{Source} eq 'run') ? 'analysed in this run'
+                           : ($target->{Source} eq 'proposal') ? "its proposal for data ending $target->{WindowEnd}"
+                           : 'not sized: its installed entitlement, a fallback';
+                push @action, sprintf('PowerHA standby for %s (%s): %d%% of its %.2f target (%s) = %.2f entitlement%s.', $primary,
+                    $cluster->{Roles}{$vm}{Source}, int(100 * $policy->{Share} + 0.5), $target->{Ent}, $source, $st->{Floor},
+                    ($st->{FloorBinds} ? sprintf('; own workload needs %.2f', $own_ent // 0) : '; its own workload needs more'));
+                push @action, _current_cycle_action_text($pair, $current_ent, $current_vp, $cfg->{pool_id});
+                push @action, sprintf('At failover it needs up to %.2f entitlement%s; takeover capacity not verified.', $target->{Ent},
+                    (defined $target->{VP} ? ($target->{VP} == 1 ? ' and 1 VP' : sprintf(' and %d VPs', $target->{VP})) : ''));
+                %result = (Source => 'HA_STANDBY', Profile => $profile, TargetEnt => $st->{TargetEnt}, TargetVP => $st->{TargetVP},
+                           OwnTargetEnt => $own_ent, OwnTargetVP => $own_vp, Floor => $st->{Floor}, Share => $policy->{Share},
+                           Primary => $primary, PrimaryTargetEnt => $target->{Ent}, PrimaryTargetVP => $target->{VP},
+                           PrimarySource => $target->{Source}, PrimaryWindowEnd => $target->{WindowEnd},
+                           PrimarySnapshot => $target->{Snapshot}, Pair => $pair);
+            }
+            else
+            {
+                my $resolved = (ref($core->{Profile_CurrentCycle}) eq 'HASH') ? $core->{Profile_CurrentCycle}{$profile} : undef;
+                next unless (ref($resolved) eq 'HASH' && defined $resolved->{Ent} && defined $current_ent && defined $current_vp);
+                next unless ($resolved->{Ent} < $current_ent - 0.005 || ($resolved->{VP} // $current_vp) < $current_vp);
+                $pair = { %$resolved, Ent => $current_ent, VP => $current_vp, Status => 'HOLD', Order => 'NONE', Binding => [],
+                          ReviewVP => undef };
+                push @action, ($entry->{Reason} eq 'took_over')
+                    ? sprintf('Reductions held: a possible workload handover to this node on %s UTC; its period still includes '
+                        . 'its time as the quiet node. No change.', $day->($entry->{Since}))
+                    : sprintf('Reductions held: a possible workload handover on %s UTC with the roles unresolved. No change.',
+                        $day->($entry->{Since}));
+                %result = (Source => 'HA_HOLD', Profile => $profile, TargetEnt => $own_ent, TargetVP => $own_vp,
+                           OwnTargetEnt => $own_ent, OwnTargetVP => $own_vp, Since => $entry->{Since}, Pair => $pair);
+            }
+            $cells->{'NFIT - ENT'}  = defined $pair->{Ent} ? sprintf('%.2f', $pair->{Ent}) : '';
+            $cells->{'NFIT - VCPU'} = defined $pair->{VP} ? $pair->{VP} : '';
+            my $action = join(' ', grep { defined $_ && $_ ne '' } @action);
+            $cells->{'NFIT - Action'} = $event_window ? "Event window: $action" : $action;
+            $core->{RoleResult} = \%result;
+            if (defined $proposals && ref($proposals->{$vm}) eq 'HASH')
+            {
+                $proposals->{$vm}{role} = {
+                    type => ($result{Source} eq 'HA_STANDBY' ? 'haStandby' : 'haHold'), profile => $profile,
+                    targetEntitlement => $result{TargetEnt}, targetVPs => $result{TargetVP}, entitlement => $pair->{Ent},
+                    VPs => $pair->{VP}, status => $pair->{Status},
+                    ($result{Source} eq 'HA_STANDBY'
+                        ? (primary => $result{Primary}, share => $result{Share}, floor => $result{Floor},
+                           primaryTarget => { entitlement => $result{PrimaryTargetEnt}, VPs => $result{PrimaryTargetVP},
+                                              source => $result{PrimarySource}, windowEnd => $result{PrimaryWindowEnd},
+                                              snapshot => $result{PrimarySnapshot} })
+                        : (since => $result{Since})),
+                };
+            }
+            $changed++;
+        }
+    }
+    return $changed;
 }
 
 # Calibration probe (NFIT_HA_PROBE="YYYY-MM-DDTHH:MM/hours,..."): the 15-minute
@@ -13130,7 +13441,7 @@ sub _ha_detail_levels
 # ==============================================================================
 sub _log_powerha_roles
 {
-    my ($log_fh, $evidence_aref, $proposals) = @_;
+    my ($log_fh, $evidence_aref, $proposals, $map_ref) = @_;
     return 0 unless (ref($evidence_aref) eq 'ARRAY' && @$evidence_aref);
     my $rules = _ha_role_rules();
     my $when = sub { return gmtime($_[0])->strftime('%d %b %Y %H:%M'); };
@@ -13148,7 +13459,8 @@ sub _log_powerha_roles
     my @out = ('', '=' x 70, 'PowerHA Roles', '=' x 70);
     push @out, _rationale_wrap('Roles of the nodes named by ha_peer, worked out from their workload on the same timestamps '
         . "(detector $rules->{detector}, provisional). CPU activity is evidence of workload, not proof of PowerHA "
-        . 'ownership: an unclear case is unresolved. Nothing in the CSV changes.', '  ', '  ');
+        . 'ownership: an unclear case is unresolved. The CSV changes only where ha_sizing = standby_share sets a standby\'s '
+        . 'floor, or a handover holds the reductions of the node that took over (NFIT columns).', '  ', '  ');
     foreach my $cluster (@$evidence_aref)
     {
         my @members = @{ $cluster->{Members} };
@@ -13209,6 +13521,12 @@ sub _log_powerha_roles
             }
         }
         push @out, _ha_probe_levels($cluster, $detection->{Metric}) if ($ENV{NFIT_HA_PROBE} && ref($detection) eq 'HASH');
+        my $policy = $cluster->{Policy} // _ha_cluster_policy(\@members, \&_vms_config_settings, _vms_config_global());
+        my $plan = $cluster->{Plan} // {};
+        push @out, ($policy->{Sizing} eq 'standby_share')
+            ? sprintf('      Sizing: standby_share at %d%% of the primary\'s target, as a floor under own workload.',
+                int(100 * $policy->{Share} + 0.5))
+            : '      Sizing: independent (each node on its own workload).';
         foreach my $name (@members)
         {
             my $r = $cluster->{Roles}{$name} or next;
@@ -13216,6 +13534,25 @@ sub _log_powerha_roles
                 ($r->{Configured} eq 'auto' ? '' : ", ha_role = $r->{Configured}"));
             $text .= "; $r->{Note}" if (($r->{Note} // '') ne '');
             push @out, _rationale_wrap("$text.", '      ', '        ');
+            my $rr = (ref($map_ref) eq 'HASH' && ref($map_ref->{$name}) eq 'HASH' && ref($map_ref->{$name}{CoreResults}) eq 'HASH')
+                ? $map_ref->{$name}{CoreResults}{RoleResult} : undef;
+            my $entry = $plan->{$name};
+            if (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_STANDBY')
+            {
+                push @out, _rationale_wrap(sprintf('%s: standby floor %.2f entitlement (%d%% of %.2f); own workload target %.2f; '
+                    . 'sized to %.2f, current cycle %.2f on %s VPs. At failover it needs up to %.2f; takeover capacity not verified.',
+                    $name, $rr->{Floor}, int(100 * $rr->{Share} + 0.5), $rr->{PrimaryTargetEnt}, ($rr->{OwnTargetEnt} // 0),
+                    $rr->{TargetEnt}, ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'), $rr->{PrimaryTargetEnt}), '        ', '          ');
+            }
+            elsif (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_HOLD')
+            {
+                push @out, _rationale_wrap(sprintf('%s: reductions held (possible handover %s UTC).', $name,
+                    gmtime($rr->{Since})->strftime('%d %b %Y %H:%M')), '        ', '          ');
+            }
+            elsif ($entry && ($entry->{Note} // '') ne '')
+            {
+                push @out, _rationale_wrap("$name: $entry->{Note}.", '        ', '          ');
+            }
             if (defined $proposals && ref($proposals->{$name}) eq 'HASH')
             {
                 $proposals->{$name}{roleEvidence} = {
@@ -13226,6 +13563,8 @@ sub _log_powerha_roles
                                      @{ (ref($detection) eq 'HASH') ? $detection->{Transitions} : [] } ],
                     role => { configured => $r->{Configured}, hint => $r->{Hint}, inferred => $r->{Inferred},
                               effective => $r->{Effective}, source => $r->{Source}, note => $r->{Note} },
+                    sizing => { policy => $policy->{Sizing}, share => $policy->{Share},
+                                treatment => ($entry ? $entry->{Treatment} : 'none') },
                     reason => $cluster->{Reason},
                 };
             }
@@ -13280,7 +13619,7 @@ sub _collect_structural_findings
         my $proposed = (defined $planning && exists $values->{$planning}) ? $values->{$planning} : undef;
         my $role_result = (ref($core->{RoleResult}) eq 'HASH') ? $core->{RoleResult} : undef;
         $proposed = $role_result->{TargetEnt}                  # a VIOS sized with its group
-            if (defined $role_result && ($role_result->{Source} // '') eq 'VIOS_PAIR');
+            if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_HOLD)$/);
         $proposed = undef unless (defined $proposed && looks_like_number($proposed) && $proposed > 0);
 
         my $current_vp = $cfg->{virtual_cpus};
@@ -13453,8 +13792,8 @@ sub _entitlement_totals
                 my $cycle = (ref($core->{Profile_CurrentCycle}) eq 'HASH') ? $core->{Profile_CurrentCycle}{$planning} : undef;
                 $cycle_ent = $number->($cycle->{Ent}) if (defined $cycle && ref($cycle) eq 'HASH');
                 my $role_result = (ref($core->{RoleResult}) eq 'HASH') ? $core->{RoleResult} : undef;
-                if (defined $role_result && ($role_result->{Source} // '') eq 'VIOS_PAIR')
-                {                                            # a VIOS sized with its group
+                if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_HOLD)$/)
+                {                                            # a VIOS or PowerHA node sized with its group
                     $target    = $number->($role_result->{TargetEnt});
                     $cycle_ent = (ref($role_result->{Pair}) eq 'HASH') ? $number->($role_result->{Pair}{Ent}) : undef;
                 }
@@ -13555,12 +13894,31 @@ sub _log_entitlement_totals
     else
     {
         push @out, _rationale_wrap('A VIOS is recognised from lpar_type in nfit.vms.cfg, else from the SystemType of the VM '
-            . 'configuration file; a standby from that SystemType.', '  ', '  ');
+            . 'configuration file; a standby from the PowerHA roles (ha_peer), else from that SystemType.', '  ', '  ');
     }
-    if ($standbys)
+    # Standby-share sensitivity (design 5.5): the standbys sized from a primary,
+    # at other shares, each still floored at its own workload.
+    my ($map_ref, $order_aref) = @args[0, 1];
+    my @sized = grep { ref($map_ref->{$_}) eq 'HASH' && ref($map_ref->{$_}{CoreResults}) eq 'HASH'
+                       && ref($map_ref->{$_}{CoreResults}{RoleResult}) eq 'HASH'
+                       && ($map_ref->{$_}{CoreResults}{RoleResult}{Source} // '') eq 'HA_STANDBY' } @{ $order_aref // [] };
+    if (@sized)
     {
-        push @out, _rationale_wrap('Each standby is sized on its own workload. The standby-share sensitivity follows '
-            . "once nfit.vms.cfg names each standby's primary (ha_peer).", '  ', '  ');
+        my $as_sized = sum0(map { $map_ref->{$_}{CoreResults}{RoleResult}{TargetEnt} // 0 } @sized);
+        my @parts;
+        foreach my $share (0.20, 0.25, 0.33, 0.50)
+        {
+            my $total = sum0(map { _ha_standby_target($map_ref->{$_}{CoreResults}{RoleResult}{OwnTargetEnt}, undef,
+                $map_ref->{$_}{CoreResults}{RoleResult}{PrimaryTargetEnt}, $share)->{TargetEnt} } @sized);
+            push @parts, sprintf('%d%%: %.2f (system %.2f)', int(100 * $share + 0.5), $total, $groups->{All}{Target} - $as_sized + $total);
+        }
+        push @out, _rationale_wrap(sprintf('Standby share sensitivity, target entitlement of the %d standby%s sized from a primary '
+            . '(each at least its own workload): %s.', scalar(@sized), (@sized == 1 ? '' : 's'), join('; ', @parts)), '  ', '  ');
+    }
+    elsif ($standbys)
+    {
+        push @out, _rationale_wrap('Each standby is sized on its own workload. The standby-share sensitivity applies where a '
+            . 'cluster uses ha_sizing = standby_share.', '  ', '  ');
     }
     print {$log_fh} join("\n", @out), "\n";
     return $totals;
@@ -13872,7 +14230,7 @@ sub _log_recommended_actions
 #             its data from the final, fully populated assimilation map.
 # ==============================================================================
 sub _write_standard_csv_report {
-    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, $anchor_bucket, $proposals) = @_;
+    my ($assimilation_map_ref, $report_type, $system_id, $file_timestamp, $is_multiplicative_run_flag, $is_recency_decay_run_flag, $is_predictive_peak_run_flag, $adaptive_runq_saturation_thresh, $adaptive_thresholds_href, $anchor_bucket, $proposals, $ha_evidence) = @_;
 
     # Ensure we have data to process before creating a file.
     # The @vm_order array is still used to control the iteration order.
@@ -15114,6 +15472,10 @@ sub _write_standard_csv_report {
     # VIOS pairs (v10 stage 3.1b): both VIOS of a pair are sized to the larger.
     _apply_vios_alignment($assimilation_map_ref, \@pending_csv_rows, \%column,
         (($is_multiplicative_run_flag || $is_predictive_peak_run_flag) ? 1 : 0), $proposals);
+
+    # PowerHA role-aware sizing (v10 stage 3.1b step 6d; standard runs).
+    _apply_ha_sizing($assimilation_map_ref, \@pending_csv_rows, \%column,
+        (($is_multiplicative_run_flag || $is_predictive_peak_run_flag) ? 1 : 0), $proposals, $ha_evidence, $report_type);
 
     # Major structural alerts lead VM_Comments (standard reports only; seasonal
     # reports carry forecasts, not the sizing plan). Existing comments are kept.

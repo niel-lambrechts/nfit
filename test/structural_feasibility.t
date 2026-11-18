@@ -26,7 +26,7 @@ my @names = qw(
     _collect_structural_findings _structural_csv_tags
     _log_structural_feasibility _resolve_vm_tier_pattern_policy
     _pool_units_text _pool_shortfall_action _rationale_wrap _log_recommended_actions
-    _structural_planning_profile _lpar_role_hint _entitlement_totals _log_entitlement_totals
+    _structural_planning_profile _lpar_role_hint _entitlement_totals _log_entitlement_totals _ha_standby_target
 );
 my $code = '';
 for my $name (@names)
@@ -43,6 +43,7 @@ my ($tolerance)      = $src =~ /^my \$STRUCTURAL_ENT_TOLERANCE\s*=\s*([0-9.]+);/
 my $harness = qq{
 package UUT;
 use Scalar::Util qw(looks_like_number);
+use List::Util qw(sum0);
 our \$FLOAT_EPSILON = 1e-9;
 our \$MIN_ENT_PER_VP = $min_ent_per_vp;
 our \$STRUCTURAL_ENT_TOLERANCE = $tolerance;
@@ -410,8 +411,20 @@ like($buffer, qr/^      Standbys\s+1\s+0\.50\s+0\.30\s+0\.30$/m, 'totals: standb
 like($buffer, qr/^      VIOS\s+1\s+1\.00\s+1\.20\s+1\.80$/m, 'totals: VIOS subtotal');
 like(flat($buffer), qr/1 LPAR without a planning-profile result is counted at the installed entitlement/, 'totals: held LPAR named');
 like(flat($buffer), qr/1 LPAR without an installed entitlement is left out\./, 'totals: unknown installed named');
-like(flat($buffer), qr/The standby-share sensitivity follows once nfit\.vms\.cfg names each standby's primary \(ha_peer\)\./,
-    'totals: standby-share sensitivity deferred to ha_peer');
+like(flat($buffer), qr/The standby-share sensitivity applies where a cluster uses ha_sizing = standby_share\./,
+    'totals: standby-share sensitivity only with standby_share');
+
+# A standby sized from its primary (v10 stage 3.1b step 6d): the sensitivity line.
+my %map5 = %{ $canon->decode($before4) };
+$map5{a2}{CoreResults}{RoleResult} = { Source => 'HA_STANDBY', TargetEnt => 0.60, OwnTargetEnt => 0.30,
+                                       PrimaryTargetEnt => 2.40, Pair => { Ent => 0.60, VP => 1 } };
+$buffer = '';
+open $log, '>', \$buffer or die;
+UUT::_log_entitlement_totals($log, \%map5, [qw(a1 a2 a3 a4 a5)], \@profiles, {}, \%roles4);
+close $log;
+like($buffer, qr/^      Standbys\s+1\s+0\.50\s+0\.60\s+0\.60$/m, 'totals: the standby at its floor');
+like(flat($buffer), qr/Standby share sensitivity, target entitlement of the 1 standby sized from a primary \(each at least its own workload\): 20%: 0\.48 \(system 4\.53\); 25%: 0\.60 \(system 4\.65\); 33%: 0\.80 \(system 4\.85\); 50%: 1\.20 \(system 5\.25\)\./,
+    'totals: the standby-share sensitivity');
 
 $buffer = '';
 open $log, '>', \$buffer or die;
