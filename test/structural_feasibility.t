@@ -306,7 +306,7 @@ $summary = UUT::_log_structural_feasibility($log, { solo => { Configuration => {
     Hinting => {}, CoreResults => { ProfileValues => { 'G3-95W15' => 1.2 }, Profile_rVCPU_Tactical => { 'G3-95W15' => 2 } } } }, ['solo'], \@profiles, {});
 close $log;
 like($buffer, qr/No LPAR in this analysis is in a user-defined pool\./, 'no user-defined pool: stated');
-like($buffer, qr/No conflict on the planning profile\./, 'no inconsistency: stated');
+like($buffer, qr/Every current-cycle pair meets this rule; NFIT - Action states the order of change\./, 'no inconsistency: stated');
 ok($summary->{PoolShortfalls} == 0 && $summary->{WidthMismatches} == 0 && $summary->{OrderNotes} == 0, 'no findings counted');
 is(UUT::_log_structural_feasibility(undef, {}, [], \@profiles, {})->{PoolsAssessed}, 0, 'empty analysis: nothing assessed');
 

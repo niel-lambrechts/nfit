@@ -224,6 +224,24 @@ class StructuralFeasibilityTests(unittest.TestCase):
                 self.assertTrue(action.startswith('No change'), vm)
             self.assertIsNone(re.search(rf'^    {vm} \(', s, re.M), vm)   # nothing to list
 
+    def test_at_a_glance_states_the_csv_pair(self):
+        """The rationale's "At a glance" block of the planning profile states the
+        same current-cycle pair and action as the CSV."""
+        text = self.log
+        for vm in VMS:
+            row = self.rows[vm]
+            blocks = [m.start() for m in re.finditer(r'^  At a glance$', text, re.M)]
+            found = False
+            for b in blocks:
+                block = text[b:text.index('\n\n', b)]
+                if f"Current-cycle action           : {row['NFIT - Action']}" in block:
+                    vps = int(row['NFIT - VCPU'])
+                    self.assertIn(f"Current cycle                  : {float(row['NFIT - ENT']):.2f} entitlement on "
+                                  + ('1 VP' if vps == 1 else f'{vps} VPs'), block, vm)
+                    found = True
+                    break
+            self.assertTrue(found, vm)
+
     def test_retired_columns_and_option(self):
         for column in ('RunQ_Tactical', 'RunQ_Strategic', 'RunQ_Potential', 'RunQ_Source', 'VCPU_Constraints',
                        'NETT', 'NETT%'):
@@ -241,7 +259,8 @@ class StructuralFeasibilityTests(unittest.TestCase):
 
     def test_terms_used_are_defined_in_the_terminology_reference(self):
         reference = self.log[self.log.index('Key Terminology Reference'):self.log.index('\nPool and VP Checks\n')]
-        for term in ('Planning profile', 'Pool entitlement', 'Entitlement and', 'Recommended', 'Raise/Reduce VPs first',
+        for term in ('Planning profile', 'Pool entitlement', 'Entitlement and', 'Recommended', 'rENT_Tactical',
+                     'rVCPU_Tactical', 'VP reduction step', 'MaxCPU', 'Planning Profile', 'NFIT - ENT /', 'NFIT - Action',
                      '[POOL_SHORTFALL]', '[VP_MISMATCH]'):
             self.assertIn(term, reference)
 
