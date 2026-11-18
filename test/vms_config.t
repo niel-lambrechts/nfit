@@ -86,6 +86,12 @@ ok((grep { /vios_takeover_margin must be a fraction from 0 to 1/ } @{ $c->{warni
 ok((grep { /ha_sizing must be one of independent, standby_share; 'bogus' ignored/ } @{ $c->{warnings} }), 'an invalid ha_sizing is warned');
 is($c->{vms}{n1}{ha_sizing}, 'standby_share', 'ha_sizing read');
 
+# --- [DEFAULT] is not [GLOBAL] ----------------------------------------------------
+$c = cfg("[DEFAULT]\nstandby_share = 0.30\n");
+is_deeply($c->{global}, {}, '[DEFAULT]: not read as the defaults');
+ok((grep { /^line 1: \[DEFAULT\] is read as the section of an LPAR of that name; defaults belong in \[GLOBAL\]/ } @{ $c->{warnings} }),
+   '[DEFAULT]: warned');
+
 # --- Clusters from ha_peer set on either node ------------------------------------
 $c = cfg("[a1]\nha_peer = a2\n[b2]\ntier = G2\n[b1]\nha_peer = b2\n[c1]\nha_peer = c2, c3\n[d2]\nha_peer = d3\n[d1]\nha_peer = d2\n"
        . "[e1]\nha_peer = E2\n[e2]\ntier = G3\n[solo]\ntier = G1\n");
