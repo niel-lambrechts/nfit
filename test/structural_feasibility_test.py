@@ -266,9 +266,9 @@ class StructuralFeasibilityTests(unittest.TestCase):
             installed += ent
             if row['NFIT - ENT'] == '' or row[profile] == '':
                 cycle, target = cycle + ent, target + ent
-            elif vm in VIOS:                                   # the pair's larger target
+            elif vm in VIOS:                                   # the pair's combined target
                 cycle += cents(row['NFIT - ENT'])
-                target += max(cents(self.rows[v][profile]) for v in VIOS)
+                target += sum(cents(self.rows[v][profile]) for v in VIOS)
             else:
                 cycle, target = cycle + cents(row['NFIT - ENT']), target + cents(row[profile])
         self.assertRegex(text, rf'(?m)^    All LPARs\s+{len(VMS)}\s+{installed / 100:.2f}\s+{cycle / 100:.2f}\s+{target / 100:.2f}$')
@@ -276,31 +276,40 @@ class StructuralFeasibilityTests(unittest.TestCase):
         self.assertRegex(text, rf'(?m)^      VIOS\s+{len(VIOS)}\s')
         self.assertIn('Standbys are not recognised: the VM configuration file (--config) was not loaded.', self.flat(text))
 
-    def test_vios_pair_sized_to_the_larger(self):
-        """Both VIOS of a pair are sized to the larger of the two, on P when no
-        TIER is configured; the profile columns keep each VIOS's own figures
-        (v10 stage 3.1b)."""
+    def test_vios_pair_sized_for_the_combined_workload(self):
+        """Both VIOS of a pair are sized to carry the sum of their own targets
+        (combined, the default; margin 0), on P when no TIER is configured; the
+        profile columns keep each VIOS's own figures (v10 stage 3.1b, design
+        revision 2)."""
         rows = {vm: self.rows[vm] for vm in VIOS}
-        own = {vm: float(r['P-99W1']) for vm, r in rows.items()}
-        larger = max(own, key=own.get)
+        own = [round(float(rows[vm]['P-99W1']), 2) for vm in VIOS]
+        combined = sum(int(round(v * 100)) for v in own) / 100
+        section = self.log[self.log.index('\nVIOS Pairs\n'):self.log.index('\nEntitlement Totals\n')]
+        own_vps = 0                                            # the strategic VPs are in the rationale only
+        for vm in VIOS:
+            m = re.search(rf'(?m)^      {vm}\s+P-99W1\s+own target {float(rows[vm]["P-99W1"]):.2f} on (\d+) VPs?;', section)
+            self.assertIsNotNone(m, vm)
+            own_vps += int(m.group(1))
+        target_vps = max(own_vps, math.ceil(combined - 1e-9))
         for vm, row in rows.items():
             self.assertEqual(row['Planning Profile'], 'P-99W1', vm)
             ent, vps = float(row['NFIT - ENT']), int(row['NFIT - VCPU'])
             self.assertLessEqual(ent, vps + 1e-9, vm)
             self.assertGreaterEqual(ent, MIN_ENT_PER_VP * vps - 1e-9, vm)
+            self.assertLessEqual(ent, combined + 1e-9, vm)
             partner = [v for v in VIOS if v != vm][0]
-            if vm == larger:
-                self.assertTrue(row['NFIT - Action'].startswith(f'Sized with {partner}, its VIOS partner: this VIOS is the larger.'), row['NFIT - Action'])
-            else:
-                self.assertTrue(row['NFIT - Action'].startswith(f'Sized to match {partner}, its VIOS partner, for SEA'), row['NFIT - Action'])
+            vp_text = '1 VP' if target_vps == 1 else f'{target_vps} VPs'
+            self.assertTrue(row['NFIT - Action'].startswith(
+                f'Combined VIOS sizing with {partner} (planning scenario): own targets '
+                f'{own[0]:.2f} + {own[1]:.2f}, margin 0% = {combined:.2f} entitlement on {vp_text}.'), row['NFIT - Action'])
+            self.assertNotEqual(row['P-99W1'], '', vm)          # own figures kept in the profile column
         # Same installed pair and the same target: the same current-cycle pair.
-        self.assertEqual({(r['NFIT - ENT'], r['NFIT - VCPU']) for r in rows.values()}.__len__(), 1)
-        self.assertEqual(rows[larger]['NFIT - ENT'], rows[larger]['P-99W1_rENT_Tactical'])
-        section = self.log[self.log.index('\nVIOS Pairs\n'):self.log.index('\nEntitlement Totals\n')]
+        self.assertEqual(len({(r['NFIT - ENT'], r['NFIT - VCPU']) for r in rows.values()}), 1)
         self.assertIn('vio1, vio2 (named by vios_peer)', section)
-        self.assertRegex(section, rf'(?m)^      {larger}\s+P-99W1\s+own target .*; the larger; current cycle')
+        self.assertIn(f'combined on P-99W1: {own[0]:.2f} + {own[1]:.2f}, margin 0% = {combined:.2f} on {vp_text}', section)
+        self.assertIn('planning scenario', self.flat(section))
         for vm in VIOS:
-            self.assertRegex(self.log, rf'(?m)^    VIOS pair\s+: sized with {[v for v in VIOS if v != vm][0]} to the larger')
+            self.assertRegex(self.log, rf'(?m)^    VIOS pair\s+: combined sizing \(planning scenario\) with {[v for v in VIOS if v != vm][0]};')
         self.assertIn('P, peak protected (default for a VIOS)', self.log)
 
     def test_retired_columns_and_option(self):

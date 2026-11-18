@@ -77,6 +77,15 @@ ok((grep { /vios_peer names its own section/ } @{ $c->{warnings} }), 'a self-ref
 is(scalar(grep { /unknown setting 'foo'/ } @{ $c->{warnings} }), 1, 'an unknown key is warned once');
 ok((grep { /^line 19: not a 'key = value' setting/ } @{ $c->{warnings} }), 'a line that is not a setting is warned with its number');
 
+# --- Sizing policy keys (design revision 2) ---------------------------------------
+$c = cfg("[GLOBAL]\nvios_sizing = combined\nvios_takeover_margin = 0.10\nha_sizing = independent\n"
+       . "[v1]\nlpar_type = vios\nvios_sizing = Match_Larger\nvios_takeover_margin = 1.5\n[n1]\nha_sizing = standby_share\nha_sizing = bogus\n");
+is_deeply($c->{global}, { vios_sizing => 'combined', vios_takeover_margin => 0.10, ha_sizing => 'independent' }, '[GLOBAL]: the policy defaults');
+is_deeply($c->{vms}{v1}, { lpar_type => 'vios', vios_sizing => 'match_larger' }, 'vios_sizing read; an invalid margin ignored');
+ok((grep { /vios_takeover_margin must be a fraction from 0 to 1/ } @{ $c->{warnings} }), 'an invalid margin is warned');
+ok((grep { /ha_sizing must be one of independent, standby_share; 'bogus' ignored/ } @{ $c->{warnings} }), 'an invalid ha_sizing is warned');
+is($c->{vms}{n1}{ha_sizing}, 'standby_share', 'ha_sizing read');
+
 # --- Clusters from ha_peer set on either node ------------------------------------
 $c = cfg("[a1]\nha_peer = a2\n[b2]\ntier = G2\n[b1]\nha_peer = b2\n[c1]\nha_peer = c2, c3\n[d2]\nha_peer = d3\n[d1]\nha_peer = d2\n"
        . "[e1]\nha_peer = E2\n[e2]\ntier = G3\n[solo]\ntier = G1\n");

@@ -19,6 +19,7 @@ my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
 for my $name (qw(_resolve_vm_tier_pattern_policy _vios_groups _align_vios_group _vios_pair_sentence
+                 _vios_group_policy _vios_group_profile _combine_vios_group
                  _resolve_current_cycle_pair _ceil_ratio))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
@@ -103,7 +104,60 @@ $al = UUT::_align_vios_group(\@members);
 is_deeply([ $al->{va}{TargetEnt}, $al->{va}{Raised}, @{ $al->{va}{Pair} }{qw(Ent VP)} ], [0.80, 1, 0.80, 1],
     'a VIOS without a result is sized from its partner');
 
-like(UUT::_vios_pair_sentence(['vb'], 1), qr/^Sized to match vb, its VIOS partner, for SEA and storage-path failover\.$/, 'raised: names the partner');
-like(UUT::_vios_pair_sentence([qw(vb vc)], 0), qr/^Sized with vb, vc, its VIOS partners: this VIOS is the larger\.$/, 'larger: names the partners');
+is(UUT::_vios_pair_sentence(['vb'], { Mode => 'match_larger', Raised => 1 }),
+   'Aligned with vb, its VIOS partner (match_larger; takeover capacity not verified).', 'match_larger raised: names the partner');
+is(UUT::_vios_pair_sentence([qw(vb vc)], { Mode => 'match_larger', Raised => 0 }),
+   'Aligned with vb, vc, its VIOS partners: this VIOS is the larger (match_larger; takeover capacity not verified).',
+   'match_larger larger: names the partners');
+
+# --- Group policy (design revision 2) ---------------------------------------------------
+my %set = (va => { vios_sizing => 'match_larger' }, vb => {}, vc => { vios_takeover_margin => 0.10 });
+my $settings_of = sub { $set{ $_[0] } // {} };
+my $pol = UUT::_vios_group_policy([qw(vb vd)], $settings_of, {}, 'vios_peer');
+is_deeply([ @$pol{qw(Mode Margin Conflict)} ], ['combined', 0, 0], 'policy: combined, no margin by default');
+$pol = UUT::_vios_group_policy([qw(va vd)], $settings_of, {}, 'vios_peer');
+is_deeply([ @$pol{qw(Mode Conflict)} ], ['combined', 1], 'policy: members disagree - the more protective (combined), warned');
+$pol = UUT::_vios_group_policy([qw(va vd)], sub { { vios_sizing => 'match_larger' } }, {}, 'vios_peer');
+is($pol->{Mode}, 'match_larger', 'policy: match_larger when every member asks for it');
+$pol = UUT::_vios_group_policy([qw(vb vc)], $settings_of, { vios_takeover_margin => 0.05 }, 'vios_peer');
+is_deeply([ @$pol{qw(Margin Conflict)} ], [0.10, 1], 'policy: margins differ - the larger');
+$pol = UUT::_vios_group_policy([qw(vb vd)], $settings_of, { vios_sizing => 'match_larger', vios_takeover_margin => 0.10 }, 'vios_peer');
+is_deeply([ @$pol{qw(Mode Margin)} ], ['match_larger', 0.10], 'policy: [GLOBAL] defaults');
+$pol = UUT::_vios_group_policy([qw(vb vd ve)], $settings_of, {}, 'system');
+is($pol->{Mode}, 'match_larger', 'policy: three unnamed VIOS are never combined');
+like($pol->{Note}, qr/name the pairs with vios_peer/, 'policy: and the planner is told why');
+is(UUT::_vios_group_policy([qw(vb vd)], $settings_of, {}, 'system')->{Mode}, 'combined', 'policy: the two VIOS of a frame are combined');
+
+# --- Group profile ------------------------------------------------------------------------
+is(UUT::_vios_group_profile([ { planning => 'P-99W1', label => 'P' }, { planning => 'P-99W1', label => 'P' } ]), 'P-99W1', 'profile: P without TIERs');
+is(UUT::_vios_group_profile([ { planning => 'G2-98W10', label => 'G2' }, { planning => 'P-99W1', label => 'P' } ]), 'P-99W1', 'profile: P is the most protective');
+is(UUT::_vios_group_profile([ { planning => 'O1-99W5', label => 'O1' }, { planning => 'G1-99W5', label => 'G1' } ]), 'G1-99W5', 'profile: all-hours before online at the same tier');
+is(UUT::_vios_group_profile([ { planning => 'G3-95W15', label => 'G3' }, { planning => 'B2-98W10', label => 'B2' } ]), 'B2-98W10', 'profile: the lower tier number first');
+
+# --- Combined sizing ----------------------------------------------------------------------
+@members = (
+    { vm => 'va', planning => 'P-99W1', current_ent => 1.00, current_vp => 2,
+      values => { 'P-99W1' => { target_ent => 0.47, target_vp => 1, step_vp => 1 } } },
+    { vm => 'vb', planning => 'P-99W1', current_ent => 1.00, current_vp => 2,
+      values => { 'P-99W1' => { target_ent => 1.37, target_vp => 2, step_vp => 2 } } },
+);
+my $cb = UUT::_combine_vios_group(\@members, 'P-99W1', 0);
+is($cb->{va}{TargetEnt}, 1.84, 'combined: the sum of the own targets');
+is($cb->{vb}{TargetEnt}, 1.84, 'combined: the same target for both');
+is($cb->{va}{TargetVP}, 3, 'combined: the sum of the own VP targets');
+is_deeply([ @{ $cb->{va}{Pair} }{qw(Ent VP)} ], [1.84, 2], 'combined: the current-cycle pair from the installed VPs');
+is($cb->{va}{Pair}{ReviewVP}, 3, 'combined: the extra VP is a review');
+is($cb->{va}{Pair}{ReviewWhy}, 'combined VIOS width', 'combined: with its reason');
+is_deeply($cb->{vb}{OwnTargets}, [0.47, 1.37], 'combined: own targets kept for the rationale');
+$cb = UUT::_combine_vios_group(\@members, 'P-99W1', 0.10);
+is($cb->{va}{TargetEnt}, 2.03, 'combined: margin 10% rounded up to 0.01 (1.84 x 1.10 = 2.024)');
+is($cb->{va}{TargetVP}, 3, 'combined: VPs at least the whole cores of the target');
+is(UUT::_combine_vios_group([ @members[0, 1], { vm => 'vc', planning => 'P-99W1', values => { 'P-99W1' => {} } } ], 'P-99W1', 0)->{va},
+   undef, 'combined: a member without an own target - not combined');
+like(UUT::_vios_pair_sentence(['vb'], $cb->{va}),
+     qr/^Combined VIOS sizing with vb \(planning scenario\): own targets 0\.47 \+ 1\.37, margin 10% = 2\.03 entitlement on 3 VPs\.$/,
+     'combined: the action states the sum, the margin and the target');
+my $big = UUT::_combine_vios_group([ map { { %$_, current_ent => 0.50, current_vp => 1 } } @members ], 'P-99W1', 0);
+ok($big->{va}{Pair}{Ent} <= $big->{va}{Pair}{VP} && $big->{va}{Pair}{Ent} >= 0.05 * $big->{va}{Pair}{VP}, 'combined: a valid pair from a small installed VIOS');
 
 done_testing();
