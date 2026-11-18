@@ -19,7 +19,7 @@ my $src = do { local $/; <$fh> };
 close $fh;
 
 my $code = '';
-for my $name (qw(_resolve_current_cycle_pair _ceil_ratio))
+for my $name (qw(_resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
@@ -86,10 +86,28 @@ check('rise beyond VPs', $r, Ent => 3.53, VP => 4, Status => 'APPLY', Order => '
       Binding => ['VP_WIDTH'], NeedVP => 4);
 valid_pair('rise beyond VPs', $r);
 
-# The same rise in a 3-core user pool: the pair cannot hold more than the pool.
+# The same rise in a 3-core user pool: the pair cannot hold more than the pool,
+# and a fourth VP would add no reach while the pool binds.
 $r = pair(target_ent => 3.53, target_vp => 4, step_vp => 3, current_ent => 1.50, current_vp => 3, pool_size => 3);
-check('rise beyond pool', $r, Ent => 3.00, VP => 4, Status => 'BLOCKED', Binding => [qw(VP_WIDTH POOL_SIZE)]);
+check('rise beyond pool', $r, Ent => 3.00, VP => 3, Status => 'BLOCKED', Binding => [qw(POOL_SIZE)], NeedVP => 3,
+      ReviewVP => undef, TargetEnt => 3.53);
 valid_pair('rise beyond pool', $r);
+
+# Reproduction (peer review, 18 November): the minimum for the VPs must not be
+# lost when the pool clips the entitlement. Formerly 1.00 on 30 VPs (invalid).
+$r = pair(target_ent => 30, target_vp => 30, step_vp => 10, current_ent => 0.50, current_vp => 10, pool_size => 1);
+check('pool clips a large rise', $r, Ent => 1.00, VP => 10, Status => 'BLOCKED', Binding => [qw(POOL_SIZE)],
+      ReviewVP => undef, TargetEnt => 30, TargetVP => 30);
+valid_pair('pool clips a large rise', $r);
+
+# More VPs than the pool maximum can carry at 0.05 each: no valid pair, so the
+# installed pair is kept, blocked, with the target visible.
+$r = pair(target_ent => 2.00, target_vp => 30, step_vp => 30, current_ent => 1.00, current_vp => 30, pool_size => 1);
+check('no valid pair in the pool', $r, Ent => 1.00, VP => 30, Status => 'BLOCKED', Order => 'NONE',
+      Reason => 'no valid pair within the pool maximum', TargetEnt => 2.00);
+is(UUT::_current_cycle_action_text($r, 1.00, 30, 7),
+   'No change: no valid pair within the pool maximum. Pool 7 must allow at least 2 cores to reach the 2.00 target.',
+   'no valid pair: the action states why and the pool prerequisite');
 
 # A verified VP limit (HMC profile maximum) stops the VP rise.
 $r = pair(target_ent => 3.53, target_vp => 4, step_vp => 3, current_ent => 1.50, current_vp => 3, vp_limit => 3);
@@ -160,5 +178,48 @@ for my $cv (1 .. 16)
     }
 }
 is($bad, 0, "sweep: $sweeps pairs valid, no entitlement raised during a reduction");
+
+# With every limit and their combinations: the returned pair is always valid
+# where it changes, never above a user pool's size, and VPs never rise past
+# what the entitlement within the pool needs (peer review, 18 November).
+my ($lsweeps, $lbad, @lfirst) = (0, 0);
+for my $cv (1 .. 12)
+{
+    for my $ce (map { $_ / 4 } 1 .. 4 * $cv)
+    {
+        for my $step (grep { $_ <= $cv } (1, 2, 3, 5, 8, 12))
+        {
+            for my $te (0.05, 0.3, 1.5, 3.2, 7.9, 30)
+            {
+                for my $pool (undef, 1, 2, 4)
+                {
+                    next if (defined $pool && $ce > $pool);     # installed already within the pool
+                    for my $limit (undef, $cv + 1)
+                    {
+                        for my $tvp (1, 30)
+                        {
+                            my $g = pair(target_ent => $te, target_vp => $tvp, step_vp => $step, current_ent => $ce,
+                                         current_vp => $cv, pool_size => $pool, vp_limit => $limit);
+                            $lsweeps++;
+                            my $changed = (abs($g->{Ent} - $ce) >= 0.005 || $g->{VP} != $cv);
+                            my $ok = !$changed || ($g->{Ent} <= $g->{VP} + 1e-9 && $g->{Ent} >= $min_ent_per_vp * $g->{VP} - 1e-9);
+                            $ok &&= ($g->{Ent} <= $pool + 1e-9 || !$changed) if (defined $pool);
+                            if ($g->{VP} > $cv)
+                            {
+                                my $reach = (defined $pool && $te > $pool) ? $pool : $te;
+                                my $need = int($reach); $need++ if ($reach - $need > 1e-9);
+                                $ok &&= ($g->{VP} <= $need);
+                                $ok &&= ($g->{VP} <= $limit) if (defined $limit);
+                            }
+                            if (!$ok) { $lbad++; push @lfirst, "$te/$tvp/$step/$ce/$cv/" . ($pool // '-') . '/' . ($limit // '-')
+                                . " -> $g->{Ent}/$g->{VP}" if (@lfirst < 5); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+is($lbad, 0, "limit sweep: $lsweeps pairs valid within every limit") or diag(join("\n", @lfirst));
 
 done_testing();
