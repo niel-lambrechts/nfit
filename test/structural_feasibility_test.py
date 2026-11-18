@@ -242,6 +242,27 @@ class StructuralFeasibilityTests(unittest.TestCase):
                     break
             self.assertTrue(found, vm)
 
+    def test_entitlement_totals_agree_with_the_csv(self):
+        """The Entitlement Totals section adds up the CSV: installed, NFIT - ENT
+        and the planning-profile target, an LPAR without a result at its
+        installed entitlement (v10 stage 3.1)."""
+        start = self.log.index('\nEntitlement Totals\n')
+        self.assertLess(self.log.index('\nPool and VP Checks\n'), start)
+        self.assertLess(start, self.log.index('\nRecommended Actions'))
+        text = self.log[start:self.log.index('\nRecommended Actions')]
+        cents = lambda v: int(round(float(v) * 100))
+        installed = cycle = target = 0
+        for vm in VMS:
+            row, profile = self.rows[vm], self.planning_profile(vm)
+            ent = cents(VMS[vm][0])
+            installed += ent
+            if row['NFIT - ENT'] == '' or row[profile] == '':
+                cycle, target = cycle + ent, target + ent
+            else:
+                cycle, target = cycle + cents(row['NFIT - ENT']), target + cents(row[profile])
+        self.assertRegex(text, rf'(?m)^    All LPARs\s+{len(VMS)}\s+{installed / 100:.2f}\s+{cycle / 100:.2f}\s+{target / 100:.2f}$')
+        self.assertIn('Standbys and VIOS are not separated: the VM configuration file was not loaded.', text)
+
     def test_retired_columns_and_option(self):
         for column in ('RunQ_Tactical', 'RunQ_Strategic', 'RunQ_Potential', 'RunQ_Source', 'VCPU_Constraints',
                        'NETT', 'NETT%'):
@@ -261,7 +282,7 @@ class StructuralFeasibilityTests(unittest.TestCase):
         reference = self.log[self.log.index('Key Terminology Reference'):self.log.index('\nPool and VP Checks\n')]
         for term in ('Planning profile', 'Pool entitlement', 'Entitlement and', 'Recommended', 'rENT_Tactical',
                      'rVCPU_Tactical', 'VP reduction step', 'MaxCPU', 'Planning Profile', 'NFIT - ENT /', 'NFIT - Action',
-                     '[POOL_SHORTFALL]', '[VP_MISMATCH]'):
+                     '[POOL_SHORTFALL]', '[VP_MISMATCH]', 'Totals'):
             self.assertIn(term, reference)
 
 

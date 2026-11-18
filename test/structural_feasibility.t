@@ -26,6 +26,7 @@ my @names = qw(
     _collect_structural_findings _structural_csv_tags
     _log_structural_feasibility _resolve_vm_tier_pattern_policy
     _pool_units_text _pool_shortfall_action _rationale_wrap _log_recommended_actions
+    _structural_planning_profile _lpar_role_hint _entitlement_totals _log_entitlement_totals
 );
 my $code = '';
 for my $name (@names)
@@ -365,5 +366,59 @@ my %map3 = (
 my $f3 = UUT::_collect_structural_findings(\%map3, [qw(w2 w3)], \@profiles, {});
 is($f3->{Summary}{WidthMismatches}, 1, 'current-cycle pair: only the invalid pair is counted');
 is_deeply([ map { $_->{vm} } @{ $f3->{VmFindings} } ], ['w3'], 'current-cycle pair: the valid pair is not listed');
+
+# --- Entitlement Totals (v10 stage 3.1) -------------------------------------------
+is(UUT::_lpar_role_hint('VIO Server'), 'vios', 'role: VIO Server is a VIOS');
+is(UUT::_lpar_role_hint('VIOS'), 'vios', 'role: VIOS');
+is(UUT::_lpar_role_hint('PowerHA Standby'), 'standby', 'role: PowerHA standby');
+is(UUT::_lpar_role_hint('AIX Production'), '', 'role: any other LPAR');
+is(UUT::_lpar_role_hint(undef), '', 'role: unknown SystemType');
+
+my %map4 = (
+    a1 => { Configuration => { entitlement => 2.00 }, Hinting => { ResolvedPlanningProfile => 'G3-95W15' },
+            CoreResults => { ProfileValues => { 'G3-95W15' => 1.50 }, Profile_CurrentCycle => { 'G3-95W15' => { Ent => 1.50, VP => 2, Status => 'OK' } } } },
+    a2 => { Configuration => { entitlement => 0.50 }, Hinting => { ResolvedPlanningProfile => 'G3-95W15' },
+            CoreResults => { ProfileValues => { 'G3-95W15' => 0.30 }, Profile_CurrentCycle => { 'G3-95W15' => { Ent => 0.30, VP => 1, Status => 'OK' } } } },
+    a3 => { Configuration => { entitlement => 1.00 }, Hinting => { ResolvedPlanningProfile => 'P-99W1' },
+            CoreResults => { ProfileValues => { 'P-99W1' => 1.80 }, Profile_CurrentCycle => { 'P-99W1' => { Ent => 1.20, VP => 2, Status => 'STAGED' } } } },
+    a4 => { Configuration => { entitlement => 0.75 }, Hinting => { ResolvedPlanningProfile => 'G3-95W15' }, CoreResults => { ProfileValues => {} } },
+    a5 => { Configuration => {}, Hinting => { ResolvedPlanningProfile => 'G3-95W15' }, CoreResults => {} },
+);
+my %roles4 = (a2 => 'standby', a3 => 'vios');
+my $before4 = $canon->encode(\%map4);
+my $t4 = UUT::_entitlement_totals(\%map4, [qw(a1 a2 a3 a4 a5)], \@profiles, {}, \%roles4);
+is($canon->encode(\%map4), $before4, 'totals: the assimilation map is left exactly as it was');
+my $g4 = $t4->{Groups};
+is_deeply([ @{ $g4->{All} }{qw(Count Installed CurrentCycle Target)} ], [4, 4.25, 3.75, 4.35],
+    'totals: all LPARs (the LPAR without a result at its installed entitlement)');
+is_deeply([ @{ $g4->{ExclStandby} }{qw(Count Installed CurrentCycle Target)} ], [3, 3.75, 3.45, 4.05], 'totals: excluding standbys');
+is_deeply([ @{ $g4->{ExclStandbyVios} }{qw(Count Installed CurrentCycle Target)} ], [2, 2.75, 2.25, 2.25], 'totals: excluding standbys and VIOS');
+is_deeply([ @{ $g4->{Standby} }{qw(Count Installed CurrentCycle Target)} ], [1, 0.5, 0.3, 0.3], 'totals: standbys');
+is_deeply([ @{ $g4->{Vios} }{qw(Count Installed CurrentCycle Target)} ], [1, 1, 1.2, 1.8], 'totals: VIOS (current cycle staged towards the target)');
+is($t4->{Held}, 1, 'totals: one LPAR counted at installed');
+is($t4->{NoInstalled}, 1, 'totals: one LPAR without an installed entitlement left out');
+
+$buffer = '';
+open $log, '>', \$buffer or die;
+UUT::_log_entitlement_totals($log, \%map4, [qw(a1 a2 a3 a4 a5)], \@profiles, {}, \%roles4);
+close $log;
+like($buffer, qr/^Entitlement Totals$/m, 'totals: section heading written');
+like($buffer, qr/^    All LPARs\s+4\s+4\.25\s+3\.75\s+4\.35$/m, 'totals: all LPARs row');
+like($buffer, qr/^    Excluding standbys\s+3\s+3\.75\s+3\.45\s+4\.05$/m, 'totals: excluding standbys row');
+like($buffer, qr/^    Excluding standbys and VIOS\s+2\s+2\.75\s+2\.25\s+2\.25$/m, 'totals: excluding standbys and VIOS row');
+like($buffer, qr/^      Standbys\s+1\s+0\.50\s+0\.30\s+0\.30$/m, 'totals: standby subtotal');
+like($buffer, qr/^      VIOS\s+1\s+1\.00\s+1\.20\s+1\.80$/m, 'totals: VIOS subtotal');
+like(flat($buffer), qr/1 LPAR without a planning-profile result is counted at the installed entitlement/, 'totals: held LPAR named');
+like(flat($buffer), qr/1 LPAR without an installed entitlement is left out\./, 'totals: unknown installed named');
+like(flat($buffer), qr/The standby-share sensitivity follows once nfit\.vms\.cfg names each standby's primary \(ha_peer\)\./,
+    'totals: standby-share sensitivity deferred to ha_peer');
+
+$buffer = '';
+open $log, '>', \$buffer or die;
+UUT::_log_entitlement_totals($log, \%map4, [qw(a1 a2 a3 a4 a5)], \@profiles, {}, undef);
+close $log;
+unlike($buffer, qr/Excluding/, 'totals: without the VM configuration, standbys and VIOS are not separated');
+like($buffer, qr/Standbys and VIOS are not separated: the VM configuration file was not loaded\./, 'totals: reason stated');
+is(UUT::_log_entitlement_totals(undef, {}, [], \@profiles, {}, undef)->{Groups}{All}{Count}, 0, 'totals: empty analysis');
 
 done_testing();

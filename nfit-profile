@@ -1303,6 +1303,7 @@ if (defined $apply_seasonality_event) {
 my $vm_config_file_path = undef;
 my $vm_config_found = 0;
 my %vm_config_data;         # Stores parsed VM config: $vm_config_data{hostname}{key} = value
+my $vm_config_loaded = 0;   # 1 once the VM configuration file is read (%vm_config_data can autovivify)
 my %vm_config_col_idx;      # Maps column names (lowercase) to their index in the CSV
 my $vm_config_header_count = 0; # Number of columns in VM config header
 
@@ -1458,6 +1459,7 @@ if ($vm_config_found)
         }
     }
     close $cfg_fh;
+    $vm_config_loaded = 1;
     print STDERR "    ✓ Loaded " . scalar(keys %vm_config_data) . " VM configuration entries\n";
 }
 else # VM config file not found or not specified
@@ -2104,6 +2106,9 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     rVCPU_Tactical); the check confirms it. A pair that fails is flagged in\n";
         print {$LOG_FH} "                     the CSV as [VP_MISMATCH] and indicates a defect.\n";
         print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Entitlement        Installed, current-cycle and target entitlement added up for each system,\n";
+        print {$LOG_FH} "  Totals             each LPAR on its planning profile, with and without standbys and VIOS.\n";
+        print {$LOG_FH} "\n";
         print {$LOG_FH} "  Recommended        One line per action from the checks, at the end of each system.\n";
         print {$LOG_FH} "  Actions            \"No additional action identified by the checks run\" closes the list.\n";
         if (_pool_exposure_wanted($current_cache_path))
@@ -2691,6 +2696,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                     $structural_summary->{WidthMismatches}) if ($structural_summary->{WidthMismatches});
                 printf STDERR "  [WARN] Pool and VP checks: %s (see rationale)\n", join(', ', @findings);
             }
+
+            # Entitlement totals for the system (rationale only). Roles come
+            # from the SystemType of the VM configuration file, when loaded.
+            my %lpar_roles = map { $_ => _lpar_role_hint(exists $vm_config_data{$_} ? $vm_config_data{$_}{systemtype} : undef) }
+                @vm_order;
+            _log_entitlement_totals($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order, \@profiles,
+                \%vm_tier_overrides, ($vm_config_loaded ? \%lpar_roles : undef));
 
             # Entitlement cut exposure (automatic when the cache has pool
             # observations and PhysB; rationale only; nothing is changed).
@@ -11729,6 +11741,48 @@ sub _describe_ent_vp_pair
 }
 
 # ==============================================================================
+# SUBROUTINE: _structural_planning_profile
+# PURPOSE:    The planning profile of one LPAR and its tier source: as resolved
+#             for the CSV where the map carries it, otherwise resolved here.
+# ARGUMENTS:  1. LPAR name  2. Hinting hashref of the LPAR
+#             3. configured VM tiers (hashref)  4. loaded profiles (arrayref)
+# RETURNS:    (planning profile name or undef, tier policy source or undef)
+# ==============================================================================
+sub _structural_planning_profile
+{
+    my ($vm_name, $hinting, $tier_overrides_href, $profiles_aref) = @_;
+    $hinting = {} unless (defined $hinting && ref($hinting) eq 'HASH');
+    my $planning = $hinting->{ResolvedPlanningProfile};
+    my $source   = $hinting->{TierPolicySource};
+    if (!defined $planning || $planning eq '')
+    {
+        my $configured = (defined $tier_overrides_href && ref($tier_overrides_href) eq 'HASH')
+            ? $tier_overrides_href->{$vm_name} : undef;
+        my $resolved = _resolve_vm_tier_pattern_policy(($configured // ''), ($hinting->{AutoTier} // ''), $profiles_aref);
+        $planning = $resolved->{ResolvedPlanningProfile};
+        $source   = $resolved->{TierPolicySource};
+    }
+    return ($planning, $source);
+}
+
+# ==============================================================================
+# SUBROUTINE: _lpar_role_hint
+# PURPOSE:    The role of an LPAR as the SystemType text of the VM configuration
+#             file states it: 'vios', 'standby' or '' (any other LPAR). The
+#             nfit.vms.cfg roles (lpar_type, ha_peer) take precedence once read.
+# ARGUMENTS:  1. SystemType text (may be undef)
+# RETURNS:    string
+# ==============================================================================
+sub _lpar_role_hint
+{
+    my ($systemtype) = @_;
+    return '' unless (defined $systemtype && $systemtype =~ /\S/);
+    return 'vios'    if ($systemtype =~ /vio(?:s|\s*server)|virtual\s+i\/o/i);
+    return 'standby' if ($systemtype =~ /standby/i);
+    return '';
+}
+
+# ==============================================================================
 # SUBROUTINE: _collect_structural_findings
 # PURPOSE:    Runs both structural checks for one system. Reads the
 #             assimilation map only; nothing in it is changed. The rationale
@@ -11768,15 +11822,7 @@ sub _collect_structural_findings
 
         # The planning profile resolved for the CSV; resolved here only if the
         # map does not carry it.
-        my $planning = $hinting->{ResolvedPlanningProfile};
-        my $source   = $hinting->{TierPolicySource};
-        if (!defined $planning || $planning eq '')
-        {
-            my $resolved = _resolve_vm_tier_pattern_policy(
-                ($tier_overrides_href->{$vm_name} // ''), ($hinting->{AutoTier} // ''), $profiles_aref);
-            $planning = $resolved->{ResolvedPlanningProfile};
-            $source   = $resolved->{TierPolicySource};
-        }
+        my ($planning, $source) = _structural_planning_profile($vm_name, $hinting, $tier_overrides_href, $profiles_aref);
 
         my $proposed = (defined $planning && exists $values->{$planning}) ? $values->{$planning} : undef;
         $proposed = undef unless (defined $proposed && looks_like_number($proposed) && $proposed > 0);
@@ -11898,6 +11944,154 @@ sub _structural_csv_tags
         }
     }
     return \%tags;
+}
+
+# ==============================================================================
+# SUBROUTINE: _entitlement_totals
+# PURPOSE:    Installed, current-cycle and target entitlement totals for one
+#             system (v10 stage 3.1), each LPAR on its planning profile: all
+#             LPARs, excluding standbys, excluding standbys and VIOS, and the
+#             standby and VIOS subtotals. The current cycle is the planning
+#             profile's current-cycle pair (NFIT - ENT); the target is its
+#             entitlement. An LPAR without a planning-profile result is counted
+#             at its installed entitlement in both. Values are added in
+#             hundredths, as the CSV shows them.
+# ARGUMENTS:  1. assimilation map (hashref)   2. VM order (arrayref)
+#             3. loaded profiles (arrayref)   4. configured VM tiers (hashref)
+#             5. role per LPAR (hashref of 'standby', 'vios' or ''; undef when
+#                the VM configuration file is not loaded)
+# RETURNS:    hashref: Groups (All, ExclStandby, ExclStandbyVios, Standby,
+#             Vios; each { Count, Installed, CurrentCycle, Target } in cores),
+#             Held (LPARs counted at installed), NoInstalled (LPARs left out:
+#             installed entitlement unknown), RolesKnown
+# ==============================================================================
+sub _entitlement_totals
+{
+    my ($map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href, $roles_href) = @_;
+    my @group_names = qw(All ExclStandby ExclStandbyVios Standby Vios);
+    my %cents = map { $_ => { Count => 0, Installed => 0, CurrentCycle => 0, Target => 0 } } @group_names;
+    my %totals = (Groups => {}, Held => 0, NoInstalled => 0,
+                  RolesKnown => (defined $roles_href && ref($roles_href) eq 'HASH') ? 1 : 0);
+    my $in_cents = sub { my ($v) = @_; return int($v * 100 + 0.5); };
+    my $number = sub { my ($v) = @_; return (defined $v && looks_like_number($v) && $v >= 0) ? $v : undef; };
+
+    if (defined $map_ref && ref($map_ref) eq 'HASH' && defined $vm_order_aref && ref($vm_order_aref) eq 'ARRAY')
+    {
+        foreach my $vm_name (@$vm_order_aref)
+        {
+            next unless (exists $map_ref->{$vm_name} && ref($map_ref->{$vm_name}) eq 'HASH');
+            my $vm_map = $map_ref->{$vm_name};
+            my $cfg  = (ref($vm_map->{Configuration}) eq 'HASH') ? $vm_map->{Configuration} : {};
+            my $core = (ref($vm_map->{CoreResults}) eq 'HASH')   ? $vm_map->{CoreResults}   : {};
+            my $installed = $number->($cfg->{entitlement});
+            if (!defined $installed)
+            {
+                $totals{NoInstalled}++;
+                next;
+            }
+            my ($planning) = _structural_planning_profile($vm_name, $vm_map->{Hinting}, $tier_overrides_href, $profiles_aref);
+            my ($target, $cycle_ent);
+            if (defined $planning)
+            {
+                $target = $number->($core->{ProfileValues}{$planning}) if (ref($core->{ProfileValues}) eq 'HASH');
+                my $cycle = (ref($core->{Profile_CurrentCycle}) eq 'HASH') ? $core->{Profile_CurrentCycle}{$planning} : undef;
+                $cycle_ent = $number->($cycle->{Ent}) if (defined $cycle && ref($cycle) eq 'HASH');
+            }
+            if (!defined $target || $target <= 0 || !defined $cycle_ent)
+            {
+                ($target, $cycle_ent) = ($installed, $installed);
+                $totals{Held}++;
+            }
+
+            my $role = ($totals{RolesKnown} && defined $roles_href->{$vm_name}) ? $roles_href->{$vm_name} : '';
+            my @groups = ('All');
+            push @groups, 'Standby'         if ($role eq 'standby');
+            push @groups, 'Vios'            if ($role eq 'vios');
+            push @groups, 'ExclStandby'     if ($role ne 'standby');
+            push @groups, 'ExclStandbyVios' if ($role ne 'standby' && $role ne 'vios');
+            foreach my $group (@groups)
+            {
+                $cents{$group}{Count}++;
+                $cents{$group}{Installed}    += $in_cents->($installed);
+                $cents{$group}{CurrentCycle} += $in_cents->($cycle_ent);
+                $cents{$group}{Target}       += $in_cents->($target);
+            }
+        }
+    }
+    foreach my $group (@group_names)
+    {
+        $totals{Groups}{$group} = { Count => $cents{$group}{Count},
+            map { $_ => $cents{$group}{$_} / 100 } qw(Installed CurrentCycle Target) };
+    }
+    return \%totals;
+}
+
+# ==============================================================================
+# SUBROUTINE: _log_entitlement_totals
+# PURPOSE:    Writes the "Entitlement Totals" section for one system to its
+#             rationale log (v10 stage 3.1): the totals of _entitlement_totals,
+#             with the rows that separate standbys and VIOS shown only where
+#             the system has them.
+# ARGUMENTS:  1. rationale log file handle (may be undef: nothing is written)
+#             2-6. as _entitlement_totals
+# RETURNS:    hashref from _entitlement_totals
+# ==============================================================================
+sub _log_entitlement_totals
+{
+    my ($log_fh, @args) = @_;
+    my $totals = _entitlement_totals(@args);
+    my $groups = $totals->{Groups};
+    return $totals unless (defined $log_fh && ref($log_fh) && $groups->{All}{Count});
+
+    my ($standbys, $vios) = ($groups->{Standby}{Count}, $groups->{Vios}{Count});
+    my $format = "    %-29s %5s %10s %14s %10s";
+    my $row = sub
+    {
+        my ($label, $group) = @_;
+        return sprintf($format, $label, $group->{Count}, map { sprintf('%.2f', $group->{$_}) } qw(Installed CurrentCycle Target));
+    };
+    my @out = ('', '=' x 70, 'Entitlement Totals', '=' x 70);
+    push @out, '  Entitlement in cores, each LPAR on its planning profile. Current cycle is the NFIT - ENT';
+    push @out, "  column of the CSV; Target is the planning profile's entitlement.";
+    push @out, '';
+    push @out, sprintf($format, '', 'LPARs', 'Installed', 'Current cycle', 'Target');
+    push @out, sprintf($format, '', '-' x 5, '-' x 10, '-' x 14, '-' x 10);
+    push @out, $row->('All LPARs', $groups->{All});
+    push @out, $row->('Excluding standbys', $groups->{ExclStandby}) if ($standbys);
+    push @out, $row->(($standbys ? 'Excluding standbys and VIOS' : 'Excluding VIOS'), $groups->{ExclStandbyVios}) if ($vios);
+    push @out, $row->('  Standbys', $groups->{Standby}) if ($standbys);
+    push @out, $row->('  VIOS', $groups->{Vios}) if ($vios);
+    push @out, '';
+    if ($totals->{Held})
+    {
+        push @out, _rationale_wrap(sprintf('%d LPAR%s without a planning-profile result %s counted at the installed '
+            . 'entitlement in the current-cycle and target totals.', $totals->{Held},
+            ($totals->{Held} == 1 ? '' : 's'), ($totals->{Held} == 1 ? 'is' : 'are')), '  ', '  ');
+    }
+    if ($totals->{NoInstalled})
+    {
+        push @out, _rationale_wrap(sprintf('%d LPAR%s without an installed entitlement %s left out.', $totals->{NoInstalled},
+            ($totals->{NoInstalled} == 1 ? '' : 's'), ($totals->{NoInstalled} == 1 ? 'is' : 'are')), '  ', '  ');
+    }
+    if (!$totals->{RolesKnown})
+    {
+        push @out, '  Standbys and VIOS are not separated: the VM configuration file was not loaded.';
+    }
+    elsif (!$standbys && !$vios)
+    {
+        push @out, '  No LPAR is marked as a standby or VIOS in the SystemType of the VM configuration file.';
+    }
+    else
+    {
+        push @out, '  Standbys and VIOS are recognised from the SystemType of the VM configuration file.';
+    }
+    if ($standbys)
+    {
+        push @out, _rationale_wrap('Each standby is sized on its own workload. The standby-share sensitivity follows '
+            . "once nfit.vms.cfg names each standby's primary (ha_peer).", '  ', '  ');
+    }
+    print {$log_fh} join("\n", @out), "\n";
+    return $totals;
 }
 
 # ==============================================================================
@@ -22208,8 +22402,8 @@ sub _candidate_trackers
         my $p = $members->{$vm};
         my $reason;
         if ($role !~ /\S/ || $role =~ /^\s*(?:unknown|N\/A)\s*$/i) { $reason = 'role not known in the VM configuration'; }
-        elsif ($role =~ /vio(?:s|\s*server)|virtual\s+i\/o/i)    { $reason = 'excluded from automatic change: VIOS'; }
-        elsif ($role =~ /standby/i)                                    { $reason = 'excluded from automatic change: standby LPAR'; }
+        elsif (_lpar_role_hint($role) eq 'vios')                       { $reason = 'excluded from automatic change: VIOS'; }
+        elsif (_lpar_role_hint($role) eq 'standby')                    { $reason = 'excluded from automatic change: standby LPAR'; }
         elsif ($role =~ /failover\s+reserve/i)                         { $reason = 'excluded from automatic change: failover reserve'; }
         elsif (($p->{hint} // '') eq 'P')                              { $reason = 'peak protected (P): planner review'; }
         elsif (!$s || $s->{end_epoch} < $asof - 86400) { $reason = 'no configuration state at the proposal date'; }
