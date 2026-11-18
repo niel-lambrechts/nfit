@@ -418,7 +418,7 @@ open $log, '>', \$buffer or die;
 UUT::_log_entitlement_totals($log, \%map4, [qw(a1 a2 a3 a4 a5)], \@profiles, {}, undef);
 close $log;
 unlike($buffer, qr/Excluding/, 'totals: without the VM configuration, standbys and VIOS are not separated');
-like($buffer, qr/Standbys and VIOS are not separated: the VM configuration file was not loaded\./, 'totals: reason stated');
+like($buffer, qr/Standbys and VIOS are not separated\./, 'totals: reason stated');
 is(UUT::_log_entitlement_totals(undef, {}, [], \@profiles, {}, undef)->{Groups}{All}{Count}, 0, 'totals: empty analysis');
 
 done_testing();

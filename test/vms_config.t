@@ -92,6 +92,14 @@ is_deeply(UUT::_ha_clusters({}), [], 'no ha_peer: no clusters');
 $c = UUT::parse_vms_config($sample);
 ok($c->{exists}, 'the sample exists');
 is_deeply($c->{warnings}, [], 'the sample reads without warnings');
-is_deeply($c->{clusters}, [ [qw(db01a db01b)], [qw(mq01a mq01b)] ], 'the sample clusters');
+is_deeply([ keys %{ $c->{vms} } ], [], 'as shipped, the sample configures no LPAR');
+# The examples, enabled (leading ';' removed), are valid settings.
+open my $in, '<', $sample or die;
+my $enabled = join('', map { s/^;(?=\[|[A-Za-z_]+\s*=)//r } <$in>);
+close $in;
+$c = cfg($enabled);
+is_deeply($c->{warnings}, [], 'the enabled examples read without warnings');
+is_deeply($c->{clusters}, [ [qw(db01a db01b)], [qw(mq01a mq01b)] ], 'the example clusters');
+is_deeply($c->{vms}{vios01a}, { lpar_type => 'vios', vios_peer => ['vios01b'] }, 'the example VIOS pair');
 
 done_testing();

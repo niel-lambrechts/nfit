@@ -295,12 +295,13 @@ my $in = decode_json(do { local $/; <STDIN> });
 my @profiles = map { { name => $_->[0], csv_output => $_->[1] } } @{ $in->{profiles} };
 my @out;
 for my $case (@{ $in->{cases} }) {
-    my $r = _resolve_vm_tier_pattern_policy($case->[0], $case->[1], \@profiles);
+    my $r = _resolve_vm_tier_pattern_policy($case->[0], $case->[1], \@profiles, $case->[2]);
     $r->{ResolvedPolicyTier} = "$r->{ResolvedPolicyTier}";
     push @out, $r;
 }
-my $overrides = parse_vms_config($cfg_path)->{tiers};
-print encode_json({ resolved => \@out, overrides => $overrides });
+my $cfg = parse_vms_config($cfg_path);
+my %types = map { $_ => $cfg->{vms}{$_}{lpar_type} } grep { defined $cfg->{vms}{$_}{lpar_type} } keys %{ $cfg->{vms} };
+print encode_json({ resolved => \@out, overrides => $cfg->{tiers}, types => \%types });
 '''
 
 
@@ -315,22 +316,27 @@ class TierResolutionParity(unittest.TestCase):
         parser.read(os.path.join(REPO, 'etc', 'nfit.profiles.cfg'), encoding='utf-8')
         profiles = [[n, parser.get(n, 'csv_output', fallback='true').strip().lower() != 'false'] for n in parser.sections()]
         profiles.append(['P-99W1', True])
-        cases = [[c, h or ''] for c in self.CONFIGURED for h in self.HINTS]
+        cases = [[c, h or '', t] for c in self.CONFIGURED for h in self.HINTS for t in ('', 'vios')]
         cfg = os.path.join(tempfile.mkdtemp(prefix='tier-cfg-'), 'nfit.vms.cfg')
         with open(cfg, 'w') as fh:
             fh.write('# comment\n[vmA]\ntier = g2   # trailing\n[ vm B ]\n; note\nTIER=O 3\n[vmC]\nother = 1\n'
-                     '[vmD]\ntier = P\ntier = B1\n[vmE]\n\ntier= b4-custom\n')
+                     '[vmD]\ntier = P\ntier = B1\n[vmE]\n\ntier= b4-custom\n'
+                     '[GLOBAL]\ntier = G1\nstandby_share = 0.25\n[vmV]\nlpar_type = VIOS\n[vmW]\nlpar_type = bogus\ntier = G2\n'
+                     '[vmX]\ntier = O1\nlpar_type = lpar\n')
         p = subprocess.run(['perl', '-e', PERL_PARITY, os.path.join(REPO, 'nfit-profile'), cfg],
                            input=json.dumps({'profiles': profiles, 'cases': cases}), capture_output=True, text=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr[-800:])
         perl = json.loads(p.stdout)
         defs = [tuple(x) for x in profiles]
-        for (configured, hint), want in zip(cases, perl['resolved']):
-            got = R['resolve_vm_tier_pattern_policy'](configured, hint, defs)
+        for (configured, hint, lpar_type), want in zip(cases, perl['resolved']):
+            got = R['resolve_vm_tier_pattern_policy'](configured, hint, defs, lpar_type)
             got['ResolvedPolicyTier'] = str(got['ResolvedPolicyTier'])
-            self.assertEqual(got, want, (configured, hint))
+            self.assertEqual(got, want, (configured, hint, lpar_type))
         self.assertEqual(R['parse_vm_tier_overrides'](cfg), perl['overrides'])
-        self.assertEqual(len(cases), 140)
+        self.assertNotIn('GLOBAL', perl['overrides'])
+        self.assertEqual(R['parse_vm_lpar_types'](cfg), perl['types'])
+        self.assertEqual(perl['types'], {'vmV': 'vios', 'vmX': 'lpar'})
+        self.assertEqual(len(cases), 280)
 
 
 # -- end to end on history written by nfit-profile ----------------------------------------
