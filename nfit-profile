@@ -2108,6 +2108,10 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     rVCPU_Tactical); the check confirms it. A pair that fails is flagged in\n";
         print {$LOG_FH} "                     the CSV as [VP_MISMATCH] and indicates a defect.\n";
         print {$LOG_FH} "\n";
+        print {$LOG_FH} "  PowerHA Roles      Roles of the nodes named by ha_peer, from their workload on the same\n";
+        print {$LOG_FH} "                     timestamps. An inferred role is evidence, not proof of PowerHA\n";
+        print {$LOG_FH} "                     ownership; an unclear case is unresolved. Report only.\n";
+        print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
         print {$LOG_FH} "                     vios_takeover_margin, a planning scenario; match_larger: aligned with the\n";
@@ -2707,6 +2711,17 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
 
             # VIOS pairs aligned by the CSV writer (rationale; v10 stage 3.1b).
             _log_vios_pairs($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order);
+
+            # PowerHA roles (v10 stage 3.1b step 6c): evidence and inferred
+            # roles of the clusters named by ha_peer; report only.
+            if ($effective_start_date_obj && $effective_end_date_obj)
+            {
+                my $role_from = $effective_start_date_obj->epoch - ($effective_start_date_obj->epoch % 86400);
+                my $role_to   = $effective_end_date_obj->epoch - ($effective_end_date_obj->epoch % 86400) + 86400;
+                my $role_evidence = _ha_role_evidence($current_cache_path, \@vm_order, $assimilation_map_ref, $role_from, $role_to);
+                my $clusters = _log_powerha_roles($open_log_files{$system_identifier}, $role_evidence, \%proposals);
+                printf STDERR "  [INFO] PowerHA roles: %d cluster(s) (see rationale)\n", $clusters if ($clusters);
+            }
 
             # Entitlement totals for the system (rationale only). A VIOS is
             # recognised from lpar_type, else the SystemType; a standby from
@@ -12396,6 +12411,707 @@ sub _log_vios_pairs
     }
     print {$log_fh} join("\n", @out), "\n";
     return scalar(@aligned);
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_role_rules
+# PURPOSE:    The provisional settings of the PowerHA role detector (v10 stage
+#             3.1b step 6c, detector ha-role-1; design "Phase 3.1b Role-Aware
+#             Sizing" section 4). They nominate candidates for the planner;
+#             they are not calibrated and decide no figure in 6c.
+# RETURNS:    hashref
+# ==============================================================================
+sub _ha_role_rules
+{
+    return {
+        detector         => 'ha-role-1',
+        blockSeconds     => 900,     # 15-minute UTC blocks
+        minCoverage      => 0.80,    # share of a block's minutes that must hold a sample
+        refBlocks        => 24,      # local noise: the latest six supported hours
+        sameTimeDays     => 7,       # reference: the same block on the previous days ...
+        minSameTimeDays  => 3,       # ... at least three of them
+        absCores         => 0.05,    # a shift exceeds max(0.05 cores, 3 x MAD)
+        madK             => 3,
+        persistBlocks    => 4,       # one hour: a sustained shift
+        leaderShare      => 0.95,    # segment: share of the separated blocks one node leads
+        multiple         => 0.20,    # each leads at least this share: multiple-active-like
+        minSeparated     => 24,      # separated blocks (six hours) needed for any verdict
+        minSegmentBlocks => 96,      # supported blocks in profile hours for a segment verdict
+    };
+}
+
+# Median and median absolute deviation of a list (both undef when empty).
+sub _ha_median_mad
+{
+    my @v = sort { $a <=> $b } grep { defined } @_;
+    return (undef, undef) unless @v;
+    my $median = (@v % 2) ? $v[$#v / 2] : ($v[@v / 2 - 1] + $v[@v / 2]) / 2;
+    my @d = sort { $a <=> $b } map { abs($_ - $median) } @v;
+    my $mad = (@d % 2) ? $d[$#d / 2] : ($d[@d / 2 - 1] + $d[@d / 2]) / 2;
+    return ($median, $mad);
+}
+
+# Nearest-rank percentile of a sorted list.
+sub _ha_percentile
+{
+    my ($sorted, $p) = @_;
+    return undef unless (@$sorted);
+    my $rank = int($p * @$sorted + 0.999999);
+    $rank = 1 if ($rank < 1);
+    $rank = @$sorted if ($rank > @$sorted);
+    return $sorted->[$rank - 1];
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_blocks
+# PURPOSE:    15-minute UTC blocks of one LPAR from its minute samples: for
+#             PhysC and PhysB, the median and P90 of the minute means and the
+#             share of minutes with a sample; and the configuration state of
+#             the block (undef where a state change falls inside it). Missing
+#             minutes are never treated as idle.
+# ARGUMENTS:  1. minutes { epoch minute => [samples, sum PhysC, pairs, sum PhysB] }
+#             2. window start (epoch, block-aligned)  3. window end (exclusive)
+#             4. configuration states of the LPAR (arrayref, may be empty)
+# RETURNS:    arrayref indexed by block: { c_med, c_p90, c_cov, b_med, b_p90,
+#             b_cov, state } (state: a signature string)
+# ==============================================================================
+sub _ha_blocks
+{
+    my ($minutes, $from, $to, $states_aref) = @_;
+    my $rules = _ha_role_rules();
+    my $step = $rules->{blockSeconds};
+    my $per = $step / 60;
+    my @states = sort { $a->{start_epoch} <=> $b->{start_epoch} }
+        grep { ref($_) eq 'HASH' && defined $_->{start_epoch} && defined $_->{end_epoch} } @{ $states_aref // [] };
+    my $signature = sub
+    {
+        my ($m) = @_;
+        $m = {} unless (ref($m) eq 'HASH');
+        return join('|', map { $m->{$_} // '' } qw(serial_number entitlement virtual_cpus pool_id smt capped));
+    };
+    my @blocks;
+    my $s = 0;
+    for (my $t = $from, my $k = 0; $t < $to; $t += $step, $k++)
+    {
+        my (@c, @b);
+        for (my $m = $t; $m < $t + $step; $m += 60)
+        {
+            my $acc = $minutes->{$m} or next;
+            push @c, $acc->[1] / $acc->[0] if ($acc->[0]);
+            push @b, $acc->[3] / $acc->[2] if ($acc->[2]);
+        }
+        @c = sort { $a <=> $b } @c;
+        @b = sort { $a <=> $b } @b;
+        $s++ while ($s < $#states && $states[$s + 1]{start_epoch} <= $t);
+        my $state;
+        if (@states && $states[$s]{start_epoch} <= $t)
+        {
+            my $next = ($s < $#states) ? $states[$s + 1]{start_epoch} : undef;
+            $state = $signature->($states[$s]{metadata}) unless (defined $next && $next < $t + $step);
+        }
+        $blocks[$k] = {
+            c_med => scalar((_ha_median_mad(@c))[0]), c_p90 => _ha_percentile(\@c, 0.90), c_cov => @c / $per,
+            b_med => scalar((_ha_median_mad(@b))[0]), b_p90 => _ha_percentile(\@b, 0.90), b_cov => @b / $per,
+            state => $state,
+        };
+    }
+    return \@blocks;
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_detect_pair
+# PURPOSE:    Role evidence for a two-node cluster (detector ha-role-1):
+#             1. one metric for both nodes: PhysB where both have it for at
+#                least 80% of their supported PhysC blocks, otherwise PhysC;
+#             2. transitions over all hours: a reciprocal displacement (one
+#                node above, the other below its own level at the same time of
+#                day on previous days, each by more than max(0.05 cores, 3 x
+#                MAD)); sustained after four consecutive supported blocks,
+#                otherwise a short handover candidate; a sustained one that
+#                ends in a reciprocal return is followed by a switch back; the
+#                boundary is an interval; a coincident configuration change
+#                makes it ambiguous;
+#             3. segments between sustained transitions, classified in each
+#                admitted window (profile hours) on the same timestamps from
+#                the blocks in which one node's P90 leads the other's by more
+#                than the other's noise: one node leads at least 95% of them
+#                (active-like/standby-like), each leads at least 20%
+#                (multiple-active-like), or UNKNOWN; at least six hours of
+#                separated blocks are needed for a verdict.
+#             Pure: reads only its arguments.
+# ARGUMENTS:  1. node A name  2. node B name  3. blocks of A  4. blocks of B
+#             5. window start (epoch)  6. hashref { window key => code ref
+#                (block start epoch) -> 0/1 }, the profile hours to classify in
+# RETURNS:    hashref { Metric, Transitions [ { Rises, Falls, From, To,
+#             Blocks, Sustained, Ambiguous } ], Segments [ { From, To,
+#             Outcome, Active, Reason, Windows {key => outcome} } ] }
+# ==============================================================================
+sub _ha_detect_pair
+{
+    my ($name_a, $name_b, $blocks_a, $blocks_b, $from, $windows) = @_;
+    my $rules = _ha_role_rules();
+    my $step = $rules->{blockSeconds};
+    my $n = (@$blocks_a > @$blocks_b) ? scalar(@$blocks_a) : scalar(@$blocks_b);
+
+    # 1. Metric.
+    my $count = sub
+    {
+        my ($blocks, $key) = @_;
+        return scalar(grep { defined $_ && ($_->{$key} // 0) >= $rules->{minCoverage} } @$blocks);
+    };
+    my $metric = 'PhysB';
+    foreach my $blocks ($blocks_a, $blocks_b)
+    {
+        my $c = $count->($blocks, 'c_cov');
+        $metric = 'PhysC' unless ($c && $count->($blocks, 'b_cov') >= 0.80 * $c);
+    }
+    my ($med, $p90, $cov) = ($metric eq 'PhysB') ? qw(b_med b_p90 b_cov) : qw(c_med c_p90 c_cov);
+    my $supported = sub
+    {
+        my ($blocks, $k) = @_;
+        my $blk = $blocks->[$k];
+        return (defined $blk && ($blk->{$cov} // 0) >= $rules->{minCoverage} && defined $blk->{$med}) ? 1 : 0;
+    };
+    my $both = sub { return $supported->($blocks_a, $_[0]) && $supported->($blocks_b, $_[0]); };
+
+    # 2. Transitions. A node's level in a block is compared with its own
+    #    level at the same time of day on the previous days (at least three
+    #    of the last seven), so a daily schedule is not mistaken for a
+    #    handover; the threshold also reflects its noise over the latest six
+    #    supported hours. Before three days of history no transition is
+    #    nominated. A sustained displacement is a transition; where it ends
+    #    with a reciprocal return against the displaced levels, the return is
+    #    a transition too (a switch back).
+    my $per_day = int(86400 / $step);
+    my $level = sub { my ($blocks, $k) = @_; return $blocks->[$k]{$med}; };
+    my $same_time = sub
+    {
+        my ($blocks, $k) = @_;
+        my @v;
+        foreach my $d (1 .. $rules->{sameTimeDays})
+        {
+            my $j = $k - $d * $per_day;
+            last if ($j < 0);
+            push @v, $level->($blocks, $j) if ($supported->($blocks, $j));
+        }
+        return (@v >= $rules->{minSameTimeDays}) ? [ _ha_median_mad(@v) ] : undef;
+    };
+    my @recent;                                         # [level A, level B] of the latest supported blocks
+    my $local_mad = sub
+    {
+        my ($i) = @_;
+        my @v = map { $_->[$i] } @recent[ ($#recent >= $rules->{refBlocks} ? $#recent - $rules->{refBlocks} + 1 : 0) .. $#recent ];
+        return @v ? (_ha_median_mad(@v))[1] : 0;
+    };
+    my $threshold = sub
+    {
+        my ($mad) = @_;
+        my $t = $rules->{madK} * ($mad // 0);
+        return ($t > $rules->{absCores}) ? $t : $rules->{absCores};
+    };
+    my $displaced = sub
+    {
+        my ($j) = @_;
+        return undef unless ($j < $n && $both->($j));
+        my ($ra, $rb) = ($same_time->($blocks_a, $j), $same_time->($blocks_b, $j));
+        return undef unless ($ra && $rb);
+        my $ta = $threshold->(($ra->[1] > $local_mad->(0)) ? $ra->[1] : $local_mad->(0));
+        my $tb = $threshold->(($rb->[1] > $local_mad->(1)) ? $rb->[1] : $local_mad->(1));
+        my ($la, $lb) = ($level->($blocks_a, $j), $level->($blocks_b, $j));
+        return 'A' if ($la - $ra->[0] > $ta && $rb->[0] - $lb > $tb);
+        return 'B' if ($lb - $rb->[0] > $tb && $ra->[0] - $la > $ta);
+        return undef;
+    };
+    my $ambiguous_between = sub
+    {
+        my ($first, $last) = @_;
+        my ($sa, $sb) = (($blocks_a->[$first]{state} // ''), ($blocks_b->[$first]{state} // ''));
+        foreach my $j ($first .. $last)
+        {
+            return 1 if (($blocks_a->[$j]{state} // '') ne $sa || ($blocks_b->[$j]{state} // '') ne $sb);
+        }
+        return 0;
+    };
+    my (@transitions, $last_supported, $previous);
+    my $k = 0;
+    while ($k < $n)
+    {
+        if (!$both->($k)) { $k++; next; }
+        my $who = $displaced->($k);
+        if (!defined $who)
+        {
+            push @recent, [ $level->($blocks_a, $k), $level->($blocks_b, $k) ];
+            shift @recent while (@recent > $rules->{refBlocks});
+            $last_supported = $k;
+            $k++;
+            next;
+        }
+        my $start = $k;
+        my $end = $start;
+        $end++ while (($displaced->($end + 1) // '') eq $who);
+        my $length = $end - $start + 1;
+        my ($rises, $falls) = ($who eq 'A') ? ($name_a, $name_b) : ($name_b, $name_a);
+        # The same displacement again, with no switch back since (after missing
+        # blocks, or the next day of a daily schedule until the same-time
+        # reference has caught up): one transition.
+        my $resumed = ($previous && $previous->{Sustained} && $previous->{Rises} eq $rises) ? 1 : 0;
+        if ($resumed)
+        {
+            $previous->{EndBlock} = $end;
+        }
+        else
+        {
+            my $first = defined $last_supported ? $last_supported : $start;
+            $previous = {
+                Rises => $rises, Falls => $falls, From => $from + (defined $last_supported ? $last_supported + 1 : $start) * $step,
+                To => $from + ($start + 1) * $step, StartBlock => $start, EndBlock => $end, Blocks => $length,
+                Sustained => ($length >= $rules->{persistBlocks} ? 1 : 0), Ambiguous => $ambiguous_between->($first, $end),
+            };
+            push @transitions, $previous;
+        }
+        $last_supported = $end;
+        $k = $end + 1;
+        next unless ($previous->{Sustained});
+
+        # A switch back: a reciprocal return against the displaced levels.
+        my @ep_a = map { $level->($blocks_a, $_) } grep { $both->($_) } ($previous->{StartBlock} .. $end);
+        my @ep_b = map { $level->($blocks_b, $_) } grep { $both->($_) } ($previous->{StartBlock} .. $end);
+        @ep_a = @ep_a[ -($rules->{refBlocks} < @ep_a ? $rules->{refBlocks} : scalar @ep_a) .. -1 ];
+        @ep_b = @ep_b[ -($rules->{refBlocks} < @ep_b ? $rules->{refBlocks} : scalar @ep_b) .. -1 ];
+        my ($ma, $da) = _ha_median_mad(@ep_a);
+        my ($mb, $db) = _ha_median_mad(@ep_b);
+        my ($ta, $tb) = ($threshold->($da), $threshold->($db));
+        my $returning = sub
+        {
+            my ($j) = @_;
+            return 0 unless ($j < $n && $both->($j));
+            my ($la, $lb) = ($level->($blocks_a, $j), $level->($blocks_b, $j));
+            return ($who eq 'A') ? (($ma - $la > $ta && $lb - $mb > $tb) ? 1 : 0)
+                                 : (($mb - $lb > $tb && $la - $ma > $ta) ? 1 : 0);
+        };
+        next unless ($returning->($k));
+        my $r_end = $k;
+        $r_end++ while ($returning->($r_end + 1));
+        my $r_length = $r_end - $k + 1;
+        $previous = {
+            Rises => $falls, Falls => $rises, From => $from + ($end + 1) * $step, To => $from + ($k + 1) * $step,
+            StartBlock => $k, EndBlock => $r_end, Blocks => $r_length, Return => 1,
+            Sustained => ($r_length >= $rules->{persistBlocks} ? 1 : 0), Ambiguous => $ambiguous_between->($end, $r_end),
+        };
+        push @transitions, $previous;
+        @recent = map { [ $level->($blocks_a, $_), $level->($blocks_b, $_) ] } grep { $both->($_) } ($k .. $r_end);
+        $last_supported = $r_end;
+        $k = $r_end + 1;
+    }
+
+    # 3. Segments between sustained transitions.
+    my @cuts = (0, (map { $_->{StartBlock} } grep { $_->{Sustained} } @transitions), $n);
+    my %short = map { my $t = $_; map { $_ => 1 } ($t->{StartBlock} .. $t->{EndBlock}) } grep { !$_->{Sustained} } @transitions;
+    my @segments;
+    foreach my $i (0 .. $#cuts - 1)
+    {
+        my ($s, $e) = ($cuts[$i], $cuts[$i + 1]);
+        next unless ($e > $s);
+        my (%by_window, %outcomes);
+        foreach my $key (sort keys %{ $windows // {} })
+        {
+            my @ks = grep { $both->($_) && !$short{$_} && $windows->{$key}->($from + $_ * $step) } ($s .. $e - 1);
+            my $verdict;
+            if (@ks < $rules->{minSegmentBlocks})
+            {
+                $verdict = 'UNKNOWN';
+            }
+            else
+            {
+                my @pa = map { $blocks_a->[$_]{$p90} // $blocks_a->[$_]{$med} } @ks;
+                my @pb = map { $blocks_b->[$_]{$p90} // $blocks_b->[$_]{$med} } @ks;
+                my (undef, $mad_a) = _ha_median_mad(@pa);
+                my (undef, $mad_b) = _ha_median_mad(@pb);
+                my $m_a = ($rules->{madK} * $mad_a > $rules->{absCores}) ? $rules->{madK} * $mad_a : $rules->{absCores};
+                my $m_b = ($rules->{madK} * $mad_b > $rules->{absCores}) ? $rules->{madK} * $mad_b : $rules->{absCores};
+                my ($lead_a, $lead_b) = (0, 0);
+                foreach my $j (0 .. $#ks)
+                {
+                    $lead_a++ if ($pa[$j] > $pb[$j] + $m_b);
+                    $lead_b++ if ($pb[$j] > $pa[$j] + $m_a);
+                }
+                # A block is separated when one node leads the other by more
+                # than the other's noise. Only separated blocks carry a verdict:
+                # a node busy in online hours and quiet at night is still the
+                # only one that leads.
+                my $separated = $lead_a + $lead_b;
+                my ($d_a, $d_b) = $separated ? ($lead_a / $separated, $lead_b / $separated) : (0, 0);
+                $verdict = ($separated < $rules->{minSeparated}) ? 'UNKNOWN'
+                         : ($d_a >= $rules->{leaderShare}) ? "ACTIVE:$name_a"
+                         : ($d_b >= $rules->{leaderShare}) ? "ACTIVE:$name_b"
+                         : ($d_a >= $rules->{multiple} && $d_b >= $rules->{multiple}) ? 'MULTIPLE'
+                         : 'UNKNOWN';
+                $by_window{$key} = { Blocks => scalar(@ks), Separated => $separated, LeadA => $d_a, LeadB => $d_b };
+            }
+            $by_window{$key}{Outcome} = $verdict;
+            $outcomes{$verdict} = 1;
+        }
+        my @distinct = sort keys %outcomes;
+        my ($outcome, $active, $reason) = ('UNKNOWN', undef, '');
+        if (!@distinct)
+        {
+            $reason = 'no profile hours to compare';
+        }
+        elsif (@distinct > 1)
+        {
+            $reason = 'the profile windows disagree';
+        }
+        elsif ($distinct[0] =~ /^ACTIVE:(.+)$/)
+        {
+            ($outcome, $active) = ('ACTIVE_STANDBY', $1);
+        }
+        elsif ($distinct[0] eq 'MULTIPLE')
+        {
+            $outcome = 'MULTIPLE_ACTIVE';
+        }
+        else
+        {
+            $reason = (grep { !defined $_->{Blocks} } values %by_window) ? 'too little common evidence in the profile hours'
+                    : 'no sustained separation between the nodes';
+        }
+        push @segments, { From => $from + $s * $step, To => $from + $e * $step, Outcome => $outcome, Active => $active,
+                          Reason => $reason, Windows => \%by_window };
+    }
+    return { Metric => $metric, Transitions => \@transitions, Segments => \@segments };
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_resolve_roles
+# PURPOSE:    The role of each node of one cluster (6c, report only), keeping
+#             the sources apart: configured (ha_role), the VM configuration's
+#             SystemType (supplementary: not timestamped), and the detector's
+#             latest segment. Precedence: ha_role active/standby; for auto, the
+#             detector; the SystemType only where the detector is UNKNOWN and
+#             does not contradict it. "PowerHA Broken/Unknown" is UNKNOWN.
+#             A cluster of three or more nodes is UNKNOWN in v10.
+# ARGUMENTS:  1. node names (arrayref)  2. detection (hashref from
+#             _ha_detect_pair, or undef with 3. a reason)
+#             4. code ref: name -> nfit.vms.cfg settings
+#             5. code ref: name -> SystemType text (may return undef)
+# RETURNS:    hashref { name => { Configured, Hint, Inferred, Effective,
+#             Source, Note } } (roles: active, standby, multiple, unknown)
+# ==============================================================================
+sub _ha_resolve_roles
+{
+    my ($names_aref, $detection, $reason, $settings_of, $systemtype_of) = @_;
+    my @names = @{ $names_aref // [] };
+    my $latest = (ref($detection) eq 'HASH' && ref($detection->{Segments}) eq 'ARRAY' && @{ $detection->{Segments} })
+        ? $detection->{Segments}[-1] : undef;
+    my %out;
+    foreach my $name (@names)
+    {
+        my $settings = (ref($settings_of) eq 'CODE') ? ($settings_of->($name) // {}) : {};
+        my $configured = $settings->{ha_role} // 'auto';
+        my $text = (ref($systemtype_of) eq 'CODE') ? ($systemtype_of->($name) // '') : '';
+        my $hint = ($text =~ /PowerHA\s+Primary\s*\(ACTIVE\)/i) ? 'active'
+                 : ($text =~ /PowerHA\s+Standby\s*\(ACTIVE\)/i) ? 'standby'
+                 : ($text =~ /PowerHA\s+Broken/i) ? 'broken' : '';
+        my ($inferred, $note) = ('unknown', '');
+        if (@names > 2)
+        {
+            $note = 'three or more nodes: roles are not resolved in v10';
+        }
+        elsif (!defined $latest)
+        {
+            $note = $reason // 'no evidence';
+        }
+        elsif ($latest->{Outcome} eq 'ACTIVE_STANDBY')
+        {
+            $inferred = ($latest->{Active} eq $name) ? 'active' : 'standby';
+        }
+        elsif ($latest->{Outcome} eq 'MULTIPLE_ACTIVE')
+        {
+            $inferred = 'multiple';
+        }
+        else
+        {
+            $note = $latest->{Reason};
+        }
+        my ($effective, $source) = ('unknown', 'unresolved');
+        if ($configured eq 'active' || $configured eq 'standby')
+        {
+            ($effective, $source) = ($configured, 'configured');
+            $note = 'the evidence points to ' . ($inferred eq 'active' ? 'an active node' : 'a quiet node')
+                . '; check the configuration' if (($configured eq 'standby' && $inferred eq 'active')
+                                                  || ($configured eq 'active' && $inferred eq 'standby'));
+        }
+        elsif ($hint eq 'broken')
+        {
+            ($effective, $source, $note) = ('unknown', 'unresolved', 'the VM configuration reports the cluster broken or unknown');
+        }
+        elsif ($inferred ne 'unknown')
+        {
+            ($effective, $source) = ($inferred, 'inferred');
+            $note = 'the VM configuration says ' . $hint if ($hint ne '' && $hint ne $inferred && $inferred ne 'multiple');
+        }
+        elsif ($hint ne '' && @names == 2)
+        {
+            ($effective, $source) = ($hint, 'VM configuration (supplementary, not timestamped)');
+        }
+        $out{$name} = { Configured => $configured, Hint => $hint, Inferred => $inferred, Effective => $effective,
+                        Source => $source, Note => $note };
+    }
+    return \%out;
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_read_minutes
+# PURPOSE:    Minute samples of the wanted LPARs from one CPU cache, read only,
+#             within [from, to): { LPAR => { minute => [samples, sum PhysC,
+#             pairs, sum PhysB] } }. A cache without a PhysB column gives
+#             PhysC only.
+# ARGUMENTS:  1. path of .nfit.cache.data  2. wanted LPARs (hashref)
+#             3. from (epoch)  4. to (epoch)  5. accumulator hashref (optional)
+# RETURNS:    the accumulator
+# ==============================================================================
+sub _ha_read_minutes
+{
+    my ($path, $wanted_href, $from, $to, $acc) = @_;
+    $acc //= {};
+    require Time::Local;
+    open my $in, '<', $path or return $acc;
+    my $header = <$in>;
+    return $acc unless (defined $header);
+    $header =~ s/[\r\n]+$//;
+    my @columns = map { s/^\s+|\s+$//gr } split /,/, $header, -1;
+    my %index = map { $columns[$_] => $_ } 0 .. $#columns;
+    return $acc unless (exists $index{Timestamp} && exists $index{VMName} && exists $index{PhysC});
+    my ($i_time, $i_vm, $i_c, $i_b) = @index{qw(Timestamp VMName PhysC PhysB)};
+    my $tolerance = $MEMBER_EXPOSURE_RULES{pairToleranceCores} // 0.02;
+    my %day_epoch;
+    while (my $line = <$in>)
+    {
+        $line =~ s/[\r\n]+$//;
+        next if ($line eq '');
+        my @field = split /,/, $line, -1;
+        my $vm = $field[$i_vm];
+        next unless (defined $vm && $wanted_href->{$vm});
+        my ($y, $mo, $d, $h, $mi, $s) = ($field[$i_time] // '') =~ /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/;
+        next unless (defined $s);
+        my $seconds = ($day_epoch{"$y$mo$d"} //= Time::Local::timegm(0, 0, 0, $d, $mo - 1, $y)) + $h * 3600 + $mi * 60 + $s;
+        next if ($seconds < $from || $seconds >= $to);
+        my ($c, $c_problem) = _pool_number($field[$i_c]);
+        next if (defined $c_problem);
+        my $slot = $acc->{$vm}{ $seconds - ($seconds % 60) } //= [0, 0, 0, 0];
+        $slot->[0]++;
+        $slot->[1] += $c;
+        next unless (defined $i_b);
+        my ($busy, $b_problem) = _pool_number($field[$i_b]);
+        if (!defined $b_problem && $busy <= $c + $tolerance)
+        {
+            $slot->[2]++;
+            $slot->[3] += $busy;
+        }
+    }
+    close $in;
+    return $acc;
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_role_evidence
+# PURPOSE:    PowerHA role evidence for the clusters with a member in this
+#             system (v10 stage 3.1b step 6c; report only). Each member's
+#             samples come from every cache beside this one whose states name
+#             it, read only, within this run's window, so a peer on another
+#             managed system is compared over the same period whatever the run
+#             order. The cache revisions used are recorded.
+# ARGUMENTS:  1. this system's cache directory  2. VM order (arrayref)
+#             3. assimilation map  4. window start (epoch)  5. window end
+# RETURNS:    arrayref of clusters { Members, Here, Detection, Reason, Roles,
+#             Caches { dir name => revision }, Window [from, to], Metric }
+# ==============================================================================
+sub _ha_role_evidence
+{
+    my ($cache_dir, $vm_order_aref, $map_ref, $from, $to) = @_;
+    my @clusters = grep { ref($_) eq 'ARRAY' } @{ (defined $vms_config && ref($vms_config) eq 'HASH') ? ($vms_config->{clusters} // []) : [] };
+    my %here = map { $_ => 1 } @$vm_order_aref;
+    @clusters = grep { grep { $here{$_} } @$_ } @clusters;
+    return [] unless (@clusters);
+    my $rules = _ha_role_rules();
+    $from -= $from % $rules->{blockSeconds};
+
+    # Every cache beside this one, and the members each names.
+    my $here_dir = abs_path($cache_dir) // $cache_dir;
+    my $parent = dirname($here_dir);
+    my @dirs = ($here_dir);
+    if (opendir(my $dh, $parent))
+    {
+        push @dirs, map { File::Spec->catfile($parent, $_) }
+            sort grep { !/^\./ && -f File::Spec->catfile($parent, $_, '.nfit.cache.states')
+                        && (abs_path(File::Spec->catfile($parent, $_)) // '') ne $here_dir }
+            readdir($dh);
+        closedir($dh);
+    }
+    my %wanted = map { $_ => 1 } map { @$_ } @clusters;
+    my (%states_of, %dirs_of, %revision);
+    foreach my $dir (@dirs)
+    {
+        my $states = eval { _exposure_load_states($dir) } // {};
+        my @named = grep { $wanted{$_} && ref($states->{$_}) eq 'ARRAY'
+                           && grep { ref($_) eq 'HASH' && ($_->{end_epoch} // 0) >= $from && ($_->{start_epoch} // 0) < $to } @{ $states->{$_} } }
+                    keys %$states;
+        next unless (@named);
+        foreach my $vm (@named)
+        {
+            push @{ $states_of{$vm} }, @{ $states->{$vm} };
+            push @{ $dirs_of{$vm} }, $dir;
+        }
+        my $rev = _proposal_revision($dir);
+        $revision{ basename($dir) } = $rev->{data} // 'absent';
+    }
+    my %minutes;
+    my %by_dir;
+    foreach my $vm (keys %dirs_of) { $by_dir{$_}{$vm} = 1 for @{ $dirs_of{$vm} }; }
+    foreach my $dir (sort keys %by_dir)
+    {
+        _ha_read_minutes(File::Spec->catfile($dir, '.nfit.cache.data'), $by_dir{$dir}, $from, $to, \%minutes);
+    }
+
+    # Profile hours of each member: its planning profile here, else the one its
+    # TIER resolves to (all hours without a hint).
+    my $population_of = _exposure_profile_populations();
+    my $window_of = sub
+    {
+        my ($vm) = @_;
+        my $planning = (ref($map_ref->{$vm}) eq 'HASH' && ref($map_ref->{$vm}{Hinting}) eq 'HASH')
+            ? $map_ref->{$vm}{Hinting}{ResolvedPlanningProfile} : undef;
+        $planning //= _resolve_vm_tier_pattern_policy((_vms_config_settings($vm)->{tier} // ''), '', \@profiles,
+            _vm_lpar_type($vm))->{ResolvedPlanningProfile};
+        return $population_of->{$planning // ''} // 'none';
+    };
+
+    my @result;
+    foreach my $members (@clusters)
+    {
+        my %c = (Members => [ @$members ], Here => [ grep { $here{$_} } @$members ], Window => [ $from, $to ],
+                 Caches => { map { my $vm = $_; map { (basename($_) => $revision{ basename($_) }) } @{ $dirs_of{$vm} // [] } } @$members },
+                 Reason => '');
+        my @missing = grep { !$minutes{$_} } @$members;
+        if (@$members > 2)
+        {
+            $c{Reason} = 'three or more nodes: roles are not resolved in v10';
+        }
+        elsif (@missing)
+        {
+            $c{Reason} = sprintf('no samples for %s in this period', join(', ', @missing));
+        }
+        else
+        {
+            my ($node_a, $node_b) = @$members;
+            my %windows;
+            foreach my $key (uniq(map { $window_of->($_) } @$members))
+            {
+                $windows{$key} = sub
+                {
+                    my ($t) = @_;
+                    my $day = int($t / 86400);
+                    return _exposure_population_admits($key, ($day + 4) % 7, int(($t % 86400) / 60));
+                };
+            }
+            $c{Detection} = _ha_detect_pair($node_a, $node_b,
+                _ha_blocks($minutes{$node_a}, $from, $to, $states_of{$node_a}), _ha_blocks($minutes{$node_b}, $from, $to, $states_of{$node_b}),
+                $from, \%windows);
+            $c{Metric} = $c{Detection}{Metric};
+        }
+        $c{Roles} = _ha_resolve_roles($members, $c{Detection}, $c{Reason}, \&_vms_config_settings, sub
+        {
+            my ($vm) = @_;
+            return (exists $vm_config_data{$vm} && ref($vm_config_data{$vm}) eq 'HASH') ? $vm_config_data{$vm}{systemtype} : undef;
+        });
+        push @result, \%c;
+    }
+    return \@result;
+}
+
+# ==============================================================================
+# SUBROUTINE: _log_powerha_roles
+# PURPOSE:    Writes the "PowerHA Roles" section for one system (6c, report
+#             only) and records each member's role evidence in its stored
+#             proposal (roleEvidence). Nothing in the CSV changes.
+# ARGUMENTS:  1. rationale log file handle (may be undef)  2. evidence
+#             (arrayref from _ha_role_evidence)  3. proposals (hashref or undef)
+# RETURNS:    number of clusters reported
+# ==============================================================================
+sub _log_powerha_roles
+{
+    my ($log_fh, $evidence_aref, $proposals) = @_;
+    return 0 unless (ref($evidence_aref) eq 'ARRAY' && @$evidence_aref);
+    my $rules = _ha_role_rules();
+    my $when = sub { return gmtime($_[0])->strftime('%d %b %H:%M'); };
+    my $span = sub
+    {
+        my ($blocks) = @_;
+        my $minutes = $blocks * $rules->{blockSeconds} / 60;
+        return ($minutes >= 120) ? sprintf('%.0f hours', $minutes / 60) : sprintf('%d minutes', $minutes);
+    };
+    my %role_text = (active => 'active', standby => 'standby', multiple => 'one of several active nodes', unknown => 'unresolved');
+    my @out = ('', '=' x 70, 'PowerHA Roles', '=' x 70);
+    push @out, _rationale_wrap('Roles of the nodes named by ha_peer, worked out from their workload on the same timestamps '
+        . "(detector $rules->{detector}, provisional). CPU activity is evidence of workload, not proof of PowerHA "
+        . 'ownership: an unclear case is unresolved. Nothing in the CSV changes.', '  ', '  ');
+    foreach my $cluster (@$evidence_aref)
+    {
+        my @members = @{ $cluster->{Members} };
+        push @out, '', sprintf('    %s%s', join(', ', @members), (defined $cluster->{Metric} ? " (compared on $cluster->{Metric})" : ''));
+        push @out, "      $cluster->{Reason}." if (($cluster->{Reason} // '') ne '');
+        my $detection = $cluster->{Detection};
+        if (ref($detection) eq 'HASH')
+        {
+            my @all = @{ $detection->{Transitions} };
+            foreach my $i (0 .. $#all)
+            {
+                my $t = $all[$i];
+                my ($next) = grep { $_->{Sustained} } @all[ $i + 1 .. $#all ];
+                my $until = defined $next ? 'until ' . $when->($next->{From}) . ' UTC' : 'to the end of the period';
+                my $text = $t->{Sustained}
+                    ? sprintf('Possible workload %s from %s to %s: %s-%s UTC; the new levels hold %s.',
+                        ($t->{Return} ? 'switch back' : 'handover'), $t->{Falls}, $t->{Rises},
+                        $when->($t->{From}), gmtime($t->{To})->strftime('%H:%M'), $until)
+                    : sprintf('Short handover candidate from %s to %s: %s UTC, %s.', $t->{Falls}, $t->{Rises},
+                        $when->($t->{To} - $rules->{blockSeconds}), $span->($t->{Blocks}));
+                $text .= ' A configuration change coincides with it.' if ($t->{Ambiguous});
+                $text .= ' PowerHA ownership not confirmed.' if ($t->{Sustained});
+                push @out, _rationale_wrap($text, '      ', '        ');
+            }
+            push @out, '      No workload handover detected in this period.' unless (@{ $detection->{Transitions} });
+            my $latest = $detection->{Segments}[-1];
+            if ($latest)
+            {
+                my $verdict = ($latest->{Outcome} eq 'ACTIVE_STANDBY') ? "$latest->{Active} active-like, its peer standby-like"
+                            : ($latest->{Outcome} eq 'MULTIPLE_ACTIVE') ? 'more than one node active-like'
+                            : "unresolved ($latest->{Reason})";
+                push @out, sprintf('      Latest period from %s: %s.', $when->($latest->{From}), $verdict);
+            }
+        }
+        foreach my $name (@members)
+        {
+            my $r = $cluster->{Roles}{$name} or next;
+            my $text = sprintf('Role of %s: %s (%s%s)', $name, $role_text{ $r->{Effective} } // $r->{Effective}, $r->{Source},
+                ($r->{Configured} eq 'auto' ? '' : ", ha_role = $r->{Configured}"));
+            $text .= "; $r->{Note}" if (($r->{Note} // '') ne '');
+            push @out, _rationale_wrap("$text.", '      ', '        ');
+            if (defined $proposals && ref($proposals->{$name}) eq 'HASH')
+            {
+                $proposals->{$name}{roleEvidence} = {
+                    detector => $rules->{detector}, metric => $cluster->{Metric}, cluster => [ @members ],
+                    window => { start => $cluster->{Window}[0], end => $cluster->{Window}[1] }, caches => $cluster->{Caches},
+                    transitions => [ map { { rises => $_->{Rises}, falls => $_->{Falls}, from => $_->{From}, to => $_->{To},
+                                              blocks => $_->{Blocks}, sustained => $_->{Sustained}, ambiguous => $_->{Ambiguous} } }
+                                     @{ (ref($detection) eq 'HASH') ? $detection->{Transitions} : [] } ],
+                    role => { configured => $r->{Configured}, hint => $r->{Hint}, inferred => $r->{Inferred},
+                              effective => $r->{Effective}, source => $r->{Source}, note => $r->{Note} },
+                    reason => $cluster->{Reason},
+                };
+            }
+        }
+    }
+    print {$log_fh} join("\n", @out), "\n" if (defined $log_fh && ref($log_fh));
+    return scalar(@$evidence_aref);
 }
 
 # ==============================================================================
