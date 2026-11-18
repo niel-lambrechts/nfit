@@ -1182,8 +1182,10 @@ if (scalar @csv_visible_profiles < scalar @profiles) {
     print STDERR "    ✓ Loaded " . scalar(@profiles) . " workload profiles\n";
 }
 
-# load custom VM tiers
-my %vm_tier_overrides = %{parse_vm_tier_overrides("$script_dir/etc/nfit.vms.cfg")};
+# load the VM configuration: TIERs; PowerHA clusters, roles and VIOS (v10 stage 3.1b)
+my $vms_config = parse_vms_config("$script_dir/etc/nfit.vms.cfg");
+_report_vms_config($vms_config);
+my %vm_tier_overrides = %{ $vms_config->{tiers} };
 
 # --- Generate CSV header columns ---
 
@@ -23023,39 +23025,226 @@ sub _build_adaptive_thresholds_hash {
 # two of the three values it returned no longer exist. Call
 # _build_adaptive_thresholds_hash() directly.
 
-# --- parse_vm_tier_overrides ---
-# Parses a simple INI-style file to allow users to override the auto-detected
-# tier for specific VMs, giving them fine-grained control.
-sub parse_vm_tier_overrides {
+# ==============================================================================
+# SUBROUTINE: parse_vms_config
+# PURPOSE:    Reads etc/nfit.vms.cfg (v10 stage 3.1b): one [section] per LPAR,
+#             and a reserved [GLOBAL] section for VM-policy defaults.
+#               LPAR keys:  tier, ha_peer, ha_role, standby_share, lpar_type,
+#                           vios_peer
+#               [GLOBAL]:   standby_share
+#             TIER is read as before: upper case without spaces, the first in
+#             a section applying. ha_peer and vios_peer take one or more names
+#             (comma or space separated); an ha_peer entry links two LPARs in
+#             whichever section it appears. A peer name that matches another
+#             section only by letter case is read as that section's name.
+#             Invalid values, unknown keys (once per key) and lines that are
+#             not settings are warned and ignored. Nothing is printed here.
+# ARGUMENTS:  1. file path
+# RETURNS:    hashref: path, exists, tiers ({LPAR => TIER}), vms ({LPAR =>
+#             {key => value}}), global ({key => value}), warnings (arrayref),
+#             clusters (arrayref from _ha_clusters)
+# ==============================================================================
+sub parse_vms_config
+{
     my ($filepath) = @_;
-    my %overrides;
-    return \%overrides unless (-f $filepath);
+    my %config = (path => $filepath, exists => 0, tiers => {}, vms => {}, global => {}, warnings => [], clusters => []);
+    return \%config unless (defined $filepath && -f $filepath);
+    $config{exists} = 1;
 
-    print STDERR "  ↳  VM-specific tier override configuration file: $filepath\n";
-    open my $fh, '<:encoding(utf8)', $filepath or do {
-        warn " [WARN] Could not open VM tier override file '$filepath': $!. Skipping overrides.";
-        return \%overrides;
-    };
+    my %vm_keys     = map { $_ => 1 } qw(tier ha_peer ha_role standby_share lpar_type vios_peer);
+    my %global_keys = map { $_ => 1 } qw(standby_share);
+    my %choices     = (ha_role => [qw(auto active standby)], lpar_type => [qw(lpar vios)]);
 
-    my $current_vm = '';
-    while (my $line = <$fh>) {
+    my $fh;
+    if (!open($fh, '<:encoding(utf8)', $filepath))
+    {
+        push @{ $config{warnings} }, "could not open the file ($!); no VM settings applied";
+        return \%config;
+    }
+    my ($section, $tier_seen, %unknown_warned) = ('', 0);
+    my $warn = sub { push @{ $config{warnings} }, sprintf('line %d: %s', $., $_[0]); };
+    while (my $line = <$fh>)
+    {
         chomp $line;
         $line =~ s/\s*[#;].*//;
         $line =~ s/^\s+|\s+$//g;
-        next if $line eq '';
+        next if ($line eq '');
 
-        if ($line =~ /^\s*\[\s*([^\]]+?)\s*\]\s*$/) {
-            $current_vm = $1;
-        } elsif ($current_vm ne '' && $line =~ /^\s*tier\s*=\s*(.+)$/i) {
-            my $tier = uc($1);
-            $tier =~ s/\s+//g;
-            $overrides{$current_vm} = $tier;
-            $current_vm = ''; # Reset after reading the tier
+        if ($line =~ /^\[\s*([^\]]+?)\s*\]$/)
+        {
+            $section   = (uc($1) eq 'GLOBAL') ? 'GLOBAL' : $1;
+            $tier_seen = 0;
+            next;
+        }
+        if ($line !~ /^([A-Za-z_]+)\s*=\s*(.*)$/)
+        {
+            $warn->("not a 'key = value' setting; ignored");
+            next;
+        }
+        my ($key, $value) = (lc($1), $2);
+        if ($section eq '')
+        {
+            $warn->("'$key' appears before any [section]; ignored");
+            next;
+        }
+        my $is_global = ($section eq 'GLOBAL') ? 1 : 0;
+        if (!($is_global ? $global_keys{$key} : $vm_keys{$key}))
+        {
+            if ($is_global && $vm_keys{$key})
+            {
+                $warn->("'$key' is an LPAR setting, not valid in [GLOBAL] (reserved for defaults); ignored");
+            }
+            elsif (!$unknown_warned{$key}++)
+            {
+                $warn->("unknown setting '$key'; ignored");
+            }
+            next;
+        }
+        if ($value eq '')
+        {
+            $warn->("'$key' has no value; ignored");
+            next;
+        }
+        my $store = $is_global ? $config{global} : ($config{vms}{$section} //= {});
+
+        if ($key eq 'tier')
+        {
+            next if ($tier_seen++);                  # the first TIER of a section applies, as before
+            (my $tier = uc($value)) =~ s/\s+//g;
+            $store->{tier} = $tier;
+            $config{tiers}{$section} = $tier;
+        }
+        elsif ($key eq 'ha_peer' || $key eq 'vios_peer')
+        {
+            foreach my $peer (grep { $_ ne '' } split /[\s,]+/, $value)
+            {
+                if ($peer eq $section)
+                {
+                    $warn->("$key names its own section; ignored");
+                    next;
+                }
+                push @{ $store->{$key} }, $peer unless (grep { $_ eq $peer } @{ $store->{$key} // [] });
+            }
+        }
+        elsif ($key eq 'standby_share')
+        {
+            if ($value =~ /^(?:\d+(?:\.\d*)?|\.\d+)$/ && $value > 0 && $value <= 1)
+            {
+                $store->{standby_share} = $value + 0;
+            }
+            else
+            {
+                $warn->("standby_share must be a fraction above 0 and at most 1 (for example 0.25); '$value' ignored");
+            }
+        }
+        else                                         # ha_role, lpar_type
+        {
+            (my $choice = lc($value)) =~ s/\s+//g;
+            if (grep { $_ eq $choice } @{ $choices{$key} })
+            {
+                $store->{$key} = $choice;
+            }
+            else
+            {
+                $warn->(sprintf("%s must be one of %s; '%s' ignored", $key, join(', ', @{ $choices{$key} }), $value));
+            }
         }
     }
     close $fh;
-    print STDERR "    ✓ Loaded " . scalar(keys %overrides) . " VM-specific tier overrides\n";
-    return \%overrides;
+
+    # A peer that matches another section only by letter case is read as it.
+    my %by_lower;
+    push @{ $by_lower{lc $_} }, $_ foreach (keys %{ $config{vms} });
+    foreach my $vm_name (sort keys %{ $config{vms} })
+    {
+        foreach my $key (qw(ha_peer vios_peer))
+        {
+            next unless (ref($config{vms}{$vm_name}{$key}) eq 'ARRAY');
+            foreach my $peer (@{ $config{vms}{$vm_name}{$key} })
+            {
+                next if (exists $config{vms}{$peer});
+                my $matches = $by_lower{lc $peer} // [];
+                next unless (@$matches == 1);
+                push @{ $config{warnings} }, sprintf("[%s] %s '%s' matches [%s] only by letter case; [%s] is used",
+                    $vm_name, $key, $peer, $matches->[0], $matches->[0]);
+                $peer = $matches->[0];
+            }
+        }
+    }
+    $config{clusters} = _ha_clusters($config{vms});
+    return \%config;
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_clusters
+# PURPOSE:    PowerHA clusters from the ha_peer entries of nfit.vms.cfg (v10
+#             stage 3.1b). Each entry links two LPARs, whichever of them it is
+#             set on; LPARs linked directly or through each other form one
+#             cluster. A cluster states membership only: the roles are worked
+#             out from the workload on each run.
+# ARGUMENTS:  1. vms hashref from parse_vms_config ({LPAR => {ha_peer => [..]}})
+# RETURNS:    arrayref of clusters, each an arrayref of member names (sorted;
+#             clusters ordered by their first member)
+# ==============================================================================
+sub _ha_clusters
+{
+    my ($vms_href) = @_;
+    return [] unless (defined $vms_href && ref($vms_href) eq 'HASH');
+    my %parent;
+    my $find = sub
+    {
+        my ($name) = @_;
+        $parent{$name} //= $name;
+        while ($parent{$name} ne $name)
+        {
+            $parent{$name} = $parent{ $parent{$name} };     # path halving
+            $name = $parent{$name};
+        }
+        return $name;
+    };
+    foreach my $vm_name (sort keys %$vms_href)
+    {
+        my $peers = (ref($vms_href->{$vm_name}) eq 'HASH') ? $vms_href->{$vm_name}{ha_peer} : undef;
+        next unless (ref($peers) eq 'ARRAY' && @$peers);
+        foreach my $peer (@$peers)
+        {
+            my ($root, $other) = ($find->($vm_name), $find->($peer));
+            next if ($root eq $other);
+            ($root, $other) = ($other, $root) if ($other lt $root);
+            $parent{$other} = $root;                        # the lower name is the root
+        }
+    }
+    my %members;
+    push @{ $members{ $find->($_) } }, $_ foreach (keys %parent);
+    my @clusters = map { [ sort @$_ ] } grep { @$_ > 1 } values %members;
+    return [ sort { $a->[0] cmp $b->[0] } @clusters ];
+}
+
+# ==============================================================================
+# SUBROUTINE: _report_vms_config
+# PURPOSE:    Prints what parse_vms_config read: the file, its warnings, the
+#             TIERs loaded and the PowerHA clusters (to STDERR).
+# ARGUMENTS:  1. hashref from parse_vms_config
+# RETURNS:    nothing
+# ==============================================================================
+sub _report_vms_config
+{
+    my ($config) = @_;
+    return unless (defined $config && ref($config) eq 'HASH' && $config->{exists});
+    print STDERR "  ↳  VM-specific tier override configuration file: $config->{path}\n";
+    print STDERR "    [WARN] nfit.vms.cfg $_\n" foreach (@{ $config->{warnings} });
+    print STDERR "    ✓ Loaded " . scalar(keys %{ $config->{tiers} }) . " VM-specific tier overrides\n";
+    my @clusters = @{ $config->{clusters} };
+    if (@clusters)
+    {
+        printf STDERR "    ✓ PowerHA clusters from ha_peer: %d\n", scalar(@clusters);
+        foreach my $cluster (grep { @$_ > 2 } @clusters)
+        {
+            printf STDERR "    [INFO] nfit.vms.cfg: cluster of %d nodes: %s (confirm the ha_peer entries)\n",
+                scalar(@$cluster), join(', ', @$cluster);
+        }
+    }
+    return;
 }
 
 # ==============================================================================

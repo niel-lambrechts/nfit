@@ -285,7 +285,7 @@ use strict; use warnings; use JSON::PP qw(encode_json decode_json);
 my ($src_path, $cfg_path) = @ARGV;
 open my $fh, '<', $src_path or die; my $src = do { local $/; <$fh> }; close $fh;
 my $code = '';
-for my $name (qw(_resolve_vm_tier_pattern_policy parse_vm_tier_overrides)) {
+for my $name (qw(_resolve_vm_tier_pattern_policy parse_vms_config _ha_clusters)) {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "cannot extract $name\n";
     $code .= "$1\n";
 }
@@ -299,9 +299,7 @@ for my $case (@{ $in->{cases} }) {
     $r->{ResolvedPolicyTier} = "$r->{ResolvedPolicyTier}";
     push @out, $r;
 }
-open my $save, '>&', \*STDERR; open STDERR, '>', '/dev/null';
-my $overrides = parse_vm_tier_overrides($cfg_path);
-open STDERR, '>&', $save;
+my $overrides = parse_vms_config($cfg_path)->{tiers};
 print encode_json({ resolved => \@out, overrides => $overrides });
 '''
 
