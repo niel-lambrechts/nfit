@@ -17,6 +17,14 @@
 #              - (optional, slow) distinct VMName values in stage/*/.nfit.cache.data
 #            The vocabulary itself is never printed.
 #
+#            VOCABULARY CACHE: where stage/ is readable, the vocabulary is also
+#            saved (mode 0600) beside the secret as redact.vocab.json, merged
+#            with what was saved before. Every run adds the saved terms to the
+#            live ones. A shell that cannot read stage/ (for example one where
+#            stage/ is a link to a folder it cannot reach) therefore still
+#            redacts system names and serials. Without either source, a
+#            warning is printed to STDERR.
+#
 #            Pseudonyms are HMAC-SHA256(secret, lower(term)) truncated to six
 #            hex digits and prefixed by category (vm_, sys_, ip_, host_). The
 #            same term therefore maps to the same pseudonym across runs, which
@@ -92,6 +100,9 @@ FQDN_RE = re.compile(
 
 # IBM machine serial as presented by firmware/HMC metadata, e.g. IBM,02 followed by seven characters.
 IBM_SERIAL_RE = re.compile(r'IBM,0?[0-9A-Z]{7,8}\b')
+
+# Vocabulary cache, saved beside the secret (see VOCABULARY CACHE above).
+VOCAB_CACHE_NAME = 'redact.vocab.json'
 
 
 # ------------------------------------------------------------------------------
@@ -234,6 +245,44 @@ def build_vocabulary(root: Path, scan_l1: bool, extra_roots=(), vm_configs=()) -
     return vocab
 
 
+def stage_readable(root: Path, extra_roots=()) -> bool:
+    """True when at least one staged system's state cache can be read, so
+    that the live vocabulary includes the system directory names."""
+    for r in [root] + [Path(x) for x in extra_roots]:
+        stage = r / 'stage'
+        try:
+            if stage.is_dir() and any(stage.glob('*/.nfit.cache.states')):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def load_vocabulary_cache(path: Path) -> dict:
+    """The saved vocabulary {term: category}, or {} when absent or unreadable."""
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    terms = data.get('terms') if isinstance(data, dict) else None
+    return {t: c for t, c in terms.items() if isinstance(t, str) and isinstance(c, str)} if isinstance(terms, dict) else {}
+
+
+def save_vocabulary_cache(path: Path, vocab: dict) -> None:
+    """Merge the live vocabulary into the saved one (mode 0600). A live
+    category takes precedence over a saved one."""
+    merged = load_vocabulary_cache(path)
+    merged.update(vocab)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            json.dump({'version': 1, 'terms': merged}, fh, sort_keys=True)
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        print(f'nfit-redact: could not save the vocabulary cache ({exc.strerror}).', file=sys.stderr)
+
+
 # ------------------------------------------------------------------------------
 # Redaction engine
 # ------------------------------------------------------------------------------
@@ -325,6 +374,17 @@ def main() -> int:
     )
 
     vocab = build_vocabulary(root, args.scan_l1, args.extra_root, args.vm_config)
+    cache_path = secret_path.parent / VOCAB_CACHE_NAME
+    live_stage = stage_readable(root, args.extra_root)
+    if live_stage:
+        save_vocabulary_cache(cache_path, vocab)
+    cached = load_vocabulary_cache(cache_path)
+    for term, category in cached.items():
+        vocab.setdefault(term, category)
+    if not live_stage and not cached:
+        print('nfit-redact: WARNING stage/ is not readable and no vocabulary cache exists; '
+              'system names and serials may pass unredacted. Run nfit-redact once where stage/ is readable.',
+              file=sys.stderr)
     if not vocab and not args.allow_empty:
         print('nfit-redact: empty vocabulary - refusing to emit output (fail-closed).', file=sys.stderr)
         return 2
@@ -333,7 +393,8 @@ def main() -> int:
         counts = {}
         for cat in vocab.values():
             counts[cat] = counts.get(cat, 0) + 1
-        print(json.dumps({'vocabulary_terms': len(vocab), 'by_category': counts}, sort_keys=True))
+        print(json.dumps({'vocabulary_terms': len(vocab), 'by_category': counts,
+                          'stage_readable': live_stage, 'cached_terms': len(cached)}, sort_keys=True))
         return 0
 
     redactor = Redactor(vocab, load_or_create_secret(secret_path))
