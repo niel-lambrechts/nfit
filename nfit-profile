@@ -673,6 +673,14 @@ my %MEMBER_EXPOSURE_RULES = (
 );
 my @MEMBER_EXPOSURE_COLUMNS = qw(aboveMinutes excessCoreMinutes aboveScarceMinutes aboveCompetitionMinutes
                                  aboveOwnWidthMinutes aboveUnclassifiedMinutes longestJointRunMinutes);
+# Cut protection (v10 stage 3.3; shadow: recorded, not applied). A cut may add
+# no observed contested exposure: the target of a cut is raised to the highest
+# protected level W = PhysB + share x (PhysC - PhysB) seen in a contested
+# minute (pool scarce, other LPARs busy), never above installed. The share is
+# set by the profile's tier (decision F2, a policy; plan 5.3).
+my $CUT_PROTECTION_RULE = 'cut-protection-1';
+my %CUT_PROTECTION_SHARE = (P => 0.95, 1 => 0.85, 2 => 0.65, 3 => 0.40, 4 => 0.00);
+my $CUT_PROTECTION_TOP_READINGS = 32;
 my @PHYSB_INVALID_REASONS  = qw(missingB nonNumericB bAboveC nonFiniteC cAboveCeiling bAboveCeiling);
 my @PHYSB_QUALITY_COUNTERS = (qw(validPairs sameSecondSamples runResets freqPctUnavailable), @PHYSB_INVALID_REASONS);
 my $min_history_days_arg;    # New flag for partial month processing
@@ -1716,7 +1724,10 @@ foreach my $system_serial (@target_systems_to_process)
         my $joint = _reconcile_trackers($db, $saved->{members}, $asof, $from, $to, \@reconcile_notes);
         my @pressure_notes;
         my $pressure = _pressure_trackers($db, $saved->{members}, $asof, $from, $to, \@pressure_notes);
-        _exposure_evaluate_window($pool, $exposure, [ @$tracks, @$joint, @$pressure ], $from, $to) if (@$tracks || @$joint || @$pressure);
+        my @loss_notes;
+        my $loss = defined $replay_from ? _protection_loss_trackers($db, $saved->{members}, $asof, $from, $to, \@loss_notes) : [];
+        _exposure_evaluate_window($pool, $exposure, [ @$tracks, @$joint, @$pressure, @$loss ], $from, $to)
+            if (@$tracks || @$joint || @$pressure || @$loss);
         print join("\n", _candidate_report($tracks, \@notes, $from, $to),
                    _reconcile_report($joint, \@reconcile_notes, $from, $to),
                    _pressure_report($pressure, $db, \@pressure_notes, $from, $to)), "\n";
@@ -1727,6 +1738,12 @@ foreach my $system_serial (@target_systems_to_process)
         my $path = _write_shadow_decisions(File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.decisions.replay-%s_%s.csv',
             $sys_name, $model_name, gmtime($from)->ymd, gmtime($to - 1)->ymd)), $rows);
         print "Decision table: $path\n";
+        if (@$loss)
+        {
+            my $replay_path = _write_protection_replay(File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.protection.replay-%s_%s.json',
+                $sys_name, $model_name, gmtime($from)->ymd, gmtime($to - 1)->ymd)), $loss, $saved, $from, $to, \@loss_notes);
+            print "Cut protection replay: $replay_path\n";
+        }
         exit 0;
     }
     # Initialise the run end date to the effective end date by default
@@ -2757,7 +2774,8 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             elsif ($effective_start_date_obj && $effective_end_date_obj)
             {
                 $exposure_summary = _log_cut_exposure($open_log_files{$system_identifier}, $assimilation_map_ref, \@vm_order,
-                    \@profiles, \%vm_tier_overrides, $current_cache_path, $effective_start_date_obj, $effective_end_date_obj, $candidate_test ? \%proposals : undef);
+                    \@profiles, \%vm_tier_overrides, $current_cache_path, $effective_start_date_obj, $effective_end_date_obj, $candidate_test ? \%proposals : undef,
+                    \%proposals);
                 printf STDERR "  [INFO] Entitlement cut exposure: %d cut(s), %d evaluated, %d to review (%s; see rationale)\n",
                     $exposure_summary->{Cuts}, $exposure_summary->{Evaluated}, $exposure_summary->{Advisories}, $exposure_summary->{Status};
             }
@@ -12827,7 +12845,7 @@ sub _ha_detect_pair
 
 # ==============================================================================
 # SUBROUTINE: _ha_resolve_roles
-# PURPOSE:    The role of each node of one cluster (6c, report only), keeping
+# PURPOSE:    The role of each node of one cluster (6c; used by the 6d sizing), keeping
 #             the sources apart: configured (ha_role), the VM configuration's
 #             SystemType (supplementary: not timestamped), and the detector's
 #             latest segment. Precedence: ha_role active/standby; for auto, the
@@ -12960,7 +12978,7 @@ sub _ha_read_minutes
 # ==============================================================================
 # SUBROUTINE: _ha_role_evidence
 # PURPOSE:    PowerHA role evidence for the clusters with a member in this
-#             system (v10 stage 3.1b step 6c; report only). Each member's
+#             system (v10 stage 3.1b step 6c; the input of the 6d sizing). Each member's
 #             samples come from every cache beside this one whose states name
 #             it, read only, within this run's window, so a peer on another
 #             managed system is compared over the same period whatever the run
@@ -13275,7 +13293,11 @@ sub _apply_ha_sizing
         my $plan = _ha_sizing_plan($cluster, $policy);
         $cluster->{Policy} = $policy;
         $cluster->{Plan} = $plan;
-        foreach my $vm (sort keys %$plan)
+        # Holds before standby floors: a standby takes the held pair of a
+        # primary that took over as its reference, so that primary must be
+        # resolved first, whatever the names' sort order.
+        my $is_floor = sub { return (($plan->{ $_[0] }{Treatment} // '') eq 'standby_floor') ? 1 : 0; };
+        foreach my $vm (sort { $is_floor->($a) <=> $is_floor->($b) || $a cmp $b } keys %$plan)
         {
             next unless (exists $row_of{$vm});
             my $core = $map_ref->{$vm}{CoreResults} //= {};
@@ -13432,9 +13454,10 @@ sub _ha_detail_levels
 
 # ==============================================================================
 # SUBROUTINE: _log_powerha_roles
-# PURPOSE:    Writes the "PowerHA Roles" section for one system (6c, report
-#             only) and records each member's role evidence in its stored
-#             proposal (roleEvidence). Nothing in the CSV changes.
+# PURPOSE:    Writes the "PowerHA Roles" section for one system (6c, with the
+#             6d sizing lines) and records each member's role evidence in its
+#             stored proposal (roleEvidence). The sizing itself is applied to
+#             the CSV by _apply_ha_sizing.
 # ARGUMENTS:  1. rationale log file handle (may be undef)  2. evidence
 #             (arrayref from _ha_role_evidence)  3. proposals (hashref or undef)
 # RETURNS:    number of clusters reported
@@ -15412,6 +15435,46 @@ sub _write_standard_csv_report {
         }
         $vm_map_ref->{CoreResults}{Profile_CurrentCycle} = \%cycle_pairs;
 
+        # MaxCPU sanity limit (shadow, plan 4.4 and decision F14): where it held
+        # a profile's target, the target and current-cycle pair without it, and
+        # the chain that produced the figure. Recorded in the stored proposal;
+        # no cell changes.
+        my %maxcpu_shadow;
+        for my $name (keys %cycle_pairs)
+        {
+            my $dbg = (ref($vm_map_ref->{CoreResults}{ProfileDebugInfo}) eq 'HASH') ? $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$name} : undef;
+            next unless (ref($dbg) eq 'HASH' && ($dbg->{CappedByMaxCPU} // '') eq 'True' && looks_like_number($dbg->{rENT_P_Planning} // ''));
+            my $cents = $dbg->{rENT_P_Planning} * 100;
+            my $up = int($cents);
+            $up++ if ($cents - $up > 1e-6);
+            my $uncapped = $up / 100;
+            my $without = _resolve_current_cycle_pair({
+                target_ent  => $uncapped,
+                target_vp   => $numeric_cell->("${name}_rVCPU"),
+                step_vp     => $numeric_cell->("${name}_rVCPU_Tactical"),
+                current_ent => $numeric_cell->('Current - ENT'),
+                current_vp  => $numeric_cell->('Current - VCPU'),
+                pool_size   => ($pool_is_user_defined ? $cfg->{pool_cpu} : undef),
+            });
+            my $pair_of = sub { my ($q) = @_; return { entitlement => $q->{Ent}, VPs => $q->{VP}, status => $q->{Status},
+                                                       binding => [ sort @{ $q->{Binding} // [] } ], reviewVPs => $q->{ReviewVP} }; };
+            my %chain = map { (defined $dbg->{$_} && $dbg->{$_} ne '') ? ($_ => "$dbg->{$_}") : () } qw(
+                BasePhysC PostGrowthBasePhysC GrowthAdjUsed AdditiveRawUncorroborated AdditiveCorroborationFactor RawAdditive
+                MaxAdditiveCap CappedRawAdditive VoltFactor PoolFactor DBWDampeningApplied HotThreadWLDampeningApplied
+                AdditiveSafetyCapApplied TierScalingFactor FinalAdditive TacticalDeadbandApplied BasePlanningDemand
+                BudgetFloorApplied GuaranteeDemand GuaranteeDemandSource RunQ_Potential RunQ_Strategic ReasonForSignalInversion
+                TacticalExceedsStrategic CPUCapLimited CPUFlatlining CPUFlatliningPartial CPUFlatliningPartialSevere
+                IsRunQPressure IsWorkloadPressure);
+            $maxcpu_shadow{$name} = {
+                maxCpu => $dbg->{LPARMaxCPUConfig}, entitlementForMultiplier => $dbg->{EntitlementForForecast},
+                multiplier => $dbg->{ForecastMultiplier}, limit => $dbg->{EffectiveMaxCPUCap},
+                planningUnrounded => 0 + $dbg->{rENT_P_Planning}, target => $numeric_cell->($name), uncappedTarget => $uncapped,
+                targetVPs => $numeric_cell->("${name}_rVCPU"), pair => $pair_of->($cycle_pairs{$name}), uncappedPair => $pair_of->($without),
+                pool => $cfg->{pool_id}, poolSize => ($pool_is_user_defined ? $cfg->{pool_cpu} : undef), chain => \%chain,
+            };
+        }
+        $vm_map_ref->{CoreResults}{MaxCpuShadow} = \%maxcpu_shadow;
+
         # Published planner cells: the planning profile, each profile's
         # current-cycle pair and the planning profile's recommendation.
         my %planner_cells = ('Planning Profile' => $planning_profile_name);
@@ -15456,6 +15519,7 @@ sub _write_standard_csv_report {
                         reviewVPs   => $pair->{ReviewVP},
                         reason      => $pair->{Reason},
                     },
+                    ($maxcpu_shadow{$name} ? (maxCpuLimit => $maxcpu_shadow{$name}) : ()),
                 };
             }
             $proposals->{$vm_name} = {
@@ -23160,6 +23224,13 @@ sub _exposure_process_day
                 : ((defined $vp && $vp > 0 && $c >= $rule{nearVp} * $vp - $eps) ? 1 : 0);
             $acc->{classified}++ if $classified;
             $acc->{scarce}++     if $scarce;
+            # Cut protection (stage 3.3): competition implies scarcity, and so
+            # a classified minute.
+            if ($competition)
+            {
+                _protection_add_minute($tracker->{protection}, $minute, $b, $c) if $tracker->{protection};
+                _protection_loss_minute($tracker->{lossStats}, \@thresholds, $minute, $b, $c, $ent) if $tracker->{lossStats};
+            }
             $tracker->{joint}{$minute} = [ $b, $competition ] if ($scarce && $tracker->{joint});
             if (my $pr = $tracker->{pressure})
             {
@@ -24227,6 +24298,22 @@ sub _candidate_levels
     return %levels;
 }
 
+# The whole minutes [begin, end) of a configuration state within [from, to):
+# a minute spanning a change can contain both configurations, so it is
+# counted in neither state, including when the next state starts after
+# sizing. Returns () when no whole minute remains.
+sub _candidate_minute_bounds
+{
+    my ($states_aref, $s, $n_states_before, $from, $to) = @_;
+    my @later = sort { $a <=> $b } map { $_->{start_epoch} } grep {
+        defined $_->{start_epoch} && $_->{start_epoch} > $s->{start_epoch}
+    } @{ $states_aref // [] };
+    my $begin = $n_states_before > 1 ? 60 * int(($s->{start_epoch}+59)/60) : $from;
+    my $end = @later ? min($to, 60 * int($later[0]/60)) : $to;
+    return () if ($end <= max($from, $begin));
+    return ($begin, $end);
+}
+
 sub _candidate_trackers
 {
     my ($db, $members, $asof, $from, $to, $notes, $populations, $levels_cb) = @_;
@@ -24253,14 +24340,8 @@ sub _candidate_trackers
                $p->{poolId} ne $m->{pool_id}) { $reason = 'installed configuration differs from the proposal\'s'; }
         elsif ($s->{end_epoch} < $from || $s->{start_epoch} >= $to) { $reason = 'its configuration changed before the replay period'; }
         if ($reason) { push @$notes, "$vm: $reason"; next; }
-        # A minute spanning a change can contain both configurations. Count it
-        # in neither state, including when the next state starts after sizing.
-        my @later = sort { $a <=> $b } map { $_->{start_epoch} } grep {
-            defined $_->{start_epoch} && $_->{start_epoch} > $s->{start_epoch}
-        } @{ $db->{$vm} };
-        my $begin = @states > 1 ? 60 * int(($s->{start_epoch}+59)/60) : $from;
-        my $end = @later ? min($to, 60 * int($later[0]/60)) : $to;
-        if ($end <= max($from, $begin)) { push @$notes, "$vm: no comparable whole minute"; next; }
+        my ($begin, $end) = _candidate_minute_bounds($db->{$vm}, $s, scalar(@states), $from, $to);
+        if (!defined $begin) { push @$notes, "$vm: no comparable whole minute"; next; }
         $bounds{$vm} = [$begin, $end];
         $states{$vm} = [$s];
     }
@@ -24326,9 +24407,324 @@ sub _candidate_report
     return @lines;
 }
 
+# ==============================================================================
+# Cut protection (v10 stage 3.3; shadow: recorded, not applied).
+# The evidence of one LPAR state and profile-hours population is kept as the
+# contested minutes that no other contested minute exceeds in both PhysB and
+# PhysC (the frontier: it gives the exact bound for any share), the highest
+# readings by PhysB, and support counts. Plan section 5.
+# ==============================================================================
+sub _protection_add_minute
+{
+    my ($p, $minute, $busy, $consumed) = @_;
+    my $eps = 1e-9;
+    $p->{contested}++;
+    $p->{days}{ int($minute / 86400) } = 1;
+    unless (grep { $_->[0] >= $busy - $eps && $_->[1] >= $consumed - $eps } @{ $p->{frontier} })
+    {
+        @{ $p->{frontier} } = ((grep { !($_->[0] <= $busy + $eps && $_->[1] <= $consumed + $eps) } @{ $p->{frontier} }),
+                               [ $busy, $consumed, $minute ]);
+    }
+    push @{ $p->{top} }, [ $busy, $consumed, $minute ];
+    if (@{ $p->{top} } > 2 * $CUT_PROTECTION_TOP_READINGS)
+    {
+        @{ $p->{top} } = (sort { $b->[0] <=> $a->[0] || $a->[2] <=> $b->[2] } @{ $p->{top} })[0 .. $CUT_PROTECTION_TOP_READINGS - 1];
+    }
+    return;
+}
+
+# The protected level for one share: the highest PhysB + share x (PhysC -
+# PhysB) over the frontier, rounded up to 0.01, never above the installed
+# entitlement (which is kept exactly, even off the 0.01 granule). undef when
+# there is no contested minute: no competition is not a measured bound of 0.
+sub _protection_bound
+{
+    my ($p, $share, $installed) = @_;
+    return undef unless (ref($p) eq 'HASH' && @{ $p->{frontier} // [] } && defined $share);
+    my $level = max(map { $_->[0] + $share * ($_->[1] - $_->[0]) } @{ $p->{frontier} });
+    my $cents = $level * 100;
+    my $up = int($cents);
+    $up++ if ($cents - $up > 1e-6);
+    my $bound = $up / 100;
+    return (defined $installed && $bound > $installed) ? $installed + 0 : $bound;
+}
+
+# The share and tier of a profile: P-... is tier P, [OGB]n-... is tier n.
+sub _protection_share_of
+{
+    my ($profile) = @_;
+    $profile //= '';
+    return ($CUT_PROTECTION_SHARE{P}, 'P') if ($profile =~ /^P(?:-|$)/);
+    return ($CUT_PROTECTION_SHARE{$1}, $1 + 0) if ($profile =~ /^[OGB]([1-4])-/);
+    return (undef, undef);
+}
+
+# Replay scoring of one contested minute: for each threshold and signal
+# (busy = PhysB, consumed = PhysC), the guarantee lost below the installed
+# entitlement, min(signal, installed) - threshold, with its minutes, days,
+# episodes and longest episode.
+sub _protection_loss_minute
+{
+    my ($stats, $thresholds_aref, $minute, $busy, $consumed, $ent) = @_;
+    return unless (defined $ent && ref($stats) eq 'ARRAY');
+    foreach my $k (0 .. $#$thresholds_aref)
+    {
+        foreach my $signal ([ 'busy', $busy ], [ 'consumed', $consumed ])
+        {
+            my $delta = min($signal->[1], $ent) - $thresholds_aref->[$k];
+            next unless ($delta > 1e-9);
+            my $r = $stats->[$k]{ $signal->[0] } //= { minutes => 0, coreMinutes => 0, days => {}, episodes => 0, longest => 0 };
+            $r->{minutes}++;
+            $r->{coreMinutes} += $delta;
+            $r->{days}{ int($minute / 86400) } = 1;
+            my $run = (defined $r->{last} && $minute == $r->{last} + 60) ? $r->{run} + 1 : 1;
+            $r->{episodes}++ if ($run == 1);
+            $r->{run}  = $run;
+            $r->{last} = $minute;
+            $r->{longest} = $run if ($run > $r->{longest});
+        }
+    }
+    return;
+}
+
+# Evidence trackers: for each LPAR named, its current configuration state
+# (decision F4), uncapped and in a shared pool, over [from, to), one per
+# profile-hours population, with the candidate test's whole-minute bounds.
+sub _protection_trackers
+{
+    my ($db, $vms_href, $asof, $from, $to, $populations) = @_;
+    my (%states, %bounds);
+    foreach my $vm (sort keys %{ $vms_href // {} })
+    {
+        my @states = sort { $a->{start_epoch} <=> $b->{start_epoch} }
+            grep { defined $_->{start_epoch} && defined $_->{end_epoch} && $_->{start_epoch} < $asof } @{ $db->{$vm} // [] };
+        my $s = $states[-1] or next;
+        next if ($s->{end_epoch} < $asof - 86400);
+        my $m = $s->{metadata} // {};
+        next if (defined $m->{shared_enabled} && !$m->{shared_enabled});
+        next unless (defined $m->{capped} && "$m->{capped}" eq '0' && defined $m->{pool_id} && looks_like_number($m->{entitlement} // ''));
+        my ($begin, $end) = _candidate_minute_bounds($db->{$vm}, $s, scalar(@states), $from, $to);
+        next unless defined $begin;
+        $states{$vm} = [$s];
+        $bounds{$vm} = [ $begin, $end ];
+    }
+    my $trackers = _exposure_trackers(\%states, $from, $to, $populations, sub {
+        my ($vm, $meta) = @_;
+        return [ { value => $meta->{entitlement} + 0, basis => 'installedEntitlement', profiles => [] } ];
+    });
+    foreach my $t (@$trackers)
+    {
+        $t->{from} = max($t->{from}, $bounds{ $t->{vm} }[0]);
+        $t->{to}   = min($t->{to},   $bounds{ $t->{vm} }[1]);
+        $t->{protection} = { contested => 0, days => {}, frontier => [], top => [] };
+    }
+    return $trackers;
+}
+
+# The cut-protection record of every profile of the evidence trackers, kept
+# in CoreResults{CutProtection} and in the stored proposal. The target is the
+# proposal's entitlement (the CSV value) where there is one, else the shown
+# profile value; installed is the entitlement of the state.
+sub _protection_results
+{
+    my ($trackers, $map_ref, $proposals) = @_;
+    my $r4  = sub { return 0 + sprintf('%.4f', $_[0]); };
+    my $iso = sub { return _pool_iso($_[0]); };
+    my $count = 0;
+    foreach my $t (@{ $trackers // [] })
+    {
+        my $p = $t->{protection} or next;
+        my $total = _exposure_totals($t);
+        my $installed = $t->{entitlement};
+        my $core = ($map_ref->{ $t->{vm} }{CoreResults} //= {});
+        my @top = sort { $b->[0] <=> $a->[0] || $a->[2] <=> $b->[2] } @{ $p->{top} };
+        $#top = $CUT_PROTECTION_TOP_READINGS - 1 if (@top > $CUT_PROTECTION_TOP_READINGS);
+        foreach my $profile (@{ $t->{profiles} })
+        {
+            my $proposal = (ref($proposals) eq 'HASH' && ref($proposals->{ $t->{vm} }) eq 'HASH')
+                ? ($proposals->{ $t->{vm} }{profiles} // {})->{$profile} : undef;
+            my $target = (ref($proposal) eq 'HASH' && defined $proposal->{entitlement}) ? $proposal->{entitlement}
+                       : _structural_shown_value((ref($core->{ProfileValues}) eq 'HASH') ? $core->{ProfileValues}{$profile} : undef);
+            my ($share, $tier) = _protection_share_of($profile);
+            my %bound = (busy     => _protection_bound($p, 0, $installed),
+                         ladder   => _protection_bound($p, $share, $installed),
+                         consumed => _protection_bound($p, 1, $installed));
+            my $cut = (defined $target && defined $installed && $target < $installed - $STRUCTURAL_ENT_TOLERANCE) ? 1 : 0;
+            my %adjusted = map {
+                my $v = $bound{$_};
+                ($_ => (!defined $target ? undef : ($cut && defined $v && $v > $target) ? $v : $target))
+            } keys %bound;
+            my %record = (
+                rule => $CUT_PROTECTION_RULE,
+                status => (!$total->{classified} ? 'unavailable' : $p->{contested} ? 'bound' : 'noCompetition'),
+                tier => $tier, share => $share, population => $t->{population}, pool => $t->{pool},
+                stateStartUTC => $iso->($t->{stateStart}), fromUTC => $iso->($t->{from}), toUTCExclusive => $iso->($t->{to}),
+                installed => $installed, target => $target, cut => ($cut ? JSON::true : JSON::false),
+                bound => \%bound, adjusted => \%adjusted,
+                support => { contestedMinutes => $p->{contested}, contestedDays => scalar(keys %{ $p->{days} }),
+                             pairedMinutes => $total->{paired}, classifiedMinutes => $total->{classified},
+                             expectedMinutes => $total->{expected} },
+                frontier => [ map { [ $r4->($_->[0]), $r4->($_->[1]), $iso->($_->[2]) ] }
+                              sort { $b->[0] <=> $a->[0] || $a->[2] <=> $b->[2] } @{ $p->{frontier} } ],
+                top => [ map { [ $r4->($_->[0]), $r4->($_->[1]), $iso->($_->[2]) ] } @top ],
+            );
+            $core->{CutProtection}{$profile} = \%record;
+            $proposal->{cutProtection} = \%record if (ref($proposal) eq 'HASH');
+            $count++;
+        }
+    }
+    return $count;
+}
+
+# The "Cut Protection (shadow)" rationale section: one line per planning-
+# profile cut. Only planning profiles are summed; alternative profiles are
+# never added together.
+sub _protection_report_lines
+{
+    my ($map_ref, $cuts_aref, $reason) = @_;
+    my @out = ('', '=' x 70, 'Cut Protection (shadow)', '=' x 70,
+        '  Recorded, not applied (v10 stage 3.3). For each planning-profile cut: the entitlement that',
+        "  keeps every busy minute covered while the LPAR's pool was scarce and other LPARs were busy,",
+        "  in its current configuration state. Protected level = PhysB + share x (PhysC - PhysB), never",
+        "  above installed; the profile's tier sets the share (P 0.95, tier 1 0.85, 2 0.65, 3 0.40,",
+        '  4 0.00). The CSV is unchanged.', '');
+    if (defined $reason)
+    {
+        push @out, "  Not evaluated: $reason.";
+        return @out;
+    }
+    my ($limited, $kept) = (0, 0);
+    my $plural = sub { return $_[0] == 1 ? '' : 's'; };
+    foreach my $cut (@{ $cuts_aref // [] })
+    {
+        my $rec = ((($map_ref->{ $cut->{vm} } // {})->{CoreResults} // {})->{CutProtection} // {})->{ $cut->{planning} };
+        my $head = sprintf('  %s %s: %.2f -> %.2f', $cut->{vm}, $cut->{planning}, $cut->{current}, $cut->{proposed});
+        if (!$rec)
+        {
+            push @out, "$head; not evaluated: no current uncapped shared-pool state.";
+            next;
+        }
+        if ($rec->{status} eq 'unavailable')
+        {
+            push @out, "$head; evidence not available (no pool-classified minute).";
+            next;
+        }
+        if ($rec->{status} eq 'noCompetition')
+        {
+            push @out, sprintf('%s; no pool competition observed (%d classified minute%s).', $head,
+                $rec->{support}{classifiedMinutes}, $plural->($rec->{support}{classifiedMinutes}));
+            next;
+        }
+        my $adjusted = $rec->{adjusted}{ladder} // $rec->{adjusted}{busy};
+        my $gain = $adjusted - $cut->{proposed};
+        if ($gain > 0.005)
+        {
+            $limited++;
+            $kept += $gain;
+        }
+        push @out, sprintf('%s; %s (share %.2f; PhysB only %.2f, PhysC %.2f); %d contested minute%s on %d day%s.',
+            $head, ($gain > 0.005 ? sprintf('protected %.2f', $adjusted) : 'not limited'), $rec->{share} // 0,
+            $rec->{bound}{busy}, $rec->{bound}{consumed}, $rec->{support}{contestedMinutes},
+            $plural->($rec->{support}{contestedMinutes}), $rec->{support}{contestedDays}, $plural->($rec->{support}{contestedDays}));
+    }
+    if (!@{ $cuts_aref // [] })
+    {
+        push @out, '  No planning-profile cut in this analysis.';
+    }
+    else
+    {
+        push @out, '', sprintf('  Summary: %d planning-profile cut%s, %d limited by the protected level; %.2f cores of entitlement kept (planning profiles only).',
+            scalar(@$cuts_aref), $plural->(scalar @$cuts_aref), $limited, $kept);
+    }
+    return @out;
+}
+
+# Replay trackers (--candidate-proposals with --candidate-window): the
+# candidate test's members, states and minute bounds, with the thresholds of
+# each cut profile's record from the sizing run: its target, the three
+# adjusted values and the installed entitlement.
+sub _protection_loss_trackers
+{
+    my ($db, $members, $asof, $from, $to, $notes) = @_;
+    my $trackers = _candidate_trackers($db, $members, $asof, $from, $to, $notes, undef, sub {
+        my ($vm, $meta, $population, $profiles) = @_;
+        my %points;
+        foreach my $profile (@$profiles)
+        {
+            my $rec = ((($members->{$vm} // {})->{profiles} // {})->{$profile} // {})->{cutProtection};
+            # Every cut is scored, with or without training evidence: the
+            # residual exposure of cuts nothing protected is part of the test.
+            next unless (ref($rec) eq 'HASH' && $rec->{cut});
+            my %levels = (target => $rec->{target}, installed => $meta->{entitlement},
+                          map { ($_ => $rec->{adjusted}{$_}) } qw(busy ladder consumed));
+            foreach my $label (sort keys %levels)
+            {
+                next unless (defined $levels{$label} && looks_like_number($levels{$label}));
+                my $cents = int($levels{$label} * 100 + 0.5);
+                my $point = $points{$cents} //= { value => $cents / 100, labels => [] };
+                push @{ $point->{labels} }, "$profile/$label";
+            }
+        }
+        return [ map { $points{$_} } sort { $a <=> $b } keys %points ];
+    });
+    foreach my $t (@$trackers)
+    {
+        $t->{lossStats} = [];
+        $t->{protectionReplay} = 1;
+    }
+    return $trackers;
+}
+
+# The replay record (research artefact; contains LPAR names, so it is
+# written only beside the decision table of --candidate-proposals).
+sub _write_protection_replay
+{
+    my ($path, $trackers, $saved, $from, $to, $notes) = @_;
+    my @rows;
+    foreach my $t (@$trackers)
+    {
+        my $total = _exposure_totals($t);
+        my @levels;
+        foreach my $k (0 .. $#{ $t->{thresholds} })
+        {
+            my $st = $t->{lossStats}[$k] // {};
+            my %signals = map {
+                my $r = $st->{$_} // {};
+                ($_ => { minutes => $r->{minutes} // 0, coreMinutes => 0 + sprintf('%.4f', $r->{coreMinutes} // 0),
+                         days => scalar(keys %{ $r->{days} // {} }), episodes => $r->{episodes} // 0, longest => $r->{longest} // 0 })
+            } qw(busy consumed);
+            push @levels, { value => $t->{thresholds}[$k]{value}, labels => $t->{thresholds}[$k]{labels}, %signals };
+        }
+        push @rows, { vm => $t->{vm}, pool => $t->{pool}, population => $t->{population}, profiles => $t->{profiles},
+            installed => $t->{entitlement}, vp => $t->{vp}, stateStartUTC => _pool_iso($t->{stateStart}),
+            fromUTC => _pool_iso($t->{from}), toUTCExclusive => _pool_iso($t->{to}),
+            pairedMinutes => $total->{paired}, classifiedMinutes => $total->{classified},
+            expectedMinutes => $total->{expected}, scarceMinutes => $total->{scarce}, levels => \@levels };
+    }
+    my %records;
+    foreach my $vm (sort keys %{ $saved->{members} // {} })
+    {
+        my $profiles = $saved->{members}{$vm}{profiles} // {};
+        foreach my $profile (sort keys %$profiles)
+        {
+            $records{$vm}{$profile} = $profiles->{$profile}{cutProtection} if (ref($profiles->{$profile}{cutProtection}) eq 'HASH');
+        }
+    }
+    my $payload = JSON->new->utf8->canonical->pretty->encode({
+        rule => $CUT_PROTECTION_RULE, system => $saved->{system}, model => $saved->{model}, sizing => $saved->{window},
+        replay => { start => gmtime($from)->ymd, end => gmtime($to - 1)->ymd }, shares => \%CUT_PROTECTION_SHARE,
+        members => [ sort keys %{ $saved->{members} // {} } ], records => \%records, trackers => \@rows, notes => $notes // [],
+    });
+    open my $fh, '>', $path or die "[ERROR] Cannot write '$path': $!\n";
+    print {$fh} $payload;
+    close $fh or die "[ERROR] Cannot write '$path': $!\n";
+    return $path;
+}
+
 sub _log_cut_exposure
 {
-    my ($log_fh, $map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href, $cache_dir, $start_obj, $end_obj, $candidates) = @_;
+    my ($log_fh, $map_ref, $vm_order_aref, $profiles_aref, $tier_overrides_href, $cache_dir, $start_obj, $end_obj, $candidates,
+        $proposals_href) = @_;
     my %summary = (Cuts => 0, Evaluated => 0, Advisories => 0, Status => 'notEvaluated', AdvisedCuts => [], Reason => '');
     return \%summary unless (defined $log_fh && ref($log_fh) && ref($map_ref) eq 'HASH' && ref($vm_order_aref) eq 'ARRAY');
     $tier_overrides_href //= {};
@@ -24358,6 +24754,23 @@ sub _log_cut_exposure
     }
     $summary{Cuts} = scalar @cuts;
 
+    # Cut protection (shadow): every LPAR with a cut on any actionable profile.
+    my $actionable = _exposure_populations();
+    my @actionable_profiles = map { @$_ } values %$actionable;
+    my %protect;
+    foreach my $vm (@$vm_order_aref)
+    {
+        my $vm_map = $map_ref->{$vm};
+        next unless (ref($vm_map) eq 'HASH' && ref($vm_map->{CoreResults}) eq 'HASH' && ref($vm_map->{CoreResults}{ProfileValues}) eq 'HASH');
+        my $current = _structural_shown_value((ref($vm_map->{Configuration}) eq 'HASH') ? $vm_map->{Configuration}{entitlement} : undef);
+        next unless defined $current;
+        $protect{$vm} = 1 if (grep {
+            my $v = _structural_shown_value($vm_map->{CoreResults}{ProfileValues}{$_});
+            defined $v && $v < $current - $STRUCTURAL_ENT_TOLERANCE
+        } @actionable_profiles);
+    }
+    my @protection_out;
+
     my @out = ('', '=' x 70, 'Entitlement Cut Exposure', '=' x 70);
     push @out, "  For each LPAR whose planning-profile entitlement is below its installed entitlement: how";
     push @out, "  often its busy work (PhysB) went above the proposal, minute by minute, whether today's";
@@ -24368,16 +24781,18 @@ sub _log_cut_exposure
     my $pool_context = _pool_history_context($cache_dir);
     my ($exposure_context, $reason) = _exposure_context($cache_dir, $pool_context);
     my @shadow;
-    if (!@cuts && !$candidates)
+    if (!@cuts && !%protect && !$candidates)
     {
         push @out, "  No planning-profile entitlement cut in this analysis.";
         $summary{Status} = 'noCuts';
+        @protection_out = _protection_report_lines($map_ref, []);
     }
     elsif (!$exposure_context)
     {
         push @out, "  Not evaluated: $reason.";
         $summary{Status} = 'unavailable';
         $summary{Reason} = $reason;
+        @protection_out = _protection_report_lines($map_ref, \@cuts, $reason);
     }
     else
     {
@@ -24410,8 +24825,11 @@ sub _log_cut_exposure
         push @$shadow, @{ _reconcile_trackers($states, $candidates, $window_end, $from, $to, \@reconcile_notes) } if $candidates;
         my @pressure_notes;
         push @$shadow, @{ _pressure_trackers($states, $candidates, $window_end, $from, $to, \@pressure_notes) } if $candidates;
-        my @same_window = (@$trackers, defined $replay_from ? () : @$shadow);
+        my $protection = _protection_trackers($states, \%protect, $window_end, $window_start, $window_end, $actionable);
+        my @same_window = (@$trackers, @$protection, defined $replay_from ? () : @$shadow);
         my $counts = @same_window ? _exposure_evaluate_window($pool_context, $exposure_context, \@same_window, $window_start, $window_end) : {};
+        _protection_results($protection, $map_ref, $proposals_href);
+        @protection_out = _protection_report_lines($map_ref, \@cuts);
         _exposure_evaluate_window($pool_context, $exposure_context, $shadow, $from, $to) if defined $replay_from && @$shadow;
         if ($candidates)
         {
@@ -24484,7 +24902,7 @@ sub _log_cut_exposure
     $summary{DecisionRows} //= _shadow_decision_rows({ members => $candidates, unavailable => ($reason || 'not evaluated'),
         from => $start_obj->epoch, to => $end_obj->epoch + 86400, sizingStart => $start_obj->ymd, sizingEnd => $end_obj->ymd,
         system => basename($cache_dir) }) if $candidates;
-    print {$log_fh} join("\n", @out, @shadow), "\n";
+    print {$log_fh} join("\n", @out, @protection_out, @shadow), "\n";
     return \%summary;
 }
 

@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : maxcpu-chains
+# PURPOSE  : MaxCPU sanity-limit exceptions for review (plan 4.4, decision
+#            F14): for every profile whose target the limit held, the chain
+#            that produced the figure, the target and current-cycle pair with
+#            and without the limit, and the consequence for the pool's total of
+#            planning-profile current-cycle entitlements.
+#
+#            Each system is analysed again with the current nfit and
+#            nfit-profile and the frozen configuration of a golden baseline (so
+#            the cases match its counts), in a private scratch tree, with the
+#            baseline's run options. The figures come from the MaxCPU shadow
+#            record of the stored proposal (maxCpuLimit). The outputs carry
+#            vm_/sys_ pseudonyms only and are audited with dev/nfit-redact.
+#
+# USAGE    : dev/maxcpu-chains [--baseline NAME] [--run decay-states]
+#                              [--systems S1,S2] [--out DIR]
+#            Default baseline v10-3.1b-8d28ba3; systems: every baseline system.
+#            Systems may be given as sys_ pseudonyms.
+#
+# OUTPUTS  : <out>/maxcpu-exceptions.json and maxcpu-exceptions.md
+# ==============================================================================
+import argparse
+import collections
+import datetime as dt
+import hashlib
+import hmac
+import importlib.machinery
+import importlib.util
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def load_golden():
+    loader = importlib.machinery.SourceFileLoader('golden_harness', str(REPO / 'dev' / 'golden'))
+    spec = importlib.util.spec_from_loader('golden_harness', loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def pseudonymiser():
+    secret = (REPO / '.private' / 'redact.secret').read_text(encoding='utf-8').strip().encode('utf-8')
+    return lambda term, category: f"{category}_{hmac.new(secret, term.lower().encode('utf-8'), hashlib.sha256).hexdigest()[:6]}"
+
+
+def tier_of(profile):
+    head = profile.split('-')[0]
+    return 'P' if head == 'P' else head[1:]
+
+
+def analyse(golden, meta, dest, system, run, pseud):
+    """One system: rerun, read the stored proposal, return anonymised records."""
+    stage_dir = Path(meta['stage_dir'])
+    sysdir = stage_dir / system
+    with tempfile.TemporaryDirectory(prefix='nfit-maxcpu-') as tmp:
+        scratch = Path(tmp)
+        sdir = golden.build_tree(scratch, REPO, dest / 'frozen' / 'etc', sysdir)
+        rc, err, _ = golden.run_profile(scratch, sdir, run, meta['enddate'], golden.perl_env())
+        if rc != 0:
+            raise RuntimeError(f'{pseud(system, "sys")}: nfit-profile exited {rc}')
+        snaps = list((sdir / '.nfit.store' / 'proposals' / 'v1').glob('*/*.json'))
+        if len(snaps) != 1:
+            raise RuntimeError(f'{pseud(system, "sys")}: expected one proposal snapshot')
+        snap = json.loads(snaps[0].read_text())
+    members = snap['members']
+    sys_p = pseud(system, 'sys')
+    # Pool totals of planning-profile current-cycle entitlements, as the CSV shows them.
+    totals = collections.defaultdict(float)
+    for vm, m in members.items():
+        cc = ((m.get('profiles') or {}).get(m.get('planningProfile') or '') or {}).get('currentCycle') or {}
+        if cc.get('entitlement') is not None:
+            totals[str(m.get('poolId'))] += cc['entitlement']
+    records = []
+    for vm in sorted(members):
+        m = members[vm]
+        for profile, p in sorted((m.get('profiles') or {}).items()):
+            rec = p.get('maxCpuLimit')
+            if not isinstance(rec, dict):
+                continue
+            planning = profile == m.get('planningProfile')
+            before, after = rec['pair'].get('entitlement'), rec['uncappedPair'].get('entitlement')
+            pool = str(rec.get('pool'))
+            records.append({
+                'system': sys_p, 'vm': pseud(vm, 'vm'), 'profile': profile, 'tier': tier_of(profile), 'planning': planning,
+                'installedEntitlement': m.get('installedEntitlement'), 'installedVPs': m.get('installedVPs'),
+                'maxCpu': rec.get('maxCpu'), 'multiplier': rec.get('multiplier'), 'limit': rec.get('limit'),
+                'target': rec.get('target'), 'uncappedTarget': rec.get('uncappedTarget'),
+                'removedByLimit': round((rec.get('uncappedTarget') or 0) - (rec.get('target') or 0), 2),
+                'targetVPs': rec.get('targetVPs'), 'pair': rec['pair'], 'uncappedPair': rec['uncappedPair'],
+                'pool': pool, 'poolSize': rec.get('poolSize'),
+                'poolPlanningTotal': round(totals.get(pool, 0.0), 2) if planning else None,
+                'poolPlanningTotalWithout': (round(totals.get(pool, 0.0) - (before or 0) + (after or 0), 2) if planning else None),
+                'chain': rec.get('chain') or {},
+            })
+    return records
+
+
+def flags(chain):
+    out = []
+    if str(chain.get('RunQ_Potential', '')).startswith('ANOMALY'):
+        out.append(chain['RunQ_Potential'])
+    for key, label in (('DBWDampeningApplied', 'DBW dampening'), ('HotThreadWLDampeningApplied', 'hot-thread dampening'),
+                       ('TacticalDeadbandApplied', 'deadband'), ('AdditiveSafetyCapApplied', 'final additive cap'),
+                       ('BudgetFloorApplied', 'guarantee floor')):
+        if str(chain.get(key, '')).startswith(('True', 'Yes')):
+            out.append(label)
+    for key in ('CPUCapLimited', 'CPUFlatlining', 'CPUFlatliningPartial', 'CPUFlatliningPartialSevere'):
+        if chain.get(key) == 'Yes':
+            out.append(key)
+    if chain.get('TacticalExceedsStrategic') == '1':
+        out.append('tactical exceeds strategic')
+    return ', '.join(out) or '-'
+
+
+def pair_text(p):
+    return f"{p.get('entitlement')} on {p.get('VPs')} VP ({p.get('status')}{'; ' + ','.join(p['binding']) if p.get('binding') else ''})"
+
+
+def write_report(out, result):
+    rows = result['records']
+    lines = ['# MaxCPU sanity-limit exceptions', '',
+             f"Generated {result['generated']} from commit {result['commit']}; baseline {result['baseline']}, run {result['run']}.",
+             'Pseudonyms only. Each row is one profile of one LPAR; alternative profiles of an LPAR are listed side by side and',
+             'are not added together. Pool totals use planning profiles only.', '',
+             f"{len(rows)} profile(s) held by the limit, {sum(r['planning'] for r in rows)} of them planning profiles.", '',
+             '## 1. Targets and pairs with and without the limit', '',
+             '| System | LPAR | Profile | Planning | Installed ENT/VP | MaxCPU | Limit | Target | Without limit | Removed | Target VPs | Current cycle | Without limit |',
+             '|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|']
+    for r in rows:
+        lines.append(f"| {r['system']} | {r['vm']} | {r['profile']} | {'yes' if r['planning'] else ''} | "
+                     f"{r['installedEntitlement']}/{r['installedVPs']} | {r['maxCpu']} | {r['limit']} | {r['target']} | "
+                     f"{r['uncappedTarget']} | {r['removedByLimit']} | {r['targetVPs']} | {pair_text(r['pair'])} | {pair_text(r['uncappedPair'])} |")
+    lines += ['', '## 2. The chain behind each figure', '',
+              '| LPAR | Profile | Base | Raw queue additive | Corroboration | Corroborated | Step cap | Pool factor | Final additive | Flags |',
+              '|---|---|---:|---:|---:|---:|---:|---:|---:|---|']
+    for r in rows:
+        c = r['chain']
+        lines.append(f"| {r['vm']} | {r['profile']} | {c.get('PostGrowthBasePhysC', c.get('BasePhysC', ''))} | "
+                     f"{c.get('AdditiveRawUncorroborated', '')} | {c.get('AdditiveCorroborationFactor', '')} | {c.get('RawAdditive', '')} | "
+                     f"{c.get('MaxAdditiveCap', '')} | {c.get('PoolFactor', '')} | {c.get('FinalAdditive', '')} | {flags(c)} |")
+    pools = [r for r in rows if r['planning']]
+    lines += ['', '## 3. Pool consequence (planning profiles)', '']
+    if pools:
+        lines += ['| System | Pool | Pool size | Planning current-cycle total | Without the limit |', '|---|---:|---:|---:|---:|']
+        seen = set()
+        for r in pools:
+            key = (r['system'], r['pool'])
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"| {r['system']} | {r['pool']} | {r['poolSize'] if r['poolSize'] is not None else 'default pool'} | "
+                         f"{r['poolPlanningTotal']} | {r['poolPlanningTotalWithout']} |")
+        lines.append('')
+        lines.append('Where several held LPARs share a pool, the "without" column of the last row of that pool includes only its own change; '
+                     'section 1 gives each change.')
+    else:
+        lines.append('No planning profile is held by the limit, so no pool total changes.')
+    (out / 'maxcpu-exceptions.md').write_text('\n'.join(lines) + '\n')
+
+
+def main():
+    ap = argparse.ArgumentParser(description='MaxCPU sanity-limit exceptions for review.')
+    ap.add_argument('--baseline', default='v10-3.1b-8d28ba3')
+    ap.add_argument('--run', default='decay-states')
+    ap.add_argument('--systems', default=None)
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance'))
+    a = ap.parse_args()
+    golden = load_golden()
+    dest = golden.GOLDEN_ROOT / a.baseline
+    meta = json.loads((dest / 'meta.json').read_text())
+    if a.run not in meta['runs']:
+        sys.exit(f'maxcpu-chains: run {a.run} is not in baseline {a.baseline}')
+    systems = list(meta['systems'])
+    if a.systems:
+        by_alias = {golden.pseudonym(name): name for name in systems}
+        systems = [by_alias.get(s.strip(), s.strip()) for s in a.systems.split(',') if s.strip()]
+        unknown = [s for s in systems if s not in meta['systems']]
+        if unknown:
+            sys.exit(f'maxcpu-chains: {len(unknown)} system(s) not in the baseline')
+    pseud = pseudonymiser()
+    records = []
+    for system in systems:
+        print(f'{pseud(system, "sys")}: analysing', flush=True)
+        found = analyse(golden, meta, dest, system, a.run, pseud)
+        print(f'{pseud(system, "sys")}: {len(found)} profile(s) held by the limit', flush=True)
+        records.extend(found)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    result = {'generated': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+              'commit': (lambda g: (g.get('commit') or 'unknown')[:7] + ('+uncommitted' if g.get('executables_dirty') else ''))(golden.git_identity(REPO)),
+              'baseline': a.baseline, 'run': a.run, 'records': records}
+    (out / 'maxcpu-exceptions.json').write_text(json.dumps(result, indent=1) + '\n')
+    write_report(out, result)
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(out / 'maxcpu-exceptions.json'),
+                            str(out / 'maxcpu-exceptions.md')], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {out / "maxcpu-exceptions.md"} and maxcpu-exceptions.json')
+    return 0 if audit.returncode == 0 else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

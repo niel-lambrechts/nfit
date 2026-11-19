@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : protection-replay
+# PURPOSE  : Acceptance replay for cut protection (v10 stage 3.3, plan 5.7):
+#            for every research system, size on the research's training
+#            window, record the exact protection bounds (PhysB only, the tier
+#            ladder, PhysC only), then score them on the held-out window with
+#            the research's loss metric, and reconcile the exact bounds with the
+#            research's candidate grid (phase3-common-grid.json).
+#
+#            Inputs are the frozen research captures, read only through
+#            symbolic links (as the research's phase3-replay.py did); every run
+#            happens in a private work tree under .private/protection-replay.
+#            The outputs carry research member labels (P10-02-member-007) and
+#            pool numbers only: no LPAR or system names. They are audited with
+#            dev/nfit-redact before the tool reports success.
+#
+# USAGE    : dev/protection-replay [--cohort P10|P9|all] [--config FILE]
+#                                  [--capture-root DIR] [--research DIR]
+#                                  [--out DIR] [--keep-work]
+#            Defaults: all cohorts; ~/Downloads/config-all-26.csv;
+#            ~/src/nfit-data/research/nfit-capture; the research folder in
+#            nfit-docs; design/acceptance.
+#
+# OUTPUTS  : <out>/protection-replay.json   records, reconciliation, totals
+#            <out>/protection-replay.md     the acceptance tables
+#
+# REQUIRES : Python 3.8+ (standard library), perl with JSON (or the
+#            .claude/perl5 development shims).
+# ==============================================================================
+import argparse
+import collections
+import datetime as dt
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HOME = Path.home()
+EXECUTABLES = ('nfit', 'nfit-profile')
+INPUTS = ('.nfit.cache.data', '.nfit.cache.states', '.nfit.cache.manifest', '.nfit_stage_id',
+          '.nfit.cache.pool.observations.csv.gz')
+# The research's cohorts: capture folder, systems, training start and end,
+# held-out start and end (phase3-replay.py).
+COHORTS = {
+    'P10': ('physb-2026-11', 10, '2026-08-08', '2026-10-02', '2026-10-03', '2026-11-05'),
+    'P9': ('power9-mr9-2026-11-07', 1, '2026-10-11', '2026-10-24', '2026-10-25', '2026-11-07'),
+}
+PLANS = ('target', 'busy', 'ladder', 'consumed')          # the original cut and the three protected levels
+TOLERANCE_SHARE = 0.05                                    # plan 5.7 item 5: a proposed tolerance
+EPS = 1e-9
+
+
+def perl_env():
+    env = dict(os.environ, TZ='UTC', LC_ALL='C')
+    shim = REPO / '.claude' / 'perl5'
+    if subprocess.run(['perl', '-MJSON', '-e1'], capture_output=True).returncode != 0 and shim.is_dir():
+        env['PERL5LIB'] = str(shim) + (os.pathsep + env['PERL5LIB'] if env.get('PERL5LIB') else '')
+    return env
+
+
+def git_identity():
+    try:
+        head = subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', '--short', 'HEAD'], text=True).strip()
+        dirty = subprocess.run(['git', '-C', str(REPO), 'diff', '--quiet', '--', *EXECUTABLES]).returncode != 0
+        return head + ('+uncommitted' if dirty else '')
+    except (OSError, subprocess.CalledProcessError):
+        return 'unknown'
+
+
+def setup_app(work, config):
+    app = work / 'app'
+    if app.is_dir():
+        shutil.rmtree(app)
+    (app / 'etc').mkdir(parents=True)
+    (app / 'output').mkdir()
+    for name in EXECUTABLES:
+        shutil.copy(REPO / name, app / name)
+        os.chmod(app / name, 0o700)
+    for f in sorted((REPO / 'etc').glob('nfit.*')):
+        if f.is_file():
+            shutil.copy(f, app / 'etc' / f.name)
+    shutil.copy(config, app / 'config.csv')
+    return app
+
+
+def link_stage(case, source):
+    stage = case / 'stage' / source.name
+    stage.mkdir(parents=True, exist_ok=True)
+    for name in INPUTS:
+        src = source / name
+        if not src.is_file():
+            raise RuntimeError('a required capture input is missing')
+        dest = stage / name
+        if not dest.exists():
+            dest.symlink_to(src)
+    return stage
+
+
+def invoke(app, case, label, args, env):
+    with (case / (label + '.private.log')).open('w') as log:
+        proc = subprocess.run([str(app / 'nfit-profile')] + args, cwd=str(app), env=env, stdout=log, stderr=subprocess.STDOUT)
+    if proc.returncode:
+        raise RuntimeError(f'{label} run exited {proc.returncode}; see its private log in the work tree')
+
+
+def run_case(app, case, source, dates, env):
+    """Training (sizing) run, then the held-out replay of its saved proposal.
+    Returns (snapshot, replay) as parsed JSON."""
+    start, cutoff, later, end = dates
+    stage = link_stage(case, source)
+    base = ['--nmondir', str(stage), '--config', str(app / 'config.csv')]
+    for p in (app / 'output').glob('*'):
+        p.unlink()
+    invoke(app, case, 'training', base + ['--candidate-test', '--startdate', start, '--enddate', cutoff,
+                                         '--analysis-reference-date', cutoff, '--runq-perc-behavior=match'], env)
+    snaps = list((stage / '.nfit.store' / 'proposals' / 'v1').glob('*/*.json'))
+    if len(snaps) != 1:
+        raise RuntimeError('expected one proposal snapshot in the isolated case')
+    for p in (app / 'output').glob('*'):
+        p.unlink()
+    invoke(app, case, 'later', base + ['--candidate-proposals', str(snaps[0]), '--candidate-window', later + '/' + end], env)
+    replays = list((app / 'output').glob('*.protection.replay-*.json'))
+    if len(replays) != 1:
+        raise RuntimeError('expected one cut-protection replay record')
+    return json.loads(snaps[0].read_text()), json.loads(replays[0].read_text())
+
+
+def anonymise(label, snapshot, replay, dates):
+    """Member records under research labels; no names leave this function."""
+    members = sorted(snapshot['members'])
+    ids = {vm: f'{label}-member-{n:03}' for n, vm in enumerate(members, 1)}
+    losses = {}
+    for t in replay['trackers']:
+        for level in t['levels']:
+            for tag in level['labels']:
+                profile, plan = tag.rsplit('/', 1)
+                losses[(t['vm'], profile, plan)] = {
+                    'level': level['value'],
+                    'busy': level['busy'], 'consumed': level['consumed'],
+                    'support': {k: t[k] for k in ('pairedMinutes', 'classifiedMinutes', 'expectedMinutes', 'scarceMinutes')},
+                }
+    records = []
+    for vm in members:
+        m = snapshot['members'][vm]
+        for profile, p in sorted((m.get('profiles') or {}).items()):
+            rec = p.get('cutProtection')
+            if not isinstance(rec, dict):
+                continue
+            row = {
+                'member': ids[vm], 'system': label, 'profile': profile, 'tier': rec.get('tier'), 'share': rec.get('share'),
+                'pool': rec.get('pool'), 'population': rec.get('population'), 'installed': rec.get('installed'),
+                'installedVPs': m.get('installedVPs'), 'target': rec.get('target'), 'cut': bool(rec.get('cut')),
+                'status': rec.get('status'), 'bound': rec.get('bound'), 'adjusted': rec.get('adjusted'),
+                'support': rec.get('support'), 'planning': profile == m.get('planningProfile'),
+                'scored': any((vm, profile, plan) in losses for plan in PLANS),
+                'later': {plan: losses.get((vm, profile, plan)) for plan in PLANS + ('installed',)},
+            }
+            records.append(row)
+    return {'system': label, 'dates': dict(zip(('trainingStart', 'trainingEnd', 'laterStart', 'laterEnd'), dates)),
+            'members': len(members), 'records': records,
+            'notes': len(replay.get('notes') or [])}
+
+
+def candidate_choices(installed, vps, baseline):
+    """The research's original-grid levels of one profile (_candidate_levels)
+    that lie between the baseline and the installed entitlement, in cents."""
+    if not (vps and baseline and baseline > 0 and vps == int(vps)):
+        return []
+    inst, base, floor = (int(x * 100 + 0.5) for x in (installed, baseline, 0.05 * vps))
+    if base > inst or inst < floor or inst > 100 * vps:
+        return []
+    feasible = max(base, floor)
+    levels = {inst, feasible, (inst + feasible + 1) // 2}
+    if feasible > floor:
+        levels.add(max(floor, (9 * feasible + 5) // 10))
+    return sorted(v for v in levels if base <= v <= inst)
+
+
+def reconcile(records, research_rows):
+    """Exact bound projected onto the research's original grid must equal the
+    research's choice: PhysB bound for the busy signal, PhysC for physc."""
+    ours = {(r['member'], r['profile']): r for r in records}
+    result = collections.Counter()
+    mismatches = []
+    for row in research_rows:
+        if row.get('grid') != 'original':
+            continue
+        r = ours.get((row['member'], row['profile']))
+        if row['baseline'] >= row['installed'] - 0.005:
+            result['noCut'] += 1
+            continue
+        if r is None:
+            result['researchRowWithoutRecord'] += 1
+            mismatches.append({'member': row['member'], 'profile': row['profile'], 'signal': row['signal'], 'why': 'no record'})
+            continue
+        if abs((r['target'] or 0) - row['baseline']) > 0.005 or abs((r['installed'] or 0) - row['installed']) > 0.005:
+            result['inputsDiffer'] += 1
+            mismatches.append({'member': row['member'], 'profile': row['profile'], 'signal': row['signal'], 'why': 'baseline or installed differs',
+                               'research': [row['baseline'], row['installed']], 'ours': [r['target'], r['installed']]})
+            continue
+        choices = candidate_choices(r['installed'], r['installedVPs'], r['target'])
+        bound = (r['bound'] or {}).get('busy' if row['signal'] == 'busy' else 'consumed')
+        need = 0 if bound is None else int(round(bound * 100))
+        expected = next((c / 100 for c in choices if c >= need), None)
+        result['compared'] += 1
+        if expected is not None and abs(expected - row['selected']) < 0.005:
+            result['equal'] += 1
+        else:
+            result['different'] += 1
+            mismatches.append({'member': row['member'], 'profile': row['profile'], 'signal': row['signal'], 'why': 'choice differs',
+                               'research': row['selected'], 'ours': expected, 'bound': bound})
+    return dict(result), mismatches
+
+
+def tier_of(profile):
+    head = profile.split('-')[0]
+    return 'P' if head == 'P' else head[1:] if len(head) > 1 else '?'
+
+
+def aggregate(records, key):
+    """Totals per key for cut profiles that were scored on the later window.
+    Alternative profiles are reported side by side, never added together
+    across profiles of the same LPAR (the key always includes the profile or
+    restricts to planning profiles)."""
+    out = collections.OrderedDict()
+    for r in records:
+        if not (r['cut'] and r['scored']):
+            continue
+        k = key(r)
+        if k is None:
+            continue
+        a = out.setdefault(k, {'cuts': 0, 'limited': {p: 0 for p in PLANS[1:]}, 'retained': {p: 0.0 for p in PLANS[1:]},
+                               'busyMinutes': {p: 0 for p in PLANS}, 'busyCoreMinutes': {p: 0.0 for p in PLANS},
+                               'consumedMinutes': {p: 0 for p in PLANS}, 'consumedCoreMinutes': {p: 0.0 for p in PLANS},
+                               'memberDays': {p: 0 for p in PLANS}, 'longest': {p: 0 for p in PLANS}})
+        a['cuts'] += 1
+        for plan in PLANS:
+            level = r['later'].get(plan) or r['later'].get('target')
+            if plan != 'target':
+                gain = (r['adjusted'] or {}).get(plan, r['target']) - r['target']
+                a['retained'][plan] += max(0.0, gain)
+                a['limited'][plan] += gain > 0.005
+            if not level:
+                continue
+            a['busyMinutes'][plan] += level['busy']['minutes']
+            a['busyCoreMinutes'][plan] += level['busy']['coreMinutes']
+            a['consumedMinutes'][plan] += level['consumed']['minutes']
+            a['consumedCoreMinutes'][plan] += level['consumed']['coreMinutes']
+            a['memberDays'][plan] += level['busy']['days']
+            a['longest'][plan] = max(a['longest'][plan], level['busy']['longest'])
+    for a in out.values():
+        for field in ('retained', 'busyCoreMinutes', 'consumedCoreMinutes'):
+            a[field] = {p: round(v, 2) for p, v in a[field].items()}
+    return out
+
+
+def research_totals(rows, grid, signal):
+    out = collections.defaultdict(lambda: {'retained': 0.0, 'laterBusyMinutes': 0, 'laterBusyCoreMinutes': 0.0})
+    for r in rows:
+        if r.get('grid') == grid and r.get('signal') == signal:
+            for k in (r['system'].split('-')[0], r['profile']):
+                out[k]['retained'] += r.get('retained', 0)
+                out[k]['laterBusyMinutes'] += r.get('laterBusyMinutes', 0)
+                out[k]['laterBusyCoreMinutes'] += r.get('laterBusyCoreMinutes', 0)
+    return {k: {f: round(v, 2) for f, v in d.items()} for k, d in out.items()}
+
+
+def exceptions(records, research_rows):
+    """Profiles of a member, and pools, where the exact PhysB bound or the
+    ladder loses more later busy core-minutes than the research grid's PhysB
+    choice."""
+    grid = {(r['member'], r['profile']): r for r in research_rows if r.get('grid') == 'original' and r.get('signal') == 'busy'}
+    rows = []
+    pools = collections.defaultdict(lambda: {'ours': 0.0, 'research': 0.0, 'ladder': 0.0})
+    for r in records:
+        g = grid.get((r['member'], r['profile']))
+        if not (g and r['cut'] and r['scored']):
+            continue
+        ours = (r['later'].get('busy') or r['later'].get('target') or {}).get('busy', {}).get('coreMinutes', 0)
+        ladder = (r['later'].get('ladder') or r['later'].get('target') or {}).get('busy', {}).get('coreMinutes', 0)
+        key = (r['system'], r['pool'])
+        pools[key]['ours'] += ours
+        pools[key]['ladder'] += ladder
+        pools[key]['research'] += g.get('laterBusyCoreMinutes', 0)
+        if ours > g.get('laterBusyCoreMinutes', 0) + 0.005 or ladder > g.get('laterBusyCoreMinutes', 0) + 0.005:
+            rows.append({'member': r['member'], 'profile': r['profile'], 'tier': r['tier'], 'pool': r['pool'],
+                         'exactBusyCoreMinutes': round(ours, 2), 'ladderBusyCoreMinutes': round(ladder, 2),
+                         'researchGridBusyCoreMinutes': round(g.get('laterBusyCoreMinutes', 0), 2)})
+    pool_rows = [{'system': k[0], 'pool': k[1], **{f: round(v, 2) for f, v in d.items()}}
+                 for k, d in sorted(pools.items(), key=lambda kv: (kv[0][0], str(kv[0][1])))
+                 if d['ours'] > d['research'] + 0.005 or d['ladder'] > d['research'] + 0.005]
+    return rows, pool_rows
+
+
+def table(headers, rows):
+    lines = ['| ' + ' | '.join(headers) + ' |', '|' + '|'.join('---:' if i else '---' for i in range(len(headers))) + '|']
+    lines += ['| ' + ' | '.join(str(c) for c in row) + ' |' for row in rows]
+    return '\n'.join(lines)
+
+
+def write_report(out, result):
+    lines = ['# Cut protection acceptance replay', '',
+             f"Generated {result['generated']} from commit {result['commit']}. Rule {result['rule']}; shares {result['shares']}.",
+             'Research member labels and pool numbers only. Alternative profiles are never added together within an LPAR:',
+             'every total below is per profile, or over planning profiles only.', '']
+    rec = result['reconciliation']
+    lines += ['## 1. Reconciliation with the research grid (original grid, 3,230 choices expected)', '',
+              table(['Compared', 'Equal', 'Different', 'Inputs differ', 'No record', 'No cut (skipped)'],
+                    [[rec.get('compared', 0), rec.get('equal', 0), rec.get('different', 0), rec.get('inputsDiffer', 0),
+                      rec.get('researchRowWithoutRecord', 0), rec.get('noCut', 0)]]), '',
+              'Each difference is listed in protection-replay.json (mismatches).', '']
+    for title, key in (('2. Planning profiles, by architecture', 'byArchitecture'), ('3. By profile', 'byProfile'),
+                       ('4. By tier', 'byTier')):
+        rows = []
+        for k, a in result[key].items():
+            for plan in PLANS:
+                rows.append([k, plan, a['cuts'] if plan == 'target' else a['limited'][plan],
+                             '' if plan == 'target' else a['retained'][plan], a['busyMinutes'][plan], a['busyCoreMinutes'][plan],
+                             a['consumedMinutes'][plan], a['consumedCoreMinutes'][plan], a['memberDays'][plan], a['longest'][plan]])
+        lines += ['## ' + title, '',
+                  table(['Group', 'Plan', 'Cuts / limited', 'Retained cores', 'Busy min', 'Busy core-min', 'Consumed min',
+                         'Consumed core-min', 'Member-days', 'Longest'], rows), '']
+    crit = result['criterion']
+    pl, ma = crit['planning'], crit['matched']
+    lines += ['## 5. Criterion of plan 5.7 (a proposed tolerance, not a research result)', '',
+              table(['Population', 'Original cuts', 'Exact PhysB', 'Ladder', 'Exact PhysC', 'Research grid', 'Exact / original',
+                     'Grid / original'],
+                    [['Planning profiles', pl['target'], pl['busy'], pl['ladder'], pl['consumed'], '',
+                      f"{crit['planningExactShare']:.1%}", ''],
+                     ['Profiles the grid also chose for', ma['target'], ma['busy'], ma['ladder'], ma['consumed'],
+                      crit['matchedResearchGrid'], f"{crit['matchedExactShare']:.1%}", f"{crit['matchedGridShare']:.1%}"]]), '',
+              f"Later contested busy core-minutes. Tolerance {TOLERANCE_SHARE:.0%} of the original cuts' core-minutes, with no "
+              'unaccepted exception on a P or tier 1 profile or on a pool (section 6).', '']
+    ex, px = result['exceptions'], result['poolExceptions']
+    lines += ['## 6. Exceptions against the research grid', '',
+              f"{len(ex)} profile(s) and {len(px)} pool(s) where the exact bound or the ladder loses more later busy core-minutes "
+              'than the research grid.', '']
+    if ex:
+        lines += [table(['Member', 'Profile', 'Tier', 'Pool', 'Exact', 'Ladder', 'Research grid'],
+                        [[e['member'], e['profile'], e['tier'], e['pool'], e['exactBusyCoreMinutes'], e['ladderBusyCoreMinutes'],
+                          e['researchGridBusyCoreMinutes']] for e in ex]), '']
+    if px:
+        lines += [table(['System', 'Pool', 'Exact', 'Ladder', 'Research grid'],
+                        [[p['system'], p['pool'], p['ours'], p['ladder'], p['research']] for p in px]), '']
+    lines += ['## 7. Provenance', '', table(['System', 'Training', 'Held-out', 'Members', 'Records', 'Replay notes'],
+              [[s['system'], f"{s['dates']['trainingStart']} to {s['dates']['trainingEnd']}",
+                f"{s['dates']['laterStart']} to {s['dates']['laterEnd']}", s['members'], s['recordCount'], s['notes']]
+               for s in result['systems']]), '']
+    (out / 'protection-replay.md').write_text('\n'.join(lines) + '\n')
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Cut protection acceptance replay (plan 5.7).')
+    ap.add_argument('--cohort', choices=('P10', 'P9', 'all'), default='all')
+    ap.add_argument('--config', default=str(HOME / 'Downloads' / 'config-all-26.csv'))
+    ap.add_argument('--capture-root', default=str(HOME / 'src' / 'nfit-data' / 'research' / 'nfit-capture'))
+    ap.add_argument('--research', default=str(HOME / 'src' / 'nfit-docs' / 'research' / 'chatgpt-phase3-research'))
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance'))
+    ap.add_argument('--keep-work', action='store_true', help='keep the private work tree')
+    a = ap.parse_args()
+    os.umask(0o077)
+    config, out = Path(a.config), Path(a.out)
+    if not config.is_file():
+        sys.exit('protection-replay: VM configuration file not found (see --config)')
+    research_rows = json.loads((Path(a.research) / 'phase3-common-grid.json').read_text())['rows']
+    out.mkdir(parents=True, exist_ok=True)
+    work = REPO / '.private' / 'protection-replay'
+    work.mkdir(parents=True, exist_ok=True)
+    env = perl_env()
+    app = setup_app(work, config)
+    systems, records = [], []
+    for cohort in (('P10', 'P9') if a.cohort == 'all' else (a.cohort,)):
+        folder, expected, *dates = COHORTS[cohort]
+        sources = sorted(p.parent for p in (Path(a.capture_root) / folder / 'stage').glob('*/.nfit_stage_id'))
+        if len(sources) != expected:
+            sys.exit(f'protection-replay: expected {expected} staged system(s) for {cohort}, found {len(sources)}')
+        for i, source in enumerate(sources, 1):
+            label = f'{cohort}-{i:02d}'
+            print(f'{label}: sizing and replay', flush=True)
+            case = work / label
+            if case.exists():
+                shutil.rmtree(case)
+            case.mkdir()
+            snapshot, replay = run_case(app, case, source, dates, env)
+            entry = anonymise(label, snapshot, replay, dates)
+            entry['recordCount'] = len(entry['records'])
+            records.extend(entry.pop('records'))
+            systems.append(entry)
+            print(f'{label}: {entry["members"]} member(s), {entry["recordCount"]} profile record(s)', flush=True)
+    rec, mismatches = reconcile(records, research_rows)
+    planning = [r for r in records if r['planning']]
+    by_arch = aggregate(planning, lambda r: r['system'].split('-')[0])
+    by_profile = aggregate(records, lambda r: r['system'].split('-')[0] + ' ' + r['profile'])
+    by_tier = aggregate(records, lambda r: r['system'].split('-')[0] + ' tier ' + str(r['tier']))
+    # The criterion of plan 5.7 on planning profiles (the research's headline
+    # population), and a like-for-like comparison on the profiles the research
+    # grid also chose for.
+    plan_all = aggregate(planning, lambda r: 'all').get('all')
+    grid_rows = {(r['member'], r['profile']): r for r in research_rows if r.get('grid') == 'original' and r.get('signal') == 'busy'}
+    matched = [r for r in records if (r['member'], r['profile']) in grid_rows]
+    match_all = aggregate(matched, lambda r: 'all').get('all')
+    zero = {p: 0.0 for p in PLANS}
+    pa = plan_all['busyCoreMinutes'] if plan_all else zero
+    ma = match_all['busyCoreMinutes'] if match_all else zero
+    grid = sum(grid_rows[(r['member'], r['profile'])].get('laterBusyCoreMinutes', 0)
+               for r in matched if r['cut'] and r['scored'])
+    ex, px = exceptions(records, research_rows)
+    result = {
+        'generated': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'commit': git_identity(),
+        'rule': 'cut-protection-1', 'shares': {'P': 0.95, '1': 0.85, '2': 0.65, '3': 0.40, '4': 0.00},
+        'systems': systems, 'reconciliation': rec, 'mismatches': mismatches,
+        'byArchitecture': by_arch, 'byProfile': by_profile, 'byTier': by_tier,
+        'researchGrid': {'busy': research_totals(research_rows, 'original', 'busy'),
+                         'physc': research_totals(research_rows, 'original', 'physc'),
+                         'familyBusy': research_totals(research_rows, 'family', 'busy')},
+        'criterion': {'tolerance': TOLERANCE_SHARE,
+                      'planning': {p: round(v, 2) for p, v in pa.items()},
+                      'planningExactShare': (pa['busy'] / pa['target']) if pa['target'] else 0.0,
+                      'planningLadderShare': (pa['ladder'] / pa['target']) if pa['target'] else 0.0,
+                      'matched': {p: round(v, 2) for p, v in ma.items()}, 'matchedResearchGrid': round(grid, 2),
+                      'matchedExactShare': (ma['busy'] / ma['target']) if ma['target'] else 0.0,
+                      'matchedGridShare': (grid / ma['target']) if ma['target'] else 0.0},
+        'exceptions': ex, 'poolExceptions': px, 'records': records,
+    }
+    (out / 'protection-replay.json').write_text(json.dumps(result, indent=1, sort_keys=False) + '\n')
+    write_report(out, result)
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(out / 'protection-replay.json'),
+                            str(out / 'protection-replay.md')], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    if audit.returncode not in (0, 1):
+        print('protection-replay: the redaction audit could not run; do not share the outputs', file=sys.stderr)
+        return 2
+    if not a.keep_work:
+        shutil.rmtree(work, ignore_errors=True)
+    print(f'Written: {out / "protection-replay.md"} and protection-replay.json')
+    return 1 if audit.returncode == 1 else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
