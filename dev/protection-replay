@@ -18,6 +18,8 @@
 # USAGE    : dev/protection-replay [--cohort P10|P9|all] [--config FILE]
 #                                  [--capture-root DIR] [--research DIR]
 #                                  [--out DIR] [--keep-work]
+#            dev/protection-replay --report-only   (rebuild the tables from
+#                                  an existing protection-replay.json)
 #            Defaults: all cohorts; ~/Downloads/config-all-26.csv;
 #            ~/src/nfit-data/research/nfit-capture; the research folder in
 #            nfit-docs; design/acceptance.
@@ -297,6 +299,25 @@ def exceptions(records, research_rows):
     return rows, pool_rows
 
 
+def composition(records):
+    """Planning-profile cuts by training evidence: how many, and the later
+    busy exposure each plan leaves, so a residual from cuts that had no
+    contested minute to learn from is seen apart from one the bound missed."""
+    out = collections.OrderedDict()
+    for r in records:
+        if not (r['planning'] and r['cut'] and r['scored']):
+            continue
+        key = (r['system'].split('-')[0], r['status'])
+        a = out.setdefault(key, {'cuts': 0, **{p: {'members': 0, 'minutes': 0, 'coreMinutes': 0.0} for p in PLANS}})
+        a['cuts'] += 1
+        for plan in PLANS:
+            busy = (r['later'].get(plan) or r['later'].get('target'))['busy']
+            a[plan]['members'] += busy['minutes'] > 0
+            a[plan]['minutes'] += busy['minutes']
+            a[plan]['coreMinutes'] = round(a[plan]['coreMinutes'] + busy['coreMinutes'], 2)
+    return out
+
+
 def table(headers, rows):
     lines = ['| ' + ' | '.join(headers) + ' |', '|' + '|'.join('---:' if i else '---' for i in range(len(headers))) + '|']
     lines += ['| ' + ' | '.join(str(c) for c in row) + ' |' for row in rows]
@@ -310,12 +331,23 @@ def write_report(out, result):
              'every total below is per profile, or over planning profiles only.', '']
     rec = result['reconciliation']
     lines += ['## 1. Reconciliation with the research grid (original grid, 3,230 choices expected)', '',
-              table(['Compared', 'Equal', 'Different', 'Inputs differ', 'No record', 'No cut (skipped)'],
+              table(['Compared', 'Equal', 'Different', 'Inputs differ', 'Of those, equal on the research baseline', 'No record',
+                     'No cut (skipped)'],
                     [[rec.get('compared', 0), rec.get('equal', 0), rec.get('different', 0), rec.get('inputsDiffer', 0),
-                      rec.get('researchRowWithoutRecord', 0), rec.get('noCut', 0)]]), '',
+                      rec.get('equalOnResearchBaseline', 0), rec.get('researchRowWithoutRecord', 0), rec.get('noCut', 0)]]), '',
+              '"Inputs differ": the profile baseline differs from the research run (an LPAR tier changed in nfit.vms.cfg since then);',
+              'the bound does not depend on the baseline, so those rows are projected again with the research\'s own baseline.', '',
               'Each difference is listed in protection-replay.json (mismatches).', '']
+    comp = result.get('composition') or {}
+    if comp:
+        rows = [[k.split('|')[0], k.split('|')[1], a['cuts']] + [f"{a[p]['members']} / {a[p]['minutes']} / {a[p]['coreMinutes']}" for p in PLANS]
+                for k, a in comp.items()]
+        lines += ['## 1a. Planning-profile cuts by training evidence', '',
+                  'Later busy exposure as LPARs affected / minutes / core-minutes. "noCompetition": no contested minute in training,',
+                  'so no bound could be learnt; "bound": the training window had contested minutes.', '',
+                  table(['Architecture', 'Training evidence', 'Cuts', 'Original cut', 'PhysB only', 'Ladder', 'PhysC only'], rows), '']
     for title, key in (('2. Planning profiles, by architecture', 'byArchitecture'), ('3. By profile', 'byProfile'),
-                       ('4. By tier', 'byTier')):
+                       ('4. Planning profiles, by tier', 'byTier')):
         rows = []
         for k, a in result[key].items():
             for plan in PLANS:
@@ -362,8 +394,14 @@ def main():
     ap.add_argument('--research', default=str(HOME / 'src' / 'nfit-docs' / 'research' / 'chatgpt-phase3-research'))
     ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance'))
     ap.add_argument('--keep-work', action='store_true', help='keep the private work tree')
+    ap.add_argument('--report-only', action='store_true', help='rebuild the tables from an existing protection-replay.json')
     a = ap.parse_args()
     os.umask(0o077)
+    if a.report_only:
+        out = Path(a.out)
+        old = json.loads((out / 'protection-replay.json').read_text())
+        research_rows = json.loads((Path(a.research) / 'phase3-common-grid.json').read_text())['rows']
+        return finish(out, old['records'], old['systems'], research_rows, old['commit'], old['generated'])
     config, out = Path(a.config), Path(a.out)
     if not config.is_file():
         sys.exit('protection-replay: VM configuration file not found (see --config)')
@@ -392,11 +430,35 @@ def main():
             records.extend(entry.pop('records'))
             systems.append(entry)
             print(f'{label}: {entry["members"]} member(s), {entry["recordCount"]} profile record(s)', flush=True)
+    rc = finish(out, records, systems, research_rows, git_identity(),
+                dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'))
+    if not a.keep_work:
+        shutil.rmtree(work, ignore_errors=True)
+    return rc
+
+
+def finish(out, records, systems, research_rows, commit, generated):
+    """Reconcile, total, write both outputs and audit them."""
     rec, mismatches = reconcile(records, research_rows)
+    # Rows whose baseline differs (the LPAR's tier configuration changed since
+    # the research) are checked again on the research's own baseline: the
+    # bound does not depend on the baseline.
+    grid_rows = {(r['member'], r['profile'], r['signal']): r for r in research_rows if r.get('grid') == 'original'}
+    ours = {(r['member'], r['profile']): r for r in records}
+    for m in mismatches:
+        if m['why'] != 'baseline or installed differs':
+            continue
+        row, r = grid_rows[(m['member'], m['profile'], m['signal'])], ours[(m['member'], m['profile'])]
+        bound = (r['bound'] or {}).get('busy' if m['signal'] == 'busy' else 'consumed')
+        need = 0 if bound is None else int(round(bound * 100))
+        expected = next((c / 100 for c in candidate_choices(row['installed'], r['installedVPs'], row['baseline']) if c >= need), None)
+        m['onResearchBaseline'] = expected
+        key = 'equalOnResearchBaseline' if expected is not None and abs(expected - row['selected']) < 0.005 else 'differentOnResearchBaseline'
+        rec[key] = rec.get(key, 0) + 1
     planning = [r for r in records if r['planning']]
     by_arch = aggregate(planning, lambda r: r['system'].split('-')[0])
     by_profile = aggregate(records, lambda r: r['system'].split('-')[0] + ' ' + r['profile'])
-    by_tier = aggregate(records, lambda r: r['system'].split('-')[0] + ' tier ' + str(r['tier']))
+    by_tier = aggregate(planning, lambda r: r['system'].split('-')[0] + ' tier ' + str(r['tier']))
     # The criterion of plan 5.7 on planning profiles (the research's headline
     # population), and a like-for-like comparison on the profiles the research
     # grid also chose for.
@@ -411,10 +473,11 @@ def main():
                for r in matched if r['cut'] and r['scored'])
     ex, px = exceptions(records, research_rows)
     result = {
-        'generated': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'commit': git_identity(),
+        'generated': generated, 'commit': commit,
         'rule': 'cut-protection-1', 'shares': {'P': 0.95, '1': 0.85, '2': 0.65, '3': 0.40, '4': 0.00},
         'systems': systems, 'reconciliation': rec, 'mismatches': mismatches,
         'byArchitecture': by_arch, 'byProfile': by_profile, 'byTier': by_tier,
+        'composition': {f'{k[0]}|{k[1]}': v for k, v in composition(records).items()},
         'researchGrid': {'busy': research_totals(research_rows, 'original', 'busy'),
                          'physc': research_totals(research_rows, 'original', 'physc'),
                          'familyBusy': research_totals(research_rows, 'family', 'busy')},
@@ -435,8 +498,6 @@ def main():
     if audit.returncode not in (0, 1):
         print('protection-replay: the redaction audit could not run; do not share the outputs', file=sys.stderr)
         return 2
-    if not a.keep_work:
-        shutil.rmtree(work, ignore_errors=True)
     print(f'Written: {out / "protection-replay.md"} and protection-replay.json')
     return 1 if audit.returncode == 1 else 0
 
