@@ -140,10 +140,10 @@ class PoolEvidenceStaging(unittest.TestCase):
 
     def test_protection_summary(self):
         golden = _load_golden()
-        evaluated = ('Cut Protection (shadow)\n' + '=' * 70 + '\n  ...\n'
+        evaluated = ('Cut Protection\n' + '=' * 70 + '\n  ...\n'
                      '  Summary: 3 planning-profile cuts, 2 limited by the protected level; 0.11 cores of entitlement kept.\n')
         self.assertEqual(golden.protection_summary(evaluated), 'cut protection: 3 cut(s), 2 limited')
-        missing = ('Cut Protection (shadow)\n' + '=' * 70 + '\n  Recorded, not applied.\n\n'
+        missing = ('Cut Protection\n' + '=' * 70 + '\n  Recorded, not applied.\n\n'
                    '  Not evaluated: the cache holds no pool observations.\n')
         self.assertEqual(golden.protection_summary(missing), 'cut protection: not evaluated (the cache holds no pool observations)')
         self.assertEqual(golden.protection_summary('no such section'), 'cut protection: section absent')

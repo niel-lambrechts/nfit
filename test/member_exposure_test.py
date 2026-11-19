@@ -376,9 +376,9 @@ class MemberExposureTests(unittest.TestCase):
         self.assertNotIn('Member exposure blocks absent', self.second.stderr)
 
     def test_rationale_reports_the_exact_cut_and_leaves_the_csv_unchanged(self):
-        plain = self.run_profile(self.root)
+        plain = self.run_profile(self.root, '--no-cut-protection')
         csv_plain = self.latest(self.root, '.csv')
-        with_option = self.run_profile(self.root, '--pool-exposure')
+        with_option = self.run_profile(self.root, '--pool-exposure', '--no-cut-protection')
         csv_option = self.latest(self.root, '.csv')
         with open(csv_plain) as fh:
             plain_rows = fh.read().splitlines()
@@ -412,7 +412,7 @@ class MemberExposureTests(unittest.TestCase):
             self.assertNotIn(jargon, section.split('Recommended Actions')[0].split('Key Terminology')[0])
 
     def test_advisory_needs_newly_exposed_busy_scarcity_and_competition(self):
-        self.run_profile(self.root, '--pool-exposure')
+        self.run_profile(self.root, '--pool-exposure', '--no-cut-protection')
         with open(self.latest(self.root, '.log'), encoding='utf-8') as fh:
             log = fh.read()
         section = log[log.index('Entitlement Cut Exposure\n'):]

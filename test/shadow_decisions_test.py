@@ -58,7 +58,8 @@ class ShadowDecisionsTest(unittest.TestCase):
             for vm in ('vmA', 'vmB', 'vmS'):
                 e, vp, pool, _ = mx.CONFIG[vm]
                 w.writerow([vm, mx.SERIAL, 'AIX', 'pool', pool, (ent or {}).get(vm, e), vp])
-        run(str(root), str(cache), '--config', str(cfg), '--candidate-test', '--runq-perc-behavior=match')
+        run(str(root), str(cache), '--config', str(cfg), '--candidate-test', '--runq-perc-behavior=match',
+            '--no-cut-protection')
         return root
 
     def test_rows_agree_with_the_rationale(self):

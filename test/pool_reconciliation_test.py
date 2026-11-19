@@ -90,7 +90,8 @@ class PoolReconciliationTest(unittest.TestCase):
             for vm in ('vmA', 'vmB', 'vmS'):
                 ent, vp, pool, _ = mx.CONFIG[vm]
                 w.writerow([vm, mx.SERIAL, 'AIX', 'pool', pool, ent, vp])
-        run(str(cls.root), str(cls.cache), '--config', str(cls.cfg), '--candidate-test', '--runq-perc-behavior=match')
+        run(str(cls.root), str(cls.cache), '--config', str(cls.cfg), '--candidate-test', '--runq-perc-behavior=match',
+            '--no-cut-protection')
         log, = [p for p in (cls.root / 'output').glob('*.log') if 'state-based' in p.name]
         text = log.read_text()
         cls.section = text[text.index('Pool reconciliation'):text.index('\n=====', text.index('Pool reconciliation'))]

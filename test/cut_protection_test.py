@@ -1,10 +1,11 @@
-"""Cut protection in shadow (v10 stage 3.3) on the member-exposure fixture.
+"""Cut protection (v10 stage 3.3) on the member-exposure fixture.
 
 The standard run records, for each profile of an LPAR with a cut, the exact
-protection bound from its contested minutes, writes the "Cut Protection
-(shadow)" section and leaves the CSV unchanged. A replay of the saved proposal
-on the held-out day scores the target, the three adjusted values and the
-installed entitlement.
+protection bound from its contested minutes, raises each cut to the bound in
+the CSV and writes the "Cut Protection" section. The profile figure recorded is
+the one --no-cut-protection publishes. A replay of the saved proposal on the
+held-out day scores the target, the three adjusted values and the installed
+entitlement.
 
 Fixture facts used: pool 7 (size 4) is full while vmA bursts (W1 10:00 and W3
 23:50, PhysB 2.5 above vmA's installed 2.0), with vmB busy, so those minutes are
@@ -56,10 +57,11 @@ class CutProtectionTest(unittest.TestCase):
         self.assertEqual(len(snaps), 1)
         return Path(snaps[0])
 
-    def test_shadow_record_bound_and_unchanged_csv(self):
+    def test_record_bound_and_protected_csv(self):
         log, csv_on = self.standard()
-        self.assertIn('\nCut Protection (shadow)\n', log)
-        self.assertIn('The CSV is unchanged.', log)
+        self.assertIn('\nCut Protection\n', log)
+        self.assertIn('The CSV carries the protected figures.', log)
+        self.assertIn('Cut protection                 : profile ', log)
         snap = self.snapshot()
         data = json.loads(snap.read_text())
         records = {p: v['cutProtection'] for p, v in data['members']['vmA']['profiles'].items() if 'cutProtection' in v}
@@ -76,11 +78,24 @@ class CutProtectionTest(unittest.TestCase):
             self.assertGreater(r['support']['contestedMinutes'], 0)
             self.assertLessEqual(r['support']['contestedMinutes'], r['support']['classifiedMinutes'])
             self.assertTrue(r['frontier'] and r['top'])
-        # The CSV does not depend on the shadow record.
+        # Switched off, the CSV carries the profile figures the record holds; switched
+        # on, each cut stops at the bound (here installed, 2.00).
         self.clear_outputs()
         shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
-        _, csv_off = self.standard('--no-pool-exposure')
-        self.assertEqual(csv_on, csv_off)
+        log_off, csv_off = self.standard('--no-cut-protection')
+        self.assertIn('Not evaluated: switched off with --no-cut-protection.', log_off)
+        self.assertIn('No figure in the CSV is protected.', log_off)
+        row = lambda text: next(r for r in csv.DictReader(text.splitlines()) if r['VM'] == 'vmA')
+        on, off = row(csv_on), row(csv_off)
+        for profile, r in records.items():
+            self.assertAlmostEqual(r['target'], float(off[profile]), places=2, msg=profile)
+            if r['cut'] and r['status'] == 'bound':
+                self.assertEqual(on[profile], '2.00', profile)
+        self.assertEqual(on['NFIT - ENT'], '2.00')
+        self.assertLess(float(off['NFIT - ENT']), 2.0)
+        self.assertTrue(on['NFIT - Action'].startswith('Cut limited to 2.00 (profile %s): busy work reached this level while pool 7 was contested'
+                                                       % off['NFIT - ENT']), on['NFIT - Action'])
+        self.assertFalse(off['NFIT - Action'].startswith('Cut limited'))
 
     def test_replay_scores_the_recorded_levels(self):
         self.standard()

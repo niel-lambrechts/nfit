@@ -622,6 +622,8 @@ my %POOL_REDUCTION = (
 # Member busy exposure: a MemberExposure block with --pool-history, and the
 # "Entitlement Cut Exposure" rationale section (--[no-]pool-exposure).
 my $pool_exposure_flag;
+# --[no-]cut-protection: limit cuts by the contested busy evidence (v10 stage 3.3; default on).
+my $cut_protection_flag;
 my ($candidate_test, $candidate_window, $candidate_snapshot);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
@@ -681,6 +683,13 @@ my @MEMBER_EXPOSURE_COLUMNS = qw(aboveMinutes excessCoreMinutes aboveScarceMinut
 my $CUT_PROTECTION_RULE = 'cut-protection-1';
 my %CUT_PROTECTION_SHARE = (P => 0.95, 1 => 0.85, 2 => 0.65, 3 => 0.40, 4 => 0.00);
 my $CUT_PROTECTION_TOP_READINGS = 32;
+# The evidence of the current system, gathered before sizing:
+# { LPAR => { profile => tracker } } (the tracker is shared by the profiles of
+# one population). Empty when the evidence is not available.
+my %CUT_PROTECTION_EVIDENCE;
+# Set while the profile is sized once more without the bound, to give the
+# figure the profile would otherwise have had (the "profile" figure reported).
+my $cut_protection_suspended = 0;
 my @PHYSB_INVALID_REASONS  = qw(missingB nonNumericB bAboveC nonFiniteC cAboveCeiling bAboveCeiling);
 my @PHYSB_QUALITY_COUNTERS = (qw(validPairs sameSecondSamples runResets freqPctUnavailable), @PHYSB_INVALID_REASONS);
 my $min_history_days_arg;    # New flag for partial month processing
@@ -732,6 +741,7 @@ GetOptions(
     'candidate-test' => \$candidate_test,
     'candidate-window=s' => \$candidate_window,
     'pool-exposure!'             => \$pool_exposure_flag,
+    'cut-protection!'            => \$cut_protection_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
@@ -2109,6 +2119,18 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "  Checks             no figure in the CSV; they say whether the proposals can be applied together.\n";
         print {$LOG_FH} "                     The order of each LPAR's own change is stated in NFIT - Action.\n";
         print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Cut protection     A cut is limited so that it adds no observed contested exposure: the\n";
+        print {$LOG_FH} "                     target is raised to the highest protected level seen in a contested\n";
+        print {$LOG_FH} "                     minute, never above installed. Protected level = PhysB + share x\n";
+        print {$LOG_FH} "                     (PhysC - PhysB); the profile's tier sets the share. See Cut Protection.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Contested minute   A minute in the profile's hours with valid PhysB and PhysC while the LPAR's\n";
+        print {$LOG_FH} "                     pool, or the frame's shared pool, had no spare capacity and other LPARs\n";
+        print {$LOG_FH} "                     were busy.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Thread headroom    PhysC - PhysB: core time the LPAR held that was not booked busy, mainly\n";
+        print {$LOG_FH} "                     idle SMT threads on its cores.\n";
+        print {$LOG_FH} "\n";
         print {$LOG_FH} "  Planning profile   The profile that carries an LPAR's sizing decision: the one matching its\n";
         print {$LOG_FH} "                     configured TIER, or tier 3 on the hinted pattern (O3/B3/G3) where no\n";
         print {$LOG_FH} "                     TIER is configured (P for a VIOS). Other profiles are alternative\n";
@@ -2314,6 +2336,18 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
     # This block now uses a conditional to call the correct logging subroutine
     # based on the analysis model that was run. It also now captures all hint
     # components for later use in the CSV report, improving efficiency
+
+    # Cut protection evidence (v10 stage 3.3; plan 5.5): gathered before
+    # sizing so that the bound enters each profile's target before its VPs and
+    # current-cycle pair are derived. Gated as the Entitlement Cut Exposure
+    # section is; seasonal model runs are left as they are (stage 3.6).
+    %CUT_PROTECTION_EVIDENCE = ();
+    if (!$apply_seasonality_event && !(defined $pool_exposure_flag && !$pool_exposure_flag)
+        && !(defined $cut_protection_flag && !$cut_protection_flag)
+        && ($candidate_test || _pool_exposure_wanted($current_cache_path)) && $effective_start_date_obj && $effective_end_date_obj)
+    {
+        _protection_evidence_before_sizing($current_cache_path, $effective_start_date_obj, $effective_end_date_obj, \@vm_order);
+    }
 
     _phase("Applying modifiers and generating rationale");
     # --- FINAL POST-PROCESSING, HINT GENERATION, and RATIONALE LOGGING ---
@@ -2543,9 +2577,26 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                 my %pressure_flags = ( abs_pressure => $p99w1_has_abs_pressure, norm_pressure => $p99w1_has_norm_pressure );
                 my %adaptive_thresholds = %$adaptive_thresholds_href;
 
+                # Cut protection (v10 stage 3.3): the same chain without the
+                # bound gives the figure the profile would otherwise have had.
+                # Sized first, because each call records the profile's VP
+                # targets and the protected call is the one that stands.
+                my $cp_unprotected;
+                if ($CUT_PROTECTION_EVIDENCE{$vm_name} && $CUT_PROTECTION_EVIDENCE{$vm_name}{$profile_name})
+                {
+                    my %pressure_flags_cp = %pressure_flags;
+                    my %adaptive_thresholds_cp = %adaptive_thresholds;
+                    $cut_protection_suspended = 1;
+                    ($cp_unprotected) = calculate_runq_modified_physc(
+                        $vm_name, $vm_map_ref, $profile, \%pressure_flags_cp, \%adaptive_thresholds_cp);
+                    $cut_protection_suspended = 0;
+                }
+
                 my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
                     $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
                 );
+                $debug_info_ref->{'CutProtectionUnprotected'} = sprintf('%.4f', $cp_unprotected)
+                    if (ref($debug_info_ref) eq 'HASH' && defined $cp_unprotected && looks_like_number($cp_unprotected));
 
                 # Persist per-profile debug info for downstream consumers (CSV VM_Comments, etc.)
                 if (defined $debug_info_ref && ref($debug_info_ref) eq 'HASH') {
@@ -3997,6 +4048,25 @@ sub log_profile_rationale
     }
     $sf_glance->('Target', sprintf('%s; VPs governed by %s',
         ($sf_pair_text->($sf_target_ent, $sf_strat_n) // $na), ($sf_re->{StrategicGovernor} // $na)));
+    # Cut protection (v10 stage 3.3), for a profile with contested-minute evidence.
+    my $sf_cp_vm = $vm_map_ref->{Configuration}{vm_name} // '';
+    my $sf_cp = ($CUT_PROTECTION_EVIDENCE{$sf_cp_vm} // {})->{$profile_being_adjusted};
+    my $sf_cp_own = $calc_debug_info_ref->{'CutProtectionUnprotected'} // $calc_debug_info_ref->{'CutProtectionTarget'};
+    if ($sf_cp && defined $sf_cp_own && looks_like_number($sf_cp_own) && defined $sf_cur_ent
+        && $sf_cp_own < $sf_cur_ent - $STRUCTURAL_ENT_TOLERANCE)
+    {
+        my $sf_cp_p = $sf_cp->{protection};
+        my ($sf_cp_min, $sf_cp_days) = ($sf_cp_p->{contested} // 0, scalar(keys %{ $sf_cp_p->{days} // {} }));
+        my $sf_cp_bound = $calc_debug_info_ref->{'CutProtectionBound'} // 'none';
+        my ($sf_cp_share) = _protection_share_of($profile_being_adjusted);
+        $sf_glance->('Cut protection',
+            ($calc_debug_info_ref->{'CutProtectionApplied'} // '') =~ /^Yes/
+                ? sprintf('profile %.2f limited to %s (share %.2f); %d contested minute%s over %d day%s in pool %s',
+                    $sf_cp_own, $sf_cp_bound, $sf_cp_share, $sf_cp_min, ($sf_cp_min == 1 ? '' : 's'),
+                    $sf_cp_days, ($sf_cp_days == 1 ? '' : 's'), $sf_cp->{pool} // $na)
+            : $sf_cp_bound eq 'none' ? 'no pool competition observed in the profile hours; the profile target stands'
+            : sprintf('not limiting (protected level %s, share %.2f)', $sf_cp_bound, $sf_cp_share));
+    }
     my $sf_vps = sub { my ($n) = @_; return defined $n ? (($n == 1) ? '1 VP' : sprintf('%d VPs', $n)) : $na; };
     $sf_glance->('Entitlement-preserving', $sf_vps->($sf_eb_n));
     $sf_glance->('VP reduction step', $sf_vps->($sf_tac_n));
@@ -8267,6 +8337,27 @@ sub calculate_runq_modified_physc
         $debug_info{'BudgetFloorApplied'} = sprintf("Yes: raised %.4f -> %.4f cores (+%.4f)",
             $calculated_demand, $budget_floor_cores, $budget_floor_cores - $calculated_demand);
         $calculated_demand = $budget_floor_cores;
+    }
+
+    # Cut protection (v10 stage 3.3; plan 5.1): a cut may add no observed
+    # contested exposure. The bound never exceeds the installed entitlement, so
+    # it can only limit a cut; the profile's tier sets the share (decision F2).
+    # Applied before the planning entitlement is kept, so the VP targets, the
+    # guarantee convergence and the current-cycle pair all follow it.
+    my $cp_tracker = ($cut_protection_suspended || !$CUT_PROTECTION_EVIDENCE{$vm_name}) ? undef
+                   : $CUT_PROTECTION_EVIDENCE{$vm_name}{$profile_name};
+    if ($cp_tracker)
+    {
+        my ($cp_share) = _protection_share_of($profile_name);
+        my $cp_bound = _protection_bound($cp_tracker->{protection}, $cp_share, $cp_tracker->{entitlement});
+        $debug_info{'CutProtectionTarget'} = sprintf('%.4f', $calculated_demand);
+        $debug_info{'CutProtectionBound'}  = defined $cp_bound ? sprintf('%.2f', $cp_bound) : 'none';
+        $debug_info{'CutProtectionApplied'} = 'No';
+        if (defined $cp_bound && $cp_bound > $calculated_demand + $FLOAT_EPSILON)
+        {
+            $debug_info{'CutProtectionApplied'} = sprintf('Yes: raised %.4f -> %.2f (share %.2f)', $calculated_demand, $cp_bound, $cp_share);
+            $calculated_demand = $cp_bound;
+        }
     }
 
     # Preserve the workload-driven (planning) entitlement before any MaxCPU sanity capping.
@@ -15490,6 +15581,19 @@ sub _write_standard_csv_report {
             $planner_cells{'NFIT - VCPU'} = $planner_cells{"${planning_profile_name}_rVCPU_Tactical"};
             my $action = _current_cycle_action_text($cycle_pairs{$planning_profile_name},
                 $numeric_cell->('Current - ENT'), $numeric_cell->('Current - VCPU'), $cfg->{pool_id});
+            # Cut protection (v10 stage 3.3): say when the planning cut was limited.
+            my $cp_dbg = (ref($vm_map_ref->{CoreResults}{ProfileDebugInfo}) eq 'HASH')
+                ? $vm_map_ref->{CoreResults}{ProfileDebugInfo}{$planning_profile_name} : undef;
+            my $cp_tracker = $CUT_PROTECTION_EVIDENCE{$vm_name}{$planning_profile_name};
+            if (ref($cp_dbg) eq 'HASH' && ($cp_dbg->{CutProtectionApplied} // '') =~ /^Yes/ && $cp_tracker)
+            {
+                my $p = $cp_tracker->{protection};
+                my ($minutes, $days) = ($p->{contested}, scalar(keys %{ $p->{days} }));
+                $action = sprintf('Cut limited to %s (profile %.2f): busy work reached this level while pool %s was contested, on %d minute%s over %d day%s.%s',
+                    $cp_dbg->{CutProtectionBound},
+                    _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
+                    $minutes, ($minutes == 1 ? '' : 's'), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''));
+            }
             # Seasonal and predictive reports size an event window, not the
             # standing configuration.
             $action = "Event window: $action"
@@ -24521,6 +24625,36 @@ sub _protection_trackers
     return $trackers;
 }
 
+# The evidence pass before sizing (plan 5.5, step 0): one pass over the
+# samples for every uncapped shared-pool LPAR in its current state, over the
+# analysis window, indexed by LPAR and profile in %CUT_PROTECTION_EVIDENCE.
+# Returns a status hashref; nothing is recorded when the cache has no pool
+# observations or no PhysB.
+sub _protection_evidence_before_sizing
+{
+    my ($cache_dir, $start_obj, $end_obj, $vms_aref) = @_;
+    %CUT_PROTECTION_EVIDENCE = ();
+    my $pool_context = _pool_history_context($cache_dir);
+    my ($exposure_context, $reason) = _exposure_context($cache_dir, $pool_context);
+    return { Status => 'unavailable', Reason => $reason } unless $exposure_context;
+    my $window_start = $start_obj->epoch - ($start_obj->epoch % 86400);
+    my $window_end   = $end_obj->epoch - ($end_obj->epoch % 86400) + 86400;
+    my $trackers = _protection_trackers(_exposure_load_states($cache_dir), { map { $_ => 1 } @{ $vms_aref // [] } },
+        $window_end, $window_start, $window_end, _exposure_populations());
+    return { Status => 'noTrackers' } unless @$trackers;
+    _step('Cut protection evidence');
+    my $started = time();
+    _task(sprintf('Contested minutes of %d LPAR state(s) over %d UTC day(s)', scalar(uniq(map { $_->{vm} } @$trackers)),
+                  ($window_end - $window_start) / 86400));
+    _exposure_evaluate_window($pool_context, $exposure_context, $trackers, $window_start, $window_end);
+    foreach my $t (@$trackers)
+    {
+        $CUT_PROTECTION_EVIDENCE{ $t->{vm} }{$_} = $t for @{ $t->{profiles} };
+    }
+    _task(sprintf('Cut protection evidence gathered (%s)', format_duration(time() - $started)));
+    return { Status => 'evaluated', Trackers => $trackers };
+}
+
 # The cut-protection record of every profile of the evidence trackers, kept
 # in CoreResults{CutProtection} and in the stored proposal. The target is the
 # proposal's entitlement (the CSV value) where there is one, else the shown
@@ -24543,7 +24677,13 @@ sub _protection_results
         {
             my $proposal = (ref($proposals) eq 'HASH' && ref($proposals->{ $t->{vm} }) eq 'HASH')
                 ? ($proposals->{ $t->{vm} }{profiles} // {})->{$profile} : undef;
-            my $target = (ref($proposal) eq 'HASH' && defined $proposal->{entitlement}) ? $proposal->{entitlement}
+            # The profile's own figure without the bound (as the CSV would show
+            # it), else the proposal's or the shown profile value.
+            my $dbg = (ref($core->{ProfileDebugInfo}) eq 'HASH') ? $core->{ProfileDebugInfo}{$profile} : undef;
+            my $own = (ref($dbg) eq 'HASH') ? ($dbg->{CutProtectionUnprotected} // $dbg->{CutProtectionTarget}) : undef;
+            my $target = (defined $own && looks_like_number($own))
+                       ? _structural_shown_value($own)
+                       : (ref($proposal) eq 'HASH' && defined $proposal->{entitlement}) ? $proposal->{entitlement}
                        : _structural_shown_value((ref($core->{ProfileValues}) eq 'HASH') ? $core->{ProfileValues}{$profile} : undef);
             my ($share, $tier) = _protection_share_of($profile);
             my %bound = (busy     => _protection_bound($p, 0, $installed),
@@ -24581,13 +24721,13 @@ sub _protection_results
 # never added together.
 sub _protection_report_lines
 {
-    my ($map_ref, $cuts_aref, $reason) = @_;
-    my @out = ('', '=' x 70, 'Cut Protection (shadow)', '=' x 70,
-        '  Recorded, not applied (v10 stage 3.3). For each planning-profile cut: the entitlement that',
-        "  keeps every busy minute covered while the LPAR's pool was scarce and other LPARs were busy,",
-        "  in its current configuration state. Protected level = PhysB + share x (PhysC - PhysB), never",
-        "  above installed; the profile's tier sets the share (P 0.95, tier 1 0.85, 2 0.65, 3 0.40,",
-        '  4 0.00). The CSV is unchanged.', '');
+    my ($map_ref, $cuts_aref, $reason, $vm_order_aref) = @_;
+    my @out = ('', '=' x 70, 'Cut Protection', '=' x 70,
+        '  Each planning-profile cut is limited so that it adds no observed contested exposure: its',
+        "  target is raised to the highest protected level seen while the LPAR's pool was scarce and",
+        "  other LPARs were busy, in its current configuration state, never above installed. Protected",
+        "  level = PhysB + share x (PhysC - PhysB); the profile's tier sets the share (P 0.95, tier 1",
+        '  0.85, 2 0.65, 3 0.40, 4 0.00). ' . (defined $reason ? 'No figure in the CSV is protected.' : 'The CSV carries the protected figures.'), '');
     if (defined $reason)
     {
         push @out, "  Not evaluated: $reason.";
@@ -24595,7 +24735,24 @@ sub _protection_report_lines
     }
     my ($limited, $kept) = (0, 0);
     my $plural = sub { return $_[0] == 1 ? '' : 's'; };
-    foreach my $cut (@{ $cuts_aref // [] })
+    # The planning-profile cuts before protection: from the records (a cut the
+    # bound cancels no longer appears among the CSV's cuts), and the CSV's cuts
+    # that have no record.
+    my %listed;
+    my @entries;
+    foreach my $vm (@{ $vm_order_aref // [] })
+    {
+        my $vm_map = $map_ref->{$vm};
+        next unless (ref($vm_map) eq 'HASH');
+        my $planning = (ref($vm_map->{Hinting}) eq 'HASH') ? $vm_map->{Hinting}{ResolvedPlanningProfile} : undef;
+        my $rec = defined $planning ? ((($vm_map->{CoreResults} // {})->{CutProtection} // {})->{$planning}) : undef;
+        next unless (ref($rec) eq 'HASH' && $rec->{cut});
+        push @entries, { vm => $vm, planning => $planning, current => $rec->{installed}, proposed => $rec->{target} };
+        $listed{$vm} = 1;
+    }
+    push @entries, grep { !$listed{ $_->{vm} } } @{ $cuts_aref // [] };
+    $cuts_aref = \@entries;
+    foreach my $cut (@$cuts_aref)
     {
         my $rec = ((($map_ref->{ $cut->{vm} } // {})->{CoreResults} // {})->{CutProtection} // {})->{ $cut->{planning} };
         my $head = sprintf('  %s %s: %.2f -> %.2f', $cut->{vm}, $cut->{planning}, $cut->{current}, $cut->{proposed});
@@ -24825,11 +24982,18 @@ sub _log_cut_exposure
         push @$shadow, @{ _reconcile_trackers($states, $candidates, $window_end, $from, $to, \@reconcile_notes) } if $candidates;
         my @pressure_notes;
         push @$shadow, @{ _pressure_trackers($states, $candidates, $window_end, $from, $to, \@pressure_notes) } if $candidates;
-        my $protection = _protection_trackers($states, \%protect, $window_end, $window_start, $window_end, $actionable);
-        my @same_window = (@$trackers, @$protection, defined $replay_from ? () : @$shadow);
+        # The evidence gathered before sizing is reused; it is gathered here
+        # only when sizing ran without it.
+        my %seen_tracker;
+        my $early = [ grep { !$seen_tracker{"$_"}++ } map { values %$_ } values %CUT_PROTECTION_EVIDENCE ];
+        my $disabled = (defined $cut_protection_flag && !$cut_protection_flag) ? 1 : 0;
+        my $protection = @$early ? $early : $disabled ? []
+                       : _protection_trackers($states, \%protect, $window_end, $window_start, $window_end, $actionable);
+        my @same_window = (@$trackers, (@$early ? () : @$protection), defined $replay_from ? () : @$shadow);
         my $counts = @same_window ? _exposure_evaluate_window($pool_context, $exposure_context, \@same_window, $window_start, $window_end) : {};
         _protection_results($protection, $map_ref, $proposals_href);
-        @protection_out = _protection_report_lines($map_ref, \@cuts);
+        @protection_out = $disabled ? _protection_report_lines($map_ref, \@cuts, 'switched off with --no-cut-protection')
+                        : _protection_report_lines($map_ref, \@cuts, undef, $vm_order_aref);
         _exposure_evaluate_window($pool_context, $exposure_context, $shadow, $from, $to) if defined $replay_from && @$shadow;
         if ($candidates)
         {
@@ -26723,6 +26887,12 @@ Model behaviour depends on the event configuration:
   --candidate-test                          : Replay feasible entitlement cuts at installed VP width in the rationale.
   --candidate-proposals FILE                 : Replay one saved proposal snapshot without repeating tactical sizing.
   --candidate-window YYYY-MM-DD/YYYY-MM-DD  : Optional held-out UTC dates after the tactical analysis end date.
+
+  --[no-]cut-protection                     : Standard runs (default on when the cache holds pool observations and a
+                                              PhysB column): a cut may add no observed contested exposure. Each cut's
+                                              target is raised to the highest protected level seen while the LPAR's
+                                              pool was scarce and other LPARs were busy, never above installed; see the
+                                              "Cut Protection" section. --no-cut-protection leaves the cuts as sized.
 
   --[no-]pool-exposure                      : Standard runs: add an "Entitlement Cut Exposure" section to the
                                               rationale for each LPAR whose planning-profile entitlement is below its
