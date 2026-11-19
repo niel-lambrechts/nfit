@@ -120,5 +120,34 @@ class CaptureResume(unittest.TestCase):
             self.assertTrue(any('not resumed' in line for line in out.lines))
 
 
+class PoolEvidenceStaging(unittest.TestCase):
+    def test_pool_observations_are_linked_and_identified(self):
+        golden = _load_golden()
+        self.assertIn('.nfit.cache.pool.observations.csv.gz', golden.STAGE_FILES)
+        with tempfile.TemporaryDirectory() as tmp:
+            sysdir = Path(tmp, 'stage', 'SYS1')
+            sysdir.mkdir(parents=True)
+            for name in ('.nfit.cache.data', '.nfit.cache.states'):
+                (sysdir / name).write_text('x')
+            old = golden.data_identity(sysdir)                      # a baseline taken before pool files
+            self.assertNotIn('.nfit.cache.pool.observations.csv.gz', old)
+            (sysdir / '.nfit.cache.pool.observations.csv.gz').write_bytes(b'pool')
+            self.assertFalse(golden.data_changed(sysdir, old), 'a file the baseline did not record is not compared')
+            new = golden.data_identity(sysdir)
+            self.assertIn('.nfit.cache.pool.observations.csv.gz', new)
+            (sysdir / '.nfit.cache.pool.observations.csv.gz').write_bytes(b'pool, changed')
+            self.assertTrue(golden.data_changed(sysdir, new))
+
+    def test_protection_summary(self):
+        golden = _load_golden()
+        evaluated = ('Cut Protection (shadow)\n' + '=' * 70 + '\n  ...\n'
+                     '  Summary: 3 planning-profile cuts, 2 limited by the protected level; 0.11 cores of entitlement kept.\n')
+        self.assertEqual(golden.protection_summary(evaluated), 'cut protection: 3 cut(s), 2 limited')
+        missing = ('Cut Protection (shadow)\n' + '=' * 70 + '\n  Recorded, not applied.\n\n'
+                   '  Not evaluated: the cache holds no pool observations.\n')
+        self.assertEqual(golden.protection_summary(missing), 'cut protection: not evaluated (the cache holds no pool observations)')
+        self.assertEqual(golden.protection_summary('no such section'), 'cut protection: section absent')
+
+
 if __name__ == '__main__':
     unittest.main()
