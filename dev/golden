@@ -44,6 +44,10 @@
 # USAGE    : dev/golden capture <name> [--stage-dir DIR] [--systems all|S1,S2]
 #                                      [--runs forensic,decay-states,windowed]
 #                                      [--enddate YYYY-MM-DD]
+#            dev/golden capture <name> --resume
+#            --resume captures, into an existing baseline, the combinations it
+#            lacks (a failed run), with the baseline's own frozen executables,
+#            configuration, stage directory and end date.
 #            dev/golden compare <name> [--stage-dir DIR] [--frozen]
 #                                      [--systems S1,S2] [--runs R1,R2] [--single]
 #            --systems/--runs restrict a compare to a subset of the baseline;
@@ -222,13 +226,17 @@ def copy_nfit_config(src: Path, dst: Path) -> None:
     dst.mkdir(parents=True, exist_ok=True)
     for f in sorted(src.iterdir()):
         if f.is_file() and f.name.startswith('nfit.'):
-            shutil.copy2(f, dst / f.name)
+            # shutil.copy, not copy2: a copy in a scratch tree under the macOS
+            # temporary folder keeps its source's old timestamps with copy2,
+            # and the system's periodic clean-up of that folder then removes
+            # it while a run is in progress.
+            shutil.copy(f, dst / f.name)
 
 
 def build_tree(scratch: Path, exe_src: Path, etc_src: Path, sysdir: Path) -> Path:
     """Create an isolated scratch tree; returns the scratch system directory."""
     for exe in EXECUTABLES:
-        shutil.copy2(exe_src / exe, scratch / exe)
+        shutil.copy(exe_src / exe, scratch / exe)            # fresh timestamps (see copy_nfit_config)
     copy_nfit_config(etc_src, scratch / 'etc')
     (scratch / 'output').mkdir()
     (scratch / 'history').mkdir()
@@ -476,11 +484,76 @@ def diff_lines(a: str, b: str, limit: int = 20, label_a: str = 'baseline', label
 # ------------------------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------------------------
+def capture_one(system: str, sysdir: Path, run: str, enddate: str, frozen: Path, env: dict, dest: Path, out):
+    """Run one system/run combination with the frozen tree and store it under
+    the baseline; returns its digests, or None when it failed."""
+    res = execute(system, sysdir, run, enddate, frozen, frozen / 'etc', env)
+    rdir = dest / 'results' / system / run
+    rdir.mkdir(parents=True)
+    if 'error' in res:
+        (rdir / 'ERROR.txt').write_text(res['error'] + '\n' + res.get('stderr_tail', ''))
+        for label in ('outputs', 'cached'):
+            for kind, text in res.get(label, {}).items():
+                prefix = 'uncached' if label == 'outputs' else 'cached'
+                (rdir / f'{prefix}.{kind}').write_text(text, encoding='utf-8')
+        out.say(f'  {system} {run:<13} FAILED: {res["error"]}')
+        report_failure(out, res)
+        return None
+    digests = {}
+    for kind, text in res['outputs'].items():
+        (rdir / f'{run}.{kind}').write_text(text, encoding='utf-8')
+        digests[kind] = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    out.say(f'  {system} {run:<13} ok ({", ".join(sorted(digests))}; cached run agrees)')
+    return digests
+
+
+def resume_capture(name: str, out) -> int:
+    """Capture the combinations an existing baseline lacks, with its own frozen
+    executables and configuration, stage directory and end date. A system
+    whose staged data changed since the capture is not resumed."""
+    dest = GOLDEN_ROOT / name
+    meta_path = dest / 'meta.json'
+    if not meta_path.is_file():
+        out.say(f'golden: no baseline named "{name}".')
+        return 2
+    meta = json.loads(meta_path.read_text())
+    frozen = dest / 'frozen'
+    stage_dir = Path(meta['stage_dir'])
+    env = perl_env()
+    out.say(f'Resuming baseline "{name}": runs {",".join(meta["runs"])}, enddate {meta["enddate"]}')
+    failures = added = 0
+    for system, sysmeta in meta['systems'].items():
+        missing = [run for run in meta['runs'] if run not in sysmeta['runs']]
+        if not missing:
+            continue
+        sysdir = stage_dir / system
+        if not sysdir.is_dir() or data_identity(sysdir) != sysmeta['data_identity']:
+            out.say(f'  {system}: staged data changed or missing since the capture; not resumed')
+            failures += len(missing)
+            continue
+        for run in missing:
+            rdir = dest / 'results' / system / run
+            if rdir.exists():
+                shutil.rmtree(rdir)                      # the failed attempt's ERROR.txt and partial outputs
+            digests = capture_one(system, sysdir, run, meta['enddate'], frozen, env, dest, out)
+            if digests is None:
+                failures += 1
+                continue
+            sysmeta['runs'][run] = digests
+            added += 1
+    meta.setdefault('resumed', []).append(dt.datetime.now().isoformat(timespec='seconds'))
+    meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True))
+    out.say(f'Baseline "{name}": {added} combination(s) added ({failures} failure(s)).')
+    return 1 if failures else 0
+
+
 def cmd_capture(a, out: RedactedOut) -> int:
+    if a.resume:
+        return resume_capture(a.name, out)
     stage_dir = Path(a.stage_dir).resolve()
     dest = GOLDEN_ROOT / a.name
     if dest.exists():
-        out.say(f'golden: baseline "{a.name}" already exists; choose another name.')
+        out.say(f'golden: baseline "{a.name}" already exists; choose another name, or --resume to add failed runs.')
         return 2
     try:
         systems = discover_systems(stage_dir, a.systems)
@@ -515,25 +588,11 @@ def cmd_capture(a, out: RedactedOut) -> int:
         sysdir = stage_dir / system
         meta['systems'][system] = {'data_identity': data_identity(sysdir), 'runs': {}}
         for run in runs:
-            res = execute(system, sysdir, run, enddate, frozen, frozen / 'etc', env)
-            rdir = dest / 'results' / system / run
-            rdir.mkdir(parents=True)
-            if 'error' in res:
+            digests = capture_one(system, sysdir, run, enddate, frozen, env, dest, out)
+            if digests is None:
                 failures += 1
-                (rdir / 'ERROR.txt').write_text(res['error'] + '\n' + res.get('stderr_tail', ''))
-                for label in ('outputs', 'cached'):
-                    for kind, text in res.get(label, {}).items():
-                        prefix = 'uncached' if label == 'outputs' else 'cached'
-                        (rdir / f'{prefix}.{kind}').write_text(text, encoding='utf-8')
-                out.say(f'  {system} {run:<13} FAILED: {res["error"]}')
-                report_failure(out, res)
                 continue
-            digests = {}
-            for kind, text in res['outputs'].items():
-                (rdir / f'{run}.{kind}').write_text(text, encoding='utf-8')
-                digests[kind] = hashlib.sha256(text.encode('utf-8')).hexdigest()
             meta['systems'][system]['runs'][run] = digests
-            out.say(f'  {system} {run:<13} ok ({", ".join(sorted(digests))}; cached run agrees)')
     (dest / 'meta.json').write_text(json.dumps(meta, indent=2, sort_keys=True))
     out.say(f'Baseline stored under .private/golden/{a.name} ({failures} failure(s)).')
     return 1 if failures else 0
@@ -572,9 +631,16 @@ def cmd_compare(a, out: RedactedOut) -> int:
             continue
         if data_identity(sysdir) != sysmeta['data_identity']:
             out.say(f'  {system}: WARNING staged data changed since capture; differences may be data, not code')
-        for run, digests in sorted(sysmeta['runs'].items()):
+        for run in sorted(meta['runs']):
             if wanted_runs is not None and run not in wanted_runs:
                 continue
+            if run not in sysmeta['runs']:
+                # A combination that failed at capture is not silently skipped.
+                differences += 1
+                unintended += 1
+                out.say(f'  {system} {run:<13} NOT IN BASELINE: its capture failed (dev/golden capture {a.name} --resume)')
+                continue
+            digests = sysmeta['runs'][run]
             res = execute(system, sysdir, run, meta['enddate'], exe_src, exe_src / 'etc', env,
                           repeat=not a.single,
                           proposal_csv=(dest / 'results' / system / run / f'{run}.csv').read_text()
@@ -718,6 +784,8 @@ def main() -> int:
     c.add_argument('--systems', default='all')
     c.add_argument('--runs', default='forensic,decay-states,windowed')
     c.add_argument('--enddate', default=None)
+    c.add_argument('--resume', action='store_true',
+                   help='Add the combinations an existing baseline lacks (failed runs), with its frozen tree')
     k = sub.add_parser('compare')
     k.add_argument('name')
     k.add_argument('--stage-dir', default=None)
