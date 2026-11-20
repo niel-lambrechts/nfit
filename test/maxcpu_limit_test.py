@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # ==============================================================================
-# End-to-end test for the MaxCPU shadow record (plan 4.4, decision F14): an
-# LPAR at its one-VP ceiling with a deep run queue has its target held by the
-# MaxCPU sanity limit. The stored proposal records, for that profile, the
-# target and current-cycle pair without the limit; the CSV keeps the limited
-# figure. Synthetic data only.
+# End-to-end test for the removal of the MaxCPU sanity limit (v10 step 3b,
+# decision F14): an LPAR at MaxCPU 1 with a deep run queue was held at
+# MaxCPU x 1.75. Its targets now state the requirement; the rationale says
+# MaxCPU must be raised, and NFIT - Action puts the MaxCPU raise first when the
+# current cycle's entitlement is above it. Synthetic data only.
 # ==============================================================================
 import calendar
 import csv
@@ -32,7 +32,7 @@ def perl_ready():
 
 
 def run():
-    root = tempfile.mkdtemp(prefix='maxcpu-shadow-')
+    root = tempfile.mkdtemp(prefix='maxcpu-limit-')
     os.makedirs(os.path.join(root, 'etc'))
     os.makedirs(os.path.join(root, 'output'))
     for prog in ('nfit', 'nfit-profile'):
@@ -76,34 +76,47 @@ def run():
     if len(snaps) == 1:
         with open(snaps[0]) as fh:
             snap = json.load(fh)
+    logs = glob.glob(os.path.join(root, 'output', '*.log'))
+    log = ''
+    if logs:
+        with open(logs[0], encoding='utf-8') as fh:
+            log = fh.read()
     shutil.rmtree(root, ignore_errors=True)
-    return proc, row, snap
+    return proc, row, snap, log
 
 
 @unittest.skipUnless(perl_ready(), 'perl with JSON and List::MoreUtils needed')
-class MaxCpuShadowTests(unittest.TestCase):
+class MaxCpuLimitTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.proc, cls.row, cls.snap = run()
+        cls.proc, cls.row, cls.snap, cls.log = run()
 
     def test_run_succeeds(self):
         self.assertEqual(self.proc.returncode, 0, self.proc.stderr[-1500:])
 
-    def test_limited_profiles_are_recorded_and_the_csv_keeps_the_limit(self):
+    def test_targets_are_not_held_at_the_limit(self):
         profiles = self.snap['members']['busy1']['profiles']
-        held = {p: v['maxCpuLimit'] for p, v in profiles.items() if 'maxCpuLimit' in v}
-        self.assertTrue(held, 'the deep queue at the one-VP ceiling must reach the MaxCPU limit on some profile')
-        for name, rec in held.items():
-            self.assertEqual(float(rec['limit']), 1.75)            # MaxCPU 1 x 1.75 for an entitlement of 1.0
-            self.assertGreater(rec['uncappedTarget'], rec['target'])
-            self.assertEqual(float(self.row[name]), rec['target'])  # the CSV keeps the limited figure
-            self.assertEqual(rec['pair']['entitlement'], profiles[name]['currentCycle']['entitlement'])
-            self.assertGreaterEqual(rec['uncappedPair']['entitlement'], rec['pair']['entitlement'])
-            self.assertIn('RawAdditive', rec['chain'])
-        unheld = [p for p, v in profiles.items() if 'maxCpuLimit' not in v]
-        for name in unheld:
-            self.assertNotIn('maxCpuLimit', profiles[name])
+        self.assertFalse([p for p, v in profiles.items() if 'maxCpuLimit' in v])
+        # The deep queue at the one-VP ceiling used to hold some profile at 1 x 1.75.
+        above = [p for p in profiles if float(self.row[p]) > 1.75]
+        self.assertTrue(above, 'some profile must now state a requirement above the former limit')
+        self.assertNotIn('Max Sanity Check', self.log)
+        self.assertNotIn('Forecast Multiplier', self.log)
+        self.assertIn('above MaxCPU 1.00: MaxCPU must be raised to at least', self.log)
+
+    def test_pairs_stay_consistent_and_the_action_names_the_maxcpu_raise(self):
+        profiles = self.snap['members']['busy1']['profiles']
+        for name, v in profiles.items():
+            pair = v['currentCycle']
+            if pair.get('entitlement') is not None and pair.get('VPs') is not None:
+                self.assertLessEqual(pair['entitlement'], pair['VPs'], name)      # an entitlement needs its VPs
+        ent = float(self.row['NFIT - ENT'])
+        action = self.row['NFIT - Action']
+        if ent > 1.0 + 0.005:
+            self.assertTrue(action.startswith('Raise MaxCPU 1.00 to at least %.2f first.' % ent), action)
+        else:
+            self.assertNotIn('Raise MaxCPU', action)
 
 
 if __name__ == '__main__':
