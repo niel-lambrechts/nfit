@@ -629,12 +629,22 @@ my $cut_protection_flag;
 # RunQ adjustments, cut protection, roles, platform limits and all VP sizing are
 # unchanged. What the rule would have added is recorded (proposal: tierFloor).
 my $research_no_peak_uplift;
-# --research-gated-peak-uplift (research only, candidate for decision F21): the
-# rule applies where the evidence window shows contested minutes for the LPAR in
-# the profile's hours; it is withheld where adequately classified pool evidence
-# shows none; without usable pool evidence it applies as before (legacy).
+# No-contention exemption (decision F21, 20 November; --[no-]uplift-exemption,
+# default on). The tier's pool-borrowing rule pulls an entitlement towards the
+# LPAR's peak. It is not applied where the pool evidence of the LPAR's current
+# configuration state, in the profile's hours, is well classified and shows no
+# contested minute: the profile figure then stands. It applies as before
+# (legacy policy) where a contested minute was seen, where the evidence is
+# insufficient or absent, and for capped LPARs. One contested minute switches
+# it on: a known step of this bounded change.
+# The two coverage figures are a conservative initial policy, not calibrated:
+# the replay that supports the exemption saw no case below 99.4% classified.
+my $uplift_exemption_flag;
+my $PEAK_UPLIFT_GATE_MIN_CLASSIFIED     = 0.99;   # classified share of the expected minutes, whole window
+my $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED = 0.90;   # and of every single day, so that a missing busy day is not read as open capacity
+# --research-gated-peak-uplift (research only): also size each profile without
+# the rule and record that figure, for dev/gated-uplift-report.
 my $research_gated_peak_uplift;
-my $PEAK_UPLIFT_GATE_MIN_CLASSIFIED = 0.90;   # share of expected minutes with a pool classification (provisional)
 my $peak_uplift_suspended = 0;                # set while a profile is sized without the rule for the record
 my ($candidate_test, $candidate_window, $candidate_snapshot);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
@@ -763,6 +773,7 @@ GetOptions(
     'cut-protection!'            => \$cut_protection_flag,
     'research-no-peak-uplift'    => \$research_no_peak_uplift,
     'research-gated-peak-uplift' => \$research_gated_peak_uplift,
+    'uplift-exemption!'          => \$uplift_exemption_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
@@ -3951,6 +3962,21 @@ sub log_profile_rationale
             printf {$fh} "  - Tier Guarantee Floor (dispatch budget)             : %s cores\n", ($calc_debug_info_ref->{'BudgetFloorCores'} // $na);
             printf {$fh} "      Basis                                           : %s\n", $calc_debug_info_ref->{'BudgetFloorReason'};
             printf {$fh} "      Applied                                         : %s\n", ($calc_debug_info_ref->{'BudgetFloorApplied'} // 'No');
+            my $gate = $calc_debug_info_ref->{'PeakUpliftGate'} // '';
+            my $gate_text =
+                  $gate eq 'withheld (no contested minute)'
+                    ? sprintf('not applied: no pool competition observed (%.1f%% of the profile hours classified); the profile figure stands',
+                              100 * ($calc_debug_info_ref->{'PeakUpliftClassifiedShare'} // 0))
+                : $gate eq 'applied (contested)'
+                    ? sprintf('applies: the pool was contested in %d minute%s (legacy policy for the amount)',
+                              $calc_debug_info_ref->{'PeakUpliftContested'} // 0, (($calc_debug_info_ref->{'PeakUpliftContested'} // 0) == 1 ? '' : 's'))
+                : $gate eq 'applied (legacy: pool evidence insufficient)'
+                    ? sprintf('applies as legacy policy: pool evidence insufficient (%.1f%% classified, lowest day %.0f%%)',
+                              100 * ($calc_debug_info_ref->{'PeakUpliftClassifiedShare'} // 0), 100 * ($calc_debug_info_ref->{'PeakUpliftWorstDay'} // 0))
+                : $gate =~ /^applied \(legacy/ ? 'applies as legacy policy: no pool evidence for the current state'
+                : $gate eq 'applied (exemption off)' ? 'applies: --no-uplift-exemption'
+                : $gate =~ /^withheld/ ? 'not applied (research switch)' : '';
+            printf {$fh} "      Pool-borrowing rule                             : %s\n", $gate_text if ($gate_text ne '');
         }
         if (defined $calc_debug_info_ref->{'GuaranteeConvergencePlannerVisible'}
             && $calc_debug_info_ref->{'GuaranteeConvergencePlannerVisible'} eq 'Yes'
@@ -7143,23 +7169,43 @@ sub _strategic_rvcpu_envelope
     };
 }
 
-# Whether the tier's pool-borrowing rule applies to one profile (research
-# switches; 'applied' in normal runs). Returns (gate, contested minutes,
-# classified share): 'withheld (switch)', 'withheld (no contested minute)',
-# 'applied (contested)', 'applied (legacy: no usable pool evidence)' or 'applied'.
+# Whether the tier's pool-borrowing rule applies to one profile (see the
+# no-contention exemption above). Returns (gate, contested minutes, classified
+# share, lowest daily classified share). The gate reads 'withheld (switch)',
+# 'withheld (no contested minute)', 'applied (contested)',
+# 'applied (legacy: ...)' or 'applied (exemption off)'.
 sub _peak_uplift_gate
 {
     my ($vm, $profile) = @_;
-    return ('withheld (switch)', undef, undef) if ($research_no_peak_uplift || $peak_uplift_suspended);
-    return ('applied', undef, undef) unless $research_gated_peak_uplift;
+    return ('withheld (switch)') if ($research_no_peak_uplift || $peak_uplift_suspended);
+    return ('applied (exemption off)') if (defined $uplift_exemption_flag && !$uplift_exemption_flag);
     my $t = $CUT_PROTECTION_EVIDENCE{$vm} ? $CUT_PROTECTION_EVIDENCE{$vm}{$profile} : undef;
-    return ('applied (legacy: no usable pool evidence)', undef, undef) unless (ref($t) eq 'HASH' && ref($t->{protection}) eq 'HASH');
-    my $total = _exposure_totals($t);
-    my $share = ($total->{expected} > 0) ? $total->{classified} / $total->{expected} : 0;
-    my $contested = $t->{protection}{contested} // 0;
-    return ('applied (contested)', $contested, $share) if ($contested > 0);
-    return ('applied (legacy: no usable pool evidence)', $contested, $share) if ($share < $PEAK_UPLIFT_GATE_MIN_CLASSIFIED);
-    return ('withheld (no contested minute)', $contested, $share);
+    return ('applied (legacy: no pool evidence for the current state)')
+        unless (ref($t) eq 'HASH' && ref($t->{protection}) eq 'HASH');
+    return _peak_uplift_gate_of($t->{protection}{contested} // 0,
+        [ map { [ $_->{expected} // 0, $_->{classified} // 0 ] } values %{ $t->{daily} // {} } ]);
+}
+
+# The decision itself, from the contested minutes and each day's (expected,
+# classified) minutes of the profile's hours.
+sub _peak_uplift_gate_of
+{
+    my ($contested, $days) = @_;
+    my ($expected, $classified, $worst) = (0, 0, undef);
+    foreach my $d (@{ $days // [] })
+    {
+        next unless ($d->[0] > 0);
+        $expected   += $d->[0];
+        $classified += $d->[1];
+        my $share = $d->[1] / $d->[0];
+        $worst = $share if (!defined $worst || $share < $worst);
+    }
+    my $share = ($expected > 0) ? $classified / $expected : 0;
+    $worst //= 0;
+    return ('applied (contested)', $contested, $share, $worst) if ($contested > 0);
+    return ('applied (legacy: pool evidence insufficient)', $contested, $share, $worst)
+        if ($share < $PEAK_UPLIFT_GATE_MIN_CLASSIFIED || $worst < $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED);
+    return ('withheld (no contested minute)', $contested, $share, $worst);
 }
 
 # What the tier's pool-borrowing rule did to one profile, for the stored
@@ -7173,6 +7219,7 @@ sub _tier_floor_record
     return (tierFloor => {
         gate => $dbg->{'PeakUpliftGate'}, contestedMinutes => $dbg->{'PeakUpliftContested'},
         classifiedShare => (defined $dbg->{'PeakUpliftClassifiedShare'} ? 0 + sprintf('%.4f', $dbg->{'PeakUpliftClassifiedShare'}) : undef),
+        worstDayShare => (defined $dbg->{'PeakUpliftWorstDay'} ? 0 + sprintf('%.4f', $dbg->{'PeakUpliftWorstDay'}) : undef),
         noRule => (defined $dbg->{'PeakUpliftNoRule'} ? 0 + $dbg->{'PeakUpliftNoRule'} : undef),
         own => (defined $dbg->{'TierFloorOwn'} ? 0 + $dbg->{'TierFloorOwn'} : undef),
         floor => (defined $dbg->{'TierFloorValue'} ? 0 + $dbg->{'TierFloorValue'} : undef),
@@ -7869,7 +7916,7 @@ sub calculate_runq_modified_physc
     $debug_info{'GuaranteedDispatchThreads'} = sprintf("%.1f", $guaranteed_lcpus);
     $debug_info{'ReachableDispatchThreads'}  = sprintf("%.1f", $reachable_lcpus);
     $debug_info{'DispatchBudgetFraction'}    = sprintf("%.2f", $dispatch_budget);
-    @debug_info{qw(PeakUpliftGate PeakUpliftContested PeakUpliftClassifiedShare)} = _peak_uplift_gate($vm_name, $profile_name);
+    @debug_info{qw(PeakUpliftGate PeakUpliftContested PeakUpliftClassifiedShare PeakUpliftWorstDay)} = _peak_uplift_gate($vm_name, $profile_name);
     $debug_info{'SmallEntitlementHandlerActive'} = ($curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) ? "Yes" : "No";
 
     # =========================
@@ -8500,7 +8547,7 @@ sub calculate_runq_modified_physc
         $debug_info{'TierFloorValue'}   = sprintf("%.4f", $budget_floor_cores);
         if ($debug_info{'PeakUpliftGate'} =~ /^withheld/ && !$is_capped_lpar) {
             $debug_info{'TierFloorWithheld'} = 1;
-            $debug_info{'BudgetFloorApplied'} = sprintf("Withheld (research): %.4f -> %.4f cores", $calculated_demand, $budget_floor_cores);
+            $debug_info{'BudgetFloorApplied'} = sprintf("No: %.4f -> %.4f cores not applied", $calculated_demand, $budget_floor_cores);
         } else {
         $debug_info{'BudgetFloorApplied'} = sprintf("Yes: raised %.4f -> %.4f cores (+%.4f)",
             $calculated_demand, $budget_floor_cores, $budget_floor_cores - $calculated_demand);
@@ -8986,7 +9033,7 @@ sub calculate_runq_modified_physc
                 if ($debug_info{'PeakUpliftGate'} =~ /^withheld/ && !$is_capped_lpar) {
                     $debug_info{'TierFloorWithheld'} = 1;
                     $conv_stop = 'peak uplift withheld (research)';
-                    $debug_info{'BudgetFloorApplied'} = sprintf("Withheld (research): %.4f -> %.4f cores", $conv_trial, $conv_floor);
+                    $debug_info{'BudgetFloorApplied'} = sprintf("No: %.4f -> %.4f cores not applied", $conv_trial, $conv_floor);
                     last;
                 }
 
@@ -27102,10 +27149,15 @@ Model behaviour depends on the event configuration:
                                               pool was scarce and other LPARs were busy, never above installed; see the
                                               "Cut Protection" section. --no-cut-protection leaves the cuts as sized.
 
-  --research-gated-peak-uplift              : Research only (candidate). The same rule applies only where the evidence
-                                              window shows contested minutes for the LPAR in the profile's hours; it is
-                                              withheld where classified pool evidence shows none, and applies as before
-                                              where there is no usable pool evidence. Not for recommendations.
+  --[no-]uplift-exemption                   : Standard runs (default on). The tier's pool-borrowing rule, which pulls an
+                                              entitlement towards the LPAR's peak, is not applied where the pool evidence
+                                              for the LPAR's current state and the profile's hours is at least 99%
+                                              classified (90% on every day) and shows no contested minute. It applies as
+                                              before where the pool was contested, where evidence is insufficient or
+                                              absent, and for capped LPARs. --no-uplift-exemption applies it everywhere.
+
+  --research-gated-peak-uplift              : Research only. Also sizes each profile without the rule and records that
+                                              figure in the stored proposal.
 
   --research-no-peak-uplift                 : Research only. The tier's pool-borrowing rule does not raise an uncapped
                                               LPAR's entitlement towards its peak; what it would have added is recorded

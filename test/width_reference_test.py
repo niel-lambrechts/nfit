@@ -133,7 +133,7 @@ class WidthReferenceTests(unittest.TestCase):
     def test_research_switch_withholds_the_peak_uplift_only(self):
         proc, row, log = self.research
         self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
-        self.assertIn('Withheld (research)', log)
+        self.assertIn('not applied (research switch)', log)
         self.assertNotIn('Dispatch width reference', log)             # nothing left for width to lower
         lower = 0
         for name in (k for k in self.row if PROFILE.match(k)):
@@ -166,6 +166,7 @@ class CappedXrqTests(unittest.TestCase):
     def test_the_limit_of_a_capped_lpar_is_its_entitlement(self):
         self.assertIn("above today's physical CPU limit 0.40 (capped: the entitlement): raising the entitlement to", self.log)
         self.assertNotIn('Dispatch width reference', self.log)       # width gives a capped LPAR no reach
+        self.assertNotIn('not applied: no pool competition observed', self.log)   # a capped LPAR keeps the rule
 
     def test_xrq_leads_the_comments_and_is_named_in_an_increase(self):
         self.assertTrue(self.row['VM_Comments'].startswith('[XRQ]'), self.row['VM_Comments'])

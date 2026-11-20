@@ -104,6 +104,43 @@ class CutProtectionTest(unittest.TestCase):
             moved = float(r_on['NFIT - ENT']) > float(r_off['NFIT - ENT']) + 0.005
             self.assertEqual(r_on['NFIT - Action'].startswith('Cut limited'), moved, r_off['VM'])
 
+    def gates(self, *flags):
+        shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
+        log, text = self.standard(*flags)
+        data = json.loads(self.snapshot().read_text())
+        gates = {}
+        for vm, member in data['members'].items():
+            for v in member['profiles'].values():
+                if 'tierFloor' in v:
+                    gates.setdefault(vm, set()).add(v['tierFloor']['gate'])
+        return gates, {r['VM']: r for r in csv.DictReader(text.splitlines())}, log
+
+    def test_uplift_exemption_follows_the_pool_evidence(self):
+        # vmA's pool was contested: the rule applies. The standby vmS sits in a pool that was
+        # never contested, fully classified: its own-workload sizing keeps the profile figure.
+        gates, rows, log = self.gates()
+        self.assertEqual(gates['vmA'], {'applied (contested)'})
+        self.assertEqual(gates['vmS'], {'withheld (no contested minute)'})
+        self.assertIn('not applied: no pool competition observed (100.0% of the profile hours classified); the profile figure stands', log)
+        self.assertIn('applies: the pool was contested in', log)
+        # Switched off, or without pool evidence, the rule applies everywhere as before.
+        off_gates, off_rows, _ = self.gates('--no-uplift-exemption')
+        self.assertEqual(off_gates['vmS'], {'applied (exemption off)'})
+        none_gates, none_rows, none_log = self.gates('--no-cut-protection')
+        self.assertEqual(none_gates['vmS'], {'applied (legacy: no pool evidence for the current state)'})
+        self.assertIn('applies as legacy policy: no pool evidence for the current state', none_log)
+        profiles = [k for k in rows['vmS'] if k + '_rENT_Tactical' in rows['vmS']]
+        lower = 0
+        for name in profiles:
+            self.assertLessEqual(float(rows['vmS'][name]), float(off_rows['vmS'][name]) + 1e-9, name)
+            self.assertEqual(off_rows['vmS'][name], none_rows['vmS'][name], name)
+            lower += float(rows['vmS'][name]) < float(off_rows['vmS'][name]) - 0.005
+            self.assertEqual(rows['vmA'][name], off_rows['vmA'][name], name)      # contested: unchanged
+        self.assertGreater(lower, 0)
+        for vm in rows:                                                          # every pair stays valid
+            ent, vps = float(rows[vm]['NFIT - ENT']), int(rows[vm]['NFIT - VCPU'])
+            self.assertTrue(0.05 * vps - 1e-9 <= ent <= vps + 1e-9, vm)
+
     def test_replay_scores_the_recorded_levels(self):
         self.standard()
         snap = self.snapshot()
