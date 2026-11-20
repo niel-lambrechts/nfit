@@ -171,6 +171,30 @@ class CutProtectionTest(unittest.TestCase):
                 self.assertGreater(target['busy']['minutes'], 0, 'the uncapped cut loses guarantee on the held-out day')
                 self.assertGreaterEqual(target['consumed']['coreMinutes'], target['busy']['coreMinutes'])
 
+    def test_pool_use_and_the_trial_increase(self):
+        # One day: pool 7 was at its maximum on that day only, which is too seldom to act on.
+        log, text = self.standard()
+        self.assertIn('\nPool Use\n', log)
+        self.assertRegex(log, r'Pool 7 was at its maximum of 4 in \d+ minutes on 1 day: too seldom to act on\.')
+        self.assertNotIn('trial increase of the pool', log + text)
+        # Two days: it recurs, and vmA had busy work above its entitlement while it was full.
+        self.clear_outputs()
+        shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
+        run(str(self.root), str(self.cache), '--config', str(self.cfg), '--enddate', '2026-09-02')
+        log = self.outputs('.log')[0].read_text(encoding='utf-8')
+        rows = {r['VM']: r for r in csv.DictReader(
+            [p for p in self.outputs('.csv') if '.decisions.' not in p.name][0].read_text(encoding='utf-8').splitlines())}
+        flat = ' '.join(log.split())
+        self.assertRegex(flat, r'Pool 7: trial increase of the pool maximum from 4 to 5 processing units, then re-measure\. The pool was at '
+                               r'its maximum of 4 in \d+ minutes on 2 days, with busy work above entitlement on 1 LPAR \(vmA\)\. A trial, '
+                               r'not a measured requirement\. Check licensing\.')
+        self.assertRegex(rows['vmA']['NFIT - Action'], r"Pool 7 was at its maximum with this LPAR's busy work above its entitlement on \d+ "
+                                                       r'minutes? over 2 days: a trial increase of the pool to 5 is recommended\.$')
+        for vm in ('vmB', 'vmS', 'vmX'):
+            self.assertNotIn('trial increase of the pool', rows[vm]['NFIT - Action'], vm)
+        self.assertRegex(flat, r'Pool 9 was at its maximum of 2 in \d+ minutes on 1 day: too seldom to act on\.')
+        self.assertNotIn('Pool 7 was at its maximum in', flat)        # the older observation line gives way
+
     def test_contested_level_is_recorded_and_changes_nothing_published(self):
         # Research switch (stage 3.4 candidate): the record is added, the CSV figures stay.
         _, plain = self.standard()

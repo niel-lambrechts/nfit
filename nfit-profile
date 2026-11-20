@@ -738,6 +738,19 @@ my $CUT_PROTECTION_TOP_READINGS = 32;
 # { LPAR => { profile => tracker } } (the tracker is shared by the profiles of
 # one population). Empty when the evidence is not available.
 my %CUT_PROTECTION_EVIDENCE;
+# Pool use (v10 stage 3.4; plan 8.2, "a pool that was full"). From the same
+# evidence pass: each user-defined pool's measured busy series against its
+# maximum, and whether its members had busy work above their entitlement
+# while it was scarce. A pool that was repeatedly at its maximum with such
+# pressure gets a trial increase of one processing unit, then re-measurement:
+# being full shows demand was at least what was served, not a measured
+# shortage. Without the pressure nothing is changed. No reduction is derived
+# here. The recurrence requirement is provisional.
+# { pool => { Maximum, Observed, Full, FullDays, Longest, P50, P95, P99, Peak,
+#             Pressured => [ { vm, minutes, days } ], Verdict } }
+my %POOL_USE;
+my $POOL_TRIAL_MIN_MINUTES = 15;
+my $POOL_TRIAL_MIN_DAYS    = 2;
 # Set while the profile is sized once more without the bound, to give the
 # figure the profile would otherwise have had (the "profile" figure reported).
 my $cut_protection_suspended = 0;
@@ -2407,6 +2420,7 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
     # current-cycle pair are derived. Gated as the Entitlement Cut Exposure
     # section is; seasonal model runs are left as they are (stage 3.6).
     %CUT_PROTECTION_EVIDENCE = ();
+    %POOL_USE = ();
     if (_cut_protection_wanted($current_cache_path) && $effective_start_date_obj && $effective_end_date_obj)
     {
         _protection_evidence_before_sizing($current_cache_path, $effective_start_date_obj, $effective_end_date_obj, \@vm_order);
@@ -2982,7 +2996,9 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             }
 
             # Recommended Actions: what the checks above ask of the planner.
-            my $action_count = _log_recommended_actions($open_log_files{$system_identifier}, $structural_summary, $exposure_summary);
+            my $pool_use_report = _pool_use_report($open_log_files{$system_identifier}, \%POOL_USE,
+                (ref($structural_summary->{Findings}) eq 'HASH' ? $structural_summary->{Findings}{Pools} : undef));
+            my $action_count = _log_recommended_actions($open_log_files{$system_identifier}, $structural_summary, $exposure_summary, $pool_use_report);
             printf STDERR "  [INFO] Recommended actions: %d (see rationale)\n", $action_count;
             _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
                 $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals);
@@ -14552,6 +14568,128 @@ sub _pool_shortfall_action
         . "maximum before the later increases. %s", $now, $target, $care);
 }
 
+# Pool use findings (see %POOL_USE): from the pool accumulators of
+# _exposure_evaluate_window and the evidence trackers (uncapped shared-pool
+# LPARs). A member counts as pressured when its busy work was above its
+# entitlement while its pool was at its maximum, in its widest hours, often
+# enough (the recurrence requirement). Pool 0 has no
+# maximum of its own and is left to the frame check.
+sub _pool_use_findings
+{
+    my ($pool_use, $trackers) = @_;
+    my %out;
+    return \%out unless (ref($pool_use) eq 'HASH');
+    # One tracker per LPAR: all hours where there is one, else its widest hours.
+    my %widest;
+    foreach my $t (@{ $trackers // [] })
+    {
+        my $expected = 0;
+        $expected += ($_->{expected} // 0) for values %{ $t->{daily} // {} };
+        my $rank = (($t->{population} // '') eq 'none' ? 1e12 : 0) + $expected;
+        $widest{ $t->{vm} } = [ $rank, $t ] if (!$widest{ $t->{vm} } || $rank > $widest{ $t->{vm} }[0]);
+    }
+    foreach my $pool (keys %$pool_use)
+    {
+        next unless (looks_like_number($pool) && $pool != 0);
+        my $use = $pool_use->{$pool};
+        next unless ($use->{observed});
+        my @sorted = sort { $a <=> $b } unpack('f<*', $use->{values});
+        my @pressured;
+        foreach my $vm (sort keys %widest)
+        {
+            my $t = $widest{$vm}[1];
+            next unless (defined $t->{pool} && $t->{pool} == $pool);
+            my ($minutes, $days) = (0, 0);
+            foreach my $acc (values %{ $t->{daily} // {} })
+            {
+                my $n = $acc->{aboveLocalFull} // 0;
+                next unless $n;
+                $minutes += $n;
+                $days++;
+            }
+            push @pressured, { vm => $vm, minutes => $minutes, days => $days }
+                if ($minutes >= $POOL_TRIAL_MIN_MINUTES && $days >= $POOL_TRIAL_MIN_DAYS);
+        }
+        my $full_days = scalar(keys %{ $use->{days} });
+        my $recurs = ($use->{full} >= $POOL_TRIAL_MIN_MINUTES && $full_days >= $POOL_TRIAL_MIN_DAYS) ? 1 : 0;
+        my @sizes = sort { $a <=> $b } keys %{ $use->{sizes} };
+        $out{ $pool + 0 } = {
+            Maximum => $use->{size}, MaximumChanged => (@sizes > 1 ? [ $sizes[0] + 0, $sizes[-1] + 0 ] : undef),
+            Observed => $use->{observed}, Full => $use->{full}, FullDays => $full_days, Longest => $use->{longest},
+            P50 => _pool_quantile(\@sorted, 0.50), P95 => _pool_quantile(\@sorted, 0.95), P99 => _pool_quantile(\@sorted, 0.99),
+            Peak => $sorted[-1], Pressured => \@pressured,
+            Verdict => (!$use->{full} ? 'open' : !$recurs ? 'fullRarely' : @pressured ? 'trial' : 'fullNoPressure'),
+        };
+    }
+    return \%out;
+}
+
+# The "Pool Use" rationale section and the pool actions that follow from it.
+# $structural_pools: the pools of _collect_structural_findings, so that a pool
+# whose members already require a larger maximum is not also given a trial.
+# Returns { Actions => [...], Observed => [...], Members => { LPAR => sentence } }.
+sub _pool_use_report
+{
+    my ($log_fh, $pool_use, $structural_pools) = @_;
+    my %result = (Actions => [], Observed => [], Members => {}, Covered => {});
+    return \%result unless (ref($pool_use) eq 'HASH' && %$pool_use);
+    my %required = map { ($_->{PoolId} => $_) } grep { ref($_) eq 'HASH' } @{ $structural_pools // [] };
+    my $plural = sub { return $_[0] == 1 ? '' : 's'; };
+    my @out = ('', '=' x 70, 'Pool Use', '=' x 70,
+        "  Each user-defined pool's measured use against its maximum, in cores, over the analysis window.",
+        '  A pool that was repeatedly at its maximum while its LPARs had busy work above their entitlement',
+        '  gets a trial increase of one processing unit, then re-measurement: being full shows that demand',
+        '  was at least what was served, not how much more was wanted. No pool reduction is derived here.', '',
+        sprintf('    %-6s %8s %8s %8s %8s %8s  %s', 'Pool', 'Maximum', 'Median', 'P95', 'P99', 'Peak', 'At its maximum'),
+        sprintf('    %-6s %8s %8s %8s %8s %8s  %s', '-' x 6, ('-' x 8) x 5, '-' x 30));
+    foreach my $pool (sort { $a <=> $b } keys %$pool_use)
+    {
+        my $u = $pool_use->{$pool};
+        $result{Covered}{ $pool + 0 } = 1;
+        my $max = _pool_units_text($u->{Maximum});
+        push @out, sprintf('    %-6s %8s %8.2f %8.2f %8.2f %8.2f  %s', $pool, $max, $u->{P50}, $u->{P95}, $u->{P99}, $u->{Peak},
+            $u->{Full} ? sprintf('%d minute%s on %d day%s (longest %d)', $u->{Full}, $plural->($u->{Full}), $u->{FullDays},
+                                 $plural->($u->{FullDays}), $u->{Longest}) : 'never');
+        my $full = sprintf('at its maximum of %s in %d minute%s on %d day%s', $max, $u->{Full}, $plural->($u->{Full}),
+                           $u->{FullDays}, $plural->($u->{FullDays}));
+        if ($u->{Verdict} eq 'trial')
+        {
+            my @who = @{ $u->{Pressured} };
+            my $names = join(', ', map { $_->{vm} } @who[0 .. ($#who > 3 ? 3 : $#who)]) . (@who > 4 ? sprintf(' and %d more', @who - 4) : '');
+            my $need = $required{$pool} ? max($required{$pool}{RequiredMax} // 0, $required{$pool}{RequiredMaxCycle} // 0) : 0;
+            if (defined $u->{Maximum} && $need > $u->{Maximum} + $FLOAT_EPSILON)
+            {
+                push @{ $result{Observed} }, sprintf("Pool %s was %s, with busy work above entitlement on %d LPAR%s (%s). The pool increase its "
+                    . "members' entitlements require covers this; re-measure after it.", $pool, $full, scalar(@who), $plural->(scalar @who), $names);
+            }
+            else
+            {
+                push @{ $result{Actions} }, sprintf("Pool %s: trial increase of the pool maximum from %s to %s processing units, then re-measure. "
+                    . "The pool was %s, with busy work above entitlement on %d LPAR%s (%s). A trial, not a measured requirement. Check licensing.",
+                    $pool, $max, _pool_units_text($u->{Maximum} + 1), $full, scalar(@who), $plural->(scalar @who), $names);
+                $result{Members}{ $_->{vm} } = sprintf('Pool %s was at its maximum with this LPAR\'s busy work above its entitlement on %d minute%s over %d day%s: '
+                    . 'a trial increase of the pool to %s is recommended.', $pool, $_->{minutes}, $plural->($_->{minutes}), $_->{days},
+                    $plural->($_->{days}), _pool_units_text($u->{Maximum} + 1)) for @who;
+            }
+        }
+        elsif ($u->{Verdict} eq 'fullNoPressure')
+        {
+            push @{ $result{Observed} }, sprintf("Pool %s was %s; no LPAR's busy work was above its entitlement then often enough to act on: no change.",
+                $pool, $full);
+        }
+        elsif ($u->{Verdict} eq 'fullRarely')
+        {
+            push @{ $result{Observed} }, sprintf('Pool %s was %s: too seldom to act on.', $pool, $full);
+        }
+        push @{ $result{Observed} }, sprintf('Pool %s reported more than one maximum in the period (%s to %s); each minute is judged against the '
+            . 'maximum of that minute.', $pool, map { _pool_units_text($_) } @{ $u->{MaximumChanged} }) if $u->{MaximumChanged};
+    }
+    push @out, '', sprintf('    Recurrence needed to act: %d minutes on %d days (provisional). Capped LPARs and the default pool (0)',
+        $POOL_TRIAL_MIN_MINUTES, $POOL_TRIAL_MIN_DAYS), '    are not assessed here.', '';
+    print {$log_fh} join("\n", @out), "\n" if (defined $log_fh && ref($log_fh));
+    return \%result;
+}
+
 # The pool prerequisite of each LPAR's planning action (plan 8.2: increases
 # raise the pool first, then the members): { LPAR => { First => sentence,
 # Later => sentence } }. First where this cycle's entitlements exceed the pool
@@ -14657,9 +14795,10 @@ sub _pool_exposure_reason
 
 sub _log_recommended_actions
 {
-    my ($log_fh, $structural, $exposure) = @_;
+    my ($log_fh, $structural, $exposure, $pool_use) = @_;
     return 0 unless (defined $log_fh && ref($log_fh));
     my $findings = (ref($structural) eq 'HASH') ? $structural->{Findings} : undef;
+    $pool_use = { Actions => [], Observed => [] } unless (ref($pool_use) eq 'HASH');
 
     my (@actions, @observed);
     if (ref($findings) eq 'HASH' && $findings->{Valid})
@@ -14676,6 +14815,8 @@ sub _log_recommended_actions
             push @actions, "$finding->{vm}: $action" if ($action ne '');
         }
     }
+    push @actions, @{ $pool_use->{Actions} // [] };
+    push @observed, @{ $pool_use->{Observed} // [] };
     my $status = (ref($exposure) eq 'HASH') ? ($exposure->{Status} // '') : 'notRequested';
     my %advised_pool;
     if ($status eq 'evaluated')
@@ -14696,7 +14837,7 @@ sub _log_recommended_actions
         foreach my $pool (sort { $a <=> $b } keys %{ $exposure->{PoolFull} // {} })
         {
             my $n = $exposure->{PoolFull}{$pool};
-            next if ($pool == 0 || !$n || $advised_pool{$pool});
+            next if ($pool == 0 || !$n || $advised_pool{$pool} || ($pool_use->{Covered} // {})->{ $pool + 0 });   # Pool Use says it better
             push @observed, sprintf("Pool %s was at its maximum in %d minute%s of the period; no entitlement cut in it needs review.",
                 $pool, $n, ($n == 1 ? '' : 's'));
         }
@@ -16017,6 +16158,9 @@ sub _write_standard_csv_report {
         my $structural_findings = _collect_structural_findings($assimilation_map_ref, \@vm_order, \@profiles, \%vm_tier_overrides);
         $structural_tags = _structural_csv_tags($structural_findings);
         $pool_first      = _pool_prerequisites($structural_findings);
+        # A pool on a trial increase: the LPARs that were above their entitlement in it say so.
+        my $trial = _pool_use_report(undef, \%POOL_USE, $structural_findings->{Pools})->{Members};
+        $pool_first->{$_}{Trial} = $trial->{$_} for keys %$trial;
     }
     my ($idx_vm_comments) = grep { $header_for_this_report[$_] eq 'VM_Comments' } 0..$#header_for_this_report;
     foreach my $pending (@pending_csv_rows)
@@ -16029,7 +16173,8 @@ sub _write_standard_csv_report {
         {
             my $note = $pool_first->{$row_vm};
             $planner_cells->{'NFIT - Action'} = join(' ', (defined $note->{First} ? $note->{First} : ()),
-                $planner_cells->{'NFIT - Action'}, (defined $note->{Later} ? $note->{Later} : ()));
+                $planner_cells->{'NFIT - Action'}, (defined $note->{Later} ? $note->{Later} : ()),
+                (defined $note->{Trial} ? $note->{Trial} : ()));
         }
         if (defined $idx_vm_comments && exists $structural_tags->{$row_vm})
         {
@@ -23710,6 +23855,8 @@ sub _exposure_process_day
                 : ((defined $vp && $vp > 0 && $c >= $rule{nearVp} * $vp - $eps) ? 1 : 0);
             $acc->{classified}++ if $classified;
             $acc->{scarce}++     if $scarce;
+            # Pool use (stage 3.4): busy work above the entitlement while the LPAR's own pool was at its maximum.
+            $acc->{aboveLocalFull}++ if ($local eq 'scarce' && defined $ent && $b > $ent + $eps);
             # Cut protection (stage 3.3): competition implies scarcity, and so
             # a classified minute.
             if ($competition)
@@ -23898,7 +24045,7 @@ sub _exposure_evaluate_window
     my ($cpu_files, $cpu_counts)   = _exposure_cpu_sources($exposure_context, [ [ $window_start, $window_end ] ], $tmp_dir, \%wanted);
     _subtask(sprintf('Classifying pool minutes and member busy (%d state(s))', scalar(@$trackers_aref)));
     my $physical_minutes = 0;
-    my (%pool_full, $frame_low);
+    my (%pool_full, $frame_low, %pool_use);
     my %rule = %MEMBER_EXPOSURE_RULES;
     $frame_low = 0;
     foreach my $day (int($window_start / 86400) .. int(($window_end - 1) / 86400))
@@ -23908,11 +24055,24 @@ sub _exposure_evaluate_window
         # Minutes each pool was at its maximum, and minutes the frame had no spare cores.
         foreach my $pool (keys %$minutes)
         {
-            foreach my $record (values %{ $minutes->{$pool} })
+            my $use = $pool_use{$pool} //= { observed => 0, full => 0, days => {}, longest => 0, run => 0, last => undef,
+                                             values => '', sizes => {}, size => undef };
+            foreach my $minute (sort { $a <=> $b } keys %{ $minutes->{$pool} })
             {
+                my $record = $minutes->{$pool}{$minute};
                 next unless (defined $record->{value} && defined $record->{size} && $record->{size} > 0);
-                $pool_full{$pool}++ if ($record->{size} - $record->{value}
+                $use->{observed}++;
+                $use->{values} .= pack('f<', $record->{value});
+                $use->{sizes}{ $record->{size} + 0 } = 1;
+                $use->{size} = $record->{size} + 0;                 # the latest reported maximum
+                next unless ($record->{size} - $record->{value}
                     <= _exposure_tolerance($rule{localScarceAbsCores}, $rule{localScarceRel}, $record->{size}) + 1e-9);
+                $pool_full{$pool}++;
+                $use->{full}++;
+                $use->{days}{$day} = 1;
+                $use->{run} = (defined $use->{last} && $minute == $use->{last} + 60) ? $use->{run} + 1 : 1;
+                $use->{last} = $minute;
+                $use->{longest} = $use->{run} if ($use->{run} > $use->{longest});
             }
         }
         foreach my $layer (values %$physical)
@@ -23923,7 +24083,8 @@ sub _exposure_evaluate_window
         _exposure_process_day($trackers_aref, $day, _exposure_read_cpu_day($cpu_files->{$day}), $minutes, $physical);
     }
     return { %$pool_counts, %$cpu_counts, physicalMinutes => $physical_minutes,
-             physicalColumns => $pool_counts->{physicalColumns} // 0, poolFull => \%pool_full, frameLow => $frame_low };
+             physicalColumns => $pool_counts->{physicalColumns} // 0, poolFull => \%pool_full, frameLow => $frame_low,
+             poolUse => \%pool_use };
 }
 
 # Totals of one tracker over its days: base counts and, per threshold, the
@@ -25169,11 +25330,12 @@ sub _protection_evidence_before_sizing
     my $started = time();
     _task(sprintf('Contested minutes of %d LPAR state(s) over %d UTC day(s)', scalar(uniq(map { $_->{vm} } @$trackers)),
                   ($window_end - $window_start) / 86400));
-    _exposure_evaluate_window($pool_context, $exposure_context, $trackers, $window_start, $window_end);
+    my $window_counts = _exposure_evaluate_window($pool_context, $exposure_context, $trackers, $window_start, $window_end);
     foreach my $t (@$trackers)
     {
         $CUT_PROTECTION_EVIDENCE{ $t->{vm} }{$_} = $t for @{ $t->{profiles} };
     }
+    %POOL_USE = %{ _pool_use_findings($window_counts->{poolUse}, $trackers) };
     _task(sprintf('Cut protection evidence gathered (%s)', format_duration(time() - $started)));
     return { Status => 'evaluated', Trackers => $trackers };
 }
