@@ -687,7 +687,18 @@ my ($candidate_test, $candidate_window, $candidate_snapshot);
 # overall and 90% on every day; no minute at the maximum; the frame not
 # without spare cores; one roster and maximum throughout.
 my $research_pool_ceiling_replay;
-my %POOL_CEILING_RULES = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90);
+my %POOL_CEILING_RULES = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90,
+    # A second coverage policy, recorded beside the first for comparison: enough
+    # well-covered days and a lower overall share with missing days counted.
+    altGoodDays => 28, altMinCoverage => 0.95,
+    # The experiment on history length, resolution and margin (research):
+    # candidates from the last N training days at one minute; from the last
+    # coarseDays reduced to coarseMinutes buckets (means of buckets at least
+    # coarseBucketShare complete, and single readings), at each offset; and
+    # with each margin on the peak. Every candidate is judged on the later
+    # period at one minute.
+    lengths => [ 14, 30 ], coarseDays => 30, coarseMinutes => 15, coarseOffsets => [ 0, 5, 10 ], coarseBucketShare => 0.80,
+    margins => [ 0, 0.05, 0.10, 0.15, 0.25 ]);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
 # Pool reconciliation (v10 milestone 2.3): illustrative budgets on minutes any
@@ -14916,6 +14927,78 @@ sub _pool_ceiling_replay
                        fullMinutesAtInstalled => scalar(grep { $_->[2] - $_->[1] <= $near->($_->[2]) + 1e-9 } @{ $later->{series} }),
                        frameScarceMinutes => scalar(grep { $frame_scarce{later}{ $_->[0] } } @{ $later->{series} }) },
         );
+        # Coverage by day: the well-covered days, and the days that are not, with the close days marked.
+        my @low_days;
+        my $good_days = 0;
+        foreach my $day (int($from / 86400) .. int(($cut - 1) / 86400))
+        {
+            my $share = ($train->{days}{$day} // 0) / 1440;
+            if ($share >= $POOL_CEILING_RULES{minDayCoverage}) { $good_days++; next; }
+            my @t = gmtime($day * 86400);
+            push @low_days, { date => gmtime($day * 86400)->ymd, coverage => 0 + sprintf('%.3f', $share),
+                              closeDay => (($t[3] == 1 || (gmtime(($day + 1) * 86400))[3] == 1) ? JSON::true : JSON::false) };
+        }
+        $row{training}{goodDays} = $good_days;
+        $row{training}{lowDays}  = \@low_days;
+        $row{coverageAlt} = (($good_days >= $POOL_CEILING_RULES{altGoodDays} && $coverage >= $POOL_CEILING_RULES{altMinCoverage}) ? JSON::true : JSON::false);
+
+        # The experiment: every candidate judged on the later period at one minute.
+        my $ceiling_for = sub
+        {
+            my ($observed_peak, $margin) = @_;
+            my $need = $observed_peak * (1 + ($margin // 0));
+            my $w = max(1, int($need));
+            $w++ while ($w - $need <= $near->($w) + 1e-9);
+            return max($structural, $w);
+        };
+        my $judged = sub
+        {
+            my ($ceiling) = @_;
+            return { ceiling => $installed, units => 0 } if ($ceiling >= $installed);
+            my $r = $replay->($later->{series}, $ceiling);
+            return { ceiling => $ceiling, units => $installed - $ceiling, map { ($_ => $r->{$_}) } qw(exceedMinutes exceedCoreMinutes exceedDays newlyNearMinutes) };
+        };
+        my %experiment;
+        foreach my $length (@{ $POOL_CEILING_RULES{lengths} }, 'all')
+        {
+            my $since = ($length eq 'all') ? $from : $cut - $length * 86400;
+            next if ($since < $from);
+            my @window = grep { $_->[0] >= $since } @{ $train->{series} };
+            next unless @window;
+            my $window_peak = max(map { $_->[1] } @window);
+            $experiment{lengths}{$length} = { peak => 0 + sprintf('%.4f', $window_peak),
+                fullMinutes => scalar(grep { $_->[2] - $_->[1] <= $near->($_->[2]) + 1e-9 } @window), %{ $judged->($ceiling_for->($window_peak, 0)) } };
+        }
+        my ($coarse, $width) = ($cut - $POOL_CEILING_RULES{coarseDays} * 86400, $POOL_CEILING_RULES{coarseMinutes} * 60);
+        if ($coarse >= $from)
+        {
+            my @window = grep { $_->[0] >= $coarse } @{ $train->{series} };
+            foreach my $offset (@{ $POOL_CEILING_RULES{coarseOffsets} })
+            {
+                my (%sum, %n, $point_peak);
+                foreach my $s (@window)
+                {
+                    my $shifted = $s->[0] - $offset * 60;
+                    my $bucket = int($shifted / $width);
+                    $sum{$bucket} += $s->[1];
+                    $n{$bucket}++;
+                    $point_peak = $s->[1] if ($shifted % $width == 0 && (!defined $point_peak || $s->[1] > $point_peak));
+                }
+                my @means = map { $sum{$_} / $n{$_} } grep { $n{$_} >= $POOL_CEILING_RULES{coarseBucketShare} * $POOL_CEILING_RULES{coarseMinutes} } keys %n;
+                push @{ $experiment{coarse}{mean} }, { offset => $offset, buckets => scalar(@means), peak => 0 + sprintf('%.4f', max(@means)),
+                    %{ $judged->($ceiling_for->(max(@means), 0)) } } if @means;
+                push @{ $experiment{coarse}{point} }, { offset => $offset, peak => 0 + sprintf('%.4f', $point_peak),
+                    %{ $judged->($ceiling_for->($point_peak, 0)) } } if defined $point_peak;
+                # Margins on the coarse mean, first offset only.
+                if (@means && $offset == $POOL_CEILING_RULES{coarseOffsets}[0])
+                {
+                    $experiment{margins}{coarseMean}{ sprintf('%.2f', $_) } = $judged->($ceiling_for->(max(@means), $_)) for @{ $POOL_CEILING_RULES{margins} };
+                }
+            }
+        }
+        $experiment{margins}{minuteAll}{ sprintf('%.2f', $_) } = $judged->($ceiling_for->($peak, $_)) for @{ $POOL_CEILING_RULES{margins} };
+        $row{experiment} = \%experiment;
+
         if ($candidate < $installed)
         {
             $row{later}{atCandidate} = $replay->($later->{series}, $candidate);

@@ -38,7 +38,7 @@ def busy(pool, day, minute):
             return 5.30
         if later and day == TRAIN_DAYS + 2 and 700 <= minute < 710:
             return 4.95
-        return 4.60 if (day == 12 and 540 <= minute < 560) else 3.00
+        return 4.60 if (day == 12 and 540 <= minute < 548) else 3.00        # an eight-minute peak
     if pool == 21:
         return 4.00 if (day in (5, 6) and 600 <= minute < 630) else 2.00
     if pool == 22:
@@ -154,6 +154,39 @@ class PoolCeilingReplayTest(unittest.TestCase):
         p = self.pools[23]
         self.assertIn('a day below 90% coverage', p['withheld'])
         self.assertIn('coverage below 99% of the minutes', p['withheld'])
+        # The second coverage policy is recorded beside it: 29 well-covered days and 96.7% overall pass.
+        self.assertEqual(p['training']['goodDays'], 29)
+        self.assertEqual(p['training']['lowDays'], [{'date': '2026-09-10', 'coverage': 0, 'closeDay': False}])
+        self.assertTrue(p['coverageAlt'])
+        self.assertTrue(self.pools[20]['coverageAlt'])
+
+    def test_history_length_changes_the_candidate(self):
+        # The peak lies 18 days before the cutoff: the last 14 days do not contain it.
+        lengths = self.pools[20]['experiment']['lengths']
+        self.assertEqual((lengths['all']['ceiling'], lengths['30']['ceiling'], lengths['14']['ceiling']), (5, 5, 4))
+        self.assertAlmostEqual(lengths['14']['peak'], 3.0, places=3)
+        self.assertEqual(lengths['14']['exceedMinutes'], 11)             # judged on the later period at one minute
+        self.assertEqual(lengths['all']['exceedMinutes'], 1)
+
+    def test_coarse_data_hides_a_short_peak(self):
+        coarse = self.pools[20]['experiment']['coarse']
+        mean = {m['offset']: m for m in coarse['mean']}
+        point = {m['offset']: m for m in coarse['point']}
+        # Eight minutes at 4.60 inside a 15-minute bucket of 3.00: the mean reads 3.85, and the candidate is a unit lower.
+        self.assertAlmostEqual(mean[0]['peak'], (8 * 4.6 + 7 * 3.0) / 15, places=3)
+        self.assertEqual(mean[0]['ceiling'], 4)
+        self.assertEqual(mean[0]['exceedMinutes'], 11)
+        self.assertEqual(mean[0]['buckets'], 30 * 96)
+        # A single reading every 15 minutes sees the peak or misses it, by offset.
+        self.assertEqual((point[0]['ceiling'], point[5]['ceiling'], point[10]['ceiling']), (5, 5, 4))
+        self.assertEqual(sorted(mean), [0, 5, 10])
+
+    def test_margins_are_reported_not_applied(self):
+        margins = self.pools[20]['experiment']['margins']
+        self.assertEqual([margins['minuteAll'][k]['ceiling'] for k in ('0.00', '0.05', '0.10', '0.15', '0.25')], [5, 5, 6, 6, 6])
+        self.assertEqual(margins['minuteAll']['0.10']['exceedMinutes'], 0)
+        self.assertEqual([margins['coarseMean'][k]['ceiling'] for k in ('0.00', '0.25')], [4, 5])
+        self.assertEqual(self.pools[20]['candidate'], 5)                 # the reference candidate carries no margin
 
 
 if __name__ == '__main__':
