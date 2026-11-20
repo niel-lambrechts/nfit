@@ -181,6 +181,26 @@ class PoolCeilingReplayTest(unittest.TestCase):
         self.assertEqual((point[0]['ceiling'], point[5]['ceiling'], point[10]['ceiling']), (5, 5, 4))
         self.assertEqual(sorted(mean), [0, 5, 10])
 
+    def test_peak_support_describes_what_stands_behind_the_peak(self):
+        ps = self.pools[20]['peakSupport']
+        self.assertEqual(ps['governs'], 'peak')
+        self.assertEqual((ps['minutesNearPeak'], ps['daysNearPeak'], ps['episodesNearPeak']), (8, 1, 1))
+        self.assertEqual((ps['settingMinutes'], ps['settingDays']), (8, 1))
+        top = ps['top'][0]
+        self.assertEqual((top['startUTC'], top['minutes'], top['window'], top['closeDay']), ('2026-09-13 09:00', 8, 'other', False))   # a Sunday
+        self.assertTrue(top['setsCeiling'])
+        self.assertFalse(top['dataGapBefore'] or top['dataGapAfter'] or top['configurationChangeWithinADay'])
+        self.assertAlmostEqual(ps['secondDayPeak'], 3.0, places=3)
+        self.assertEqual(ps['candidateWithoutTopEpisode'], 4)              # shown, not applied
+        self.assertEqual(self.pools[20]['candidate'], 5)
+        quiet = self.pools[22]['peakSupport']
+        self.assertEqual(quiet['governs'], 'entitlements')
+        self.assertFalse(quiet['top'][0]['setsCeiling'])
+        self.assertEqual(quiet['daysNearPeak'], 30)                        # the hourly reading recurs every day
+        self.assertFalse(quiet['top'][0]['dataGapBefore'])                 # the start of the period is not a gap
+        gapped = self.pools[23]['peakSupport']['top'][0]
+        self.assertTrue(gapped['dataGapAfter'])                            # the unobserved day follows the first run
+
     def test_margins_are_reported_not_applied(self):
         margins = self.pools[20]['experiment']['margins']
         self.assertEqual([margins['minuteAll'][k]['ceiling'] for k in ('0.00', '0.05', '0.10', '0.15', '0.25')], [5, 5, 6, 6, 6])

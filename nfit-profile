@@ -14898,6 +14898,67 @@ sub _pool_ceiling_replay
         my $workload = max(1, int($peak));
         $workload++ while ($workload - $peak <= $near->($workload) + 1e-9);
         my $candidate = max($structural, $workload);
+        # Peak support: how much of the training period stands behind the peak. It describes how far the
+        # candidate depends on a rare reading; it is not a rule for leaving a peak out.
+        my $whole = sub { my ($v) = @_; my $w = max(1, int($v)); $w++ while ($w - $v <= $near->($w) + 1e-9); return $w; };
+        my $window_of = sub
+        {
+            my ($minute) = @_;
+            my ($of_day, $weekday) = (($minute % 86400) / 60, (int($minute / 86400) + 4) % 7);
+            return ($weekday != 0 && $weekday != 6 && $of_day >= 480 && $of_day < 1020) ? 'online' : ($of_day >= 1080 || $of_day < 360) ? 'batch' : 'other';
+        };
+        my $close_of = sub { my ($minute) = @_; return (((gmtime($minute))[3] == 1 || (gmtime($minute + 86400))[3] == 1) ? JSON::true : JSON::false); };
+        my $near_peak = 0.90 * $peak;
+        my (@episodes, %near_days, %setting_days, $near_minutes, $setting_minutes, %day_peak);
+        ($near_minutes, $setting_minutes) = (0, 0);
+        my $rows = $train->{series};
+        foreach my $i (0 .. $#$rows)
+        {
+            my ($minute, $value) = @{ $rows->[$i] };
+            my $day = int($minute / 86400);
+            $day_peak{$day} = $value if (!defined $day_peak{$day} || $value > $day_peak{$day});
+            next unless ($value >= $near_peak - 1e-9);
+            $near_minutes++;
+            $near_days{$day} = 1;
+            if ($whole->($value) == $workload) { $setting_minutes++; $setting_days{$day} = 1; }
+            if (@episodes && $episodes[-1]{last} == $minute - 60)
+            {
+                my $e = $episodes[-1];
+                $e->{minutes}++;
+                $e->{last} = $minute;
+                $e->{peak} = $value if ($value > $e->{peak});
+                $e->{lastIndex} = $i;
+            }
+            else
+            {
+                push @episodes, { start => $minute, last => $minute, minutes => 1, peak => $value, firstIndex => $i, lastIndex => $i };
+            }
+        }
+        my @top = sort { $b->{peak} <=> $a->{peak} || $a->{start} <=> $b->{start} } @episodes;
+        my $first = $top[0];
+        my $without_top = max(0, map { $_->[1] } grep { $_->[0] < $first->{start} || $_->[0] > $first->{last} } @$rows);
+        my @day_peaks = sort { $b <=> $a } values %day_peak;
+        $#top = 4 if (@top > 5);
+        my %support = (nearPeakShare => 0.90, minutesNearPeak => $near_minutes, daysNearPeak => scalar(keys %near_days),
+            episodesNearPeak => scalar(@episodes), settingMinutes => $setting_minutes, settingDays => scalar(keys %setting_days),
+            governs => ($structural >= $workload ? 'entitlements' : 'peak'),
+            secondDayPeak => (@day_peaks > 1 ? 0 + sprintf('%.4f', $day_peaks[1]) : undef),
+            candidateWithoutTopEpisode => max($structural, $whole->($without_top)),
+            top => [ map {
+                my $e = $_;
+                # Data missing just before or after the episode, and a configuration boundary inside the day.
+                # (the first and last minute of the training period are not gaps)
+                my $gap_before = ($e->{start} <= $from) ? 0
+                               : ($e->{firstIndex} == 0 || $rows->[ $e->{firstIndex} - 1 ][0] != $e->{start} - 60) ? 1 : 0;
+                my $gap_after  = ($e->{last} >= $cut - 60) ? 0
+                               : ($e->{lastIndex} == $#$rows || $rows->[ $e->{lastIndex} + 1 ][0] != $e->{last} + 60) ? 1 : 0;
+                my $boundary = scalar(grep { abs($_->{from} - $e->{start}) < 86400 && $_->{from} > $from } @{ $segments->{$id} // [] }) ? 1 : 0;
+                { startUTC => gmtime($e->{start})->strftime('%Y-%m-%d %H:%M'), minutes => $e->{minutes}, peak => 0 + sprintf('%.4f', $e->{peak}),
+                  window => $window_of->($e->{start}), closeDay => $close_of->($e->{start}),
+                  setsCeiling => (($structural < $workload && $whole->($e->{peak}) == $workload) ? JSON::true : JSON::false),
+                  dataGapBefore => ($gap_before ? JSON::true : JSON::false), dataGapAfter => ($gap_after ? JSON::true : JSON::false),
+                  configurationChangeWithinADay => ($boundary ? JSON::true : JSON::false) }
+            } @top ]);
         my @withheld;
         push @withheld, sprintf('fewer than %d days observed', $POOL_CEILING_RULES{minDays}) if ($train_days < $POOL_CEILING_RULES{minDays});
         push @withheld, 'coverage below 99% of the minutes' if ($coverage < $POOL_CEILING_RULES{minCoverage});
@@ -14913,7 +14974,7 @@ sub _pool_ceiling_replay
             installedEntitlement => 0 + sprintf('%.2f', $ent_sum), structuralMinimum => $structural,
             workloadCandidate => $workload, candidate => $candidate,
             unitsRemoved => ($candidate < $installed ? $installed - $candidate : 0),
-            withheld => \@withheld, reserve => 'unknown',
+            withheld => \@withheld, reserve => 'unknown', peakSupport => \%support,
             training => { days => $train_days, minutes => scalar(@values), coverage => 0 + sprintf('%.4f', $coverage),
                           worstDayCoverage => 0 + sprintf('%.4f', $worst_day), peak => 0 + sprintf('%.4f', $peak),
                           p50 => $q->(0.50), p95 => $q->(0.95), p99 => $q->(0.99), p999 => $q->(0.999),
