@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/gated-uplift-report
+# PURPOSE  : Research report for the candidate of decision F21: the tier's
+#            pool-borrowing rule applied only where the training window shows
+#            contested minutes (--research-gated-peak-uplift). Reads the records
+#            of dev/protection-replay --records-only and reports:
+#              1. how the gate decided, and which profiles the later window
+#                 could not score, with the reason;
+#              2. profiles where the rule was withheld: later borrowing above
+#                 the published figure;
+#              3. planning profiles where the rule applied and raised the
+#                 figure: protection against allocation at five levels chosen
+#                 from training (no rule, three between, published);
+#              4. the same for alternative profiles, as counts;
+#              5. how few contested minutes switch the rule on;
+#              6. planning entitlement per pool.
+#            Borrowing is busy work (PhysB) above a level in the profile's
+#            hours of the later window: in contested minutes (pool scarce and
+#            other LPARs busy), in scarce minutes that were not contested (the
+#            LPAR itself fills the pool), and in all minutes.
+# USAGE    : dev/gated-uplift-report [--in DIR] (default design/acceptance/gated-peak-uplift)
+# OUTPUT   : <in>/gated-uplift-report.md (research labels only)
+# ==============================================================================
+import argparse
+import collections
+import json
+import subprocess
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+LEVELS = ('noRule', 'q25', 'q50', 'q75', 'recommended')
+NAMES = {'noRule': 'without the rule', 'q25': '25%', 'q50': '50%', 'q75': '75%', 'recommended': 'published (rule applied)'}
+
+
+def borrow(rec, plan, scope):
+    b = (((rec.get('later') or {}).get(plan) or {}).get('borrow') or {}).get(scope) or {}
+    return b.get('minutes', 0), b.get('coreMinutes', 0.0), b.get('days', 0), b.get('longest', 0)
+
+
+def own_fill(rec, plan):
+    """Scarce minutes that were not contested: the LPAR itself fills the pool."""
+    s, c = borrow(rec, plan, 'scarce'), borrow(rec, plan, 'contested')
+    return s[0] - c[0], s[1] - c[1]
+
+
+def table(lines, header, body):
+    lines.append('| ' + ' | '.join(header) + ' |')
+    lines.append('|' + '|'.join('---' for _ in header) + '|')
+    lines.extend('| ' + ' | '.join(str(c) for c in row) + ' |' for row in body)
+    lines.append('')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--in', dest='src', default=str(REPO / 'design' / 'acceptance' / 'gated-peak-uplift'))
+    a = ap.parse_args()
+    src = Path(a.src)
+    data = json.loads((src / 'protection-replay.json').read_text())
+    recs = [r for r in data['records'] if (r.get('tierFloor') or {}).get('gate')]
+    gate = lambda r: r['tierFloor']['gate']
+    kind = lambda r: 'planning' if r.get('planning') else 'alternative'
+    level = lambda r, plan: ((r.get('later') or {}).get(plan) or {}).get('level')
+    support = lambda r, plan: ((r.get('later') or {}).get(plan) or {}).get('support') or {}
+    lines = ['# Candidate: the pool-borrowing rule applied only where the pool was contested', '',
+             f'Generated {data["generated"]}; commit {str(data["commit"])[:7]}; options {" ".join(data.get("profileArgs") or []) or "none"}.',
+             f'Systems: {", ".join(s["system"] for s in data["systems"])}. Every figure is the complete calculation of the',
+             'training window (convergence and current-cycle pair included); levels are chosen from training and scored on',
+             'the later window. Alternative profiles are scenarios of the same LPAR and are not added together.', '']
+
+    # 1. Gate decisions and what could not be scored
+    lines += ['## 1. How the gate decided', '',
+              'Only profiles where the rule bound, or would have, carry a record.', '']
+    count = collections.Counter((gate(r), kind(r)) for r in recs)
+    table(lines, ['Gate', 'Planning', 'Alternative'],
+          [[g, count[(g, 'planning')], count[(g, 'alternative')]] for g in sorted({k[0] for k in count})])
+    withheld = [r for r in recs if r['tierFloor'].get('withheld')]
+    ruled = [r for r in recs if not r['tierFloor'].get('withheld') and r['tierFloor'].get('noRule') is not None]
+    unscored = [r for r in withheld if level(r, 'recommended') is None] + [r for r in ruled if level(r, 'noRule') is None]
+    reasons = collections.Counter()
+    for r in unscored:
+        reasons['no later scoring for this LPAR: role excluded from the replay (standby, VIOS), capped, or no '
+                'current uncapped shared-pool state in the later window'] += 1
+    lines += [f'Not scored in the later window: {len(unscored)} of {len(withheld) + len(ruled)} profiles '
+              f'({len({r["member"] for r in unscored})} LPARs). They are excluded below, not counted as clean.', '']
+    table(lines, ['Reason', 'Profiles'], [[k, n] for k, n in reasons.items()] or [['none', 0]])
+
+    # 2. Withheld
+    scored_w = [r for r in withheld if level(r, 'recommended') is not None]
+    lines += ['## 2. Rule withheld (classified pool evidence, no contested minute in training)', '']
+    rows = []
+    for k in ('planning', 'alternative'):
+        g = [r for r in scored_w if kind(r) == k]
+        rows.append([k, len(g), len({r['member'] for r in g}),
+                     sum(1 for r in g if support(r, 'recommended').get('scarceMinutes', 0) > 0),
+                     sum(1 for r in g if borrow(r, 'recommended', 'contested')[0] > 0),
+                     f'{sum(borrow(r, "recommended", "contested")[0] for r in g)} / {sum(borrow(r, "recommended", "contested")[1] for r in g):.2f}',
+                     f'{sum(own_fill(r, "recommended")[0] for r in g)} / {sum(own_fill(r, "recommended")[1] for r in g):.2f}',
+                     f'{min((r["tierFloor"].get("classifiedShare") or 0) for r in g):.3f}' if g else 'n/a',
+                     f'{sum(support(r, "recommended").get("classifiedMinutes", 0) for r in g)} / {sum(support(r, "recommended").get("expectedMinutes", 0) for r in g)}'])
+    table(lines, ['Kind', 'Profiles', 'LPARs', 'With later scarce minutes', 'With later contested borrowing above the published figure',
+                  'Contested borrowing (min / core-min)', 'Scarce, not contested (min / core-min)',
+                  'Lowest classified share in training', 'Later classified / expected minutes'], rows)
+    for r in sorted((r for r in scored_w if borrow(r, 'recommended', 'scarce')[0] > 0), key=lambda r: -borrow(r, 'recommended', 'scarce')[1])[:15]:
+        lines.append(f'- {r["member"]} {r["profile"]} ({kind(r)}): published {level(r, "recommended")}; later scarce borrowing '
+                     f'{borrow(r, "recommended", "scarce")[0]} min / {borrow(r, "recommended", "scarce")[1]:.2f} core-min, of which contested '
+                     f'{borrow(r, "recommended", "contested")[0]} min.')
+    lines.append('')
+
+    # 3. Applied, planning: protection against allocation
+    scored_r = [r for r in ruled if level(r, 'noRule') is not None]
+    lines += ['## 3. Rule applied and binding: planning profiles, protection against allocation', '',
+              'Each LPAR at five entitlement levels from training. Cells: minutes / core-minutes / days.', '']
+    for r in sorted((r for r in scored_r if r.get('planning')), key=lambda r: r['member']):
+        tf, pair = r['tierFloor'], r.get('pair') or {}
+        lines += [f'**{r["member"]} {r["profile"]}** — installed {r.get("installed")} on {r.get("installedVPs")} VPs; training: '
+                  f'{tf.get("contestedMinutes")} contested minutes; later: {support(r, "recommended").get("scarceMinutes", 0)} scarce minutes; '
+                  f'current-cycle pair {pair.get("entitlement")} / {pair.get("VPs")} {pair.get("status") or ""} '
+                  f'{"(" + ", ".join(pair.get("binding") or []) + ")" if pair.get("binding") else ""}', '']
+        table(lines, ['Level', 'Entitlement', 'Above installed', 'Contested borrowing', 'Scarce, not contested (min / core-min)', 'All minutes'],
+              [[NAMES[p], f'{level(r, p):.2f}', f'{level(r, p) - (r.get("installed") or 0):+.2f}',
+                '{} / {:.2f} / {}'.format(*borrow(r, p, 'contested')[:3]), '{} / {:.2f}'.format(*own_fill(r, p)),
+                '{} / {:.2f} / {}'.format(*borrow(r, p, 'all')[:3])] for p in LEVELS if level(r, p) is not None])
+
+    # 4. Applied, alternatives
+    alt = [r for r in scored_r if not r.get('planning')]
+    lines += ['## 4. Rule applied and binding: alternative profiles', '']
+    table(lines, ['Profiles', 'LPARs', 'With contested borrowing above the no-rule figure', 'Of those, none left at the published figure',
+                  'With no contested borrowing even without the rule'],
+          [[len(alt), len({r['member'] for r in alt}), sum(1 for r in alt if borrow(r, 'noRule', 'contested')[0] > 0),
+            sum(1 for r in alt if borrow(r, 'noRule', 'contested')[0] > 0 and borrow(r, 'recommended', 'contested')[0] == 0),
+            sum(1 for r in alt if borrow(r, 'noRule', 'contested')[0] == 0)]])
+
+    # 5. Few contested minutes
+    few = sorted((r for r in ruled if (r['tierFloor'].get('contestedMinutes') or 0) <= 10),
+                 key=lambda r: (not r.get('planning'), -((r.get('published') or 0) - (r['tierFloor'].get('noRule') or 0))))
+    lines += ['## 5. Rule switched on by ten contested minutes or fewer', '',
+              f'{len(few)} profiles ({sum(1 for r in few if r.get("planning"))} planning) on {len({r["member"] for r in few})} LPARs. '
+              'The step each takes because of those minutes:', '']
+    table(lines, ['LPAR', 'Profile', 'Kind', 'Training contested minutes', 'Without the rule', 'Published', 'Step',
+                  'Later contested borrowing without the rule (min / core-min)', 'At the published figure'],
+          [[r['member'], r['profile'], kind(r), r['tierFloor'].get('contestedMinutes'), f'{r["tierFloor"]["noRule"]:.2f}', r.get('published'),
+            f'{(r.get("published") or 0) - r["tierFloor"]["noRule"]:+.2f}',
+            '{} / {:.2f}'.format(*borrow(r, 'noRule', 'contested')[:2]), '{} / {:.2f}'.format(*borrow(r, 'recommended', 'contested')[:2])]
+           for r in few[:25]])
+
+    # 6. Pools
+    lines += ['## 6. Planning entitlement per pool', '',
+              'LPARs with a record only (uncapped, current shared-pool state); the pool size is not in these records, so',
+              'this shows the direction per pool, not a fit verdict. nFit\'s own Pool and VP Checks give the verdict.', '']
+    pools = collections.defaultdict(lambda: [0, 0.0, 0.0, 0.0])
+    for r in data['records']:
+        if not r.get('planning') or r.get('published') is None or r.get('installed') is None:
+            continue
+        p = pools[(r['system'], str(r.get('pool')))]
+        tf = r.get('tierFloor') or {}
+        no_rule = tf.get('noRule') if (tf.get('noRule') is not None and not tf.get('withheld')) else r['published']
+        p[0] += 1; p[1] += r['installed']; p[2] += no_rule; p[3] += r['published']
+    table(lines, ['System', 'Pool', 'LPARs', 'Installed', 'Without the rule', 'Published (gated rule)', 'Added by the rule'],
+          [[k[0], k[1], v[0], f'{v[1]:.2f}', f'{v[2]:.2f}', f'{v[3]:.2f}', f'{v[3] - v[2]:+.2f}'] for k, v in sorted(pools.items())])
+
+    target = src / 'gated-uplift-report.md'
+    target.write_text('\n'.join(lines) + '\n')
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
