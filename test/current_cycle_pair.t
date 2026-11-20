@@ -114,14 +114,6 @@ $r = pair(target_ent => 3.53, target_vp => 4, step_vp => 3, current_ent => 1.50,
 check('verified VP limit', $r, Ent => 3.00, VP => 3, Status => 'BLOCKED', Binding => [qw(VP_WIDTH VP_LIMIT)]);
 valid_pair('verified VP limit', $r);
 
-# An entitlement above the installed MaxCPU (v10 step 3b): the action puts the
-# MaxCPU raise first; within MaxCPU, or with MaxCPU unknown, it says nothing.
-$r = pair(target_ent => 1.96, target_vp => 2, step_vp => 2, current_ent => 1.00, current_vp => 1);
-like(UUT::_current_cycle_action_text($r, 1.00, 1, 0, 1), qr/^Raise MaxCPU 1\.00 to at least 1\.96 first\. /,
-     'above MaxCPU: the MaxCPU raise comes first');
-unlike(UUT::_current_cycle_action_text($r, 1.00, 1, 0, 2), qr/MaxCPU/, 'within MaxCPU: no prerequisite');
-unlike(UUT::_current_cycle_action_text($r, 1.00, 1, 0), qr/MaxCPU/, 'MaxCPU unknown: no prerequisite');
-
 # A simple cut that reaches its target in one cycle.
 $r = pair(target_ent => 1.20, target_vp => 3, step_vp => 3, current_ent => 2.00, current_vp => 4);
 check('simple cut', $r, Ent => 1.20, VP => 3, Status => 'APPLY', Order => 'EITHER', Binding => []);

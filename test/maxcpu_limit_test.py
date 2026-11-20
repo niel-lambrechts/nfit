@@ -2,9 +2,11 @@
 # ==============================================================================
 # End-to-end test for the removal of the MaxCPU sanity limit (v10 step 3b,
 # decision F14): an LPAR at MaxCPU 1 with a deep run queue was held at
-# MaxCPU x 1.75. Its targets now state the requirement; the rationale says
-# MaxCPU must be raised, and NFIT - Action puts the MaxCPU raise first when the
-# current cycle's entitlement is above it. Synthetic data only.
+# MaxCPU x 1.75. MaxCPU is today's physical CPU limit (the entitlement when
+# capped, else the smaller of the VPs and the pool), derived from the
+# configuration and never itself a value to change. The targets now state the
+# requirement; the rationale says it is above today's limit, and NFIT - Action
+# names the VP change, never MaxCPU. Synthetic data only.
 # ==============================================================================
 import calendar
 import csv
@@ -103,20 +105,20 @@ class MaxCpuLimitTests(unittest.TestCase):
         self.assertTrue(above, 'some profile must now state a requirement above the former limit')
         self.assertNotIn('Max Sanity Check', self.log)
         self.assertNotIn('Forecast Multiplier', self.log)
-        self.assertIn('above MaxCPU 1.00: MaxCPU must be raised to at least', self.log)
+        self.assertIn("above today's physical CPU limit 1.00 (the smaller of 1 VP and pool 32 cores)", self.log)
+        self.assertNotIn('MaxCPU must be raised', self.log)
 
-    def test_pairs_stay_consistent_and_the_action_names_the_maxcpu_raise(self):
+    def test_pairs_stay_consistent_and_the_action_names_the_vp_change(self):
         profiles = self.snap['members']['busy1']['profiles']
         for name, v in profiles.items():
             pair = v['currentCycle']
             if pair.get('entitlement') is not None and pair.get('VPs') is not None:
                 self.assertLessEqual(pair['entitlement'], pair['VPs'], name)      # an entitlement needs its VPs
-        ent = float(self.row['NFIT - ENT'])
+        ent, vps = float(self.row['NFIT - ENT']), int(self.row['NFIT - VCPU'])
         action = self.row['NFIT - Action']
-        if ent > 1.0 + 0.005:
-            self.assertTrue(action.startswith('Raise MaxCPU 1.00 to at least %.2f first.' % ent), action)
-        else:
-            self.assertNotIn('Raise MaxCPU', action)
+        self.assertNotIn('MaxCPU', action)
+        self.assertGreater(ent, 1.0)                     # above today's limit of 1 core
+        self.assertTrue(action.startswith('Raise VPs 1 to %d, then raise entitlement 1.00 to %.2f.' % (vps, ent)), action)
 
 
 if __name__ == '__main__':
