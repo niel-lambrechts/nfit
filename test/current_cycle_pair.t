@@ -114,6 +114,23 @@ $r = pair(target_ent => 3.53, target_vp => 4, step_vp => 3, current_ent => 1.50,
 check('verified VP limit', $r, Ent => 3.00, VP => 3, Status => 'BLOCKED', Binding => [qw(VP_WIDTH VP_LIMIT)]);
 valid_pair('verified VP limit', $r);
 
+# The current-cycle pair meets the tier floor at its own VPs (v10 step 3b
+# correction): a cut whose target relies on a second VP that is only a review
+# item stops where one VP needs it.
+my $floor = sub { my ($v) = @_; return ($v >= 2) ? 0.10 : 0.30; };
+$r = pair(target_ent => 0.23, target_vp => 2, step_vp => 1, current_ent => 0.50, current_vp => 1, tier_floor => $floor);
+check('cut stops at the floor of its own VPs', $r, Ent => 0.30, VP => 1, Status => 'STAGED', Binding => [qw(TIER_FLOOR)],
+      ReviewVP => 2, TargetEnt => 0.23);
+valid_pair('cut stops at the floor of its own VPs', $r);
+like(UUT::_current_cycle_action_text($r, 0.50, 1, 0), qr/^Reduce entitlement 0\.50 to 0\.30\. Cut limited to 0\.30 by the tier's pool-borrowing limit on 1 VP\./,
+     'the action states where the cut stops and why');
+$r = pair(target_ent => 0.23, target_vp => 2, step_vp => 1, current_ent => 0.25, current_vp => 1, tier_floor => sub { 1.00 });
+check('a floor above installed holds the cut', $r, Ent => 0.25, VP => 1, Binding => [qw(TIER_FLOOR)]);
+$r = pair(target_ent => 0.60, target_vp => 1, step_vp => 1, current_ent => 0.80, current_vp => 1, tier_floor => sub { 0.30 });
+check('a floor below the target changes nothing', $r, Ent => 0.60, Status => 'APPLY', Binding => []);
+$r = pair(target_ent => 1.20, target_vp => 2, step_vp => 2, current_ent => 0.80, current_vp => 2, tier_floor => sub { 2.00 });
+check('a raise is not touched by the floor', $r, Ent => 1.20, Binding => []);
+
 # A simple cut that reaches its target in one cycle.
 $r = pair(target_ent => 1.20, target_vp => 3, step_vp => 3, current_ent => 2.00, current_vp => 4);
 check('simple cut', $r, Ent => 1.20, VP => 3, Status => 'APPLY', Order => 'EITHER', Binding => []);

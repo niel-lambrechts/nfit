@@ -117,6 +117,9 @@ class MaxCpuLimitTests(unittest.TestCase):
         ent, vps = float(self.row['NFIT - ENT']), int(self.row['NFIT - VCPU'])
         action = self.row['NFIT - Action']
         self.assertNotIn('MaxCPU', action)
+        # A run queue far beyond today's limit is flagged and named in the increase, not suppressed.
+        self.assertTrue(self.row['VM_Comments'].startswith('[XRQ]'), self.row['VM_Comments'])
+        self.assertTrue(action.endswith('The run queue is implausibly high (XRQ): find the cause before applying the increase.'), action)
         self.assertGreater(ent, 1.0)                     # above today's limit of 1 core
         self.assertTrue(action.startswith('Raise VPs 1 to %d, then raise entitlement 1.00 to %.2f.' % (vps, ent)), action)
 

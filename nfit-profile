@@ -690,6 +690,13 @@ my %CUT_PROTECTION_EVIDENCE;
 # Set while the profile is sized once more without the bound, to give the
 # figure the profile would otherwise have had (the "profile" figure reported).
 my $cut_protection_suspended = 0;
+# Dispatch width reference (v10 step 3b correction). VPs that the micro-
+# partition floor or the RunQ override add beyond the entitlement's own VP
+# range give dispatch width, not room to borrow from the pool. Where a profile was
+# widened, it is sized again with that widening suspended; the entitlement of
+# that sizing is the floor the widened sizing may not go below.
+my $dispatch_widening_suspended = 0;
+my %WIDTH_FLOOR;   # LPAR => profile => { protected | unprotected } => entitlement
 my @PHYSB_INVALID_REASONS  = qw(missingB nonNumericB bAboveC nonFiniteC cAboveCeiling bAboveCeiling);
 my @PHYSB_QUALITY_COUNTERS = (qw(validPairs sameSecondSamples runResets freqPctUnavailable), @PHYSB_INVALID_REASONS);
 my $min_history_days_arg;    # New flag for partial month processing
@@ -2012,8 +2019,7 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     any coordinated configuration work can be implemented.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  rVCPU_EntBounded   The VP destination that preserves the current entitlement. It may sit\n";
-        print {$LOG_FH} "                     above the normal envelope when RunQ or peak evidence requires it; a\n";
-        print {$LOG_FH} "                     VP increase must be allowed by the HMC profile maximum.\n";
+        print {$LOG_FH} "                     above the normal envelope when RunQ or peak evidence requires it.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  VP reduction step  The VP count one cycle may reduce to, after the per-tier rate limits and\n";
         print {$LOG_FH} "                     the reduction-safety controls. It steps towards rVCPU_EntBounded and\n";
@@ -2032,10 +2038,11 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     entitlement core than today's configuration or the 2:1 envelope,\n";
         print {$LOG_FH} "                     whichever is looser. Blank where the profile has no result.\n";
         print {$LOG_FH} "\n";
-        print {$LOG_FH} "  MaxCPU             The LPAR's current consumption ceiling: its VPs, or a smaller shared\n";
-        print {$LOG_FH} "                     pool. It does not limit a recommendation: more VPs or a larger pool may\n";
-        print {$LOG_FH} "                     be proposed where the evidence requires them. The HMC profile maximum\n";
-        print {$LOG_FH} "                     is not collected and must be confirmed before a VP increase.\n";
+        print {$LOG_FH} "  MaxCPU             The LPAR's physical CPU limit today: its entitlement when capped,\n";
+        print {$LOG_FH} "                     otherwise the smaller of its VPs and the shared pool. It follows from\n";
+        print {$LOG_FH} "                     those settings and does not limit a recommendation: more VPs, a larger\n";
+        print {$LOG_FH} "                     pool or (capped) more entitlement may be proposed where the evidence\n";
+        print {$LOG_FH} "                     requires them.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  Run-queue          The VP width required to dispatch observed runnable concurrency at the\n";
         print {$LOG_FH} "  dispatch width     tier's operating posture. Converts the run-queue high-water thread count\n";
@@ -2085,6 +2092,9 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                       - [POOL_SHORTFALL]: the LPAR's pool cannot hold all its LPARs'\n";
         print {$LOG_FH} "                         proposed entitlements. This is about the guarantees, not about\n";
         print {$LOG_FH} "                         the pool running out. See Pool entitlement.\n";
+        print {$LOG_FH} "                       - [XRQ]: a profile's run queue implies more than twice today's\n";
+        print {$LOG_FH} "                         physical CPU limit: a backlog, a malfunction or severe\n";
+        print {$LOG_FH} "                         under-capacity. Find the cause before applying an increase.\n";
         print {$LOG_FH} "                       - [VP_MISMATCH]: the current-cycle entitlement and VPs cannot be\n";
         print {$LOG_FH} "                         set together. nFit resolves a valid pair, so this indicates a\n";
         print {$LOG_FH} "                         defect in its inputs. See Entitlement and VP count.\n";
@@ -2092,7 +2102,7 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     CPU Ceiling Detection (Two-Tier System):\n";
         print {$LOG_FH} "                       - CAP_LIMITED[<profile>]: CPU ceiling reached (informational).\n";
         print {$LOG_FH} "                         Sustained high load near MaxCPU with low variability.\n";
-        print {$LOG_FH} "                         VM may benefit from increased MaxCPU allocation.\n";
+        print {$LOG_FH} "                         It may need more VPs or a larger pool (capped: more entitlement).\n";
         print {$LOG_FH} "                       - CPU_FLATLINING[<profile>]: Suspicious plateau (warning).\n";
         print {$LOG_FH} "                         CPU pinned at ceiling with very low variability, AND not\n";
         print {$LOG_FH} "                         explained by genuine RunQ demand (corroboration gate failed).\n";
@@ -2578,20 +2588,36 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                 # bound gives the figure the profile would otherwise have had.
                 # Sized first, because each call records the profile's VP
                 # targets and the protected call is the one that stands.
-                my $cp_unprotected;
-                if ($CUT_PROTECTION_EVIDENCE{$vm_name} && $CUT_PROTECTION_EVIDENCE{$vm_name}{$profile_name})
+                # A profile widened by dispatch evidence is sized again without
+                # the widening; its entitlement may not go below that sizing's
+                # (%WIDTH_FLOOR). The protected sizing is always the last call.
+                delete $WIDTH_FLOOR{$vm_name}{$profile_name} if ($WIDTH_FLOOR{$vm_name});
+                my $size_profile = sub
                 {
-                    my %pressure_flags_cp = %pressure_flags;
-                    my %adaptive_thresholds_cp = %adaptive_thresholds;
-                    $cut_protection_suspended = 1;
-                    ($cp_unprotected) = calculate_runq_modified_physc(
-                        $vm_name, $vm_map_ref, $profile, \%pressure_flags_cp, \%adaptive_thresholds_cp);
-                    $cut_protection_suspended = 0;
-                }
+                    my ($unprotected) = @_;
+                    my $once = sub
+                    {
+                        my ($no_widening) = @_;
+                        my %pf = %pressure_flags;
+                        my %at = %adaptive_thresholds;
+                        ($cut_protection_suspended, $dispatch_widening_suspended) = ($unprotected ? 1 : 0, $no_widening ? 1 : 0);
+                        my @r = calculate_runq_modified_physc($vm_name, $vm_map_ref, $profile, \%pf, \%at);
+                        ($cut_protection_suspended, $dispatch_widening_suspended) = (0, 0);
+                        return @r;
+                    };
+                    my @r = $once->(0);
+                    return @r unless (_profile_widened($r[1]));
+                    my ($reference) = $once->(1);
+                    my ($ref_shown, $own_shown) = map { _structural_shown_value($_) } ($reference, $r[0]);
+                    return @r unless (defined $ref_shown && defined $own_shown && $ref_shown > $own_shown + $STRUCTURAL_ENT_TOLERANCE);
+                    $WIDTH_FLOOR{$vm_name}{$profile_name}{ $unprotected ? 'unprotected' : 'protected' } = $reference + 0;
+                    return $once->(0);
+                };
+                my $cp_unprotected;
+                ($cp_unprotected) = $size_profile->(1)
+                    if ($CUT_PROTECTION_EVIDENCE{$vm_name} && $CUT_PROTECTION_EVIDENCE{$vm_name}{$profile_name});
 
-                my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
-                    $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
-                );
+                my ($adjusted_physc, $debug_info_ref) = $size_profile->(0);
                 if (ref($debug_info_ref) eq 'HASH' && defined $cp_unprotected && looks_like_number($cp_unprotected))
                 {
                     # Limited only when the published figure moved: a bound that
@@ -3678,7 +3704,7 @@ sub log_profile_rationale
         # Tier 1: Cap-limited (informational)
         print {$fh} "       PLANNER NOTE [CAP_LIMITED - CPU Ceiling]: Sustained high load near MaxCPU.\n";
         printf {$fh} "         %s.\n", ($calc_debug_info_ref->{'CPUCapLimitedDetail'} // "");
-        print {$fh} "         This VM may benefit from increased MaxCPU allocation.\n";
+        print {$fh} "         It may need more VPs or a larger pool (capped: more entitlement).\n";
     }
 
     # --- Dispatch Headroom ---
@@ -3930,6 +3956,14 @@ sub log_profile_rationale
             printf {$fh} "  - GUARANTEED-CAPACITY CHECK FAILED                   : %s\n",
                 ($calc_debug_info_ref->{'GuaranteeInvariant'} // 'No detail available');
         }
+        if (defined $calc_debug_info_ref->{'WidthReferenceApplied'})
+        {
+            printf {$fh} "  - Dispatch width reference                           : raised %s cores\n",
+                $calc_debug_info_ref->{'WidthReferenceApplied'};
+            print  {$fh} "      Basis                                           : the tier's pool-borrowing limit is applied without the\n";
+            print  {$fh} "                                                        VPs added on run-queue evidence; they add dispatch width,\n";
+            print  {$fh} "                                                        not room to borrow. A policy limit, not a measured need.\n";
+        }
         printf {$fh} "  - Target and today's physical CPU limit             : %s\n",
             _maxcpu_target_text($final_recommendation_unrounded_str, $cfg);
         # Chronic under-entitlement advice. Relocated here from Section C: it is
@@ -3965,10 +3999,8 @@ sub log_profile_rationale
         if (!defined $target || !looks_like_number($target)) {
             printf {$fh} "    Configuration fit (%-14s): N/A - target unavailable.\n", $label;
         } elsif (defined $curr_vcpu_numeric_log && ($target + 0) > $curr_vcpu_numeric_log) {
-            # MaxCPU is the current consumption ceiling, which a VP increase
-            # raises; the limit that matters is the HMC profile maximum, which
-            # is not collected.
-            printf {$fh} "    Configuration fit (%-14s): a VP increase from %.0f to %s; confirm that the HMC profile maximum allows it.\n",
+            # MaxCPU follows from the VPs, so a VP increase raises it.
+            printf {$fh} "    Configuration fit (%-14s): a VP increase from %.0f to %s.\n",
                 $label, $curr_vcpu_numeric_log, $target;
             my $pool_size = $vm_map_ref->{Configuration}{pool_cpu};
             if (defined $pool_size && looks_like_number($pool_size) && $pool_size > 0 && ($target + 0) > $pool_size)
@@ -4022,13 +4054,6 @@ sub log_profile_rationale
     my $sf_tier_text = sprintf('%s (%s)', ($sf_tier eq 'P' ? 'P, peak protected' : $sf_tier),
         ($sf_source_text{$sf_source} // ($sf_source ne '' ? $sf_source : $na)));
 
-    # The HMC profile maximum is not collected: a VP count above today's must be
-    # confirmed against it before it is configured.
-    my @sf_wider = grep { defined $_ && defined $sf_cur_n && $_ > $sf_cur_n }
-        ((defined $sf_pair ? $sf_pair->{VP} : undef), $sf_strat_n, $sf_eb_n);
-    my $sf_hmc_text = !defined $sf_cur_n ? $na
-                    : @sf_wider ? sprintf('must allow %d VPs; not collected, confirm before applying', max(@sf_wider))
-                    : 'no VP increase proposed';
 
     print {$fh} "  At a glance\n";
     $sf_glance->('Installed', sprintf('%s (physical CPU limit %s)',
@@ -4076,7 +4101,6 @@ sub log_profile_rationale
         ? $sf_pair_text->($sf_pair->{Ent}, $sf_pair->{VP}) : 'no recommendation');
     $sf_glance->('Current-cycle action', defined $sf_pair
         ? _current_cycle_action_text($sf_pair, $sf_cur_ent, $sf_cur_n, $sf_cfg->{pool_id}) : $na);
-    $sf_glance->('HMC profile maximum', $sf_hmc_text);
     print {$fh} "\n";
 
 # Determine binding constraint for plain-language verdict
@@ -4394,11 +4418,11 @@ sub log_profile_rationale
         if (defined $env_min && defined $env_max) {
             if ($env_exceeds_op && defined $ent_cores_planning && defined $ent_cores) {
                 # Show both planning and operational values when they differ
-                printf {$fh} "      * Virtual Processor Range (from planning rENT_P=%.2f cores, pre MaxCPU sanity): min %d VPs, max %d VPs\n",
+                printf {$fh} "      * Virtual Processor Range (from planning rENT_P=%.2f cores): min %d VPs, max %d VPs\n",
                     $ent_cores_planning, $env_min, $env_max;
                 printf {$fh} "        NOTE: Planning range derived from workload demand (%.2f cores), which exceeds\n",
                     $ent_cores_planning;
-                printf {$fh} "              operational rENT_P (%.2f cores, post MaxCPU sanity). Raise MaxCPU to realise full range.\n",
+                printf {$fh} "              operational rENT_P (%.2f cores).\n",
                     $ent_cores;
             } elsif (defined $ent_cores_planning) {
                 printf {$fh} "      * Virtual Processor Range (from rENT_P=%.2f cores): min %d VPs, max %d VPs\n",
@@ -6383,11 +6407,15 @@ sub _compute_entbounded_and_tactical
 #                                default pool or when unknown
 #               hold_reason    - non-empty: keep the installed pair (excluded
 #                                role or other reason supplied by the caller)
+#               tier_floor     - optional code ref: the tier guarantee floor at a
+#                                given VP count. A cut stops at the floor of the
+#                                pair's own VPs (TIER_FLOOR), so it never rests on
+#                                borrowing that only a later VP increase gives
 # RETURNS:    hashref: Ent, VP (the current-cycle pair), Status (HOLD,
 #             NO_CHANGE, APPLY, STAGED or BLOCKED; a HOLD without a usable
 #             installed pair or target leaves Ent and VP undefined), Order (VP_FIRST, ENT_FIRST,
 #             EITHER, COMBINED or NONE), Binding (array of the limits that
-#             shaped the pair: PLATFORM_MINIMUM, RATIO_GUARD, VP_WIDTH,
+#             shaped the pair: PLATFORM_MINIMUM, RATIO_GUARD, TIER_FLOOR, VP_WIDTH,
 #             VP_LIMIT, POOL_SIZE), NeedVP, ReviewVP (evidence-only VP increase
 #             to review, or undef), TargetEnt, TargetVP, Reason.
 # ==============================================================================
@@ -6530,6 +6558,14 @@ sub _resolve_current_cycle_pair
             push @binding, 'RATIO_GUARD';
         }
     }
+    my $tier_floor = (ref($terms->{tier_floor}) eq 'CODE') ? $terms->{tier_floor}->($vp) : undef;
+    if (defined $tier_floor && looks_like_number($tier_floor)
+        && $ent < $current_ent - $FLOAT_EPSILON && $ent < $tier_floor - $FLOAT_EPSILON)
+    {
+        $ent = $up->($tier_floor);
+        $ent = $current_ent if ($ent > $current_ent);
+        push @binding, 'TIER_FLOOR';
+    }
     if ($ent > $vp + $FLOAT_EPSILON)
     {
         $ent = $vp;
@@ -6638,8 +6674,17 @@ sub _maxcpu_target_text
                     ((($cfg->{virtual_cpus} // '') eq '1') ? '1 VP' : (($cfg->{virtual_cpus} // '?') . ' VPs')), $cfg->{pool_cpu} // '?');
     return sprintf('within today\'s physical CPU limit %.2f (%s)', $limit, $basis)
         if ($shown <= $limit + $STRUCTURAL_ENT_TOLERANCE);
-    return sprintf('above today\'s physical CPU limit %.2f (%s): the target needs the VP and pool changes '
-                 . 'in NFIT - Action and the Pool and VP Checks', $limit, $basis);
+    return sprintf('above today\'s physical CPU limit %.2f (%s): raising the entitlement to %.2f raises the limit',
+                   $limit, $basis, $shown) if ($cfg->{is_capped} // 0);
+    my $cores = int($shown);
+    $cores++ if ($shown - $cores > $FLOAT_EPSILON);
+    my @needs;
+    push @needs, sprintf('at least %d VPs', $cores)
+        if (defined $cfg->{virtual_cpus} && looks_like_number($cfg->{virtual_cpus}) && $cfg->{virtual_cpus} < $cores);
+    push @needs, sprintf('a pool of at least %d cores', $cores)
+        if (defined $cfg->{pool_cpu} && looks_like_number($cfg->{pool_cpu}) && $cfg->{pool_cpu} < $cores);
+    return sprintf('above today\'s physical CPU limit %.2f (%s)%s', $limit, $basis,
+                   (@needs ? ': it needs ' . join(' and ', @needs) : ''));
 }
 
 sub _current_cycle_action_text
@@ -6716,6 +6761,10 @@ sub _current_cycle_action_text
         $cores++ if ($target_ent - $cores > $FLOAT_EPSILON);
         push @sentences, sprintf('Pool %s must allow at least %d cores to reach the %.2f target.',
             ($pool_id // '?'), $cores, $target_ent);
+    }
+    if ($binding{TIER_FLOOR} && defined $ent && defined $vp)
+    {
+        push @sentences, sprintf('Cut limited to %.2f by the tier\'s pool-borrowing limit on %s.', $ent, $vps_text->($vp));
     }
     if ($binding{VP_LIMIT} && defined $pair->{NeedVP} && defined $target_ent)
     {
@@ -6890,7 +6939,8 @@ sub _planner_csv_row
 # In (hashref): rent_p, rent_for_envelope, rvcpu_raw, p99w1_floor_vcpu,
 #   configured_burst_floor_vcpu,
 #   runnable_density, runq_hi_threads, smt, max_cpu, runq_potential,
-#   is_runq_pressure, is_workload_pressure
+#   is_runq_pressure, is_workload_pressure, no_widening (true: neither the
+#   micro-partition floor nor the RunQ override widens the envelope)
 # Out (hashref): rvcpu_min, rvcpu_max, rvcpu_final, orig_rvcpu_min,
 #   orig_rvcpu_max, runq_envelope_override, runq_envelope_basis,
 #   micro_expansion_note (undef unless expansion occurred)
@@ -6963,7 +7013,8 @@ sub _strategic_rvcpu_envelope
                     $micro_width_evidence_source = $candidate->[1];
                 }
             }
-            if (defined $rENT_P_for_envelope
+            if (!$in->{no_widening}
+                && defined $rENT_P_for_envelope
                 && $rENT_P_for_envelope > 0
                 && $rENT_P_for_envelope < $VCPU_MICRO_PARTITION_THRESHOLD
                 && defined $rvcpu_max
@@ -7030,7 +7081,8 @@ sub _strategic_rvcpu_envelope
                 (defined $is_runq_pressure && $is_runq_pressure eq "True") ||
                 (defined $is_workload_pressure && $is_workload_pressure eq "True");
 
-            if (   defined $rENT_P && $rENT_P > 0 && $rENT_P < $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH
+            if (   !$in->{no_widening}
+                && defined $rENT_P && $rENT_P > 0 && $rENT_P < $MICRO_PARTITION_RUNQ_OVERRIDE_ENT_THRESH
                 && defined $runnable_density && $runnable_density > $MICRO_PARTITION_RUNQ_OVERRIDE_CRED_THRESH
                 && defined $rvcpu_raw && defined $rvcpu_max && $rvcpu_raw > $rvcpu_max
                 && !$is_dbw_anomaly && !$is_xrq_anomaly
@@ -7061,6 +7113,38 @@ sub _strategic_rvcpu_envelope
         runq_envelope_basis    => $runq_envelope_basis,
         micro_expansion_note   => $micro_expansion_note,
     };
+}
+
+# The tier guarantee floor of one profile as a function of the VP count, for
+# the current-cycle pair (v10 step 3b correction): the profile's guarantee
+# demand and dispatch budget at reach min(VPs, pool). Uncapped LPARs only;
+# undef when the sizing recorded no demand or budget.
+sub _profile_tier_floor
+{
+    my ($dbg, $cfg) = @_;
+    return undef unless (ref($dbg) eq 'HASH' && ref($cfg) eq 'HASH' && !($cfg->{is_capped} // 0));
+    my ($demand, $budget) = ($dbg->{'GuaranteeDemand'}, $dbg->{'DispatchBudgetFraction'});
+    return undef unless (defined $demand && looks_like_number($demand) && $demand > 0
+                         && defined $budget && looks_like_number($budget));
+    my $pool = (defined $cfg->{pool_cpu} && looks_like_number($cfg->{pool_cpu}) && $cfg->{pool_cpu} > 0) ? $cfg->{pool_cpu} + 0 : undef;
+    return sub
+    {
+        my ($vps) = @_;
+        return undef unless (defined $vps && $vps >= 1);
+        my $reach = (defined $pool && $pool < $vps) ? $pool : $vps;
+        my ($floor) = _tier_guarantee_floor($demand + 0, $reach, 0, $budget + 0, 'current cycle');
+        return $floor;
+    };
+}
+
+# Whether a sizing widened the VP envelope on dispatch evidence beyond the
+# entitlement's own VP range (micro-partition floor or RunQ override).
+sub _profile_widened
+{
+    my ($dbg) = @_;
+    return 0 unless (ref($dbg) eq 'HASH');
+    return 1 if (defined $dbg->{'MicroPartitionEnvExpansion'} && $dbg->{'MicroPartitionEnvExpansion'} ne '');
+    return (($dbg->{'rVCPU_RunQEnvelopeOverride'} // 'No') eq 'Yes') ? 1 : 0;
 }
 
 sub calculate_runq_modified_physc
@@ -8277,7 +8361,7 @@ sub calculate_runq_modified_physc
     $debug_info{'TacticalExceedsStrategic'} = $tactical_exceeds_strategic ? 1 : 0;
     if ($tactical_exceeds_strategic) {
         $debug_info{'TacticalExceedsStrategicNote'} = sprintf(
-            "Tactical (%.4f cores) exceeds Strategic (%.4f cores). Raise MaxCPU before implementing Tactical.",
+            "Tactical (%.4f cores) exceeds Strategic (%.4f cores): raise the VPs or the pool (capped: the entitlement) before implementing Tactical.",
             $final_tactical_modifier, $strategic_val
         );
     }
@@ -8366,6 +8450,17 @@ sub calculate_runq_modified_physc
         {
             $debug_info{'CutProtectionApplied'} = sprintf('Yes: raised %.4f -> %.2f (share %.2f)', $calculated_demand, $cp_bound, $cp_share);
             $calculated_demand = $cp_bound;
+        }
+    }
+
+    # Dispatch width reference (v10 step 3b correction): see %WIDTH_FLOOR.
+    if (!$dispatch_widening_suspended && $WIDTH_FLOOR{$vm_name})
+    {
+        my $wf = ($WIDTH_FLOOR{$vm_name}{$profile_name} // {})->{ $cut_protection_suspended ? 'unprotected' : 'protected' };
+        if (defined $wf && $wf > $calculated_demand + $FLOAT_EPSILON)
+        {
+            $debug_info{'WidthReferenceApplied'} = sprintf('%.4f -> %.4f', $calculated_demand, $wf);
+            $calculated_demand = $wf;
         }
     }
 
@@ -8715,6 +8810,7 @@ sub calculate_runq_modified_physc
             $conv_pre_rent      = $rENT_P_for_envelope;
             {
                 my $pre = _strategic_rvcpu_envelope({
+                    no_widening          => $dispatch_widening_suspended,
                     rent_p               => $rENT_P,
                     rent_for_envelope    => $conv_pre_rent,
                     rvcpu_raw            => $rvcpu_raw,
@@ -8753,6 +8849,7 @@ sub calculate_runq_modified_physc
             while (defined $conv_trial) {
                 $conv_iters++;
                 my $s = _strategic_rvcpu_envelope({
+                    no_widening          => $dispatch_widening_suspended,
                     rent_p               => $conv_trial,
                     rent_for_envelope    => $conv_trial,
                     rvcpu_raw            => $rvcpu_raw,
@@ -8858,6 +8955,7 @@ sub calculate_runq_modified_physc
             # the final strategic pair.
             # ------------------------------------------------------------------
             my $strat = _strategic_rvcpu_envelope({
+                no_widening          => $dispatch_widening_suspended,
                 rent_p               => $rENT_P,
                 rent_for_envelope    => $rENT_P_for_envelope,
                 rvcpu_raw            => $rvcpu_raw,
@@ -15474,6 +15572,11 @@ sub _write_standard_csv_report {
         if (scalar(@vm_comment_tags) > $CPU_FLATLINING_MAX_TAGS) {
             @vm_comment_tags = @vm_comment_tags[0 .. ($CPU_FLATLINING_MAX_TAGS - 1)];
         }
+        # An implausible run queue (XRQ) on any profile leads the tags: the
+        # queue-based part of the figures needs the cause found first.
+        unshift @vm_comment_tags, '[XRQ]'
+            if (grep { (($core->{ProfileDebugInfo}{ $_->{name} } // {})->{'RunQ_Potential'} // '') =~ /ANOMALY\s*\(XRQ\)/i }
+                grep { defined $_->{name} && $_->{name} ne '' } @csv_visible_profiles);
         my $vm_comments_str = join("; ", @vm_comment_tags);
         push @data_row_csv, $vm_comments_str;
 
@@ -15502,6 +15605,7 @@ sub _write_standard_csv_report {
                 current_ent => $numeric_cell->('Current - ENT'),
                 current_vp  => $numeric_cell->('Current - VCPU'),
                 pool_size   => ($pool_is_user_defined ? $cfg->{pool_cpu} : undef),
+                tier_floor  => _profile_tier_floor($core->{ProfileDebugInfo}{$name}, $cfg),
             });
         }
         $vm_map_ref->{CoreResults}{Profile_CurrentCycle} = \%cycle_pairs;
@@ -15533,6 +15637,15 @@ sub _write_standard_csv_report {
                     $cp_dbg->{CutProtectionLimited},
                     _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
                     $minutes, ($minutes == 1 ? '' : 's'), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''));
+            }
+            # XRQ on the planning profile: an increase rests on a run queue far
+            # beyond today's limit; its cause is found before the increase is applied.
+            my $cp_pair = $cycle_pairs{$planning_profile_name};
+            if (ref($cp_dbg) eq 'HASH' && ($cp_dbg->{'RunQ_Potential'} // '') =~ /ANOMALY\s*\(XRQ\)/i && ref($cp_pair) eq 'HASH'
+                && ((defined $cp_pair->{Ent} && defined $numeric_cell->('Current - ENT') && $cp_pair->{Ent} > $numeric_cell->('Current - ENT') + 0.005)
+                    || (defined $cp_pair->{VP} && defined $numeric_cell->('Current - VCPU') && $cp_pair->{VP} > $numeric_cell->('Current - VCPU'))))
+            {
+                $action .= ($action ne '' ? ' ' : '') . 'The run queue is implausibly high (XRQ): find the cause before applying the increase.';
             }
             # Seasonal and predictive reports size an event window, not the
             # standing configuration.
