@@ -624,6 +624,11 @@ my %POOL_REDUCTION = (
 my $pool_exposure_flag;
 # --[no-]cut-protection: limit cuts by the contested busy evidence (v10 stage 3.3; default on).
 my $cut_protection_flag;
+# --research-no-peak-uplift (research only): the tier's pool-borrowing rule does
+# not raise an uncapped LPAR's entitlement towards its peak. The profile, growth,
+# RunQ adjustments, cut protection, roles, platform limits and all VP sizing are
+# unchanged. What the rule would have added is recorded (proposal: tierFloor).
+my $research_no_peak_uplift;
 my ($candidate_test, $candidate_window, $candidate_snapshot);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
@@ -749,6 +754,7 @@ GetOptions(
     'candidate-window=s' => \$candidate_window,
     'pool-exposure!'             => \$pool_exposure_flag,
     'cut-protection!'            => \$cut_protection_flag,
+    'research-no-peak-uplift'    => \$research_no_peak_uplift,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
@@ -7115,6 +7121,22 @@ sub _strategic_rvcpu_envelope
     };
 }
 
+# What the tier's pool-borrowing rule did to one profile, for the stored
+# proposal: the entitlement before it, the first floor it asked for, the demand
+# it protected and where that demand came from, and whether it was applied or
+# withheld (--research-no-peak-uplift). Empty when the rule did not bind.
+sub _tier_floor_record
+{
+    my ($dbg) = @_;
+    return () unless (ref($dbg) eq 'HASH' && defined $dbg->{'TierFloorValue'});
+    return (tierFloor => {
+        own => 0 + $dbg->{'TierFloorOwn'}, floor => 0 + $dbg->{'TierFloorValue'},
+        demand => (looks_like_number($dbg->{'GuaranteeDemand'} // '') ? 0 + $dbg->{'GuaranteeDemand'} : undef),
+        demandSource => $dbg->{'GuaranteeDemandSource'}, budget => $dbg->{'DispatchBudgetFraction'},
+        withheld => ($dbg->{'TierFloorWithheld'} ? JSON::true : JSON::false),
+    });
+}
+
 # The tier guarantee floor of one profile as a function of the VP count, for
 # the current-cycle pair (v10 step 3b correction): the profile's guarantee
 # demand and dispatch budget at reach min(VPs, pool). Uncapped LPARs only;
@@ -7123,6 +7145,7 @@ sub _profile_tier_floor
 {
     my ($dbg, $cfg) = @_;
     return undef unless (ref($dbg) eq 'HASH' && ref($cfg) eq 'HASH' && !($cfg->{is_capped} // 0));
+    return undef if $research_no_peak_uplift;
     my ($demand, $budget) = ($dbg->{'GuaranteeDemand'}, $dbg->{'DispatchBudgetFraction'});
     return undef unless (defined $demand && looks_like_number($demand) && $demand > 0
                          && defined $budget && looks_like_number($budget));
@@ -8427,9 +8450,16 @@ sub calculate_runq_modified_physc
     $debug_info{'BudgetFloorApplied'} = 'No';
 
     if (defined $budget_floor_cores && $budget_floor_cores > $calculated_demand + $FLOAT_EPSILON) {
+        $debug_info{'TierFloorOwn'}   //= sprintf("%.4f", $calculated_demand);
+        $debug_info{'TierFloorValue'}   = sprintf("%.4f", $budget_floor_cores);
+        if ($research_no_peak_uplift && !$is_capped_lpar) {
+            $debug_info{'TierFloorWithheld'} = 1;
+            $debug_info{'BudgetFloorApplied'} = sprintf("Withheld (research): %.4f -> %.4f cores", $calculated_demand, $budget_floor_cores);
+        } else {
         $debug_info{'BudgetFloorApplied'} = sprintf("Yes: raised %.4f -> %.4f cores (+%.4f)",
             $calculated_demand, $budget_floor_cores, $budget_floor_cores - $calculated_demand);
         $calculated_demand = $budget_floor_cores;
+        }
     }
 
     # Cut protection (v10 stage 3.3; plan 5.1): a cut may add no observed
@@ -8905,6 +8935,15 @@ sub calculate_runq_modified_physc
 
                 last unless (defined $conv_floor && $conv_floor > $conv_trial + $FLOAT_EPSILON);
 
+                $debug_info{'TierFloorOwn'}   //= sprintf("%.4f", $conv_trial);
+                $debug_info{'TierFloorValue'}   = sprintf("%.4f", $conv_floor);
+                if ($research_no_peak_uplift && !$is_capped_lpar) {
+                    $debug_info{'TierFloorWithheld'} = 1;
+                    $conv_stop = 'peak uplift withheld (research)';
+                    $debug_info{'BudgetFloorApplied'} = sprintf("Withheld (research): %.4f -> %.4f cores", $conv_trial, $conv_floor);
+                    last;
+                }
+
                 my $raised = _ceil_to_granule($conv_floor, $ent_granule);
                 if (!defined $raised || $raised <= $conv_trial + $FLOAT_EPSILON) {
                     $conv_stop = 'no progress at granule';
@@ -9001,6 +9040,10 @@ sub calculate_runq_modified_physc
                 $is_capped_lpar, $dispatch_budget, $final_tier);
             $debug_info{'GuaranteeInvariantHolds'} = !defined($conv_inv_ok) ? 'N/A'
                                                    : ($conv_inv_ok ? 'Yes' : 'No');
+            # Research: the withheld uplift must not change the VP logic, which
+            # reads a failed invariant as a reason to hold a VP reduction.
+            $debug_info{'GuaranteeInvariantHolds'} = 'N/A'
+                if ($debug_info{'TierFloorWithheld'} && defined $conv_inv_ok && !$conv_inv_ok);
             $debug_info{'GuaranteeInvariant'}      = $conv_inv_msg;
 
             my @conv_impl_blocks;
@@ -15667,6 +15710,7 @@ sub _write_standard_csv_report {
                     recommendedVPs => $numeric_cell->("${name}_rVCPU"),
                     entitlementBoundedVPs => $numeric_cell->("${name}_rVCPU_EntBounded"),
                     tacticalVPs => $numeric_cell->("${name}_rVCPU_Tactical"),
+                    _tier_floor_record($core->{ProfileDebugInfo}{$name}),
                     currentCycle => {
                         entitlement => $pair->{Ent},
                         VPs         => $pair->{VP},
@@ -24866,6 +24910,17 @@ sub _protection_loss_trackers
             next unless (ref($rec) eq 'HASH' && $rec->{cut});
             my %levels = (target => $rec->{target}, installed => $meta->{entitlement},
                           map { ($_ => $rec->{adjusted}{$_}) } qw(busy ladder consumed));
+            # Research (--research-no-peak-uplift): where the tier's borrowing
+            # rule was withheld, also score the level it would have kept: its
+            # floor, within installed and never below the protected level.
+            my $tf = ((($members->{$vm} // {})->{profiles} // {})->{$profile} // {})->{tierFloor};
+            if (ref($tf) eq 'HASH' && $tf->{withheld} && looks_like_number($tf->{floor} // ''))
+            {
+                my $rule = int($tf->{floor} * 100 + 0.999999) / 100;
+                $rule = $meta->{entitlement} if (defined $meta->{entitlement} && $rule > $meta->{entitlement});
+                $rule = $levels{ladder} if (defined $levels{ladder} && $levels{ladder} > $rule);
+                $levels{rule} = $rule;
+            }
             foreach my $label (sort keys %levels)
             {
                 next unless (defined $levels{$label} && looks_like_number($levels{$label}));
@@ -26945,6 +27000,10 @@ Model behaviour depends on the event configuration:
                                               target is raised to the highest protected level seen while the LPAR's
                                               pool was scarce and other LPARs were busy, never above installed; see the
                                               "Cut Protection" section. --no-cut-protection leaves the cuts as sized.
+
+  --research-no-peak-uplift                 : Research only. The tier's pool-borrowing rule does not raise an uncapped
+                                              LPAR's entitlement towards its peak; what it would have added is recorded
+                                              in the stored proposal. Not for recommendations.
 
   --[no-]pool-exposure                      : Standard runs: add an "Entitlement Cut Exposure" section to the
                                               rationale for each LPAR whose planning-profile entitlement is below its

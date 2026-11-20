@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/peak-uplift-report
+# PURPOSE  : Research report for the tier's pool-borrowing rule (the peak-derived
+#            entitlement uplift). Reads the records of a replay made with
+#            --research-no-peak-uplift (dev/protection-replay --records-only)
+#            and reports, for every profile where the rule was withheld:
+#              - the entitlement with the rule and without it (both after cut
+#                protection), and what the difference releases;
+#              - the later contested busy exposure at both levels;
+#              - whether cut protection still limits the cut;
+#              - the current-cycle pair.
+#            Planning profiles are totalled per tier. Alternative profiles are
+#            scenarios of the same LPAR and are listed, never added together.
+# USAGE    : dev/peak-uplift-report [--in DIR] (default design/acceptance/no-peak-uplift)
+# OUTPUT   : <in>/peak-uplift-report.md (research labels only)
+# ==============================================================================
+import argparse
+import collections
+import json
+import subprocess
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def loss(rec, plan):
+    level = (rec.get('later') or {}).get(plan) or {}
+    busy = level.get('busy') or {}
+    return level.get('level'), busy.get('minutes', 0), busy.get('coreMinutes', 0.0), busy.get('days', 0)
+
+
+def rows(records):
+    out = []
+    for r in records:
+        tf = r.get('tierFloor') or {}
+        if not tf.get('withheld'):
+            continue
+        with_rule, rule_min, rule_core, rule_days = loss(r, 'rule')
+        without, new_min, new_core, new_days = loss(r, 'ladder')
+        if with_rule is None or without is None:
+            continue
+        out.append({
+            'member': r['member'], 'profile': r['profile'], 'tier': r.get('tier'), 'planning': bool(r.get('planning')),
+            'installed': r.get('installed'), 'vps': r.get('installedVPs'), 'profileTarget': r.get('target'),
+            'demand': tf.get('demand'), 'source': tf.get('demandSource'), 'budget': tf.get('budget'),
+            'withRule': with_rule, 'without': without, 'released': round(with_rule - without, 2),
+            'protected': (r.get('adjusted') or {}).get('ladder', 0) > (r.get('target') or 0) + 0.005,
+            'ruleMin': rule_min, 'ruleCore': rule_core, 'newMin': new_min, 'newCore': new_core, 'newDays': new_days,
+            'pair': r.get('pair') or {},
+        })
+    return out
+
+
+def table(lines, header, body):
+    lines.append('| ' + ' | '.join(header) + ' |')
+    lines.append('|' + '|'.join('---' for _ in header) + '|')
+    lines.extend('| ' + ' | '.join(str(c) for c in row) + ' |' for row in body)
+    lines.append('')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--in', dest='src', default=str(REPO / 'design' / 'acceptance' / 'no-peak-uplift'))
+    a = ap.parse_args()
+    src = Path(a.src)
+    data = json.loads((src / 'protection-replay.json').read_text())
+    found = [x for x in rows(data['records']) if x['released'] > 0.005]
+    planning = [x for x in found if x['planning']]
+    lines = ['# Peak-derived entitlement uplift: with the rule and without it', '',
+             f'Generated {data["generated"]}; commit {str(data["commit"])[:7]}; options {" ".join(data.get("profileArgs") or []) or "none"}.',
+             f'Systems: {", ".join(s["system"] for s in data["systems"])}. Sized on the training window, scored on the later one.', '',
+             'Both entitlements are after cut protection. "With the rule" is the level the tier\'s pool-borrowing rule',
+             'would have kept (its first floor, within installed). Exposure is busy work (PhysB) above the level in',
+             'later minutes when the pool was contested. Alternative profiles are not added together.', '',
+             f'Profiles where the rule would have kept more: {len(found)} ({len(planning)} planning, '
+             f'{len(found) - len(planning)} alternative) on {len({x["member"] for x in found})} LPARs.', '']
+
+    lines += ['## 1. Planning profiles, per tier', '']
+    by_tier = collections.defaultdict(list)
+    for x in planning:
+        by_tier[str(x['tier'])].append(x)
+    table(lines, ['Tier', 'LPARs', 'Entitlement with the rule', 'Without', 'Released', 'Later exposure with the rule (min / core-min)',
+                  'Without (min / core-min)', 'LPARs with any later exposure', 'Still limited by cut protection'],
+          [[t, len(v), f'{sum(x["withRule"] for x in v):.2f}', f'{sum(x["without"] for x in v):.2f}',
+            f'{sum(x["released"] for x in v):.2f}', f'{sum(x["ruleMin"] for x in v)} / {sum(x["ruleCore"] for x in v):.2f}',
+            f'{sum(x["newMin"] for x in v)} / {sum(x["newCore"] for x in v):.2f}',
+            sum(1 for x in v if x['newMin'] > 0), sum(1 for x in v if x['protected'])]
+           for t, v in sorted(by_tier.items())])
+
+    lines += ['## 2. What raised the demand the rule protected', '']
+    sources = collections.Counter((x['source'] or 'unknown') for x in found)
+    table(lines, ['Demand source', 'Profiles'], [[k, n] for k, n in sources.most_common()])
+
+    def detail(title, items):
+        lines.extend([title, ''])
+        table(lines, ['LPAR', 'Profile', 'Installed (ENT / VPs)', 'Profile figure', 'Demand the rule used', 'With the rule', 'Without',
+                      'Released', 'Later exposure without (min / core-min / days)', 'With the rule (min / core-min)',
+                      'Cut protection limits', 'Current-cycle pair'],
+              [[x['member'], x['profile'], f'{x["installed"]} / {x["vps"]}', x['profileTarget'],
+                f'{x["demand"]:.2f}' if isinstance(x['demand'], (int, float)) else 'n/a', x['withRule'], x['without'], x['released'],
+                f'{x["newMin"]} / {x["newCore"]:.2f} / {x["newDays"]}', f'{x["ruleMin"]} / {x["ruleCore"]:.2f}',
+                'yes' if x['protected'] else 'no',
+                f'{x["pair"].get("entitlement")} / {x["pair"].get("VPs")} {x["pair"].get("status") or ""}']
+               for x in items])
+
+    detail('## 3. Planning profiles, largest release first',
+           sorted(planning, key=lambda x: (-x['released'], x['member'])))
+    alternatives = [x for x in found if not x['planning']]
+    exposed = [x for x in alternatives if x['newMin'] > x['ruleMin']]
+    lines += ['## 4. Alternative profiles', '',
+              f'{len(alternatives)} alternative profiles; {len(exposed)} have more later contested exposure without the rule.', '']
+    detail('### 4.1 Alternatives with added later exposure', sorted(exposed, key=lambda x: (-(x['newCore'] - x['ruleCore']), x['member'])))
+    detail('### 4.2 The 30 largest releases among the others',
+           sorted((x for x in alternatives if x not in exposed), key=lambda x: (-x['released'], x['member']))[:30])
+
+    # Increases the rule would have made: not cuts, so nothing to score later.
+    raises = []
+    for r in data['records']:
+        tf = r.get('tierFloor') or {}
+        inst, new = r.get('installed'), r.get('published')
+        if tf.get('withheld') and isinstance(inst, (int, float)) and isinstance(tf.get('floor'), (int, float)) \
+                and tf['floor'] > inst + 0.005 and tf['floor'] > (new or 0) + 0.005:
+            raises.append((r['member'], r['profile'], 'planning' if r.get('planning') else 'alternative', inst, new,
+                           round(tf['floor'], 2), f'{tf["demand"]:.2f}' if isinstance(tf.get('demand'), (int, float)) else 'n/a',
+                           tf.get('demandSource')))
+    lines += ['## 5. Entitlement above installed that only the rule asked for', '',
+              f'{len(raises)} profiles ({sum(1 for x in raises if x[2] == "planning")} planning). Without the rule the figure is the',
+              'published one; these are not cuts, so the later period cannot score them.', '']
+    table(lines, ['LPAR', 'Profile', 'Kind', 'Installed', 'Without the rule', 'With the rule (first floor)', 'Demand the rule used', 'Source'],
+          sorted(raises, key=lambda x: (x[2] != 'planning', -(x[5] - (x[4] or 0))))[:40])
+
+    target = src / 'peak-uplift-report.md'
+    target.write_text('\n'.join(lines) + '\n')
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

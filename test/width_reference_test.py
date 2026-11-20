@@ -36,7 +36,7 @@ def perl_ready():
             subprocess.run(['perl', '-MJSON', '-MList::MoreUtils', '-e1'], capture_output=True).returncode == 0)
 
 
-def run(ent, vps, capped, physc, runq, tier):
+def run(ent, vps, capped, physc, runq, tier, *extra):
     """Size one synthetic LPAR (pool 32, SMT8); returns (process, CSV row, log)."""
     root = tempfile.mkdtemp(prefix='width-ref-')
     try:
@@ -72,7 +72,7 @@ def run(ent, vps, capped, physc, runq, tier):
         with open(os.path.join(cache, '.nfit_stage_id'), 'w') as fh:
             fh.write('synthetic\n')
         proc = subprocess.run(['perl', os.path.join(root, 'nfit-profile'), '--runq-perc-behavior=match',
-                               '--enddate', last, '--nmondir', cache], capture_output=True, text=True, timeout=600, cwd=root)
+                               '--enddate', last, '--nmondir', cache, *extra], capture_output=True, text=True, timeout=600, cwd=root)
         row, log = {}, ''
         csvs = [f for f in glob.glob(os.path.join(root, 'output', '*.csv')) if '.decisions.' not in f]
         if csvs:
@@ -116,6 +116,7 @@ class WidthReferenceTests(unittest.TestCase):
         def runq(e, h):
             return 6.0 + 0.5 * math.sin(e / 333.0) if 8 <= h < 18 else 0.3
         cls.proc, cls.row, cls.log = run(0.70, 1, 0, physc, runq, 'O3')
+        cls.research = run(0.70, 1, 0, physc, runq, 'O3', '--research-no-peak-uplift')
 
     def test_run_succeeds(self):
         self.assertEqual(self.proc.returncode, 0, self.proc.stderr[-1500:])
@@ -128,6 +129,18 @@ class WidthReferenceTests(unittest.TestCase):
             self.assertGreater(reference, own, profile)
             self.assertAlmostEqual(float(self.row[profile]), reference, places=2, msg=profile)
         self.assertIn('not room to borrow. A policy limit, not a measured need.', self.log)
+
+    def test_research_switch_withholds_the_peak_uplift_only(self):
+        proc, row, log = self.research
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
+        self.assertIn('Withheld (research)', log)
+        self.assertNotIn('Dispatch width reference', log)             # nothing left for width to lower
+        lower = 0
+        for name in (k for k in self.row if PROFILE.match(k)):
+            self.assertLessEqual(float(row[name]), float(self.row[name]) + 1e-9, name)
+            lower += float(row[name]) < float(self.row[name]) - 0.005
+            self.assertEqual(row[name + '_rVCPU'], self.row[name + '_rVCPU'], name) if name + '_rVCPU' in row else None
+        self.assertGreater(lower, 0)
 
     def test_current_cycle_pairs_are_valid(self):
         for name in (k for k in self.row if PROFILE.match(k)):
