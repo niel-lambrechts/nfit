@@ -21,7 +21,7 @@ for my $constant (qw($POOL_TRIAL_MIN_MINUTES $POOL_TRIAL_MIN_DAYS))
     $src =~ /^(my \Q$constant\E\s*=.*?;)/m or die "could not extract $constant\n";
     $code .= "$1\n";
 }
-for my $name (qw(_pool_use_findings _pool_use_report _pool_quantile _pool_units_text))
+for my $name (qw(_pool_use_findings _pool_use_resolve _pool_use_report _pool_quantile _pool_units_text))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n\n";
@@ -42,6 +42,7 @@ my $tracker = sub
     my ($vm, $pool_id, $population, @per_day) = @_;
     my $day = 0;
     return { vm => $vm, pool => $pool_id, population => $population,
+             profiles => [ { none => 'G3-95W15', online => 'O3-95W15', batch => 'B3-95W15' }->{$population} ],
              daily => { map { (++$day => { expected => 1440, aboveLocalFull => $_ }) } @per_day } };
 };
 my @busy = ((2.0) x 900, (3.5) x 60, (4.0) x 40);
@@ -67,7 +68,7 @@ ok(!exists $found->{0}, 'the default pool is left to the frame check');
 
 my $report = UUT::_pool_use_report(undef, $found, []);
 is(scalar(@{ $report->{Actions} }), 1, 'one action');
-like($report->{Actions}[0], qr/^Pool 7: trial increase of the pool maximum from 4 to 5 processing units, then re-measure\. The pool was at its maximum of 4 in 40 minutes on 3 days, with busy work above entitlement on 2 LPARs \(lpA, lpD\)\. A trial, not a measured requirement\. Check licensing\.$/,
+like($report->{Actions}[0], qr/^Pool 7: trial increase of the pool maximum from 4 to 5 processing units, then re-measure\. The pool was at its maximum of 4 in 40 minutes on 3 days, with busy work above entitlement on 2 LPARs in their profile hours \(lpA, lpD\)\. A trial, not a measured requirement\. Check licensing\.$/,
     'the trial is one processing unit, labelled as a trial');
 like($report->{Members}{lpA}, qr/^Pool 7 was at its maximum with this LPAR's busy work above its entitlement on 20 minutes over 2 days: a trial increase of the pool to 5 is recommended\.$/,
     'the pressured LPAR carries the sentence for its action');
@@ -85,6 +86,24 @@ is(scalar(@{ $report->{Actions} }), 0, 'no trial where the members already requi
 is(scalar(grep { /^Pool 7 was at its maximum.*The pool increase its members' entitlements require covers this; re-measure after it\.$/ } @{ $report->{Observed} }), 1,
     'the pressure is still stated, with the structural increase named as the answer');
 ok(!%{ $report->{Members} }, 'and no LPAR carries the trial sentence');
+
+# An LPAR is read in the hours of its planning profile: lpO is busy above its entitlement at
+# night while the pool is full (all hours: 30 minutes on 3 days), but on an online profile its
+# own hours show 4 minutes on one day. That is reported and does not count towards a trial.
+{
+    my $hours = UUT::_pool_use_findings({ 7 => $pool->(4, 40, 3, 25, @busy) },
+        [ $tracker->('lpO', 7, 'none', 10, 10, 10), $tracker->('lpO', 7, 'online', 4, 0, 0) ]);
+    is($hours->{7}{Verdict}, 'trial', 'profile unknown: the widest hours are used');
+    my $r = UUT::_pool_use_report(undef, $hours, [ { PoolId => 7, RequiredMax => 3, RequiredMaxCycle => 3,
+                                                    Members => [ { Vm => 'lpO', PlanningProfile => 'O3-95W15' } ] } ]);
+    is($hours->{7}{Verdict}, 'fullNoPressure', 'on its online profile the LPAR was not pressured often enough');
+    is(scalar(@{ $r->{Actions} }), 0, 'no trial from busy work outside the profile hours');
+    like($r->{Observed}[0], qr/Busy work was above entitlement in those minutes on 1 LPAR \(most: lpO, 4 minutes on 1 day\)\. Outside their profile hours, 1 LPAR had busy work above entitlement in those minutes; this is reported, not acted on\./,
+         'the minutes inside and outside its hours are both stated');
+    $r = UUT::_pool_use_report(undef, $hours, [ { PoolId => 7, RequiredMax => 3, RequiredMaxCycle => 3,
+                                                 Members => [ { Vm => 'lpO', PlanningProfile => 'G3-95W15' } ] } ]);
+    is(scalar(@{ $r->{Actions} }), 1, 'on an all-hours profile the same LPAR supports the trial');
+}
 
 # Pool full and frame without spare cores in the same minutes: both are named.
 {

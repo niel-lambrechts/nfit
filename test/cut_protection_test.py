@@ -186,7 +186,7 @@ class CutProtectionTest(unittest.TestCase):
             [p for p in self.outputs('.csv') if '.decisions.' not in p.name][0].read_text(encoding='utf-8').splitlines())}
         flat = ' '.join(log.split())
         self.assertRegex(flat, r'Pool 7: trial increase of the pool maximum from 4 to 5 processing units, then re-measure\. The pool was at '
-                               r'its maximum of 4 in \d+ minutes on 2 days, with busy work above entitlement on 1 LPAR \(vmA\)\. A trial, '
+                               r'its maximum of 4 in \d+ minutes on 2 days, with busy work above entitlement on 1 LPAR in its profile hours \(vmA\)\. A trial, '
                                r'not a measured requirement\. Check licensing\.')
         self.assertRegex(rows['vmA']['NFIT - Action'], r"Pool 7 was at its maximum with this LPAR's busy work above its entitlement on \d+ "
                                                        r'minutes? over 2 days: a trial increase of the pool to 5 is recommended\.$')

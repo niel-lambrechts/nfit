@@ -14607,14 +14607,30 @@ sub _pool_use_findings
     my ($pool_use, $trackers) = @_;
     my %out;
     return \%out unless (ref($pool_use) eq 'HASH');
-    # One tracker per LPAR: all hours where there is one, else its widest hours.
-    my %widest;
+    # Per LPAR: the minutes and days its busy work was above its entitlement while its
+    # pool was at its maximum, for the hours of each of its profiles, and for its
+    # widest hours (all hours where it has them), kept under '*'.
+    my (%counts, %rank);
     foreach my $t (@{ $trackers // [] })
     {
-        my $expected = 0;
-        $expected += ($_->{expected} // 0) for values %{ $t->{daily} // {} };
+        my ($expected, $minutes, $days) = (0, 0, 0);
+        foreach my $acc (values %{ $t->{daily} // {} })
+        {
+            $expected += ($acc->{expected} // 0);
+            my $n = $acc->{aboveLocalFull} // 0;
+            next unless $n;
+            $minutes += $n;
+            $days++;
+        }
+        my $vm = $t->{vm};
+        $counts{$vm}{pool} = $t->{pool};
+        $counts{$vm}{$_} = [ $minutes, $days ] for @{ $t->{profiles} // [] };
         my $rank = (($t->{population} // '') eq 'none' ? 1e12 : 0) + $expected;
-        $widest{ $t->{vm} } = [ $rank, $t ] if (!$widest{ $t->{vm} } || $rank > $widest{ $t->{vm} }[0]);
+        if (!defined $rank{$vm} || $rank > $rank{$vm})
+        {
+            $rank{$vm} = $rank;
+            $counts{$vm}{'*'} = [ $minutes, $days ];
+        }
     }
     foreach my $pool (keys %$pool_use)
     {
@@ -14622,38 +14638,46 @@ sub _pool_use_findings
         my $use = $pool_use->{$pool};
         next unless ($use->{observed});
         my @sorted = sort { $a <=> $b } unpack('f<*', $use->{values});
-        # Pressured: above entitlement in the pool's full minutes (the same minutes, not
-        # merely the same period) often enough for a trial; seldom: fewer such minutes,
-        # kept as evidence.
-        my (@pressured, @seldom);
-        foreach my $vm (sort keys %widest)
-        {
-            my $t = $widest{$vm}[1];
-            next unless (defined $t->{pool} && $t->{pool} == $pool);
-            my ($minutes, $days) = (0, 0);
-            foreach my $acc (values %{ $t->{daily} // {} })
-            {
-                my $n = $acc->{aboveLocalFull} // 0;
-                next unless $n;
-                $minutes += $n;
-                $days++;
-            }
-            next unless $minutes;
-            if ($minutes >= $POOL_TRIAL_MIN_MINUTES && $days >= $POOL_TRIAL_MIN_DAYS) { push @pressured, { vm => $vm, minutes => $minutes, days => $days }; }
-            else                                                                      { push @seldom,    { vm => $vm, minutes => $minutes, days => $days }; }
-        }
         my $full_days = scalar(keys %{ $use->{days} });
-        my $recurs = ($use->{full} >= $POOL_TRIAL_MIN_MINUTES && $full_days >= $POOL_TRIAL_MIN_DAYS) ? 1 : 0;
         my @sizes = sort { $a <=> $b } keys %{ $use->{sizes} };
-        $out{ $pool + 0 } = {
+        $out{ $pool + 0 } = _pool_use_resolve({
             Maximum => $use->{size}, MaximumChanged => (@sizes > 1 ? [ $sizes[0] + 0, $sizes[-1] + 0 ] : undef),
             Observed => $use->{observed}, Full => $use->{full}, FullDays => $full_days, Longest => $use->{longest},
             P50 => _pool_quantile(\@sorted, 0.50), P95 => _pool_quantile(\@sorted, 0.95), P99 => _pool_quantile(\@sorted, 0.99),
-            Peak => $sorted[-1], Pressured => \@pressured, Seldom => \@seldom, FullFrameScarce => $use->{fullFrameScarce} // 0,
-            Verdict => (!$use->{full} ? 'open' : !$recurs ? 'fullRarely' : @pressured ? 'trial' : 'fullNoPressure'),
-        };
+            Peak => $sorted[-1], FullFrameScarce => $use->{fullFrameScarce} // 0,
+            Members => { map { ($_ => $counts{$_}) } grep { defined $counts{$_}{pool} && $counts{$_}{pool} == $pool } keys %counts },
+        }, {});
     }
     return \%out;
+}
+
+# Reads a pool's member counts in each LPAR's profile hours: the hours of its
+# planning profile where that is known ($planning_of: LPAR => profile), else
+# its widest hours. nFit forms its conclusions about an LPAR from the hours of
+# its workload profile; busy work above entitlement outside them is reported
+# (Outside) and does not count towards a trial.
+#   Pressured: often enough for a trial; Seldom: fewer such minutes, kept as
+#   evidence. Sets the verdict.
+sub _pool_use_resolve
+{
+    my ($u, $planning_of) = @_;
+    my (@pressured, @seldom, @outside);
+    foreach my $vm (sort keys %{ $u->{Members} // {} })
+    {
+        my $m = $u->{Members}{$vm};
+        my $profile = (ref($planning_of) eq 'HASH') ? $planning_of->{$vm} : undef;
+        my $in_hours = (defined $profile && ref($m->{$profile}) eq 'ARRAY') ? $m->{$profile} : $m->{'*'};
+        my ($minutes, $days) = @{ $in_hours // [ 0, 0 ] };
+        my $elsewhere = ($m->{'*'} // [ 0, 0 ])->[0] - $minutes;
+        push @outside, { vm => $vm, minutes => $elsewhere } if ($elsewhere > 0);
+        next unless $minutes;
+        if ($minutes >= $POOL_TRIAL_MIN_MINUTES && $days >= $POOL_TRIAL_MIN_DAYS) { push @pressured, { vm => $vm, minutes => $minutes, days => $days }; }
+        else                                                                      { push @seldom,    { vm => $vm, minutes => $minutes, days => $days }; }
+    }
+    my $recurs = ($u->{Full} >= $POOL_TRIAL_MIN_MINUTES && $u->{FullDays} >= $POOL_TRIAL_MIN_DAYS) ? 1 : 0;
+    @{$u}{qw(Pressured Seldom Outside)} = (\@pressured, \@seldom, \@outside);
+    $u->{Verdict} = !$u->{Full} ? 'open' : !$recurs ? 'fullRarely' : @pressured ? 'trial' : 'fullNoPressure';
+    return $u;
 }
 
 # The "Pool Use" rationale section and the pool actions that follow from it.
@@ -14663,15 +14687,20 @@ sub _pool_use_findings
 sub _pool_use_report
 {
     my ($log_fh, $pool_use, $structural_pools) = @_;
+    # Each LPAR is read in the hours of its planning profile.
+    my %planning_of = map { ($_->{Vm} => $_->{PlanningProfile}) } grep { ref($_) eq 'HASH' && defined $_->{Vm} && defined $_->{PlanningProfile} }
+                      map { @{ $_->{Members} // [] } } grep { ref($_) eq 'HASH' } @{ $structural_pools // [] };
+    _pool_use_resolve($_, \%planning_of) for (ref($pool_use) eq 'HASH' ? values %$pool_use : ());
     my %result = (Actions => [], Observed => [], Members => {}, Covered => {});
     return \%result unless (ref($pool_use) eq 'HASH' && %$pool_use);
     my %required = map { ($_->{PoolId} => $_) } grep { ref($_) eq 'HASH' } @{ $structural_pools // [] };
     my $plural = sub { return $_[0] == 1 ? '' : 's'; };
     my @out = ('', '=' x 70, 'Pool Use', '=' x 70,
         "  Each user-defined pool's measured use against its maximum, in cores, over the analysis window.",
-        '  A pool that was repeatedly at its maximum while its LPARs had busy work above their entitlement',
-        '  gets a trial increase of one processing unit, then re-measurement: being full shows that demand',
-        '  was at least what was served, not how much more was wanted. No pool reduction is derived here.', '',
+        '  A pool that was repeatedly at its maximum while its LPARs had busy work above their entitlement,',
+        '  in the hours of their planning profiles, gets a trial increase of one processing unit, then',
+        '  re-measurement: being full shows that demand was at least what was served, not how much more',
+        '  was wanted. No pool reduction is derived here.', '',
         sprintf('    %-6s %8s %8s %8s %8s %8s  %s', 'Pool', 'Maximum', 'Median', 'P95', 'P99', 'Peak', 'At its maximum'),
         sprintf('    %-6s %8s %8s %8s %8s %8s  %s', '-' x 6, ('-' x 8) x 5, '-' x 30));
     foreach my $pool (sort { $a <=> $b } keys %$pool_use)
@@ -14689,6 +14718,9 @@ sub _pool_use_report
         my $seldom = @seldom ? sprintf(' Busy work was above entitlement in those minutes on %d LPAR%s (most: %s, %d minute%s on %d day%s).',
             scalar(@seldom), $plural->(scalar @seldom), $seldom[0]{vm}, $seldom[0]{minutes}, $plural->($seldom[0]{minutes}),
             $seldom[0]{days}, $plural->($seldom[0]{days})) : '';
+        my @outside = @{ $u->{Outside} // [] };
+        $seldom .= sprintf(' Outside their profile hours, %d LPAR%s had busy work above entitlement in those minutes; this is reported, not acted on.',
+            scalar(@outside), $plural->(scalar @outside)) if @outside;
         # Pool full and frame without spare cores in the same minutes: both need attention.
         my $frame = ($u->{FullFrameScarce} // 0)
             ? sprintf(' The frame had no spare cores in %d of those minute%s: check the frame\'s capacity as well.', $u->{FullFrameScarce},
@@ -14706,8 +14738,8 @@ sub _pool_use_report
             else
             {
                 push @{ $result{Actions} }, sprintf("Pool %s: trial increase of the pool maximum from %s to %s processing units, then re-measure. "
-                    . "The pool was %s, with busy work above entitlement on %d LPAR%s (%s). A trial, not a measured requirement. Check licensing.%s",
-                    $pool, $max, _pool_units_text($u->{Maximum} + 1), $full, scalar(@who), $plural->(scalar @who), $names, $frame);
+                    . "The pool was %s, with busy work above entitlement on %d LPAR%s in %s profile hours (%s). A trial, not a measured requirement. Check licensing.%s",
+                    $pool, $max, _pool_units_text($u->{Maximum} + 1), $full, scalar(@who), $plural->(scalar @who), (@who == 1 ? 'its' : 'their'), $names, $frame);
                 $result{Members}{ $_->{vm} } = sprintf('Pool %s was at its maximum with this LPAR\'s busy work above its entitlement on %d minute%s over %d day%s: '
                     . 'a trial increase of the pool to %s is recommended.', $pool, $_->{minutes}, $plural->($_->{minutes}), $_->{days},
                     $plural->($_->{days}), _pool_units_text($u->{Maximum} + 1)) for @who;
