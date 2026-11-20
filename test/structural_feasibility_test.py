@@ -225,7 +225,9 @@ class StructuralFeasibilityTests(unittest.TestCase):
                 self.assertIn(f'VPs {current_vp} to {vps}', action, vm)
                 self.assertIn('re-measure', action, vm)
             if vps > current_vp and ent > current_vp:          # VPs must rise before the entitlement
-                self.assertRegex(action, rf'^Raise VPs {current_vp} to {vps}, then raise entitlement', vm)
+                # The fixture's MaxCPU is the installed VP count, so the MaxCPU raise comes first (v10 step 3b).
+                self.assertRegex(action, rf'^Raise MaxCPU {current_vp:.2f} to at least {ent:.2f} first\. '
+                                         rf'Raise VPs {current_vp} to {vps}, then raise entitlement', vm)
             if abs(ent - current_ent) < 0.005 and vps == current_vp:
                 self.assertTrue(action.startswith('No change'), vm)
             self.assertIsNone(re.search(rf'^    {vm} \(', s, re.M), vm)   # nothing to list
