@@ -12065,7 +12065,7 @@ sub _assess_pool_entitlement_feasibility
         my @ceiling_values = sort { $a <=> $b } map { $_ + 0 } keys %ceiling_seen;
         my $ceiling = (scalar(@ceiling_values) == 1) ? $ceiling_values[0] : undef;
 
-        my ($installed_sum, $proposed_sum, $lowest_sum) = (0, 0, 0);
+        my ($installed_sum, $proposed_sum, $lowest_sum, $cycle_sum) = (0, 0, 0, 0);
         my ($installed_complete, $proposed_complete, $configured_count) = (1, 1, 0);
         my @rows;
         foreach my $member (@members)
@@ -12094,6 +12094,10 @@ sub _assess_pool_entitlement_feasibility
                 $proposed_complete = 0;
             }
 
+            # This cycle: the resolved current-cycle entitlement, else what it has.
+            my $cycle = _structural_shown_value($member->{cycle_ent}) // $current;
+            $cycle_sum += $cycle if (defined $cycle);
+
             my $lowest_used = $proposed_used;
             if (defined $lowest && (!defined $lowest_used || $lowest < $lowest_used))
             {
@@ -12109,6 +12113,7 @@ sub _assess_pool_entitlement_feasibility
                 TierSource      => $member->{tier_source},
                 Current         => $current,
                 Proposed        => $proposed,
+                Cycle           => $cycle,
                 Change          => (defined $current && defined $proposed) ? ($proposed - $current) : undef,
                 SumIfAlone      => undef,
                 FitsAlone       => undef,
@@ -12134,8 +12139,15 @@ sub _assess_pool_entitlement_feasibility
             CeilingValues           => \@ceiling_values,
             InstalledSum            => $installed_sum,
             ProposedSum             => $proposed_sum,
+            CycleSum                => $cycle_sum,
             LowestSum               => $lowest_sum,
             Shortfall               => 0,
+            CycleShortfall          => 0,
+            # The structural minimum of the pool maximum (plan 8.2 part 1): the
+            # members' entitlements in whole processing units, for the targets
+            # and for this cycle. The pool's reserve is not collected.
+            RequiredMax             => int($proposed_sum - $FLOAT_EPSILON) + 1,
+            RequiredMaxCycle        => int($cycle_sum - $FLOAT_EPSILON) + 1,
             LowestShortfall         => 0,
             InstalledExceedsCeiling => 0,
             InstalledComplete       => $installed_complete,
@@ -12154,6 +12166,10 @@ sub _assess_pool_entitlement_feasibility
             {
                 $pool{Status}    = 'SHORTFALL';
                 $pool{Shortfall} = $proposed_sum - $ceiling;
+            }
+            if ($cycle_sum > $ceiling + $STRUCTURAL_ENT_TOLERANCE)
+            {
+                $pool{CycleShortfall} = $cycle_sum - $ceiling;
             }
             if ($lowest_sum > $ceiling + $STRUCTURAL_ENT_TOLERANCE)
             {
@@ -14044,6 +14060,20 @@ sub _collect_structural_findings
             if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_HOLD)$/);
         $proposed = undef unless (defined $proposed && looks_like_number($proposed) && $proposed > 0);
 
+        # The pool plan (v10 stage 3.4, plan 8.2 part 1) counts what can be
+        # configured: this cycle's entitlement, and the target at no less than
+        # the platform minimum of its VPs.
+        my $planning_cycle = (defined $planning && ref($core->{Profile_CurrentCycle}) eq 'HASH')
+            ? $core->{Profile_CurrentCycle}{$planning} : undef;
+        $planning_cycle = $role_result->{Pair}
+            if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_HOLD)$/ && ref($role_result->{Pair}) eq 'HASH');
+        my $cycle_ent = (ref($planning_cycle) eq 'HASH' && looks_like_number($planning_cycle->{Ent} // '')) ? $planning_cycle->{Ent} + 0 : undef;
+        if (defined $proposed && ref($planning_cycle) eq 'HASH' && looks_like_number($planning_cycle->{TargetVP} // ''))
+        {
+            my $minimum = int($MIN_ENT_PER_VP * $planning_cycle->{TargetVP} * 100 + 0.5) / 100;
+            $proposed = $minimum if ($proposed < $minimum - 0.005);
+        }
+
         my $current_vp = $cfg->{virtual_cpus};
         my ($lowest, %pair_by_profile);
         foreach my $profile_name (@actionable)
@@ -14083,6 +14113,7 @@ sub _collect_structural_findings
             pool_cpu         => $cfg->{pool_cpu},
             current_ent      => $cfg->{entitlement},
             proposed_ent     => $proposed,
+            cycle_ent        => $cycle_ent,
             lowest_ent       => $lowest,
             planning_profile => $planning,
             tier_source      => $source,
@@ -14224,6 +14255,15 @@ sub _entitlement_totals
             {
                 ($target, $cycle_ent) = ($installed, $installed);
                 $totals{Held}++;
+            }
+            elsif (defined $planning && ref($core->{Profile_CurrentCycle}) eq 'HASH'
+                   && ref($core->{Profile_CurrentCycle}{$planning}) eq 'HASH'
+                   && looks_like_number($core->{Profile_CurrentCycle}{$planning}{TargetVP} // ''))
+            {
+                # The target is counted as it can be configured: no less than
+                # the platform minimum of its VPs (as NFIT - Action states it).
+                my $minimum = int($MIN_ENT_PER_VP * $core->{Profile_CurrentCycle}{$planning}{TargetVP} * 100 + 0.5) / 100;
+                $target = $minimum if ($target < $minimum - 0.005);
             }
 
             my $role = ($totals{RolesKnown} && defined $roles_href->{$vm_name}) ? $roles_href->{$vm_name} : '';
@@ -14395,16 +14435,10 @@ sub _log_structural_feasibility
             push @out, sprintf("    Pool %s - the proposed entitlements do not fit", $pool->{PoolId});
             push @out, sprintf("      %s cores proposed against a pool maximum of %s (%s).",
                 $proposed, _pool_units_text($pool->{Ceiling}), $context);
-            push @out, _rationale_wrap('Action: ' . _pool_shortfall_action($pool), '      ', '      ');
-            if ($pool->{LowestShortfall} > 0)
-            {
-                push @out, sprintf("      Even each LPAR's lowest profile totals %.2f cores, so no TIER choice fits within %s.",
-                    $pool->{LowestSum}, _pool_units_text($pool->{Ceiling}));
-            }
-            else
-            {
-                push @out, sprintf("      A lower TIER choice would fit: the lowest profiles total %.2f cores.", $pool->{LowestSum});
-            }
+            push @out, _rationale_wrap('Action: ' . ucfirst(_pool_shortfall_action($pool)), '      ', '      ');
+            push @out, _rationale_wrap(sprintf("Structural minimum of the pool maximum: %d processing units for this cycle's entitlements "
+                . "(%.2f cores), %d for the targets (%.2f cores). Reserve not included.", $pool->{RequiredMaxCycle}, $pool->{CycleSum},
+                $pool->{RequiredMax}, $pool->{ProposedSum}), '      ', '      ');
             $table = 1;
         }
         elsif ($pool->{Status} eq 'FITS')
@@ -14497,14 +14531,60 @@ sub _pool_units_text
     return (abs($value - int($value + 0.5)) < $FLOAT_EPSILON) ? sprintf('%d', int($value + 0.5)) : sprintf('%.2f', $value);
 }
 
-# The action for a pool whose proposed entitlements exceed its maximum. A
-# user-defined pool maximum is set in whole processing units.
+# The action for a pool whose members' entitlements exceed its maximum (v10
+# stage 3.4, plan 8.2 part 1). The members' requirements stand: the pool is
+# raised first, to the structural minimum in whole processing units. Where
+# only the targets exceed the maximum, this cycle's changes can go ahead.
 sub _pool_shortfall_action
 {
     my ($pool) = @_;
-    my $target = int($pool->{ProposedSum} - $FLOAT_EPSILON) + 1;
-    return sprintf("defer at least %.2f cores of the proposed increases, or raise the pool maximum from %s to at least %d processing units.",
-        $pool->{Shortfall}, _pool_units_text($pool->{Ceiling}), $target);
+    my $target = $pool->{RequiredMax} // (int($pool->{ProposedSum} - $FLOAT_EPSILON) + 1);
+    my $cycle  = $pool->{RequiredMaxCycle} // $target;
+    $cycle = $target if ($cycle > $target);
+    my $now = _pool_units_text($pool->{Ceiling});
+    my $care = 'Confirm the pool\'s reserved capacity and check licensing.';
+    if (($pool->{CycleShortfall} // $pool->{Shortfall} // 0) > 0)
+    {
+        return sprintf("raise the pool maximum from %s to at least %d processing units before this cycle's entitlement increases%s. %s",
+            $now, $cycle, ($target > $cycle ? sprintf(' (%d for the targets)', $target) : ''), $care);
+    }
+    return sprintf("this cycle's changes fit within the maximum of %s. The targets need at least %d processing units: raise the pool "
+        . "maximum before the later increases. %s", $now, $target, $care);
+}
+
+# The pool prerequisite of each LPAR's planning action (plan 8.2: increases
+# raise the pool first, then the members): { LPAR => { First => sentence,
+# Later => sentence } }. First where this cycle's entitlements exceed the pool
+# maximum and the LPAR's entitlement rises this cycle; Later where only the
+# targets exceed it and the LPAR's target is above what this cycle sets.
+sub _pool_prerequisites
+{
+    my ($findings) = @_;
+    my %out;
+    return \%out unless (ref($findings) eq 'HASH' && $findings->{Valid});
+    foreach my $pool (grep { $_->{Status} eq 'SHORTFALL' } @{ $findings->{Pools} })
+    {
+        my $target = $pool->{RequiredMax};
+        my $cycle  = ($pool->{RequiredMaxCycle} > $target) ? $target : $pool->{RequiredMaxCycle};
+        my $now = _pool_units_text($pool->{Ceiling});
+        foreach my $row (@{ $pool->{Members} })
+        {
+            next unless (defined $row->{Vm} && defined $row->{Current});
+            if ($pool->{CycleShortfall} > 0 && defined $row->{Cycle} && $row->{Cycle} > $row->{Current} + $STRUCTURAL_ENT_TOLERANCE)
+            {
+                $out{ $row->{Vm} }{First} = sprintf('First raise the maximum of pool %s from %s to at least %d processing units (check licensing).',
+                    $pool->{PoolId}, $now, $cycle);
+            }
+            if ($target > $cycle || !($pool->{CycleShortfall} > 0))
+            {
+                my $reached = $row->{Cycle} // $row->{Current};
+                $out{ $row->{Vm} }{Later} = sprintf('The target needs the maximum of pool %s raised to at least %d processing units (check licensing).',
+                    $pool->{PoolId}, $target)
+                    if (defined $row->{Proposed} && $row->{Proposed} > $reached + $STRUCTURAL_ENT_TOLERANCE);
+            }
+        }
+    }
+    return \%out;
 }
 
 # Word-wraps one paragraph: first line after $first, the rest after $next.
@@ -15931,16 +16011,26 @@ sub _write_standard_csv_report {
 
     # Major structural alerts lead VM_Comments (standard reports only; seasonal
     # reports carry forecasts, not the sizing plan). Existing comments are kept.
-    my $structural_tags = {};
+    my ($structural_tags, $pool_first) = ({}, {});
     if (!$is_multiplicative_run_flag && !$is_recency_decay_run_flag && !$is_predictive_peak_run_flag)
     {
-        $structural_tags = _structural_csv_tags(
-            _collect_structural_findings($assimilation_map_ref, \@vm_order, \@profiles, \%vm_tier_overrides));
+        my $structural_findings = _collect_structural_findings($assimilation_map_ref, \@vm_order, \@profiles, \%vm_tier_overrides);
+        $structural_tags = _structural_csv_tags($structural_findings);
+        $pool_first      = _pool_prerequisites($structural_findings);
     }
     my ($idx_vm_comments) = grep { $header_for_this_report[$_] eq 'VM_Comments' } 0..$#header_for_this_report;
     foreach my $pending (@pending_csv_rows)
     {
         my ($row_vm, $row, $planner_cells) = @$pending;
+        # The pool is raised before its members (v10 stage 3.4): the planning
+        # action names the pool change its increase waits for.
+        if (ref($planner_cells) eq 'HASH' && $pool_first->{$row_vm} && ($planner_cells->{'NFIT - Action'} // '') ne ''
+            && $planner_cells->{'NFIT - Action'} !~ /^Pool \S+ must allow| Pool \S+ must allow/)
+        {
+            my $note = $pool_first->{$row_vm};
+            $planner_cells->{'NFIT - Action'} = join(' ', (defined $note->{First} ? $note->{First} : ()),
+                $planner_cells->{'NFIT - Action'}, (defined $note->{Later} ? $note->{Later} : ()));
+        }
         if (defined $idx_vm_comments && exists $structural_tags->{$row_vm})
         {
             my $existing = $row->[$idx_vm_comments] // '';

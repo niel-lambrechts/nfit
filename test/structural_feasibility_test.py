@@ -177,8 +177,12 @@ class StructuralFeasibilityTests(unittest.TestCase):
             self.assertIn(f'Pool {POOL_ID} - the proposed entitlements do not fit', s)
             self.assertIn(f'{proposed:.2f} cores proposed against a pool maximum of {units} '
                           f'(installed today {installed:.2f}; 4 LPARs analysed).', s)
-            self.assertIn(f'Action: defer at least {proposed - POOL_SIZE:.2f} cores of the proposed increases, or raise the '
-                          f'pool maximum from {units} to at least {math.floor(proposed - 1e-9) + 1} processing units.', s)
+            need = math.floor(proposed - 1e-9) + 1
+            self.assertRegex(s, rf"Action: (Raise the pool maximum from {units} to at least \d+ processing units before this cycle's "
+                                rf"entitlement increases( \({need} for the targets\))?\.|This cycle's changes fit within the maximum of "
+                                rf"{units}\. The targets need at least {need} processing units: raise the pool maximum before the later "
+                                rf"increases\.) Confirm the pool's reserved capacity and check licensing\.")
+            self.assertNotIn('defer', s)
             self.assertRegex(self.proc.stderr, r'\[WARN\] Pool and VP checks: 1 pool\(s\) cannot hold the proposed entitlements')
             for vm in members:                                 # every member row shows the CSV figures
                 value = float(self.rows[vm][self.planning_profile(vm)])
@@ -186,7 +190,14 @@ class StructuralFeasibilityTests(unittest.TestCase):
                 self.assertRegex(raw, rf'{vm}\s+{re.escape(self.planning_profile(vm))}( \(default\))?\s+'
                                       rf'{VMS[vm][0]:.2f}\s+{value:.2f}\s+{change}')
             actions = self.flat(self.log[self.log.index('Recommended Actions'):])
-            self.assertIn(f'Pool {POOL_ID}: Defer at least {proposed - POOL_SIZE:.2f} cores', actions)
+            self.assertRegex(actions, rf"Pool {POOL_ID}: (Raise the pool maximum from {units} to at least|This cycle's changes fit within)")
+            # The planning action of a member whose entitlement rises names the pool change it waits for.
+            waiting = [vm for vm in members if 'the maximum of pool %s' % POOL_ID in self.rows[vm]['NFIT - Action']]
+            rising = [vm for vm in members if float(self.rows[vm][self.planning_profile(vm)]) > VMS[vm][0] + 0.005]
+            self.assertTrue(set(waiting) <= set(rising), (waiting, rising))
+            self.assertTrue(waiting, 'some rising member carries the pool prerequisite')
+            for vm in waiting:
+                self.assertIn('(check licensing)', self.rows[vm]['NFIT - Action'])
         else:
             self.assertIn(f'Pool {POOL_ID} - fits: {proposed:.2f} cores proposed against a maximum of {units}', s)
         self.assertNotIn('Pool 0 -', s)                        # the default pool is not assessed
@@ -225,7 +236,8 @@ class StructuralFeasibilityTests(unittest.TestCase):
                 self.assertIn(f'VPs {current_vp} to {vps}', action, vm)
                 self.assertIn('re-measure', action, vm)
             if vps > current_vp and ent > current_vp:          # VPs must rise before the entitlement
-                self.assertRegex(action, rf'^Raise VPs {current_vp} to {vps}, then raise entitlement', vm)
+                self.assertRegex(action, rf'^(First raise the maximum of pool \d+ from \S+ to at least \d+ processing units '
+                                         rf'\(check licensing\)\. )?Raise VPs {current_vp} to {vps}, then raise entitlement', vm)
             if abs(ent - current_ent) < 0.005 and vps == current_vp:
                 self.assertTrue(action.startswith('No change'), vm)
             self.assertIsNone(re.search(rf'^    {vm} \(', s, re.M), vm)   # nothing to list
@@ -238,11 +250,16 @@ class StructuralFeasibilityTests(unittest.TestCase):
             if vm in VIOS:                                     # the aligned pair: test_vios_pair_sized_to_the_larger
                 continue
             row = self.rows[vm]
+            # The CSV adds the pool change an increase waits for, which is known only once
+            # every member is sized; the LPAR's own action is the same in both places.
+            own = re.sub(r'^First raise the maximum of pool \d+ from \S+ to at least \d+ processing units \(check licensing\)\. ', '',
+                         row['NFIT - Action'])
+            own = re.sub(r' The target needs the maximum of pool \d+ raised to at least \d+ processing units \(check licensing\)\.$', '', own)
             blocks = [m.start() for m in re.finditer(r'^  At a glance$', text, re.M)]
             found = False
             for b in blocks:
                 block = text[b:text.index('\n\n', b)]
-                if f"Current-cycle action           : {row['NFIT - Action']}" in block:
+                if f"Current-cycle action           : {own}" in block:
                     vps = int(row['NFIT - VCPU'])
                     self.assertIn(f"Current cycle                  : {float(row['NFIT - ENT']):.2f} entitlement on "
                                   + ('1 VP' if vps == 1 else f'{vps} VPs'), block, vm)

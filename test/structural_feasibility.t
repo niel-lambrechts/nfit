@@ -25,7 +25,7 @@ my @names = qw(
     _structural_shown_value _structural_tactical_vp _describe_ent_vp_pair
     _collect_structural_findings _structural_csv_tags
     _log_structural_feasibility _resolve_vm_tier_pattern_policy
-    _pool_units_text _pool_shortfall_action _rationale_wrap _log_recommended_actions
+    _pool_units_text _pool_shortfall_action _pool_prerequisites _rationale_wrap _log_recommended_actions
     _structural_planning_profile _lpar_role_hint _entitlement_totals _log_entitlement_totals _ha_standby_target
 );
 my $code = '';
@@ -227,9 +227,12 @@ is($summary->{OrderNotes}, 1, 'one LPAR with an order-of-change note on its plan
 like($buffer, qr/^Pool and VP Checks$/m, 'section heading written');
 like($buffer, qr/Pool 25 - the proposed entitlements do not fit\n\s+8\.20 cores proposed against a pool maximum of 7 \(installed today 6\.50; 4 LPARs analysed\)\./,
     'pool verdict with proposed, maximum, installed and members (2.60 + 2.83 + 1.72 configured G1 + 1.05)');
-like(flat($buffer), qr/Action: defer at least 1\.20 cores of the proposed increases, or raise the pool maximum from 7 to at least 9 processing units\./,
-    'shortfall action: defer the shortfall, or a whole-unit pool maximum that holds the proposals');
-like($buffer, qr/Even each LPAR's lowest profile totals 7\.32 cores, so no TIER choice fits within 7\./, 'lowest-profile sum written');
+# No current-cycle pair in this map: this cycle keeps the installed entitlements, so only the targets need the pool.
+like(flat($buffer), qr/Action: This cycle's changes fit within the maximum of 7\. The targets need at least 9 processing units: raise the pool maximum before the later increases\. Confirm the pool's reserved capacity and check licensing\./,
+    'shortfall action: the pool is raised to a whole-unit maximum that holds the targets; the members are not reduced');
+like(flat($buffer), qr/Structural minimum of the pool maximum: 7 processing units for this cycle's entitlements \(6\.50 cores\), 9 for the targets \(8\.20 cores\)\. Reserve not included\./,
+    'the structural minimum is given for this cycle and for the targets');
+unlike($buffer, qr/defer|TIER choice/, 'no member is asked to defer or to take a lower tier to fit the pool');
 like($buffer, qr/lparC\s+G1-99W5\s+1\.50\s+1\.72\s+\+0\.22\s+Yes/, 'configured TIER selects the planning profile');
 like($buffer, qr/lparB\s+G3-95W15 \(default\)\s+2\.00\s+2\.83\s+\+0\.83\s+No \(7\.33\)/, 'default tier 3 is labelled; fits-alone verdict written');
 unlike($buffer, qr/Pool 0 /, 'the default pool is not assessed');
@@ -268,8 +271,8 @@ like($buffer, qr/Pool 34 - fits: 5\.00 cores proposed against a maximum of 6 \(i
     'a pool that fits is reported on one line with no member table');
 like($buffer, qr/Pool 12 - no verdict: its LPARs report different maximums \(5, 7\)\.\n\s+2\.00 cores proposed .*Confirm the pool maximum on the HMC\./,
     'conflicting pool sizes are reported without a verdict');
-like($buffer, qr/Pool 40 - the proposed entitlements do not fit.*?defer at least 1\.00 cores.*?to at least 3\s+processing units\.\n\s+A lower TIER choice would fit: the lowest profiles total 1\.80 cores\./s,
-    'a shortfall that another TIER selection avoids is described as such');
+like(flat($buffer), qr/Pool 40 - the proposed entitlements do not fit.*?The targets need at least 3 processing units: raise the pool maximum before the later increases\./,
+    'a shortfall is answered by the pool increase, whatever a lower tier would total');
 like(flat($buffer), qr/w1 \(G3-95W15\): The proposed 0\.47 cores is too little for 12 VPs: PowerVM needs at least 0\.05 per VP, so 12 VPs need 0\.60\. Action: Reduce VPs from 16 to 12 \(the VP recommendation\) - minimum entitlement 0\.60\. If 16 VPs stay, the minimum is 0\.80\./,
     'below the VP minimum: the recommended VP count and its minimum, and the minimum if the VPs stay');
 unlike($buffer, qr/Reduce VPs to 9/, 'no VP cut beyond the VP recommendation is proposed');
@@ -277,6 +280,52 @@ is($summary->{WidthMismatches}, 1, '  and is counted');
 
 like($buffer, qr/PowerVM needs 0\.05 to 1\.00 cores of entitlement per VP\./, 'the per-VP range is stated');
 like($buffer, qr/Reserved pool capacity and\n\s+LPARs outside this analysis are not counted/, 'what a fit leaves out is stated');
+
+# --- The pool plan, part 1: structural minimum and order of change ------------------
+{
+    my $cyc = sub { my ($ent, $vp, $tvp) = @_; return { 'G3-95W15' => { Ent => $ent, VP => $vp, TargetVP => $tvp // $vp, Status => 'APPLY' } }; };
+    my $lp = sub
+    {
+        my ($ent, $vp, $target, $cycle_ent, $cycle_vp, $target_vp) = @_;
+        return { Configuration => { entitlement => $ent, virtual_cpus => $vp, pool_id => 7, pool_cpu => 4 }, Hinting => {},
+                 CoreResults => { ProfileValues => { 'G3-95W15' => $target }, Profile_CurrentCycle => $cyc->($cycle_ent, $cycle_vp, $target_vp) } };
+    };
+    # Pool 7, maximum 4. up1 rises now (1.00 -> 2.00); up2 is staged (1.00 -> 1.50 now, 2.60 target);
+    # cut drops (1.50 -> 1.00); tiny has a workload figure below the platform minimum of its 2 VPs.
+    my %plan = (up1 => $lp->(1.00, 2, 2.00, 2.00, 2), up2 => $lp->(1.00, 2, 2.60, 1.50, 2, 3),
+                cut => $lp->(1.50, 2, 1.00, 1.00, 1), tiny => $lp->(0.20, 2, 0.01, 0.10, 2));
+    my @plan_order = qw(up1 up2 cut tiny);
+    my $found = UUT::_collect_structural_findings(\%plan, \@plan_order, \@profiles, {});
+    my ($p7) = @{ $found->{Pools} };
+    ok(near($p7->{CycleSum}, 4.60), "this cycle's entitlements are summed (2.00 + 1.50 + 1.00 + 0.10)");
+    ok(near($p7->{ProposedSum}, 5.70), 'the targets are summed as they can be configured (tiny at 0.10, not 0.01)');
+    is($p7->{RequiredMaxCycle}, 5, 'structural minimum for this cycle, in whole units');
+    is($p7->{RequiredMax}, 6, 'structural minimum for the targets');
+    ok(near($p7->{CycleShortfall}, 0.60), 'this cycle already exceeds the maximum');
+    like(UUT::_pool_shortfall_action($p7),
+         qr/^raise the pool maximum from 4 to at least 5 processing units before this cycle's entitlement increases \(6 for the targets\)\. Confirm the pool's reserved capacity and check licensing\.$/,
+         'the pool is raised first; both values are given');
+    my $first = UUT::_pool_prerequisites($found);
+    is($first->{up1}{First}, 'First raise the maximum of pool 7 from 4 to at least 5 processing units (check licensing).',
+       'an LPAR whose entitlement rises this cycle waits for the pool');
+    ok(!defined $first->{up1}{Later}, '  and has nothing later when this cycle reaches its target');
+    like($first->{up2}{First}, qr/^First raise the maximum of pool 7 from 4 to at least 5/, 'a staged increase waits for the pool too');
+    is($first->{up2}{Later}, 'The target needs the maximum of pool 7 raised to at least 6 processing units (check licensing).',
+       '  and its target names the larger maximum');
+    ok(!exists $first->{cut} && !exists $first->{tiny}, 'an LPAR that is cut or unchanged carries no pool prerequisite');
+
+    # The same pool with room for this cycle: only the staged target needs the pool.
+    $plan{up1} = $lp->(1.00, 2, 1.20, 1.20, 2);
+    $found = UUT::_collect_structural_findings(\%plan, \@plan_order, \@profiles, {});
+    ($p7) = @{ $found->{Pools} };
+    ok(near($p7->{CycleSum}, 3.80) && $p7->{CycleShortfall} == 0 && $p7->{Status} eq 'SHORTFALL', 'this cycle fits; the targets (4.90) do not');
+    like(UUT::_pool_shortfall_action($p7), qr/^this cycle's changes fit within the maximum of 4\. The targets need at least 5 processing units/,
+         'the action says this cycle can go ahead');
+    $first = UUT::_pool_prerequisites($found);
+    ok(!exists $first->{up1}, 'an increase that this cycle completes is not held back');
+    ok(!defined $first->{up2}{First} && $first->{up2}{Later} =~ /raised to at least 5 processing units/, 'only the staged target names the pool');
+    is_deeply(UUT::_pool_prerequisites(undef), {}, 'no findings: no prerequisite');
+}
 
 # --- _structural_csv_tags ---------------------------------------------------------
 my $tags = UUT::_structural_csv_tags(UUT::_collect_structural_findings(\%map, \@order, \@profiles, \%tiers));
@@ -334,7 +383,7 @@ my $n_actions = UUT::_log_recommended_actions($log, $structural, {
 close $log;
 is($n_actions, 5, 'actions: one pool shortfall, two VP findings, two cut reviews');
 like(flat($buffer), qr/Recommended Actions \(planning profile of each LPAR\)/, 'section heading written');
-like(flat($buffer), qr/1\. Pool 25: Defer at least 1\.20 cores of the proposed increases, or raise the pool maximum from 7 to at least 9 processing units\./,
+like(flat($buffer), qr/1\. Pool 25: This cycle's changes fit within the maximum of 7\. The targets need at least 9 processing units: raise the pool maximum before the later increases\./,
     'the pool shortfall leads the list');
 like(flat($buffer), qr/lparD: Limit the entitlement to 1\.00/, 'the width finding is an action');
 like(flat($buffer), qr/Pool 44: review these entitlement cuts together before applying them - x1 0\.50 to 0\.12 \(416 of 423 full-pool minutes\); x2 0\.50 to 0\.11 \(398 of 423/,
