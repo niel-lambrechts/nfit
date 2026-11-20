@@ -96,6 +96,13 @@ class CutProtectionTest(unittest.TestCase):
         self.assertTrue(on['NFIT - Action'].startswith('Cut limited to 2.00 (profile %s): busy work reached this level while pool 7 was contested'
                                                        % off['NFIT - ENT']), on['NFIT - Action'])
         self.assertFalse(off['NFIT - Action'].startswith('Cut limited'))
+        # The prefix appears exactly where the published planning figure moved: vmB's bound
+        # raises some alternatives but leaves its planning entitlement as it was.
+        rows_on = {r['VM']: r for r in csv.DictReader(csv_on.splitlines())}
+        for r_off in csv.DictReader(csv_off.splitlines()):
+            r_on = rows_on[r_off['VM']]
+            moved = float(r_on['NFIT - ENT']) > float(r_off['NFIT - ENT']) + 0.005
+            self.assertEqual(r_on['NFIT - Action'].startswith('Cut limited'), moved, r_off['VM'])
 
     def test_replay_scores_the_recorded_levels(self):
         self.standard()
