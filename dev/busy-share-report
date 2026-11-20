@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/busy-share-report
+# PURPOSE  : Research report for the busy-share comparison (stage 3.4 design
+#            note, section 3.1; --research-busy-share). Reads the records of
+#            dev/protection-replay --records-only. For each uncapped
+#            shared-pool LPAR, in its current configuration state and one
+#            profile-hours population, minutes under pressure are compared
+#            with relaxed minutes of the same consumption (PhysC / entitlement
+#            in the same band of 0.10), separately below, near and above the
+#            entitlement:
+#              contested  : pool scarce while other LPARs are busy;
+#              solitary   : pool scarce, filled by the LPAR itself;
+#              VP ceiling : pool open, PhysC at the LPAR's VPs.
+#            Sections:
+#              1. coverage: how many comparisons the evidence allows;
+#              2. the three-way summary: busy share and run queue per VP,
+#                 pressured against relaxed, by condition and regime;
+#              3. every comparison of the planning profile's hours.
+#            Observational: pressured minutes are also heavier workload
+#            periods, and minutes of one episode are not independent.
+# USAGE    : dev/busy-share-report [--in DIR] (default design/acceptance/contested-level)
+# OUTPUT   : <in>/busy-share-report.md (research labels only)
+# ==============================================================================
+import argparse
+import collections
+import json
+import statistics
+import subprocess
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+CONDITIONS = (('contested', 'Contested'), ('solitary', 'Solitary saturation'), ('vpCeiling', 'VP ceiling, pool open'))
+REGIMES = (('below', 'below entitlement'), ('near', 'near entitlement (0.95 to 1.05)'), ('above', 'above entitlement'))
+SAME = 0.01                                                 # busy shares within this are counted as unchanged
+
+
+def table(lines, header, body):
+    lines.append('| ' + ' | '.join(header) + ' |')
+    lines.append('|' + '|'.join('---' for _ in header) + '|')
+    lines.extend('| ' + ' | '.join(str(c) for c in row) + ' |' for row in body)
+    lines.append('')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--in', dest='src', default=str(REPO / 'design' / 'acceptance' / 'contested-level'))
+    a = ap.parse_args()
+    src = Path(a.src)
+    data = json.loads((src / 'protection-replay.json').read_text())
+    # One set of comparisons per LPAR and profile-hours population (profiles of a population share it).
+    states, planning = {}, set()
+    tracked = set()
+    for r in data['records']:
+        key = (r['member'], str(r.get('population')))
+        tracked.add(key)
+        if r.get('planning'):
+            planning.add(key)
+        if isinstance(r.get('busyShare'), list):
+            states.setdefault(key, {'rows': r['busyShare'], 'installed': r.get('installed'), 'vps': r.get('installedVPs'),
+                                    'profiles': []})['profiles'].append(r['profile'])
+    rows = [(key, row) for key, s in sorted(states.items()) for row in s['rows']]
+    ok = [(key, row) for key, row in rows if row.get('sufficient')]
+    lines = ['# Busy share under pressure: the three-way comparison', '',
+             f'Generated {data["generated"]}; commit {str(data["commit"])[:7]}; options {" ".join(data.get("profileArgs") or []) or "none"}.',
+             f'Systems: {", ".join(s["system"] for s in data["systems"])}. Training window, current configuration state, one',
+             'comparison per LPAR and profile-hours population. The busy share is PhysB ÷ PhysC. Both sides of a comparison',
+             'are read at the same consumption (PhysC ÷ entitlement in the same band of 0.10, weighted by the pressured',
+             'minutes). Minutes below 0.10 cores or 10% of entitlement are left out. A comparison needs 15 minutes on',
+             'each side.', '',
+             'This is observational. Pressured minutes are also heavier workload periods, and the minutes of one episode',
+             'are not independent, so the counts below describe direction, not significance.', '']
+
+    # 1. Coverage
+    lines += ['## 1. Coverage', '',
+              f'{len(tracked)} LPAR populations tracked on {len({k[0] for k in tracked})} LPARs; {len(states)} had classified minutes under '
+              f'pressure at usable consumption ({len({k[0] for k in states})} LPARs).', '']
+    body = []
+    for c, c_name in CONDITIONS:
+        for g, g_name in REGIMES:
+            sel = [row for _, row in rows if row['condition'] == c and row['regime'] == g]
+            good = [row for row in sel if row.get('sufficient')]
+            body.append([c_name, g_name, len(sel), len(good), sum(1 for row in good if 'runqPerVpPressured' in row),
+                         sum(row.get('pressuredMinutesAll', 0) for row in sel), sum(row.get('pressuredMinutes', 0) for row in good)])
+    table(lines, ['Condition', 'Consumption', 'LPAR populations with such minutes', 'Comparable', 'With run queue', 'Pressured minutes',
+                  'Of which in comparisons'], body)
+    lines += ['Not comparable: fewer than 15 minutes on a side, or no relaxed minutes at that consumption. For an LPAR that',
+              'is only ever above its entitlement when the pool is scarce, there is nothing relaxed to compare with.', '']
+
+    # 2. Three-way summary
+    lines += ['## 2. Pressured against relaxed at the same consumption', '',
+              f'Busy share counted as unchanged within ±{SAME:.2f}. Medians are across LPAR populations.', '']
+    body = []
+    med = lambda xs: f'{statistics.median(xs):.2f}' if xs else 'n/a'
+    for c, c_name in CONDITIONS:
+        for g, g_name in REGIMES:
+            good = [row for _, row in ok if row['condition'] == c and row['regime'] == g]
+            if not good:
+                body.append([c_name, g_name, 0] + ['n/a'] * 7)
+                continue
+            d = [row['busySharePressured'] - row['busyShareRelaxed'] for row in good]
+            q = [row for row in good if 'runqPerVpPressured' in row]
+            ratios = [row['runqPerVpPressured'] / row['runqPerVpRelaxed'] for row in q if row['runqPerVpRelaxed'] > 0]
+            body.append([c_name, g_name, len(good),
+                         f'{sum(1 for x in d if x > SAME)} / {sum(1 for x in d if abs(x) <= SAME)} / {sum(1 for x in d if x < -SAME)}',
+                         med([row['busyShareRelaxed'] for row in good]), med([row['busySharePressured'] for row in good]),
+                         f'{statistics.median(d):+.2f}', len(q),
+                         f'{sum(1 for x in ratios if x > 1.05)} / {sum(1 for x in ratios if 0.95 <= x <= 1.05)} / {sum(1 for x in ratios if x < 0.95)}',
+                         f'{(statistics.median(ratios) - 1) * 100:+.0f}%' if ratios else 'n/a'])
+    table(lines, ['Condition', 'Consumption', 'Comparisons', 'Busy share higher / unchanged / lower', 'Median relaxed', 'Median pressured',
+                  'Median difference', 'Run-queue comparisons', 'Run queue per VP higher / within 5% / lower', 'Median run-queue change'], body)
+    lines += ['How to read it:',
+              '- A rise under "contested" at the same consumption repeats the Pool View finding (section 6a) with the',
+              '  competition definition.',
+              '- Comparing the three consumption rows of one condition shows whether running above the entitlement carries',
+              '  an effect of its own: if the rise is of similar size below, near and above, crossing the entitlement adds',
+              '  nothing beyond the pressure itself.',
+              '- "VP ceiling, pool open" is the width case: the pool had room and the LPAR was at its VPs.', '']
+
+    # 3. Planning populations in full
+    lines += ['## 3. Every comparison of the planning profile\'s hours', '']
+    body = []
+    for key, row in rows:
+        if key not in planning:
+            continue
+        s = states[key]
+        cmp_ = row.get('sufficient')
+        body.append([key[0], key[1], s['installed'], s['vps'], dict(CONDITIONS)[row['condition']], row['regime'],
+                     f'{row.get("pressuredMinutes", 0)} of {row.get("pressuredMinutesAll", 0)} on {row.get("pressuredDays", 0)} d',
+                     f'{row.get("relaxedMinutes", 0)} on {row.get("relaxedDays", 0)} d',
+                     f'{row["consumptionPressured"]:.2f} / {row["consumptionRelaxed"]:.2f}' if cmp_ else 'n/a',
+                     f'{row["busyShareRelaxed"]:.2f} → {row["busySharePressured"]:.2f}' if cmp_ else 'not comparable',
+                     f'{row["runqPerVpRelaxed"]:.2f} → {row["runqPerVpPressured"]:.2f}' if 'runqPerVpPressured' in row else 'n/a'])
+    table(lines, ['LPAR', 'Hours', 'Entitlement', 'VPs', 'Condition', 'Consumption', 'Pressured minutes (compared of all)', 'Relaxed minutes',
+                  'PhysC ÷ entitlement (pressured / relaxed)', 'Busy share (relaxed → pressured)', 'Run queue per VP (relaxed → pressured)'],
+          body or [['none'] + [''] * 10])
+
+    target = src / 'busy-share-report.md'
+    target.write_text('\n'.join(lines) + '\n')
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

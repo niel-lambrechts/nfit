@@ -659,6 +659,18 @@ my $research_contested_level;
 my $CONTESTED_LEVEL_MIN_MINUTES = 15;
 my $CONTESTED_LEVEL_MIN_DAYS    = 2;
 my $contested_floor_value;                    # set while a profile is sized with the candidate floor for the record
+# --research-busy-share (research only; stage 3.4 design note, section 3.1).
+# The busy share is PhysB / PhysC. For each LPAR state and profile-hours
+# population, minutes under pressure (contested pool; pool scarce by the LPAR
+# alone; at the VP ceiling with the pool open) are compared with relaxed
+# minutes of the same consumption: PhysC / entitlement in the same band of
+# binWidth (so within +/-5%). The comparison is given separately below, near
+# and above the entitlement. Minutes of very low consumption are left out
+# (the ratio is unstable there). A band counts only with minBinMinutes on both
+# sides, a comparison only with minMinutes on both sides. Observational: it
+# corroborates pressure and is never a sizing input.
+my $research_busy_share;
+my %BUSY_SHARE_RULES = (binWidth => 0.10, minCores => 0.10, minEntShare => 0.10, minBinMinutes => 5, minMinutes => 15);
 my ($candidate_test, $candidate_window, $candidate_snapshot);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
@@ -787,6 +799,7 @@ GetOptions(
     'research-no-peak-uplift'    => \$research_no_peak_uplift,
     'research-gated-peak-uplift' => \$research_gated_peak_uplift,
     'research-contested-level'   => \$research_contested_level,
+    'research-busy-share'        => \$research_busy_share,
     'uplift-exemption!'          => \$uplift_exemption_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
@@ -2701,6 +2714,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                 my ($adjusted_physc, $debug_info_ref) = $size_profile->(0);
                 $debug_info_ref->{'ContestedLevelRecord'} = { %contested_record }
                     if (ref($debug_info_ref) eq 'HASH' && %contested_record);
+                # Research (busy share): the matched comparisons of the profile's hours.
+                if ($research_busy_share && ref($debug_info_ref) eq 'HASH' && $CUT_PROTECTION_EVIDENCE{$vm_name}
+                    && (my $bs_tracker = $CUT_PROTECTION_EVIDENCE{$vm_name}{$profile_name}))
+                {
+                    my $rows = ($bs_tracker->{busyShareRecord} //= _busy_share_record($bs_tracker->{busyShare}));
+                    $debug_info_ref->{'BusyShareRecord'} = $rows if @$rows;
+                }
                 $debug_info_ref->{'PeakUpliftNoRule'} = sprintf('%.4f', $no_rule)
                     if (ref($debug_info_ref) eq 'HASH' && defined $no_rule && looks_like_number($no_rule)
                         && looks_like_number($adjusted_physc // '') && $adjusted_physc > $no_rule + $STRUCTURAL_ENT_TOLERANCE);
@@ -15873,6 +15893,8 @@ sub _write_standard_csv_report {
                     _tier_floor_record($core->{ProfileDebugInfo}{$name}),
                     ((ref(($core->{ProfileDebugInfo}{$name} // {})->{'ContestedLevelRecord'}) eq 'HASH')
                         ? (contestedLevel => $core->{ProfileDebugInfo}{$name}{'ContestedLevelRecord'}) : ()),
+                    ((ref(($core->{ProfileDebugInfo}{$name} // {})->{'BusyShareRecord'}) eq 'ARRAY')
+                        ? (busyShare => $core->{ProfileDebugInfo}{$name}{'BusyShareRecord'}) : ()),
                     currentCycle => {
                         entitlement => $pair->{Ent},
                         VPs         => $pair->{VP},
@@ -23370,6 +23392,7 @@ sub _exposure_partition_cpu
         die "[ERROR] The CPU cache has no $required column.\n" unless exists $index{$required};
     }
     my ($i_time, $i_vm, $i_c, $i_b) = @index{qw(Timestamp VMName PhysC PhysB)};
+    my $i_rq = $research_busy_share ? $index{RunQ} : undef;       # research: the run queue rides along
     my ($lowest, $highest) = (min(map { $_->[0] } @$windows_aref), max(map { $_->[1] } @$windows_aref));
 
     my (%handle, %file, %counts, %day_epoch);
@@ -23399,7 +23422,7 @@ sub _exposure_partition_cpu
             open $out, '>', $file{$day} or die "[ERROR] Cannot write '$file{$day}': $!\n";
             $handle{$day} = $out;
         }
-        print {$out} join("\t", $seconds, $vm, ($field[$i_c] // ''), ($field[$i_b] // '')), "\n";
+        print {$out} join("\t", $seconds, $vm, ($field[$i_c] // ''), ($field[$i_b] // ''), (defined $i_rq ? ($field[$i_rq] // '') : ())), "\n";
         $counts{samplesInWindow}++;
     }
     close $in;
@@ -23408,7 +23431,8 @@ sub _exposure_partition_cpu
 }
 
 # One day of CPU samples: { LPAR => { minute => [samples, sum PhysC, valid
-# pairs, sum PhysB over valid pairs] } }. A sample needs a finite, non-negative
+# pairs, sum PhysB over valid pairs, run-queue samples, sum RunQ] } } (the
+# run queue only under --research-busy-share). A sample needs a finite, non-negative
 # PhysC; a pair also needs a finite PhysB with 0 <= B <= C + tolerance.
 sub _exposure_read_cpu_day
 {
@@ -23416,10 +23440,15 @@ sub _exposure_read_cpu_day
     my %minutes;
     my $tolerance = $MEMBER_EXPOSURE_RULES{pairToleranceCores};
     my $add = sub {
-        my ($seconds, $vm, $c, $b) = @_;
+        my ($seconds, $vm, $c, $b, $rq) = @_;
         my ($c_value, $c_problem) = _pool_number($c);
         return if defined $c_problem;
-        my $acc = $minutes{$vm}{ $seconds - ($seconds % 60) } //= [ 0, 0, 0, 0 ];
+        my $acc = $minutes{$vm}{ $seconds - ($seconds % 60) } //= [ 0, 0, 0, 0, 0, 0 ];
+        if (defined $rq)
+        {
+            my ($rq_value, $rq_problem) = _pool_number($rq);
+            if (!defined $rq_problem) { $acc->[4]++; $acc->[5] += $rq_value; }
+        }
         $acc->[0]++;
         $acc->[1] += $c_value;
         my ($b_value, $b_problem) = _pool_number($b);
@@ -23437,7 +23466,8 @@ sub _exposure_read_cpu_day
             my $n = $to->[2] - $from->[2];
             my @cols;
             foreach my $range (['ep', 4*$from->[2], 4*$n], ['pc', $from->[3], $to->[3]-$from->[3]],
-                               ['pb', $from->[5], $to->[5]-$from->[5]])
+                               ['pb', $from->[5], $to->[5]-$from->[5]],
+                               (($research_busy_share && -f "$base.rq") ? ['rq', $from->[4], $to->[4]-$from->[4]] : ()))
             {
                 my ($suffix, $offset, $length) = @$range;
                 open my $col, '<:raw', "$base.$suffix" or die "Cannot open sample column: $!";
@@ -23450,7 +23480,7 @@ sub _exposure_read_cpu_day
                 die "Inconsistent exposure sample column" unless @values == $n;
                 push @cols, \@values;
             }
-            for my $i (0 .. $n-1) { $add->($cols[0][$i], $vm, $cols[1][$i], $cols[2][$i]); }
+            for my $i (0 .. $n-1) { $add->($cols[0][$i], $vm, $cols[1][$i], $cols[2][$i], ($cols[3] ? $cols[3][$i] : undef)); }
         }
         return \%minutes;
     }
@@ -23459,8 +23489,8 @@ sub _exposure_read_cpu_day
     while (my $line = <$in>)
     {
         chomp $line;
-        my ($seconds, $vm, $c, $b) = split /\t/, $line, -1;
-        $add->($seconds, $vm, $c, $b);
+        my ($seconds, $vm, $c, $b, $rq) = split /\t/, $line, -1;
+        $add->($seconds, $vm, $c, $b, $rq);
     }
     close $in;
     return \%minutes;
@@ -23596,6 +23626,12 @@ sub _exposure_process_day
             _protection_borrow_minute($tracker->{borrowStats}, \@thresholds, $minute, $b, $scarce, $competition)
                 if $tracker->{borrowStats};
             $tracker->{joint}{$minute} = [ $b, $competition ] if ($scarce && $tracker->{joint});
+            if ($tracker->{busyShare} && $classified)
+            {
+                _busy_share_add_minute($tracker->{busyShare}, $minute, $b, $c, $ent,
+                    (($sample->[4] && defined $vp && $vp > 0) ? $sample->[5] / $sample->[4] / $vp : undef),
+                    ($competition ? 'contested' : $scarce ? 'solitary' : $own_width ? 'vpCeiling' : 'relaxed'));
+            }
             if (my $pr = $tracker->{pressure})
             {
                 my $kind = !(defined $ent && $b > $ent + $eps) ? 'none'
@@ -24814,6 +24850,90 @@ sub _protection_bound
     return (defined $installed && $bound > $installed) ? $installed + 0 : $bound;
 }
 
+# Busy share (research): one classified minute into its condition and its
+# consumption band. Cell: [minutes, sum PhysB, sum PhysC, sum PhysC/entitlement,
+# run-queue minutes, sum RunQ per VP, { day }].
+sub _busy_share_add_minute
+{
+    my ($bs, $minute, $busy, $consumed, $ent, $runq_per_vp, $condition) = @_;
+    return unless (defined $ent && $ent > 0 && $consumed >= $BUSY_SHARE_RULES{minCores}
+                   && $consumed / $ent >= $BUSY_SHARE_RULES{minEntShare});
+    my $cell = $bs->{$condition}{ int($consumed / $ent / $BUSY_SHARE_RULES{binWidth} + 0.5) } //= [ 0, 0, 0, 0, 0, 0, {} ];
+    $cell->[0]++;
+    $cell->[1] += $busy;
+    $cell->[2] += $consumed;
+    $cell->[3] += $consumed / $ent;
+    if (defined $runq_per_vp) { $cell->[4]++; $cell->[5] += $runq_per_vp; }
+    $cell->[6]{ int($minute / 86400) } = 1;
+    return;
+}
+
+# Busy share (research): the matched comparisons of one tracker. For each
+# pressure condition and each regime of consumption against the entitlement
+# (below: under 0.95; near: 0.95 to 1.05; above: over 1.05), the bands with
+# enough minutes on both sides are compared, each side's busy share being the
+# ratio of its sums in the band, and the bands weighted by the pressured
+# side's minutes (so both sides are read at the pressured side's consumption).
+# The run queue per VP likewise, over the bands where both sides carry it.
+sub _busy_share_record
+{
+    my ($bs) = @_;
+    return [] unless (ref($bs) eq 'HASH' && ref($bs->{relaxed}) eq 'HASH');
+    my $near = int(1 / $BUSY_SHARE_RULES{binWidth} + 0.5);
+    my %regime = (below => sub { $_[0] < $near }, near => sub { $_[0] == $near }, above => sub { $_[0] > $near });
+    my @out;
+    foreach my $condition (qw(contested solitary vpCeiling))
+    {
+        my $pressured = $bs->{$condition} or next;
+        foreach my $name (qw(below near above))
+        {
+            my @bins = grep { $regime{$name}->($_) } sort { $a <=> $b } keys %$pressured;
+            my $all = 0;
+            $all += $pressured->{$_}[0] for @bins;
+            next unless $all;
+            my @matched = grep { $pressured->{$_}[0] >= $BUSY_SHARE_RULES{minBinMinutes}
+                                 && ($bs->{relaxed}{$_} // [0])->[0] >= $BUSY_SHARE_RULES{minBinMinutes} } @bins;
+            my ($np, $nr, $share_p, $share_r, $cons_p, $cons_r, %days_p, %days_r) = (0, 0, 0, 0, 0, 0);
+            $np += $pressured->{$_}[0] for @matched;
+            foreach my $bin (@matched)
+            {
+                my ($p, $r) = ($pressured->{$bin}, $bs->{relaxed}{$bin});
+                my $w = $p->[0] / $np;
+                $nr += $r->[0];
+                $share_p += $w * $p->[1] / $p->[2];
+                $share_r += $w * $r->[1] / $r->[2];
+                $cons_p  += $w * $p->[3] / $p->[0];
+                $cons_r  += $w * $r->[3] / $r->[0];
+                @days_p{ keys %{ $p->[6] } } = ();
+                @days_r{ keys %{ $r->[6] } } = ();
+            }
+            my $enough = ($np >= $BUSY_SHARE_RULES{minMinutes} && $nr >= $BUSY_SHARE_RULES{minMinutes}) ? 1 : 0;
+            my %row = (condition => $condition, regime => $name, pressuredMinutesAll => $all, pressuredMinutes => $np,
+                       relaxedMinutes => $nr, pressuredDays => scalar(keys %days_p), relaxedDays => scalar(keys %days_r),
+                       bands => scalar(@matched), sufficient => ($enough ? JSON::true : JSON::false));
+            if ($enough)
+            {
+                %row = (%row, busySharePressured => 0 + sprintf('%.4f', $share_p), busyShareRelaxed => 0 + sprintf('%.4f', $share_r),
+                        consumptionPressured => 0 + sprintf('%.4f', $cons_p), consumptionRelaxed => 0 + sprintf('%.4f', $cons_r));
+                my @queued = grep { $pressured->{$_}[4] >= $BUSY_SHARE_RULES{minBinMinutes}
+                                    && $bs->{relaxed}{$_}[4] >= $BUSY_SHARE_RULES{minBinMinutes} } @matched;
+                my ($nq, $rq_p, $rq_r) = (0, 0, 0);
+                $nq += $pressured->{$_}[4] for @queued;
+                foreach my $bin (@queued)
+                {
+                    my ($p, $r) = ($pressured->{$bin}, $bs->{relaxed}{$bin});
+                    $rq_p += $p->[4] / $nq * $p->[5] / $p->[4];
+                    $rq_r += $p->[4] / $nq * $r->[5] / $r->[4];
+                }
+                %row = (%row, runqMinutes => $nq, runqPerVpPressured => 0 + sprintf('%.4f', $rq_p), runqPerVpRelaxed => 0 + sprintf('%.4f', $rq_r))
+                    if ($nq >= $BUSY_SHARE_RULES{minMinutes});
+            }
+            push @out, \%row;
+        }
+    }
+    return \@out;
+}
+
 # The contested level for one share and percentile (research, stage 3.4): the
 # percentile of PhysB + share x (PhysC - PhysB) over every contested minute,
 # rounded up to 0.01 and not limited by the installed entitlement. Returns
@@ -24929,6 +25049,7 @@ sub _protection_trackers
         $t->{from} = max($t->{from}, $bounds{ $t->{vm} }[0]);
         $t->{to}   = min($t->{to},   $bounds{ $t->{vm} }[1]);
         $t->{protection} = { contested => 0, days => {}, frontier => [], top => [] };
+        $t->{busyShare}  = {} if $research_busy_share;
     }
     return $trackers;
 }
@@ -27256,6 +27377,11 @@ Model behaviour depends on the event configuration:
 
   --research-gated-peak-uplift              : Research only. Also sizes each profile without the rule and records that
                                               figure in the stored proposal.
+
+  --research-busy-share                     : Research only. Records, for each uncapped shared-pool LPAR, the busy share
+                                              (PhysB / PhysC) and the run queue per VP in minutes under pressure against
+                                              relaxed minutes of the same consumption, separately below, near and above
+                                              the entitlement. Nothing published changes.
 
   --research-contested-level                : Research only. Records, for each profile of an LPAR with contested minutes,
                                               the profile's percentile of the protected level over those minutes and

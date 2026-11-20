@@ -175,13 +175,18 @@ class CutProtectionTest(unittest.TestCase):
         # Research switch (stage 3.4 candidate): the record is added, the CSV figures stay.
         _, plain = self.standard()
         shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
-        _, text = self.standard('--research-contested-level')
+        _, text = self.standard('--research-contested-level', '--research-busy-share')
         cells = lambda t: {r['VM']: {k: v for k, v in r.items() if k and k[0] in 'PGOB' and '-' in k} for r in csv.DictReader(t.splitlines())}
         self.assertEqual(cells(plain), cells(text))
         snap = self.snapshot()
         profiles = json.loads(snap.read_text())['members']['vmA']['profiles']
         levels = {p: v['contestedLevel'] for p, v in profiles.items() if 'contestedLevel' in v}
         self.assertTrue(levels, 'vmA has contested minutes, so its profiles carry a contested level')
+        # Busy share (research): the fixture has no relaxed minute at the contested consumption,
+        # so the comparison is recorded as not comparable, with its minutes counted.
+        shares = [row for v in profiles.values() for row in v.get('busyShare', [])]
+        self.assertTrue(shares and all(r['condition'] == 'contested' and r['regime'] == 'above' for r in shares))
+        self.assertTrue(all(not r['sufficient'] and r['pressuredMinutesAll'] > 0 and 'busySharePressured' not in r for r in shares))
         for name, c in levels.items():
             self.assertGreater(c['minutes'], 0, name)
             self.assertEqual(c['sufficient'], c['minutes'] >= 15 and c['days'] >= 2, name)
