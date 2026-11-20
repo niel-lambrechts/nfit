@@ -120,6 +120,18 @@ class CaptureResume(unittest.TestCase):
             self.assertTrue(any('not resumed' in line for line in out.lines))
 
 
+class ProfileArgs(unittest.TestCase):
+    def test_extra_options_and_reserved_ones(self):
+        golden = _load_golden()
+        self.assertEqual(golden.parse_profile_args('--no-cut-protection --pool-exposure'),
+                         ['--no-cut-protection', '--pool-exposure'])
+        self.assertEqual(golden.parse_profile_args(''), [])
+        with self.assertRaises(ValueError):
+            golden.parse_profile_args('--enddate=2026-10-31')
+        with self.assertRaises(ValueError):
+            golden.parse_profile_args('--nmondir /x')
+
+
 class PoolEvidenceStaging(unittest.TestCase):
     def test_pool_observations_are_linked_and_identified(self):
         golden = _load_golden()
@@ -147,6 +159,8 @@ class PoolEvidenceStaging(unittest.TestCase):
                    '  Not evaluated: the cache holds no pool observations.\n')
         self.assertEqual(golden.protection_summary(missing), 'cut protection: not evaluated (the cache holds no pool observations)')
         self.assertEqual(golden.protection_summary('no such section'), 'cut protection: section absent')
+        unavailable = '  Pool competition for entitlement cuts could not be checked: the CPU cache declares no PhysB column.\n'
+        self.assertEqual(golden.protection_summary(unavailable), 'cut protection: not run (the CPU cache declares no PhysB column)')
 
 
 if __name__ == '__main__':

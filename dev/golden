@@ -43,7 +43,12 @@
 #
 # USAGE    : dev/golden capture <name> [--stage-dir DIR] [--systems all|S1,S2]
 #                                      [--runs forensic,decay-states,windowed]
-#                                      [--enddate YYYY-MM-DD]
+#                                      [--enddate YYYY-MM-DD] [--single]
+#                                      [--profile-args=OPTIONS]
+#            --profile-args adds nfit-profile options to every run and is
+#            recorded; a compare reuses them unless given its own
+#            (--profile-args= for none), so capturing with a switch and
+#            comparing without it isolates that switch's effect.
 #            dev/golden capture <name> --resume
 #            --resume captures, into an existing baseline, the combinations it
 #            lacks (a failed run), with the baseline's own frozen executables,
@@ -97,6 +102,22 @@ RUNS = {
     'windowed':     ['--runq-perc-behavior=match', '--enable-windowed-decay'],
 }
 DECAY_RUNS = {'decay-states', 'windowed'}
+
+# Extra nfit-profile options for every run (--profile-args), e.g. a switch whose
+# effect is to be measured: capture with it, compare without it. Options the
+# harness sets itself are refused.
+PROFILE_ARGS: list = []
+RESERVED_ARGS = ('--nmondir', '--enddate', '--analysis-reference-date', '--config')
+
+
+def parse_profile_args(text):
+    """The --profile-args string as a list, or raises ValueError."""
+    import shlex
+    args = shlex.split(text or '')
+    bad = [x for x in args if x.split('=', 1)[0] in RESERVED_ARGS]
+    if bad:
+        raise ValueError(f'set by the harness: {", ".join(bad)}')
+    return args
 
 VOLATILE = [
     (re.compile(r'(Date/Time Generated\s*:\s*).*'), r'\1<TIMESTAMP>'),
@@ -179,6 +200,9 @@ def protection_summary(log_text: str) -> str:
         return f'cut protection: not evaluated ({m.group(1)})'
     if 'No planning-profile cut in this analysis.' in (log_text or '') and 'Cut Protection' in (log_text or ''):
         return 'cut protection: no planning-profile cut'
+    m = re.search(r'Pool competition for entitlement cuts could not be checked: ([^\n]*?)\.?\n', log_text or '')
+    if m:
+        return f'cut protection: not run ({m.group(1)})'
     return 'cut protection: section absent'
 
 
@@ -297,7 +321,7 @@ def canonical_text(text: str, scratch: Path) -> str:
 
 
 def run_profile(scratch: Path, sdir: Path, run: str, enddate: str, env: dict):
-    args = [str(scratch / 'nfit-profile')] + RUNS[run] + ['--enddate', enddate, '--nmondir', str(sdir)]
+    args = [str(scratch / 'nfit-profile')] + RUNS[run] + PROFILE_ARGS + ['--enddate', enddate, '--nmondir', str(sdir)]
     if run in DECAY_RUNS:
         args += ['--analysis-reference-date', enddate]
     r = subprocess.run(args, cwd=str(scratch), env=env, capture_output=True, text=True)
@@ -512,10 +536,11 @@ def diff_lines(a: str, b: str, limit: int = 20, label_a: str = 'baseline', label
 # ------------------------------------------------------------------------------
 # Commands
 # ------------------------------------------------------------------------------
-def capture_one(system: str, sysdir: Path, run: str, enddate: str, frozen: Path, env: dict, dest: Path, out):
+def capture_one(system: str, sysdir: Path, run: str, enddate: str, frozen: Path, env: dict, dest: Path, out,
+                repeat: bool = True):
     """Run one system/run combination with the frozen tree and store it under
     the baseline; returns its digests, or None when it failed."""
-    res = execute(system, sysdir, run, enddate, frozen, frozen / 'etc', env)
+    res = execute(system, sysdir, run, enddate, frozen, frozen / 'etc', env, repeat=repeat)
     rdir = dest / 'results' / system / run
     rdir.mkdir(parents=True)
     if 'error' in res:
@@ -531,7 +556,7 @@ def capture_one(system: str, sysdir: Path, run: str, enddate: str, frozen: Path,
     for kind, text in res['outputs'].items():
         (rdir / f'{run}.{kind}').write_text(text, encoding='utf-8')
         digests[kind] = hashlib.sha256(text.encode('utf-8')).hexdigest()
-    out.say(f'  {system} {run:<13} ok ({", ".join(sorted(digests))}; cached run agrees; '
+    out.say(f'  {system} {run:<13} ok ({", ".join(sorted(digests))}; {"cached run agrees" if repeat else "single run"}; '
             f'{protection_summary(res["outputs"].get("log", ""))})')
     return digests
 
@@ -549,7 +574,9 @@ def resume_capture(name: str, out) -> int:
     frozen = dest / 'frozen'
     stage_dir = Path(meta['stage_dir'])
     env = perl_env()
-    out.say(f'Resuming baseline "{name}": runs {",".join(meta["runs"])}, enddate {meta["enddate"]}')
+    PROFILE_ARGS[:] = meta.get('profile_args', [])
+    out.say(f'Resuming baseline "{name}": runs {",".join(meta["runs"])}, enddate {meta["enddate"]}'
+            + (f', options {" ".join(PROFILE_ARGS)}' if PROFILE_ARGS else ''))
     failures = added = 0
     for system, sysmeta in meta['systems'].items():
         missing = [run for run in meta['runs'] if run not in sysmeta['runs']]
@@ -564,7 +591,8 @@ def resume_capture(name: str, out) -> int:
             rdir = dest / 'results' / system / run
             if rdir.exists():
                 shutil.rmtree(rdir)                      # the failed attempt's ERROR.txt and partial outputs
-            digests = capture_one(system, sysdir, run, meta['enddate'], frozen, env, dest, out)
+            digests = capture_one(system, sysdir, run, meta['enddate'], frozen, env, dest, out,
+                                  repeat=not meta.get('single', False))
             if digests is None:
                 failures += 1
                 continue
@@ -595,6 +623,11 @@ def cmd_capture(a, out: RedactedOut) -> int:
             out.say(f'golden: unknown run "{r}" (choose from {",".join(RUNS)})')
             return 2
     enddate = a.enddate or last_complete_month_end(dt.date.today()).isoformat()
+    try:
+        PROFILE_ARGS[:] = parse_profile_args(a.profile_args)
+    except ValueError as exc:
+        out.say(f'golden: --profile-args: {exc}')
+        return 2
 
     frozen = dest / 'frozen'
     frozen.mkdir(parents=True)
@@ -608,16 +641,18 @@ def cmd_capture(a, out: RedactedOut) -> int:
         'stage_dir': str(stage_dir), 'enddate': enddate, 'runs': runs,
         'source': git_identity(REPO),
         'executables_sha256': {e: sha256_file(REPO / e) for e in EXECUTABLES},
+        'profile_args': PROFILE_ARGS, 'single': bool(a.single),
         'systems': {},
     }
-    out.say(f'Capturing baseline "{a.name}": {len(systems)} system(s), runs {",".join(runs)}, enddate {enddate}')
+    out.say(f'Capturing baseline "{a.name}": {len(systems)} system(s), runs {",".join(runs)}, enddate {enddate}'
+            + (f', options {" ".join(PROFILE_ARGS)}' if PROFILE_ARGS else '') + (', single run' if a.single else ''))
     out.say(f'  stage dir (resolved): {stage_dir}')
     failures = 0
     for system in systems:
         sysdir = stage_dir / system
         meta['systems'][system] = {'data_identity': data_identity(sysdir), 'runs': {}}
         for run in runs:
-            digests = capture_one(system, sysdir, run, enddate, frozen, env, dest, out)
+            digests = capture_one(system, sysdir, run, enddate, frozen, env, dest, out, repeat=not a.single)
             if digests is None:
                 failures += 1
                 continue
@@ -637,8 +672,15 @@ def cmd_compare(a, out: RedactedOut) -> int:
     stage_dir = Path(a.stage_dir or meta['stage_dir']).resolve()
     exe_src = dest / 'frozen' if a.frozen else REPO
     env = perl_env()
+    # The baseline's own options unless others are given (--profile-args= for none).
+    try:
+        PROFILE_ARGS[:] = parse_profile_args(a.profile_args) if a.profile_args is not None else meta.get('profile_args', [])
+    except ValueError as exc:
+        out.say(f'golden: --profile-args: {exc}')
+        return 2
     out.say(f'Comparing against baseline "{a.name}" (source: {"frozen copy" if a.frozen else "current tree"}, '
-            f'enddate {meta["enddate"]})')
+            f'enddate {meta["enddate"]}; options: baseline {" ".join(meta.get("profile_args", [])) or "none"}, '
+            f'this run {" ".join(PROFILE_ARGS) or "none"})')
     differences = 0
     unintended = 0
     wanted_systems = None
@@ -813,6 +855,9 @@ def main() -> int:
     c.add_argument('--systems', default='all')
     c.add_argument('--runs', default='forensic,decay-states,windowed')
     c.add_argument('--enddate', default=None)
+    c.add_argument('--profile-args', default='',
+                   help='Extra nfit-profile options for every run, as one string: --profile-args=--no-cut-protection')
+    c.add_argument('--single', action='store_true', help='Skip the cached repeat run (half the time)')
     c.add_argument('--resume', action='store_true',
                    help='Add the combinations an existing baseline lacks (failed runs), with its frozen tree')
     k = sub.add_parser('compare')
@@ -823,6 +868,8 @@ def main() -> int:
     k.add_argument('--runs', default=None, help='Subset of baseline runs, e.g. decay-states')
     k.add_argument('--check-proposals', action='store_true', help='Also compare each stored tactical proposal with the baseline CSV')
     k.add_argument('--single', action='store_true', help='Skip the cached repeat run')
+    k.add_argument('--profile-args', default=None,
+                   help="Extra nfit-profile options (default: the baseline's own; --profile-args= for none)")
     k.add_argument('--classify', action='store_true',
                    help='Sort differences into intended (VM_Comments alert tags, INTENDED_SECTIONS) and unintended')
     sub.add_parser('list')
