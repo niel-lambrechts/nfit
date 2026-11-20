@@ -131,6 +131,14 @@ check('a floor below the target changes nothing', $r, Ent => 0.60, Status => 'AP
 $r = pair(target_ent => 1.20, target_vp => 2, step_vp => 2, current_ent => 0.80, current_vp => 2, tier_floor => sub { 2.00 });
 check('a raise is not touched by the floor', $r, Ent => 1.20, Binding => []);
 
+# A staged target below the platform minimum of its VPs is stated as the pair
+# PowerVM accepts, with the workload figure beside it.
+$r = pair(target_ent => 0.01, target_vp => 2, step_vp => 1, current_ent => 0.50, current_vp => 1);
+like(UUT::_current_cycle_action_text($r, 0.50, 1, 0),
+     qr/Target 0\.10 entitlement on 2 VPs over later cycles \(the platform minimum for 2 VPs; the workload figure is 0\.01\)\./,
+     'staged target stated as a configurable pair');
+unlike(UUT::_current_cycle_action_text($r, 0.50, 1, 0), qr/Target 0\.01 entitlement on/, 'no invalid pair in the action');
+
 # A simple cut that reaches its target in one cycle.
 $r = pair(target_ent => 1.20, target_vp => 3, step_vp => 3, current_ent => 2.00, current_vp => 4);
 check('simple cut', $r, Ent => 1.20, VP => 3, Status => 'APPLY', Order => 'EITHER', Binding => []);
