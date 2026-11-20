@@ -44,7 +44,9 @@
 # USAGE    : dev/golden capture <name> [--stage-dir DIR] [--systems all|S1,S2]
 #                                      [--runs forensic,decay-states,windowed]
 #                                      [--enddate YYYY-MM-DD] [--single]
-#                                      [--profile-args=OPTIONS]
+#                                      [--profile-args=OPTIONS] [--from-commit REV]
+#            --from-commit freezes the executables as committed at REV, so a
+#            "before" baseline can be taken while the working tree changes.
 #            --profile-args adds nfit-profile options to every run and is
 #            recorded; a compare reuses them unless given its own
 #            (--profile-args= for none), so capturing with a switch and
@@ -108,6 +110,12 @@ DECAY_RUNS = {'decay-states', 'windowed'}
 # effect is to be measured: capture with it, compare without it. Options the
 # harness sets itself are refused.
 PROFILE_ARGS: list = []
+# Lines listed per output by compare --classify (--listed; 0 lists every line).
+LISTED = 20
+
+
+def room(lines: list) -> bool:
+    return LISTED <= 0 or len(lines) < LISTED
 RESERVED_ARGS = ('--nmondir', '--enddate', '--analysis-reference-date', '--config')
 
 
@@ -474,7 +482,7 @@ def classify_log(base: str, cur: str) -> dict:
                 result['intended'] += 1
             else:
                 result['other'] += 1
-                if len(result['other_lines']) < 20:
+                if room(result['other_lines']):
                     result['other_lines'].append(f'{sign} [{key}] {text}')
     return result
 
@@ -511,7 +519,7 @@ def classify_csv(base: str, cur: str) -> dict:
                 continue                                     # blank before v10 unless formulas were on
             if result['layout'] is not None and LAYOUT_COMPLETED.match(name):
                 result['completed'] += 1
-                if len(result['completed_lines']) < 20:
+                if room(result['completed_lines']):
                     result['completed_lines'].append(f'{row_a[0]} {name} (current-cycle pair): {va} -> {vb}')
                 continue
             if name == 'VM_Comments':
@@ -519,11 +527,11 @@ def classify_csv(base: str, cur: str) -> dict:
                     result['tags_only'] += 1
                 else:
                     result['comments_other'] += 1
-                    if len(result['cell_lines']) < 20:
+                    if room(result['cell_lines']):
                         result['cell_lines'].append(f'{row_a[0]} VM_Comments: {va!r} -> {vb!r}')
                 continue
             result['cells'] += 1
-            if len(result['cell_lines']) < 20:
+            if room(result['cell_lines']):
                 result['cell_lines'].append(f'{row_a[0]} {name}: {va} -> {vb}')
     return result
 
@@ -632,24 +640,43 @@ def cmd_capture(a, out: RedactedOut) -> int:
         out.say(f'golden: --profile-args: {exc}')
         return 2
 
+    # Executables from a commit (--from-commit), or from the working tree.
+    source = git_identity(REPO)
+    blobs = {}
+    if a.from_commit:
+        for exe in EXECUTABLES:
+            r = subprocess.run(['git', '-C', str(REPO), 'show', f'{a.from_commit}:{exe}'], capture_output=True)
+            if r.returncode != 0:
+                out.say(f'golden: --from-commit: {exe} not found at {a.from_commit}')
+                return 2
+            blobs[exe] = r.stdout
+        r = subprocess.run(['git', '-C', str(REPO), 'rev-parse', '--verify', f'{a.from_commit}^{{commit}}'],
+                           capture_output=True, text=True)
+        source = {'commit': r.stdout.strip(), 'executables_dirty': False, 'from_commit': True}
+
     frozen = dest / 'frozen'
     frozen.mkdir(parents=True)
     for exe in EXECUTABLES:
-        shutil.copy2(REPO / exe, frozen / exe)
+        if exe in blobs:
+            (frozen / exe).write_bytes(blobs[exe])
+            (frozen / exe).chmod(0o755)
+        else:
+            shutil.copy2(REPO / exe, frozen / exe)
     copy_nfit_config(REPO / 'etc', frozen / 'etc')
     env = perl_env()
 
     meta = {
         'name': a.name, 'created': dt.datetime.now().isoformat(timespec='seconds'),
         'stage_dir': str(stage_dir), 'enddate': enddate, 'runs': runs,
-        'source': git_identity(REPO),
-        'executables_sha256': {e: sha256_file(REPO / e) for e in EXECUTABLES},
+        'source': source,
+        'executables_sha256': {e: sha256_file(frozen / e) for e in EXECUTABLES},
         'profile_args': PROFILE_ARGS, 'single': bool(a.single),
         'systems': {},
     }
     out.say(f'Capturing baseline "{a.name}": {len(systems)} system(s), runs {",".join(runs)}, enddate {enddate}'
             + (f', options {" ".join(PROFILE_ARGS)}' if PROFILE_ARGS else '') + (', single run' if a.single else ''))
     out.say(f'  stage dir (resolved): {stage_dir}')
+    out.say(f'  executables: {"commit " + source["commit"][:7] if a.from_commit else "working tree"}')
     failures = 0
     for system in systems:
         sysdir = stage_dir / system
@@ -675,6 +702,8 @@ def cmd_compare(a, out: RedactedOut) -> int:
     stage_dir = Path(a.stage_dir or meta['stage_dir']).resolve()
     exe_src = dest / 'frozen' if a.frozen else REPO
     env = perl_env()
+    global LISTED
+    LISTED = a.listed
     # The baseline's own options unless others are given (--profile-args= for none).
     try:
         PROFILE_ARGS[:] = parse_profile_args(a.profile_args) if a.profile_args is not None else meta.get('profile_args', [])
@@ -752,8 +781,9 @@ def cmd_compare(a, out: RedactedOut) -> int:
                             f'other cells changed {c["cells"]}, VM_Comments alert tags only {c["tags_only"]}, '
                             f'VM_Comments other {c["comments_other"]}')
                     # Unintended cells first, so that the expected current-cycle
-                    # changes never push them out of the 20-line listing.
-                    for line in c['cell_lines'] + c['completed_lines'][:max(0, 20 - len(c['cell_lines']))]:
+                    # changes never push them out of the listing.
+                    rest = None if LISTED <= 0 else max(0, LISTED - len(c['cell_lines']))
+                    for line in c['cell_lines'] + c['completed_lines'][:rest]:
                         out.say('        ' + line)
                 elif a.classify and kind == 'log':
                     c = classify_log(base, current)
@@ -864,6 +894,8 @@ def main() -> int:
     c.add_argument('--profile-args', default='',
                    help='Extra nfit-profile options for every run, as one string: --profile-args=--no-cut-protection')
     c.add_argument('--single', action='store_true', help='Skip the cached repeat run (half the time)')
+    c.add_argument('--from-commit', default=None, metavar='REV',
+                   help='Freeze nfit and nfit-profile as committed at REV instead of the working tree')
     c.add_argument('--resume', action='store_true',
                    help='Add the combinations an existing baseline lacks (failed runs), with its frozen tree')
     k = sub.add_parser('compare')
@@ -874,6 +906,7 @@ def main() -> int:
     k.add_argument('--runs', default=None, help='Subset of baseline runs, e.g. decay-states')
     k.add_argument('--check-proposals', action='store_true', help='Also compare each stored tactical proposal with the baseline CSV')
     k.add_argument('--single', action='store_true', help='Skip the cached repeat run')
+    k.add_argument('--listed', type=int, default=20, help='Lines listed per output with --classify (0: all)')
     k.add_argument('--profile-args', default=None,
                    help="Extra nfit-profile options (default: the baseline's own; --profile-args= for none)")
     k.add_argument('--classify', action='store_true',
