@@ -29,7 +29,8 @@ for my $name (qw(_protection_add_minute _protection_bound _protection_share_of _
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
 }
-eval "package UUT;\nuse List::Util qw(max min);\n$code\n1;" or die "harness eval failed: $@\n";
+# $research_contested_level: the research switch read by _protection_add_minute (off here).
+eval "package UUT;\nuse List::Util qw(max min);\nmy \$research_contested_level;\n$code\n1;" or die "harness eval failed: $@\n";
 
 my $T0 = 1788220800;                          # 2026-09-01 00:00 UTC
 my $new = sub { return { contested => 0, days => {}, frontier => [], top => [] }; };

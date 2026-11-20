@@ -646,6 +646,19 @@ my $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED = 0.90;   # and of every single day, so 
 # the rule and record that figure, for dev/gated-uplift-report.
 my $research_gated_peak_uplift;
 my $peak_uplift_suspended = 0;                # set while a profile is sized without the rule for the record
+# --research-contested-level (research only; stage 3.4 candidate). The
+# contested level of a profile is its percentile of the protected level,
+# PhysB + share x (PhysC - PhysB), over the contested minutes of its hours in
+# the LPAR's current state. It is an additional entitlement floor on the
+# sizing made without the tier's pool-borrowing rule: not limited by the
+# installed entitlement or the pool, and a supported minimum, since the
+# minutes are ones in which the LPAR was held back. The published figures do
+# not change; the candidate is recorded in the stored proposal for
+# dev/contested-level-report. The evidence requirement is provisional.
+my $research_contested_level;
+my $CONTESTED_LEVEL_MIN_MINUTES = 15;
+my $CONTESTED_LEVEL_MIN_DAYS    = 2;
+my $contested_floor_value;                    # set while a profile is sized with the candidate floor for the record
 my ($candidate_test, $candidate_window, $candidate_snapshot);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
@@ -773,6 +786,7 @@ GetOptions(
     'cut-protection!'            => \$cut_protection_flag,
     'research-no-peak-uplift'    => \$research_no_peak_uplift,
     'research-gated-peak-uplift' => \$research_gated_peak_uplift,
+    'research-contested-level'   => \$research_contested_level,
     'uplift-exemption!'          => \$uplift_exemption_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
@@ -2644,16 +2658,49 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
 
                 # Research (gated rule): the figure the same profile gets without
                 # the rule, for the record. Sized before the call that stands.
-                my $no_rule;
-                if ($research_gated_peak_uplift)
+                my ($no_rule, $no_rule_dbg);
+                if ($research_gated_peak_uplift || $research_contested_level)
                 {
                     $peak_uplift_suspended = 1;
-                    ($no_rule) = $size_profile->(0);
+                    ($no_rule, $no_rule_dbg) = $size_profile->(0);
                     $peak_uplift_suspended = 0;
                     delete $WIDTH_FLOOR{$vm_name}{$profile_name} if ($WIDTH_FLOOR{$vm_name});
                 }
 
+                # Research (contested level): the same sizing without the rule,
+                # with the contested level as an additional floor where the
+                # evidence is sufficient and the level is above that sizing.
+                my %contested_record;
+                my $cl_tracker = ($research_contested_level && $CUT_PROTECTION_EVIDENCE{$vm_name})
+                               ? $CUT_PROTECTION_EVIDENCE{$vm_name}{$profile_name} : undef;
+                if ($cl_tracker && looks_like_number($no_rule // ''))
+                {
+                    my ($cl_share) = _protection_share_of($profile_name);
+                    my $cl_perc = (($profile->{flags} // '') =~ /(?:-p|--percentile)\s+([0-9.]+)/) ? $1 + 0 : $DEFAULT_PERCENTILE + 0;
+                    my ($cl_level, $cl_minutes, $cl_days, $cl_enough) = _contested_level($cl_tracker->{protection}, $cl_share, $cl_perc);
+                    if (defined $cl_level)
+                    {
+                        my $vps_of = sub { my ($d) = @_; return (ref($d) eq 'HASH' && looks_like_number($d->{'rVCPU_Final'} // '')) ? $d->{'rVCPU_Final'} + 0 : undef; };
+                        my $own = _structural_shown_value($no_rule);
+                        my ($candidate, $candidate_vps) = ($own, $vps_of->($no_rule_dbg));
+                        if ($cl_enough && defined $own && $cl_level > $own + $STRUCTURAL_ENT_TOLERANCE)
+                        {
+                            ($peak_uplift_suspended, $contested_floor_value) = (1, $cl_level);
+                            my ($cl_value, $cl_dbg) = $size_profile->(0);
+                            ($peak_uplift_suspended, $contested_floor_value) = (0, undef);
+                            delete $WIDTH_FLOOR{$vm_name}{$profile_name} if ($WIDTH_FLOOR{$vm_name});
+                            ($candidate, $candidate_vps) = (_structural_shown_value($cl_value), $vps_of->($cl_dbg))
+                                if looks_like_number($cl_value // '');
+                        }
+                        %contested_record = (percentile => $cl_perc, share => $cl_share, minutes => $cl_minutes, days => $cl_days,
+                            sufficient => ($cl_enough ? JSON::true : JSON::false), level => $cl_level,
+                            noRule => $own, noRuleVPs => $vps_of->($no_rule_dbg), candidate => $candidate, candidateVPs => $candidate_vps);
+                    }
+                }
+
                 my ($adjusted_physc, $debug_info_ref) = $size_profile->(0);
+                $debug_info_ref->{'ContestedLevelRecord'} = { %contested_record }
+                    if (ref($debug_info_ref) eq 'HASH' && %contested_record);
                 $debug_info_ref->{'PeakUpliftNoRule'} = sprintf('%.4f', $no_rule)
                     if (ref($debug_info_ref) eq 'HASH' && defined $no_rule && looks_like_number($no_rule)
                         && looks_like_number($adjusted_physc // '') && $adjusted_physc > $no_rule + $STRUCTURAL_ENT_TOLERANCE);
@@ -8586,6 +8633,14 @@ sub calculate_runq_modified_physc
             $debug_info{'CutProtectionApplied'} = sprintf('Yes: raised %.4f -> %.2f (share %.2f)', $calculated_demand, $cp_bound, $cp_share);
             $calculated_demand = $cp_bound;
         }
+    }
+
+    # Research (--research-contested-level): the candidate floor, for the
+    # recorded sizing only. Not limited by the installed entitlement.
+    if (defined $contested_floor_value && !$cut_protection_suspended && $contested_floor_value > $calculated_demand + $FLOAT_EPSILON)
+    {
+        $debug_info{'ContestedLevelApplied'} = sprintf('%.4f -> %.2f', $calculated_demand, $contested_floor_value);
+        $calculated_demand = $contested_floor_value;
     }
 
     # Dispatch width reference (v10 step 3b correction): see %WIDTH_FLOOR.
@@ -15816,6 +15871,8 @@ sub _write_standard_csv_report {
                     entitlementBoundedVPs => $numeric_cell->("${name}_rVCPU_EntBounded"),
                     tacticalVPs => $numeric_cell->("${name}_rVCPU_Tactical"),
                     _tier_floor_record($core->{ProfileDebugInfo}{$name}),
+                    ((ref(($core->{ProfileDebugInfo}{$name} // {})->{'ContestedLevelRecord'}) eq 'HASH')
+                        ? (contestedLevel => $core->{ProfileDebugInfo}{$name}{'ContestedLevelRecord'}) : ()),
                     currentCycle => {
                         entitlement => $pair->{Ent},
                         VPs         => $pair->{VP},
@@ -24727,6 +24784,7 @@ sub _protection_add_minute
     my $eps = 1e-9;
     $p->{contested}++;
     $p->{days}{ int($minute / 86400) } = 1;
+    push @{ $p->{all} }, [ $busy, $consumed ] if $research_contested_level;
     unless (grep { $_->[0] >= $busy - $eps && $_->[1] >= $consumed - $eps } @{ $p->{frontier} })
     {
         @{ $p->{frontier} } = ((grep { !($_->[0] <= $busy + $eps && $_->[1] <= $consumed + $eps) } @{ $p->{frontier} }),
@@ -24754,6 +24812,27 @@ sub _protection_bound
     $up++ if ($cents - $up > 1e-6);
     my $bound = $up / 100;
     return (defined $installed && $bound > $installed) ? $installed + 0 : $bound;
+}
+
+# The contested level for one share and percentile (research, stage 3.4): the
+# percentile of PhysB + share x (PhysC - PhysB) over every contested minute,
+# rounded up to 0.01 and not limited by the installed entitlement. Returns
+# (level, minutes, days, sufficient); the level is undef without a contested
+# minute. Sufficient is the provisional evidence requirement.
+sub _contested_level
+{
+    my ($p, $share, $percentile) = @_;
+    return (undef, 0, 0, 0) unless (ref($p) eq 'HASH' && @{ $p->{all} // [] } && defined $share && defined $percentile);
+    my @sorted = sort { $a <=> $b } map { $_->[0] + $share * ($_->[1] - $_->[0]) } @{ $p->{all} };
+    my $n = scalar @sorted;
+    my $rank  = ($n - 1) * $percentile / 100;
+    my $lower = int($rank);
+    my $upper = ($lower + 1 < $n) ? $lower + 1 : $lower;
+    my $cents = ($sorted[$lower] + ($sorted[$upper] - $sorted[$lower]) * ($rank - $lower)) * 100;
+    my $up = int($cents);
+    $up++ if ($cents - $up > 1e-6);
+    my $days = scalar(keys %{ $p->{days} // {} });
+    return ($up / 100, $n, $days, ($n >= $CONTESTED_LEVEL_MIN_MINUTES && $days >= $CONTESTED_LEVEL_MIN_DAYS) ? 1 : 0);
 }
 
 # The share and tier of a profile: P-... is tier P, [OGB]n-... is tier n.
@@ -25047,8 +25126,15 @@ sub _protection_loss_trackers
             # Every cut is scored, with or without training evidence: the
             # residual exposure of cuts nothing protected is part of the test.
             # Research: so is every profile whose tier floor was withheld.
-            next unless ((ref($rec) eq 'HASH' && $rec->{cut}) || $withheld || $ruled);
+            # Research (--research-contested-level): every profile with a
+            # contested level is scored at the figure without the rule, the
+            # candidate and the published figure.
+            my $cl = $saved->{contestedLevel};
+            my $leveled = (ref($cl) eq 'HASH' && looks_like_number($cl->{noRule} // '')) ? 1 : 0;
+            next unless ((ref($rec) eq 'HASH' && $rec->{cut}) || $withheld || $ruled || $leveled);
             my %levels = (installed => $meta->{entitlement});
+            %levels = (%levels, clNoRule => $cl->{noRule}, clCandidate => $cl->{candidate}, clPublished => $saved->{entitlement})
+                if $leveled;
             %levels = (%levels, target => $rec->{target}, map { ($_ => $rec->{adjusted}{$_}) } qw(busy ladder consumed))
                 if (ref($rec) eq 'HASH' && $rec->{cut});
             if ($withheld)
@@ -27170,6 +27256,11 @@ Model behaviour depends on the event configuration:
 
   --research-gated-peak-uplift              : Research only. Also sizes each profile without the rule and records that
                                               figure in the stored proposal.
+
+  --research-contested-level                : Research only. Records, for each profile of an LPAR with contested minutes,
+                                              the profile's percentile of the protected level over those minutes and
+                                              the sizing it gives as an additional floor without the pool-borrowing
+                                              rule. The published figures do not change.
 
   --research-no-peak-uplift                 : Research only. The tier's pool-borrowing rule does not raise an uncapped
                                               LPAR's entitlement towards its peak; what it would have added is recorded

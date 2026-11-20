@@ -171,6 +171,57 @@ class CutProtectionTest(unittest.TestCase):
                 self.assertGreater(target['busy']['minutes'], 0, 'the uncapped cut loses guarantee on the held-out day')
                 self.assertGreaterEqual(target['consumed']['coreMinutes'], target['busy']['coreMinutes'])
 
+    def test_contested_level_is_recorded_and_changes_nothing_published(self):
+        # Research switch (stage 3.4 candidate): the record is added, the CSV figures stay.
+        _, plain = self.standard()
+        shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
+        _, text = self.standard('--research-contested-level')
+        cells = lambda t: {r['VM']: {k: v for k, v in r.items() if k and k[0] in 'PGOB' and '-' in k} for r in csv.DictReader(t.splitlines())}
+        self.assertEqual(cells(plain), cells(text))
+        snap = self.snapshot()
+        profiles = json.loads(snap.read_text())['members']['vmA']['profiles']
+        levels = {p: v['contestedLevel'] for p, v in profiles.items() if 'contestedLevel' in v}
+        self.assertTrue(levels, 'vmA has contested minutes, so its profiles carry a contested level')
+        for name, c in levels.items():
+            self.assertGreater(c['minutes'], 0, name)
+            self.assertEqual(c['sufficient'], c['minutes'] >= 15 and c['days'] >= 2, name)
+            self.assertGreaterEqual(c['candidate'], c['noRule'] - 1e-9, name)
+            if c['sufficient'] and c['level'] > c['noRule'] + 0.005:
+                self.assertGreaterEqual(c['candidate'], c['level'] - 1e-9, name)     # a floor, not limited by installed
+            else:
+                self.assertEqual(c['candidate'], c['noRule'], name)                  # thin evidence or no gain: unchanged
+        # The fixture's contested minutes fall on one day. With the day requirement of the
+        # copied program lowered to 1, the floor is applied in the recorded sizing: above
+        # the installed 2.0, and still nothing published moves.
+        prog = self.root / 'nfit-profile'
+        source = prog.read_text(encoding='utf-8')
+        self.assertEqual(source.count('my $CONTESTED_LEVEL_MIN_DAYS    = 2;'), 1)
+        prog.write_text(source.replace('my $CONTESTED_LEVEL_MIN_DAYS    = 2;', 'my $CONTESTED_LEVEL_MIN_DAYS    = 1;'), encoding='utf-8')
+        shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
+        _, text = self.standard('--research-contested-level')
+        self.assertEqual(cells(plain), cells(text))
+        snap = self.snapshot()
+        profiles = json.loads(snap.read_text())['members']['vmA']['profiles']
+        raised = 0
+        for name, c in ((p, v['contestedLevel']) for p, v in profiles.items() if 'contestedLevel' in v):
+            self.assertEqual(c['sufficient'], c['minutes'] >= 15, name)
+            if c['sufficient'] and c['level'] > c['noRule'] + 0.005:
+                self.assertGreaterEqual(c['candidate'], c['level'] - 1e-9, name)
+                self.assertGreater(c['candidate'], 2.0, name)
+                self.assertGreaterEqual(c['candidateVPs'], c['candidate'] - 1e-9, name)
+                raised += 1
+        self.assertGreater(raised, 0)
+        self.clear_outputs()
+        proc = subprocess.run(['perl', str(self.root / 'nfit-profile'), '--nmondir', str(self.cache), '--config', str(self.cfg),
+                               '--candidate-proposals', str(snap), '--candidate-window', '2026-09-02/2026-09-02'],
+                              cwd=str(self.root), capture_output=True, text=True, timeout=600)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        replay, = self.outputs('.json')
+        labels = {l for t in json.loads(replay.read_text())['trackers'] for level in t['levels'] for l in level['labels']}
+        for name in levels:
+            for plan in ('clNoRule', 'clCandidate', 'clPublished'):
+                self.assertIn(name + '/' + plan, labels)
+
 
 if __name__ == '__main__':
     unittest.main()
