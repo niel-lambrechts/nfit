@@ -50,4 +50,25 @@ my $spike = { all => [ (map { [ 0.5, 0.5 ] } 1 .. 14), [ 3.0, 3.0 ] ], days => {
 ($level) = UUT::_contested_level($spike, 0.85, 99);
 ok($level > 2.5, 'one high reading among 15 carries a 99th percentile (documented limitation)');
 
+# --- The provisional boundary (15 minutes on 2 days), both sides ---------------------
+my $flat = sub { my ($n, @days) = @_; return { all => [ map { [ 2.0, 3.0 ] } 1 .. $n ], days => { map { $_ => 1 } @days } }; };
+my @at;
+@at = UUT::_contested_level($flat->(15, 1, 2), 0.4, 95);
+ok($at[3], 'exactly 15 minutes on exactly 2 days: sufficient');
+is($at[0], 2.4, 'and the level is the one the 14-minute evidence already showed');
+@at = UUT::_contested_level($flat->(14, 1, 2), 0.4, 95);
+ok(!$at[3], '14 minutes on 2 days: not sufficient');
+is($at[0], 2.4, 'the level is still reported, so the withheld step is visible');
+@at = UUT::_contested_level($flat->(500, 1), 0.4, 95);
+ok(!$at[3], '500 minutes on one day: not sufficient (one long episode is one occasion)');
+@at = UUT::_contested_level($flat->(15, 1, 2, 3, 4, 5), 0.4, 95);
+ok($at[3], 'more days than needed: sufficient');
+# Known limitation, recorded: the day requirement is met by a single minute on a second
+# day, and one added minute moves a profile from no uplift to the whole level.
+ok((UUT::_contested_level({ all => [ map { [ 2.0, 3.0 ] } 1 .. 15 ], days => { 1 => 1, 2 => 1 } }, 0.4, 95))[3],
+   '14 minutes on one day and 1 on another passes (limitation: the second day may be one minute)');
+# The level does not depend on which side of the boundary the evidence falls: only its use does.
+is((UUT::_contested_level($flat->(14, 1, 2), 0.85, 99))[0], (UUT::_contested_level($flat->(15, 1, 2), 0.85, 99))[0],
+   'the same readings give the same level on either side of the boundary');
+
 done_testing();
