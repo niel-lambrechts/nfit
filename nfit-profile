@@ -23431,6 +23431,8 @@ sub _exposure_process_day
                 _protection_add_minute($tracker->{protection}, $minute, $b, $c) if $tracker->{protection};
                 _protection_loss_minute($tracker->{lossStats}, \@thresholds, $minute, $b, $c, $ent) if $tracker->{lossStats};
             }
+            _protection_borrow_minute($tracker->{borrowStats}, \@thresholds, $minute, $b, $scarce, $competition)
+                if $tracker->{borrowStats};
             $tracker->{joint}{$minute} = [ $b, $competition ] if ($scarce && $tracker->{joint});
             if (my $pr = $tracker->{pressure})
             {
@@ -24687,6 +24689,32 @@ sub _protection_loss_minute
     return;
 }
 
+# Replay scoring of one paired minute in the profile's hours (research): busy
+# work (PhysB) above each threshold, whatever the installed entitlement, in
+# every minute, in scarce minutes and in contested minutes.
+sub _protection_borrow_minute
+{
+    my ($stats, $thresholds_aref, $minute, $busy, $scarce, $contested) = @_;
+    return unless (ref($stats) eq 'ARRAY');
+    foreach my $k (0 .. $#$thresholds_aref)
+    {
+        my $delta = $busy - $thresholds_aref->[$k];
+        next unless ($delta > 1e-9);
+        foreach my $scope ('all', ($scarce ? 'scarce' : ()), ($contested ? 'contested' : ()))
+        {
+            my $r = $stats->[$k]{$scope} //= { minutes => 0, coreMinutes => 0, days => {}, longest => 0 };
+            $r->{minutes}++;
+            $r->{coreMinutes} += $delta;
+            $r->{days}{ int($minute / 86400) } = 1;
+            my $run = (defined $r->{last} && $minute == $r->{last} + 60) ? $r->{run} + 1 : 1;
+            $r->{run}  = $run;
+            $r->{last} = $minute;
+            $r->{longest} = $run if ($run > $r->{longest});
+        }
+    }
+    return;
+}
+
 # Evidence trackers: for each LPAR named, its current configuration state
 # (decision F4), uncapped and in a shared pool, over [from, to), one per
 # profile-hours population, with the candidate test's whole-minute bounds.
@@ -24904,17 +24932,28 @@ sub _protection_loss_trackers
         my %points;
         foreach my $profile (@$profiles)
         {
-            my $rec = ((($members->{$vm} // {})->{profiles} // {})->{$profile} // {})->{cutProtection};
+            my $saved = (($members->{$vm} // {})->{profiles} // {})->{$profile} // {};
+            my $rec = $saved->{cutProtection};
+            my $tf_any = $saved->{tierFloor};
+            my $withheld = (ref($tf_any) eq 'HASH' && $tf_any->{withheld} && looks_like_number($tf_any->{floor} // '')) ? 1 : 0;
             # Every cut is scored, with or without training evidence: the
             # residual exposure of cuts nothing protected is part of the test.
-            next unless (ref($rec) eq 'HASH' && $rec->{cut});
-            my %levels = (target => $rec->{target}, installed => $meta->{entitlement},
-                          map { ($_ => $rec->{adjusted}{$_}) } qw(busy ladder consumed));
+            # Research: so is every profile whose tier floor was withheld.
+            next unless ((ref($rec) eq 'HASH' && $rec->{cut}) || $withheld);
+            my %levels = (installed => $meta->{entitlement});
+            %levels = (%levels, target => $rec->{target}, map { ($_ => $rec->{adjusted}{$_}) } qw(busy ladder consumed))
+                if (ref($rec) eq 'HASH' && $rec->{cut});
+            if ($withheld)
+            {
+                # The published figure without the rule, and the rule's first floor in full.
+                $levels{recommended} = $saved->{entitlement};
+                $levels{ruleFull}    = int($tf_any->{floor} * 100 + 0.999999) / 100;
+            }
             # Research (--research-no-peak-uplift): where the tier's borrowing
             # rule was withheld, also score the level it would have kept: its
             # floor, within installed and never below the protected level.
             my $tf = ((($members->{$vm} // {})->{profiles} // {})->{$profile} // {})->{tierFloor};
-            if (ref($tf) eq 'HASH' && $tf->{withheld} && looks_like_number($tf->{floor} // ''))
+            if (ref($tf) eq 'HASH' && $tf->{withheld} && looks_like_number($tf->{floor} // '') && defined $levels{ladder})
             {
                 my $rule = int($tf->{floor} * 100 + 0.999999) / 100;
                 $rule = $meta->{entitlement} if (defined $meta->{entitlement} && $rule > $meta->{entitlement});
@@ -24934,6 +24973,7 @@ sub _protection_loss_trackers
     foreach my $t (@$trackers)
     {
         $t->{lossStats} = [];
+        $t->{borrowStats} = [];
         $t->{protectionReplay} = 1;
     }
     return $trackers;
@@ -24957,7 +24997,13 @@ sub _write_protection_replay
                 ($_ => { minutes => $r->{minutes} // 0, coreMinutes => 0 + sprintf('%.4f', $r->{coreMinutes} // 0),
                          days => scalar(keys %{ $r->{days} // {} }), episodes => $r->{episodes} // 0, longest => $r->{longest} // 0 })
             } qw(busy consumed);
-            push @levels, { value => $t->{thresholds}[$k]{value}, labels => $t->{thresholds}[$k]{labels}, %signals };
+            my $bs = ($t->{borrowStats} // [])->[$k] // {};
+            my %borrow = map {
+                my $r = $bs->{$_} // {};
+                ($_ => { minutes => $r->{minutes} // 0, coreMinutes => 0 + sprintf('%.4f', $r->{coreMinutes} // 0),
+                         days => scalar(keys %{ $r->{days} // {} }), longest => $r->{longest} // 0 })
+            } qw(all scarce contested);
+            push @levels, { value => $t->{thresholds}[$k]{value}, labels => $t->{thresholds}[$k]{labels}, %signals, borrow => \%borrow };
         }
         push @rows, { vm => $t->{vm}, pool => $t->{pool}, population => $t->{population}, profiles => $t->{profiles},
             installed => $t->{entitlement}, vp => $t->{vp}, stateStartUTC => _pool_iso($t->{stateStart}),

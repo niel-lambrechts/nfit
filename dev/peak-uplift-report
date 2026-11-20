@@ -48,6 +48,9 @@ def rows(records):
             'protected': (r.get('adjusted') or {}).get('ladder', 0) > (r.get('target') or 0) + 0.005,
             'ruleMin': rule_min, 'ruleCore': rule_core, 'newMin': new_min, 'newCore': new_core, 'newDays': new_days,
             'pair': r.get('pair') or {},
+            'scarce': (((r.get('later') or {}).get('ladder') or {}).get('support') or {}).get('scarceMinutes', 0),
+            'paired': (((r.get('later') or {}).get('ladder') or {}).get('support') or {}).get('pairedMinutes', 0),
+            'expected': (((r.get('later') or {}).get('ladder') or {}).get('support') or {}).get('expectedMinutes', 0),
         })
     return out
 
@@ -70,9 +73,12 @@ def main():
     lines = ['# Peak-derived entitlement uplift: with the rule and without it', '',
              f'Generated {data["generated"]}; commit {str(data["commit"])[:7]}; options {" ".join(data.get("profileArgs") or []) or "none"}.',
              f'Systems: {", ".join(s["system"] for s in data["systems"])}. Sized on the training window, scored on the later one.', '',
-             'Both entitlements are after cut protection. "With the rule" is the level the tier\'s pool-borrowing rule',
-             'would have kept (its first floor, within installed). Exposure is busy work (PhysB) above the level in',
-             'later minutes when the pool was contested. Alternative profiles are not added together.', '',
+             'Both entitlements are target levels after cut protection, chosen from the training window only.',
+             '"With the rule" is an estimate: the first floor the tier\'s pool-borrowing rule asked for, within installed.',
+             'It is not a full run with the rule, and "released" is the difference between the two target levels, not a',
+             'current-cycle change (the pair column shows what this cycle would configure). Exposure is busy work (PhysB)',
+             'above the level in later minutes when the pool was contested; zero means little where the later window had',
+             'no scarce minutes, so those are shown. Alternative profiles are not added together.', '',
              f'Profiles where the rule would have kept more: {len(found)} ({len(planning)} planning, '
              f'{len(found) - len(planning)} alternative) on {len({x["member"] for x in found})} LPARs.', '']
 
@@ -80,12 +86,15 @@ def main():
     by_tier = collections.defaultdict(list)
     for x in planning:
         by_tier[str(x['tier'])].append(x)
-    table(lines, ['Tier', 'LPARs', 'Entitlement with the rule', 'Without', 'Released', 'Later exposure with the rule (min / core-min)',
-                  'Without (min / core-min)', 'LPARs with any later exposure', 'Still limited by cut protection'],
+    table(lines, ['Tier', 'LPARs', 'Target with the rule (estimate)', 'Without', 'Difference', 'Later exposure with the rule (min / core-min)',
+                  'Without (min / core-min)', 'LPARs with any later exposure', 'Still limited by cut protection',
+                  'LPARs with later scarce minutes', 'Later scarce minutes', 'Paired / expected minutes'],
           [[t, len(v), f'{sum(x["withRule"] for x in v):.2f}', f'{sum(x["without"] for x in v):.2f}',
             f'{sum(x["released"] for x in v):.2f}', f'{sum(x["ruleMin"] for x in v)} / {sum(x["ruleCore"] for x in v):.2f}',
             f'{sum(x["newMin"] for x in v)} / {sum(x["newCore"] for x in v):.2f}',
-            sum(1 for x in v if x['newMin'] > 0), sum(1 for x in v if x['protected'])]
+            sum(1 for x in v if x['newMin'] > 0), sum(1 for x in v if x['protected']),
+            sum(1 for x in v if x['scarce'] > 0), sum(x['scarce'] for x in v),
+            f'{sum(x["paired"] for x in v)} / {sum(x["expected"] for x in v)}']
            for t, v in sorted(by_tier.items())])
 
     lines += ['## 2. What raised the demand the rule protected', '']
@@ -96,12 +105,12 @@ def main():
         lines.extend([title, ''])
         table(lines, ['LPAR', 'Profile', 'Installed (ENT / VPs)', 'Profile figure', 'Demand the rule used', 'With the rule', 'Without',
                       'Released', 'Later exposure without (min / core-min / days)', 'With the rule (min / core-min)',
-                      'Cut protection limits', 'Current-cycle pair'],
+                      'Cut protection limits', 'Current-cycle pair', 'Later scarce minutes'],
               [[x['member'], x['profile'], f'{x["installed"]} / {x["vps"]}', x['profileTarget'],
                 f'{x["demand"]:.2f}' if isinstance(x['demand'], (int, float)) else 'n/a', x['withRule'], x['without'], x['released'],
                 f'{x["newMin"]} / {x["newCore"]:.2f} / {x["newDays"]}', f'{x["ruleMin"]} / {x["ruleCore"]:.2f}',
                 'yes' if x['protected'] else 'no',
-                f'{x["pair"].get("entitlement")} / {x["pair"].get("VPs")} {x["pair"].get("status") or ""}']
+                f'{x["pair"].get("entitlement")} / {x["pair"].get("VPs")} {x["pair"].get("status") or ""}', x['scarce']]
                for x in items])
 
     detail('## 3. Planning profiles, largest release first',
@@ -114,21 +123,50 @@ def main():
     detail('### 4.2 The 30 largest releases among the others',
            sorted((x for x in alternatives if x not in exposed), key=lambda x: (-x['released'], x['member']))[:30])
 
-    # Increases the rule would have made: not cuts, so nothing to score later.
+    # Increases only the rule asked for: later busy work above installed, above the
+    # figure without the rule, and above the rule's first floor.
+    def borrow(r, plan, scope):
+        b = (((r.get('later') or {}).get(plan) or {}).get('borrow') or {}).get(scope) or {}
+        return b.get('minutes', 0), b.get('coreMinutes', 0.0), b.get('days', 0), b.get('longest', 0)
+
     raises = []
     for r in data['records']:
-        tf = r.get('tierFloor') or {}
-        inst, new = r.get('installed'), r.get('published')
-        if tf.get('withheld') and isinstance(inst, (int, float)) and isinstance(tf.get('floor'), (int, float)) \
-                and tf['floor'] > inst + 0.005 and tf['floor'] > (new or 0) + 0.005:
-            raises.append((r['member'], r['profile'], 'planning' if r.get('planning') else 'alternative', inst, new,
-                           round(tf['floor'], 2), f'{tf["demand"]:.2f}' if isinstance(tf.get('demand'), (int, float)) else 'n/a',
-                           tf.get('demandSource')))
+        tf, later = r.get('tierFloor') or {}, r.get('later') or {}
+        rec_level, rule_level = (later.get('recommended') or {}).get('level'), (later.get('ruleFull') or {}).get('level')
+        inst = r.get('installed')
+        if not tf.get('withheld') or rec_level is None or rule_level is None or not isinstance(inst, (int, float)):
+            continue
+        if rule_level <= inst + 0.005 or rule_level <= rec_level + 0.005:
+            continue
+        support = (later.get('recommended') or {}).get('support') or {}
+        raises.append({'r': r, 'inst': inst, 'rec': rec_level, 'rule': rule_level, 'support': support,
+                       'demand': tf.get('demand'), 'planning': bool(r.get('planning'))})
+    fmt = lambda t: f'{t[0]} / {t[1]:.2f} / {t[2]} / {t[3]}'
     lines += ['## 5. Entitlement above installed that only the rule asked for', '',
-              f'{len(raises)} profiles ({sum(1 for x in raises if x[2] == "planning")} planning). Without the rule the figure is the',
-              'published one; these are not cuts, so the later period cannot score them.', '']
-    table(lines, ['LPAR', 'Profile', 'Kind', 'Installed', 'Without the rule', 'With the rule (first floor)', 'Demand the rule used', 'Source'],
-          sorted(raises, key=lambda x: (x[2] != 'planning', -(x[5] - (x[4] or 0))))[:40])
+              f'{len(raises)} profiles ({sum(1 for x in raises if x["planning"])} planning). Three levels are scored in the later',
+              'window, in the profile\'s hours: installed, the figure without the rule, and the rule\'s first floor.',
+              'Each cell is minutes / core-minutes / days / longest run of busy work (PhysB) above the level.', '']
+
+    def raise_table(items):
+        table(lines, ['LPAR', 'Profile', 'Installed', 'Without the rule', 'Rule (first floor)', 'Demand the rule used',
+                      'Busy above installed, all minutes', 'Above the figure without the rule, all minutes', 'Above the rule level, all minutes',
+                      'Above installed, scarce minutes', 'Above the figure without the rule, scarce', 'Above the rule level, scarce',
+                      'Later scarce minutes', 'Paired / expected'],
+              [[x['r']['member'], x['r']['profile'], x['inst'], x['rec'], x['rule'],
+                f'{x["demand"]:.2f}' if isinstance(x['demand'], (int, float)) else 'n/a',
+                fmt(borrow(x['r'], 'installed', 'all')), fmt(borrow(x['r'], 'recommended', 'all')), fmt(borrow(x['r'], 'ruleFull', 'all')),
+                fmt(borrow(x['r'], 'installed', 'scarce')), fmt(borrow(x['r'], 'recommended', 'scarce')), fmt(borrow(x['r'], 'ruleFull', 'scarce')),
+                x['support'].get('scarceMinutes', 0), f'{x["support"].get("pairedMinutes", 0)} / {x["support"].get("expectedMinutes", 0)}']
+               for x in items])
+
+    lines += ['### 5.1 Planning profiles', '']
+    raise_table(sorted((x for x in raises if x['planning']), key=lambda x: -(x['rule'] - x['rec'])))
+    alt = [x for x in raises if not x['planning']]
+    hit = [x for x in alt if borrow(x['r'], 'recommended', 'scarce')[0] > 0]
+    lines += ['### 5.2 Alternative profiles', '',
+              f'{len(alt)} alternatives; {sum(1 for x in alt if x["support"].get("scarceMinutes", 0) > 0)} had later scarce minutes; '
+              f'{len(hit)} had busy work above the figure without the rule in a scarce minute. Those are listed.', '']
+    raise_table(sorted(hit, key=lambda x: -borrow(x['r'], 'recommended', 'scarce')[1])[:40])
 
     target = src / 'peak-uplift-report.md'
     target.write_text('\n'.join(lines) + '\n')
