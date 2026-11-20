@@ -676,6 +676,18 @@ my $contested_floor_value;                    # set while a profile is sized wit
 my $research_busy_share;
 my %BUSY_SHARE_RULES = (binWidth => 0.10, minCores => 0.10, minEntShare => 0.10, minBinMinutes => 5, minMinutes => 15);
 my ($candidate_test, $candidate_window, $candidate_snapshot);
+# --research-pool-ceiling-replay START/CUTOFF/END (research only; v10 stage 3.4,
+# pool reduction policy). No sizing is run. For each user-defined pool, a
+# candidate maximum is taken from the pool's own minutes in START..CUTOFF and
+# replayed on the days after CUTOFF up to END. The candidate is the smallest
+# whole number of processing units that holds the members' installed
+# entitlements and keeps the highest credible minute of pool busy outside the
+# near-ceiling tolerance (unsmoothed, all hours). Evidence required before a
+# reduction is offered (provisional): 28 days, 99% of the minutes credible
+# overall and 90% on every day; no minute at the maximum; the frame not
+# without spare cores; one roster and maximum throughout.
+my $research_pool_ceiling_replay;
+my %POOL_CEILING_RULES = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
 # Pool reconciliation (v10 milestone 2.3): illustrative budgets on minutes any
@@ -817,6 +829,7 @@ GetOptions(
     'research-gated-peak-uplift' => \$research_gated_peak_uplift,
     'research-contested-level'   => \$research_contested_level,
     'research-busy-share'        => \$research_busy_share,
+    'research-pool-ceiling-replay=s' => \$research_pool_ceiling_replay,
     'uplift-exemption!'          => \$uplift_exemption_flag,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
@@ -1782,6 +1795,21 @@ foreach my $system_serial (@target_systems_to_process)
 
     ($effective_start_date_obj, $effective_end_date_obj) =
         _resolve_effective_window($start_date, $end_date, $cli_start_obj, $cli_end_obj);
+
+    if (defined $research_pool_ceiling_replay)
+    {
+        my @dates = $research_pool_ceiling_replay =~ m{^(\d{4}-\d\d-\d\d)/(\d{4}-\d\d-\d\d)/(\d{4}-\d\d-\d\d)$};
+        die "Expected --research-pool-ceiling-replay START/CUTOFF/END as YYYY-MM-DD dates\n" unless (@dates == 3 && $dates[0] le $dates[1] && $dates[1] lt $dates[2]);
+        my ($from, $cut, $to) = map { Time::Piece->strptime($_, '%Y-%m-%d')->epoch } @dates;
+        my $result = _pool_ceiling_replay($current_cache_path, $from, $cut + 86400, $to + 86400);
+        $result->{window} = { trainingStart => $dates[0], trainingEnd => $dates[1], laterEnd => $dates[2] };
+        my $path = File::Spec->catfile($output_dir, 'nfit-profile.pool-ceiling-replay.json');
+        open my $out, '>', $path or die "Cannot write '$path': $!\n";
+        print {$out} JSON->new->utf8->canonical->pretty->encode($result);
+        close $out;
+        print "Pool ceiling replay: $path\n";
+        next;
+    }
 
     my $saved;
     if (defined $candidate_snapshot)
@@ -14594,7 +14622,10 @@ sub _pool_use_findings
         my $use = $pool_use->{$pool};
         next unless ($use->{observed});
         my @sorted = sort { $a <=> $b } unpack('f<*', $use->{values});
-        my @pressured;
+        # Pressured: above entitlement in the pool's full minutes (the same minutes, not
+        # merely the same period) often enough for a trial; seldom: fewer such minutes,
+        # kept as evidence.
+        my (@pressured, @seldom);
         foreach my $vm (sort keys %widest)
         {
             my $t = $widest{$vm}[1];
@@ -14607,8 +14638,9 @@ sub _pool_use_findings
                 $minutes += $n;
                 $days++;
             }
-            push @pressured, { vm => $vm, minutes => $minutes, days => $days }
-                if ($minutes >= $POOL_TRIAL_MIN_MINUTES && $days >= $POOL_TRIAL_MIN_DAYS);
+            next unless $minutes;
+            if ($minutes >= $POOL_TRIAL_MIN_MINUTES && $days >= $POOL_TRIAL_MIN_DAYS) { push @pressured, { vm => $vm, minutes => $minutes, days => $days }; }
+            else                                                                      { push @seldom,    { vm => $vm, minutes => $minutes, days => $days }; }
         }
         my $full_days = scalar(keys %{ $use->{days} });
         my $recurs = ($use->{full} >= $POOL_TRIAL_MIN_MINUTES && $full_days >= $POOL_TRIAL_MIN_DAYS) ? 1 : 0;
@@ -14617,7 +14649,7 @@ sub _pool_use_findings
             Maximum => $use->{size}, MaximumChanged => (@sizes > 1 ? [ $sizes[0] + 0, $sizes[-1] + 0 ] : undef),
             Observed => $use->{observed}, Full => $use->{full}, FullDays => $full_days, Longest => $use->{longest},
             P50 => _pool_quantile(\@sorted, 0.50), P95 => _pool_quantile(\@sorted, 0.95), P99 => _pool_quantile(\@sorted, 0.99),
-            Peak => $sorted[-1], Pressured => \@pressured,
+            Peak => $sorted[-1], Pressured => \@pressured, Seldom => \@seldom, FullFrameScarce => $use->{fullFrameScarce} // 0,
             Verdict => (!$use->{full} ? 'open' : !$recurs ? 'fullRarely' : @pressured ? 'trial' : 'fullNoPressure'),
         };
     }
@@ -14652,6 +14684,15 @@ sub _pool_use_report
                                  $plural->($u->{FullDays}), $u->{Longest}) : 'never');
         my $full = sprintf('at its maximum of %s in %d minute%s on %d day%s', $max, $u->{Full}, $plural->($u->{Full}),
                            $u->{FullDays}, $plural->($u->{FullDays}));
+        # Fewer minutes than a trial needs are still evidence, and are stated.
+        my @seldom = sort { $b->{minutes} <=> $a->{minutes} || $a->{vm} cmp $b->{vm} } @{ $u->{Seldom} // [] };
+        my $seldom = @seldom ? sprintf(' Busy work was above entitlement in those minutes on %d LPAR%s (most: %s, %d minute%s on %d day%s).',
+            scalar(@seldom), $plural->(scalar @seldom), $seldom[0]{vm}, $seldom[0]{minutes}, $plural->($seldom[0]{minutes}),
+            $seldom[0]{days}, $plural->($seldom[0]{days})) : '';
+        # Pool full and frame without spare cores in the same minutes: both need attention.
+        my $frame = ($u->{FullFrameScarce} // 0)
+            ? sprintf(' The frame had no spare cores in %d of those minute%s: check the frame\'s capacity as well.', $u->{FullFrameScarce},
+                      $plural->($u->{FullFrameScarce})) : '';
         if ($u->{Verdict} eq 'trial')
         {
             my @who = @{ $u->{Pressured} };
@@ -14660,13 +14701,13 @@ sub _pool_use_report
             if (defined $u->{Maximum} && $need > $u->{Maximum} + $FLOAT_EPSILON)
             {
                 push @{ $result{Observed} }, sprintf("Pool %s was %s, with busy work above entitlement on %d LPAR%s (%s). The pool increase its "
-                    . "members' entitlements require covers this; re-measure after it.", $pool, $full, scalar(@who), $plural->(scalar @who), $names);
+                    . "members' entitlements require covers this; re-measure after it.%s", $pool, $full, scalar(@who), $plural->(scalar @who), $names, $frame);
             }
             else
             {
                 push @{ $result{Actions} }, sprintf("Pool %s: trial increase of the pool maximum from %s to %s processing units, then re-measure. "
-                    . "The pool was %s, with busy work above entitlement on %d LPAR%s (%s). A trial, not a measured requirement. Check licensing.",
-                    $pool, $max, _pool_units_text($u->{Maximum} + 1), $full, scalar(@who), $plural->(scalar @who), $names);
+                    . "The pool was %s, with busy work above entitlement on %d LPAR%s (%s). A trial, not a measured requirement. Check licensing.%s",
+                    $pool, $max, _pool_units_text($u->{Maximum} + 1), $full, scalar(@who), $plural->(scalar @who), $names, $frame);
                 $result{Members}{ $_->{vm} } = sprintf('Pool %s was at its maximum with this LPAR\'s busy work above its entitlement on %d minute%s over %d day%s: '
                     . 'a trial increase of the pool to %s is recommended.', $pool, $_->{minutes}, $plural->($_->{minutes}), $_->{days},
                     $plural->($_->{days}), _pool_units_text($u->{Maximum} + 1)) for @who;
@@ -14674,20 +14715,190 @@ sub _pool_use_report
         }
         elsif ($u->{Verdict} eq 'fullNoPressure')
         {
-            push @{ $result{Observed} }, sprintf("Pool %s was %s; no LPAR's busy work was above its entitlement then often enough to act on: no change.",
-                $pool, $full);
+            push @{ $result{Observed} }, sprintf("Pool %s was %s; no LPAR's busy work was above its entitlement then often enough to act on: no change.%s%s",
+                $pool, $full, $seldom, $frame);
         }
         elsif ($u->{Verdict} eq 'fullRarely')
         {
-            push @{ $result{Observed} }, sprintf('Pool %s was %s: too seldom to act on.', $pool, $full);
+            push @{ $result{Observed} }, sprintf('Pool %s was %s: too seldom to act on.%s%s', $pool, $full, $seldom, $frame);
         }
         push @{ $result{Observed} }, sprintf('Pool %s reported more than one maximum in the period (%s to %s); each minute is judged against the '
             . 'maximum of that minute.', $pool, map { _pool_units_text($_) } @{ $u->{MaximumChanged} }) if $u->{MaximumChanged};
     }
-    push @out, '', sprintf('    Recurrence needed to act: %d minutes on %d days (provisional). Capped LPARs and the default pool (0)',
-        $POOL_TRIAL_MIN_MINUTES, $POOL_TRIAL_MIN_DAYS), '    are not assessed here.', '';
+    push @out, '', sprintf('    Recurrence needed for a trial: %d minutes on %d days (provisional), counted in the minutes the pool', $POOL_TRIAL_MIN_MINUTES,
+        $POOL_TRIAL_MIN_DAYS), '    was at its maximum. Fewer minutes are reported as observations. Pressure on capped LPARs is not',
+        '    evaluated by this check (which is not a finding that there is none); they count in the pool\'s', '    measured use. The default pool (0) is assessed with the frame.', '';
     print {$log_fh} join("\n", @out), "\n" if (defined $log_fh && ref($log_fh));
     return \%result;
+}
+
+# The pool ceiling replay (research; see $research_pool_ceiling_replay): the
+# candidate of each user-defined pool from [from, cut) and its replay on
+# [cut, to), whole UTC days. Pools and counts only: no LPAR is named.
+sub _pool_ceiling_replay
+{
+    my ($cache_dir, $from, $cut, $to) = @_;
+    my $context = _pool_history_context($cache_dir);
+    return { status => 'unavailable', reason => 'the cache holds no pool observations', pools => [] } unless $context;
+    my %rule = %MEMBER_EXPOSURE_RULES;
+    my $near = sub { my ($ceiling) = @_; return _exposure_tolerance($rule{localScarceAbsCores}, $rule{localScarceRel}, $ceiling); };
+    my $tmp_dir = File::Temp::tempdir('nfit_poolreplay_XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my ($files) = _pool_day_sources($context, [ [ $from, $to ] ], $tmp_dir);
+    my $segments = _pool_segments(_exposure_load_states($cache_dir), $from, $to);
+
+    # One pass: per pool and period, the credible minutes (busy and maximum reported, busy not above the maximum).
+    my (%pool, %frame_scarce);
+    foreach my $day (int($from / 86400) .. int(($to - 1) / 86400))
+    {
+        my ($minutes, $physical) = _pool_day_reduction($files->{$day});
+        my $period = ($day * 86400 < $cut) ? 'training' : 'later';
+        foreach my $minute (keys %$physical)
+        {
+            my $layer = $physical->{$minute};
+            $frame_scarce{$period}{$minute} = 1 if (defined $layer->{idle} && $layer->{idle}
+                <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $layer->{size}) + 1e-9);
+        }
+        foreach my $id (keys %$minutes)
+        {
+            next unless (looks_like_number($id) && $id != 0);
+            my $p = $pool{ $id + 0 }{$period} //= { series => '', days => {}, sizes => {}, aboveMaximum => 0, unusable => 0 };
+            foreach my $minute (sort { $a <=> $b } keys %{ $minutes->{$id} })
+            {
+                my $r = $minutes->{$id}{$minute};
+                if (!defined $r->{value} || !defined $r->{size} || $r->{size} <= 0) { $p->{unusable}++; next; }
+                if ($r->{value} > $r->{size} + $near->($r->{size}))                 { $p->{aboveMaximum}++; next; }
+                $p->{series} .= pack('L<f<f<', $minute, $r->{value}, $r->{size});      # in time order: days ascend, minutes sorted
+                $p->{days}{$day}++;
+                $p->{sizes}{ $r->{size} + 0 } = 1;
+            }
+        }
+    }
+
+    # A packed series as [minute, busy, maximum] triples.
+    my $rows_of = sub
+    {
+        my @flat = unpack('(L<f<f<)*', $_[0] // '');
+        return [ map { [ @flat[ 3 * $_ .. 3 * $_ + 2 ] ] } 0 .. (@flat / 3) - 1 ];
+    };
+    # Minutes of a series above a ceiling, and within the near-ceiling tolerance of it.
+    my $replay = sub
+    {
+        my ($series, $ceiling, $installed_near) = @_;
+        my %r = (exceedMinutes => 0, exceedCoreMinutes => 0, nearMinutes => 0, newlyNearMinutes => 0, longestExceed => 0,
+                 windows => { map { $_ => { exceedMinutes => 0, nearMinutes => 0 } } qw(online batch other closeDays) });
+        my (%days, %near_days, $last, $run);
+        my $tolerance = $near->($ceiling);
+        foreach my $s (@$series)
+        {
+            my ($minute, $value, $size) = @$s;
+            my $over = ($value > $ceiling + 1e-9) ? 1 : 0;
+            my $close = (!$over && $ceiling - $value <= $tolerance + 1e-9) ? 1 : 0;
+            next unless ($over || $close);
+            my $day = int($minute / 86400);
+            my $of_day = ($minute % 86400) / 60;
+            my $weekday = ($day + 4) % 7;
+            my $window = ($weekday != 0 && $weekday != 6 && $of_day >= 480 && $of_day < 1020) ? 'online'
+                       : ($of_day >= 1080 || $of_day < 360) ? 'batch' : 'other';
+            my @t = gmtime($minute);
+            my $close_day = ($t[3] == 1 || (gmtime($minute + 86400))[3] == 1) ? 1 : 0;      # last and first day of a month
+            if ($over)
+            {
+                $r{exceedMinutes}++;
+                $r{exceedCoreMinutes} += $value - $ceiling;
+                $days{$day} = 1;
+                $run = (defined $last && $minute == $last + 60) ? $run + 1 : 1;
+                $last = $minute;
+                $r{longestExceed} = $run if ($run > $r{longestExceed});
+                $r{windows}{$window}{exceedMinutes}++;
+                $r{windows}{closeDays}{exceedMinutes}++ if $close_day;
+            }
+            else
+            {
+                $r{nearMinutes}++;
+                $near_days{$day} = 1;
+                $r{newlyNearMinutes}++ unless ($size - $value <= $near->($size) + 1e-9);      # not already near the installed maximum
+                $r{windows}{$window}{nearMinutes}++;
+                $r{windows}{closeDays}{nearMinutes}++ if $close_day;
+            }
+        }
+        $r{exceedCoreMinutes} = 0 + sprintf('%.4f', $r{exceedCoreMinutes});
+        $r{exceedDays} = scalar(keys %days);
+        $r{nearDays}   = scalar(keys %near_days);
+        return \%r;
+    };
+
+    my @rows;
+    foreach my $id (sort { $a <=> $b } keys %pool)
+    {
+        my $train = $pool{$id}{training} or next;
+        my $later = $pool{$id}{later} // { series => '', days => {}, sizes => {}, aboveMaximum => 0, unusable => 0 };
+        next unless length($train->{series});
+        $_->{series} = $rows_of->($_->{series}) for ($train, $later);          # one pool at a time
+        my @sizes = sort { $a <=> $b } keys %{ $train->{sizes} };
+        my $installed = $sizes[-1] + 0;
+        my @values = sort { $a <=> $b } map { $_->[1] } @{ $train->{series} };
+        my $peak = $values[-1];
+        my $train_days = int(($cut - $from) / 86400);
+        my $coverage = scalar(@values) / (1440 * $train_days);
+        my $worst_day = min(map { ($train->{days}{$_} // 0) / 1440 } int($from / 86400) .. int(($cut - 1) / 86400));
+        my $full = scalar(grep { $_->[2] - $_->[1] <= $near->($_->[2]) + 1e-9 } @{ $train->{series} });
+        my $frame_low = scalar(grep { $frame_scarce{training}{ $_->[0] } } @{ $train->{series} });
+        # Members and their installed entitlements at the end of training; roster or configuration changes.
+        my @segs = @{ $segments->{$id} // [] };
+        my @train_segs = grep { $_->{from} < $cut && @{ $_->{members} } } @segs;
+        my @later_segs = grep { $_->{to} > $cut && @{ $_->{members} } } @segs;
+        my $roster = @train_segs ? $train_segs[-1]{members} : [];
+        my $ent_sum = sum0(map { $_->{entitlement} // 0 } @$roster);
+        my $unknown_ent = scalar(grep { !defined $_->{entitlement} } @$roster);
+        my $capped = scalar(grep { $_->{capped} } @$roster);
+        my $structural = int($ent_sum - 1e-9) + 1;
+        my $workload = max(1, int($peak));
+        $workload++ while ($workload - $peak <= $near->($workload) + 1e-9);
+        my $candidate = max($structural, $workload);
+        my @withheld;
+        push @withheld, sprintf('fewer than %d days observed', $POOL_CEILING_RULES{minDays}) if ($train_days < $POOL_CEILING_RULES{minDays});
+        push @withheld, 'coverage below 99% of the minutes' if ($coverage < $POOL_CEILING_RULES{minCoverage});
+        push @withheld, 'a day below 90% coverage' if ($worst_day < $POOL_CEILING_RULES{minDayCoverage});
+        push @withheld, 'the pool was at its maximum' if $full;
+        push @withheld, 'the frame had no spare cores' if $frame_low;
+        push @withheld, 'the pool maximum changed' if (@sizes > 1);
+        push @withheld, 'the roster or a member configuration changed' if (@train_segs > 1);
+        push @withheld, 'a member entitlement is not known' if $unknown_ent;
+        push @withheld, 'no member state' unless @$roster;
+        my $q = sub { return 0 + sprintf('%.4f', _pool_quantile(\@values, $_[0])); };
+        my %row = (pool => $id + 0, installedMaximum => $installed, members => scalar(@$roster), cappedMembers => $capped,
+            installedEntitlement => 0 + sprintf('%.2f', $ent_sum), structuralMinimum => $structural,
+            workloadCandidate => $workload, candidate => $candidate,
+            unitsRemoved => ($candidate < $installed ? $installed - $candidate : 0),
+            withheld => \@withheld, reserve => 'unknown',
+            training => { days => $train_days, minutes => scalar(@values), coverage => 0 + sprintf('%.4f', $coverage),
+                          worstDayCoverage => 0 + sprintf('%.4f', $worst_day), peak => 0 + sprintf('%.4f', $peak),
+                          p50 => $q->(0.50), p95 => $q->(0.95), p99 => $q->(0.99), p999 => $q->(0.999),
+                          fullMinutes => $full, frameScarceMinutes => $frame_low, maximaSeen => [ map { $_ + 0 } @sizes ],
+                          segments => scalar(@train_segs), aboveMaximumReadings => $train->{aboveMaximum}, unusableMinutes => $train->{unusable},
+                          closeDayInside => (scalar(grep { my @t = gmtime($_ * 86400); $t[3] == 1 } int($from / 86400) .. int(($cut - 1) / 86400)) ? JSON::true : JSON::false) },
+            later => { days => int(($to - $cut) / 86400), minutes => scalar(@{ $later->{series} }),
+                       peak => (@{ $later->{series} } ? 0 + sprintf('%.4f', max(map { $_->[1] } @{ $later->{series} })) : undef),
+                       maximaSeen => [ map { $_ + 0 } sort { $a <=> $b } keys %{ $later->{sizes} } ],
+                       segments => scalar(@later_segs),
+                       fullMinutesAtInstalled => scalar(grep { $_->[2] - $_->[1] <= $near->($_->[2]) + 1e-9 } @{ $later->{series} }),
+                       frameScarceMinutes => scalar(grep { $frame_scarce{later}{ $_->[0] } } @{ $later->{series} }) },
+        );
+        if ($candidate < $installed)
+        {
+            $row{later}{atCandidate} = $replay->($later->{series}, $candidate);
+            # What the percentile alternatives would have cost, for context only.
+            foreach my $alt ([ p999 => $q->(0.999) ], [ p99 => $q->(0.99) ])
+            {
+                my $c = max($structural, max(1, int($alt->[1] - 1e-9) + 1));
+                $row{later}{ 'at' . ucfirst($alt->[0]) } = { ceiling => $c, %{ $replay->($later->{series}, $c) } } if ($c < $candidate);
+            }
+        }
+        push @rows, \%row;
+        delete $pool{$id};
+    }
+    return { status => 'evaluated', rules => { %POOL_CEILING_RULES, nearCeilingAbsCores => $rule{localScarceAbsCores}, nearCeilingRel => $rule{localScarceRel} },
+             pools => \@rows };
 }
 
 # The pool prerequisite of each LPAR's planning action (plan 8.2: increases
@@ -24070,6 +24281,10 @@ sub _exposure_evaluate_window
                 $pool_full{$pool}++;
                 $use->{full}++;
                 $use->{days}{$day} = 1;
+                # The frame without spare cores in the same minute: a larger pool maximum alone would not have helped.
+                my $layer = $physical->{$minute};
+                $use->{fullFrameScarce}++ if ($layer && defined $layer->{idle} && $layer->{idle}
+                    <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $layer->{size}) + 1e-9);
                 $use->{run} = (defined $use->{last} && $minute == $use->{last} + 60) ? $use->{run} + 1 : 1;
                 $use->{last} = $minute;
                 $use->{longest} = $use->{run} if ($use->{run} > $use->{longest});
@@ -27633,6 +27848,11 @@ Model behaviour depends on the event configuration:
 
   --research-gated-peak-uplift              : Research only. Also sizes each profile without the rule and records that
                                               figure in the stored proposal.
+
+  --research-pool-ceiling-replay S/C/E      : Research only; no sizing. For each user-defined pool, the smallest whole
+                                              pool maximum that holds the members' installed entitlements and the pool's
+                                              highest measured minute in S..C, replayed on the days after C up to E.
+                                              Writes output/nfit-profile.pool-ceiling-replay.json (pools and counts only).
 
   --research-busy-share                     : Research only. Records, for each uncapped shared-pool LPAR, the busy share
                                               (PhysB / PhysC) and the run queue per VP in minutes under pressure against

@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/pool-ceiling-replay
+# PURPOSE  : Research replay for the pool reduction policy (v10 stage 3.4). For
+#            each research system, runs nfit-profile's pool ceiling replay
+#            (--research-pool-ceiling-replay; no sizing) on the cohort's
+#            training and held-out periods and reports, per user-defined pool:
+#            the installed maximum, the structural minimum (the members'
+#            installed entitlements), the workload candidate (the highest
+#            credible minute kept outside the near-ceiling tolerance), the
+#            candidate, the units removed, the reasons a reduction is
+#            withheld, and what the held-out period did against the candidate:
+#            minutes above it, minutes newly near it, by window and on the
+#            close days (the last and first day of a month).
+#            A clean replay has no minute above the candidate and no minute
+#            newly near it. The replay does not simulate the hypervisor and
+#            says nothing about bursts inside a minute.
+# USAGE    : dev/pool-ceiling-replay [--cohort P10|P9|all] [--systems P10-02,...] [--out DIR]
+# OUTPUT   : <out>/pool-ceiling-replay.json and .md (research labels and pool
+#            numbers only; no LPAR is named)
+# ==============================================================================
+import argparse
+import collections
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+_loader = importlib.machinery.SourceFileLoader('protection_replay', str(REPO / 'dev' / 'protection-replay'))
+_spec = importlib.util.spec_from_loader('protection_replay', _loader)
+pr = importlib.util.module_from_spec(_spec)
+_loader.exec_module(pr)
+
+
+def table(lines, header, body):
+    lines.append('| ' + ' | '.join(header) + ' |')
+    lines.append('|' + '|'.join('---' for _ in header) + '|')
+    lines.extend('| ' + ' | '.join(str(c) for c in row) + ' |' for row in body)
+    lines.append('')
+
+
+def setup_app(work):
+    app = work / 'app'
+    if app.is_dir():
+        shutil.rmtree(app)
+    (app / 'etc').mkdir(parents=True)
+    (app / 'output').mkdir()
+    for name in pr.EXECUTABLES:
+        shutil.copy(REPO / name, app / name)
+        (app / name).chmod(0o700)
+    for f in sorted((REPO / 'etc').glob('nfit.*')):
+        if f.is_file():
+            shutil.copy(f, app / 'etc' / f.name)
+    return app
+
+
+def clean(p):
+    at = (p.get('later') or {}).get('atCandidate') or {}
+    return at.get('exceedMinutes', 0) == 0 and at.get('newlyNearMinutes', 0) == 0
+
+
+def report(out, data):
+    pools = data['pools']
+    lines = ['# Pool ceiling replay: a conservative reduction candidate, tested on a later period', '',
+             f'Generated {data["generated"]}; commit {str(data["commit"])[:7]}. Systems: {", ".join(s["system"] for s in data["systems"])}.',
+             'Candidate: the smallest whole pool maximum that holds the members\' installed entitlements and keeps the',
+             'highest credible minute of pool busy in training outside the near-ceiling tolerance (unsmoothed, all hours).',
+             'The members\' entitlements are the installed ones: no sizing is run, so this tests the workload rule, not the',
+             'final structural figure. The reserve is not known for any pool, so every reduction is conditional on it.',
+             'A clean replay has no later minute above the candidate and none newly near it. Bursts inside a minute are',
+             'not seen.', '']
+    for s in data['systems']:
+        lines.append(f'- {s["system"]}: training {s["window"]["trainingStart"]} to {s["window"]["trainingEnd"]}, later to '
+                     f'{s["window"]["laterEnd"]}; {s["pools"]} user-defined pool(s).')
+    lines.append('')
+
+    lower = [p for p in pools if p['unitsRemoved'] > 0]
+    eligible = [p for p in lower if not p['withheld']]
+    held = [p for p in lower if p['withheld']]
+    lines += ['## 1. Summary', '']
+    table(lines, ['', 'Pools', 'Installed maximum', 'Candidate', 'Units removed', 'Clean later', 'Not clean'],
+          [[name, len(g), sum(p['installedMaximum'] for p in g), sum(p['candidate'] for p in g), sum(p['unitsRemoved'] for p in g),
+            sum(1 for p in g if clean(p)), sum(1 for p in g if not clean(p))]
+           for name, g in (('Reduction offered (evidence complete)', eligible),
+                           ('Candidate below the maximum, reduction withheld', held))]
+          + [['No reduction (candidate at or above the maximum)', len(pools) - len(lower),
+              sum(p['installedMaximum'] for p in pools if p['unitsRemoved'] == 0), '', 0, '', '']])
+    reasons = collections.Counter(r for p in pools for r in p['withheld'])
+    lines += ['Reasons a reduction is withheld (a pool can have several):', '']
+    table(lines, ['Reason', 'Pools'], [[k, n] for k, n in reasons.most_common()] or [['none', 0]])
+    governs = collections.Counter('members\' entitlements' if p['structuralMinimum'] >= p['workloadCandidate'] else 'measured peak' for p in lower)
+    lines += [f'What sets the candidate where it is below the maximum: {dict(governs)}.', '']
+
+    def rows(group):
+        body = []
+        for p in sorted(group, key=lambda p: (p['system'], p['pool'])):
+            t, l = p['training'], p['later']
+            at = l.get('atCandidate') or {}
+            w = at.get('windows') or {}
+            body.append([p['system'], p['pool'], p['installedMaximum'], f'{p["members"]} ({p["cappedMembers"]})', f'{p["installedEntitlement"]:.2f}',
+                         p['structuralMinimum'], p['workloadCandidate'], p['candidate'], p['unitsRemoved'],
+                         f'{t["peak"]:.2f} / {t["p99"]:.2f}', f'{l["peak"]:.2f}' if l.get('peak') is not None else 'n/a',
+                         f'{at.get("exceedMinutes", 0)} / {at.get("exceedCoreMinutes", 0):.2f} / {at.get("exceedDays", 0)} / {at.get("longestExceed", 0)}',
+                         at.get('newlyNearMinutes', 0),
+                         ' '.join(f'{k} {w[k]["exceedMinutes"]}+{w[k]["nearMinutes"]}' for k in ('online', 'batch', 'other', 'closeDays') if k in w
+                                  and (w[k]['exceedMinutes'] or w[k]['nearMinutes'])) or 'none',
+                         'yes' if (l.get('segments', 1) > 1 or len(l.get('maximaSeen') or []) > 1) else 'no',
+                         '; '.join(p['withheld']) or 'none'])
+        return body
+    header = ['System', 'Pool', 'Maximum', 'Members (capped)', 'Installed entitlement', 'Structural minimum', 'Workload candidate', 'Candidate',
+              'Units removed', 'Training peak / P99', 'Later peak', 'Later above candidate (min / core-min / days / longest)',
+              'Later newly near', 'By window (above+near)', 'Changed later', 'Withheld because']
+    lines += ['## 2. Reductions offered', '']
+    table(lines, header, rows(eligible) or [['none'] + [''] * (len(header) - 1)])
+    lines += ['## 3. Candidate below the maximum, reduction withheld', '',
+              'Shown with their later replay so that the withholding rules can be judged.', '']
+    table(lines, header, rows(held) or [['none'] + [''] * (len(header) - 1)])
+    lines += ['## 4. No reduction', '']
+    table(lines, ['System', 'Pool', 'Maximum', 'Structural minimum', 'Workload candidate', 'Training peak', 'Minutes at maximum (training)',
+                  'Frame without spare cores (training minutes)', 'Withheld because'],
+          [[p['system'], p['pool'], p['installedMaximum'], p['structuralMinimum'], p['workloadCandidate'], f'{p["training"]["peak"]:.2f}',
+            p['training']['fullMinutes'], p['training']['frameScarceMinutes'], '; '.join(p['withheld']) or 'none']
+           for p in sorted(pools, key=lambda p: (p['system'], p['pool'])) if p['unitsRemoved'] == 0] or [['none'] + [''] * 8])
+    lines += ['## 5. Context: what a percentile rule would have cost', '',
+              'Not a proposal. For pools where the 99.9th or 99th percentile of training would give a lower ceiling than',
+              'the peak rule, the later minutes above that ceiling.', '']
+    body = []
+    for p in sorted(lower, key=lambda p: (p['system'], p['pool'])):
+        for key, name in (('atP999', 'P99.9'), ('atP99', 'P99')):
+            alt = p['later'].get(key)
+            if alt:
+                body.append([p['system'], p['pool'], p['candidate'], name, alt['ceiling'], p['candidate'] - alt['ceiling'],
+                             f'{alt["exceedMinutes"]} / {alt["exceedCoreMinutes"]:.2f} / {alt["exceedDays"]}', alt['newlyNearMinutes']])
+    table(lines, ['System', 'Pool', 'Peak-rule candidate', 'Rule', 'Ceiling', 'Further units', 'Later above it (min / core-min / days)', 'Later newly near'],
+          body or [['none'] + [''] * 7])
+    (out / 'pool-ceiling-replay.md').write_text('\n'.join(lines) + '\n')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--cohort', choices=('P10', 'P9', 'all'), default='all')
+    ap.add_argument('--capture-root', default=str(pr.HOME / 'src' / 'nfit-data' / 'research' / 'nfit-capture'))
+    ap.add_argument('--systems', default=None, help='only these research labels, e.g. P10-02,P10-06')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'pool-ceiling-replay'))
+    ap.add_argument('--report-only', action='store_true', help='rebuild the report from an existing pool-ceiling-replay.json')
+    a = ap.parse_args()
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    if not a.report_only:
+        wanted = {x.strip() for x in a.systems.split(',')} if a.systems else None
+        work = REPO / '.private' / 'pool-ceiling-replay'
+        work.mkdir(parents=True, exist_ok=True)
+        env = pr.perl_env()
+        app = setup_app(work)
+        systems, pools = [], []
+        for cohort in (('P10', 'P9') if a.cohort == 'all' else (a.cohort,)):
+            folder, expected, start, cutoff, _later, end = pr.COHORTS[cohort]
+            sources = sorted(p.parent for p in (Path(a.capture_root) / folder / 'stage').glob('*/.nfit_stage_id'))
+            if len(sources) != expected:
+                sys.exit(f'pool-ceiling-replay: expected {expected} staged system(s) for {cohort}, found {len(sources)}')
+            for i, source in enumerate(sources, 1):
+                label = f'{cohort}-{i:02d}'
+                if wanted is not None and label not in wanted:
+                    continue
+                print(f'{label}: replay', flush=True)
+                case = work / label
+                if case.exists():
+                    shutil.rmtree(case)
+                case.mkdir()
+                stage = pr.link_stage(case, source)
+                for p in (app / 'output').glob('*'):
+                    p.unlink()
+                pr.invoke(app, case, 'pool-ceiling', ['--nmondir', str(stage), '--research-pool-ceiling-replay', f'{start}/{cutoff}/{end}'], env)
+                result = json.loads((app / 'output' / 'nfit-profile.pool-ceiling-replay.json').read_text())
+                for p in result.get('pools', []):
+                    p['system'] = label
+                    pools.append(p)
+                systems.append({'system': label, 'status': result.get('status'), 'window': result.get('window'), 'pools': len(result.get('pools', []))})
+                print(f'{label}: {systems[-1]["pools"]} pool(s) ({result.get("status")})', flush=True)
+        data = {'generated': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'commit': pr.git_identity(),
+                'systems': systems, 'pools': pools}
+        (out / 'pool-ceiling-replay.json').write_text(json.dumps(data, indent=1) + '\n')
+        shutil.rmtree(work, ignore_errors=True)
+    data = json.loads((out / 'pool-ceiling-replay.json').read_text())
+    report(out, data)
+    for name in ('pool-ceiling-replay.json', 'pool-ceiling-replay.md'):
+        audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(out / name)], capture_output=True, text=True)
+        print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {out / "pool-ceiling-replay.md"}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

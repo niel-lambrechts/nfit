@@ -72,8 +72,9 @@ like($report->{Actions}[0], qr/^Pool 7: trial increase of the pool maximum from 
 like($report->{Members}{lpA}, qr/^Pool 7 was at its maximum with this LPAR's busy work above its entitlement on 20 minutes over 2 days: a trial increase of the pool to 5 is recommended\.$/,
     'the pressured LPAR carries the sentence for its action');
 ok(!exists $report->{Members}{lpB}, 'an LPAR that was not pressured carries nothing');
-is(scalar(grep { /^Pool 9 was at its maximum of 2 in 30 minutes on 3 days; no LPAR's busy work was above its entitlement then often enough to act on: no change\.$/ } @{ $report->{Observed} }), 1,
-    'a full pool without pressure is observed, not changed');
+is(scalar(grep { /^Pool 9 was at its maximum of 2 in 30 minutes on 3 days; no LPAR's busy work was above its entitlement then often enough to act on: no change\. Busy work was above entitlement in those minutes on 1 LPAR \(most: lpC, 3 minutes on 1 day\)\.$/ } @{ $report->{Observed} }), 1,
+    'a full pool without recurring pressure is observed, not changed; the few minutes are still stated');
+is_deeply([ map { $_->{vm} } @{ $found->{7}{Seldom} } ], ['lpB'], 'fewer minutes than a trial needs are kept as evidence');
 is(scalar(grep { /^Pool 11 .* too seldom to act on\.$/ } @{ $report->{Observed} }), 1, 'a pool seldom full is observed');
 is(scalar(grep { /Pool 12/ } @{ $report->{Observed} }, @{ $report->{Actions} }), 0, 'an open pool is not mentioned');
 is_deeply([ sort { $a <=> $b } keys %{ $report->{Covered} } ], [ 7, 9, 11, 12 ], 'every assessed pool is marked as covered');
@@ -85,6 +86,17 @@ is(scalar(grep { /^Pool 7 was at its maximum.*The pool increase its members' ent
     'the pressure is still stated, with the structural increase named as the answer');
 ok(!%{ $report->{Members} }, 'and no LPAR carries the trial sentence');
 
+# Pool full and frame without spare cores in the same minutes: both are named.
+{
+    my $use = $pool->(4, 40, 3, 25, @busy);
+    $use->{fullFrameScarce} = 12;
+    my $both = UUT::_pool_use_findings({ 7 => $use }, [ $tracker->('lpA', 7, 'none', 12, 8, 0) ]);
+    is($both->{7}{FullFrameScarce}, 12, 'frame-scarce minutes among the full minutes are carried');
+    like(UUT::_pool_use_report(undef, $both, [])->{Actions}[0],
+         qr/Check licensing\. The frame had no spare cores in 12 of those minutes: check the frame's capacity as well\.$/,
+         'the trial names the frame where it was also without spare cores');
+}
+
 # The section is written.
 my $buffer = '';
 open my $log, '>', \$buffer or die;
@@ -94,6 +106,7 @@ like($buffer, qr/^Pool Use$/m, 'section heading');
 like($buffer, qr/^\s+7\s+4\s+2\.00\s+3\.50\s+4\.00\s+4\.00\s+40 minutes on 3 days \(longest 25\)$/m, 'pool row: maximum, median, P95, P99, peak, fullness');
 like($buffer, qr/^\s+12\s+8\s+2\.00\s+2\.00\s+2\.00\s+2\.00\s+never$/m, 'an open pool row');
 like($buffer, qr/No pool reduction is derived here\./, 'no reduction is derived');
+like($buffer, qr/Pressure on capped LPARs is not\n\s+evaluated by this check \(which is not a finding that there is none\)/, 'capped LPARs: not evaluated, not absent');
 
 is_deeply(UUT::_pool_use_findings(undef, []), {}, 'no evidence: nothing');
 is_deeply(UUT::_pool_use_report(undef, {}, [])->{Actions}, [], 'nothing to report');
