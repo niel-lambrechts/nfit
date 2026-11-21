@@ -47,7 +47,7 @@ def coarse_root(pool_step=STEP, member_step=STEP, pool_shift=0, no_pool=False):
 
 
 class CoarseRun:
-    def __init__(self, pool_step=STEP, enddate='2026-09-02', pool_shift=0, no_pool=False, member_step=STEP):
+    def __init__(self, pool_step=STEP, enddate='2026-09-02', pool_shift=0, no_pool=False, member_step=STEP, extra=()):
         mx.MemberExposureTests.roots = []
         self.root, self.cache, self.samples_per_lpar = coarse_root(pool_step, member_step, pool_shift=pool_shift, no_pool=no_pool)
         cfg = self.root / 'vms.csv'
@@ -57,7 +57,7 @@ class CoarseRun:
             for vm, role in [('vmA', 'AIX'), ('vmB', 'VIO Server'), ('vmS', 'PowerHA Standby')]:
                 ent, vp, pool, _ = mx.CONFIG[vm]
                 w.writerow([vm, mx.SERIAL, role, 'pool', pool, ent, vp])
-        run(str(self.root), str(self.cache), '--config', str(cfg), '--enddate', enddate)
+        run(str(self.root), str(self.cache), '--config', str(cfg), '--enddate', enddate, *extra)
         self.log = glob.glob(str(self.root / 'output' / '*.log'))[0]
         self.log = Path(self.log).read_text(encoding='utf-8')
         self.flat = ' '.join(self.log.split())
@@ -83,6 +83,7 @@ class IntervalEvidenceTest(unittest.TestCase):
         cls.shifted = CoarseRun(pool_shift=180)     # pool observed three minutes after the LPAR samples
         cls.no_pool = CoarseRun(no_pool=True)       # coarse LPAR samples, no pool observations
         cls.fine_no_pool = CoarseRun(no_pool=True, member_step=1)
+        cls.normal = CoarseRun(extra=('--guarantee-policy', 'normal'))
 
     @classmethod
     def tearDownClass(cls):
@@ -91,6 +92,7 @@ class IntervalEvidenceTest(unittest.TestCase):
         cls.shifted.close()
         cls.no_pool.close()
         cls.fine_no_pool.close()
+        cls.normal.close()
 
     def test_an_observation_is_one_sample_and_coverage_follows_the_cadence(self):
         support = [v['cutProtection']['support'] for v in self.coarse.members['vmA']['profiles'].values() if 'cutProtection' in v]
@@ -137,6 +139,22 @@ class IntervalEvidenceTest(unittest.TestCase):
         self.assertRegex(row['NFIT - Action'], r'^No change\. Hold the cut to \d\.\d\d: 15-minute data cannot assess brief pool competition\. '
                                                r'Obtain finer evidence or authorise a monitored trial\.$')
         self.assertNotIn('Hold the cut', self.coarse.rows['vmX']['NFIT - Action'])       # a dedicated LPAR has no pool evidence
+
+    def test_normal_planning_applies_the_cut_and_says_what_the_data_could_not_show(self):
+        strict, normal = self.coarse.rows['vmS'], self.normal.rows['vmS']
+        profile = normal['Planning Profile']
+        self.assertEqual(normal[profile], strict[profile])                               # the target does not depend on the policy
+        self.assertLess(float(normal['NFIT - ENT']), 1.5)
+        self.assertNotIn('Hold the cut', normal['NFIT - Action'])
+        self.assertEqual(normal['NFIT - Action'].count('15-minute data cannot assess brief pool competition.'), 1)
+        self.assertNotIn('cannot assess', self.normal.rows['vmX']['NFIT - Action'])      # dedicated
+        # Both policies' pairs are recorded by either run, and agree with what each run published.
+        for run_, policy in ((self.coarse, 'strict'), (self.normal, 'normal')):
+            saved = run_.members['vmS']['profiles'][profile]
+            self.assertEqual(saved['currentCycle']['entitlement'], saved['cycleByPolicy'][policy]['entitlement'])
+            self.assertAlmostEqual(saved['cycleByPolicy']['strict']['entitlement'], 1.5)
+            self.assertAlmostEqual(saved['cycleByPolicy']['normal']['entitlement'], float(normal['NFIT - ENT']))
+        self.assertNotIn('cycleByPolicy', self.fine_no_pool.members.get('vmS', {}).get('profiles', {}).get(profile, {}))
 
     def test_the_hold_does_not_depend_on_pool_observations_being_present(self):
         # Coarse LPAR samples with no pool observations at all: the uncapped shared-pool LPAR's cut is held as well.

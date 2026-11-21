@@ -275,4 +275,31 @@ is($lbad, 0, "limit sweep: $lsweeps pairs valid within every limit") or diag(joi
     is($cut->{Ent}, 0.12, 'without coarse evidence the cut is applied');
 }
 
+# Normal planning: coarse data alone does not stop a cut; the action says what it could not show.
+{
+    my %case = (target_ent => 0.60, target_vp => 1, step_vp => 1, current_ent => 2.00, current_vp => 2, pool_size => 4);
+    my $plain  = UUT::_resolve_current_cycle_pair({ %case });
+    my $normal = UUT::_resolve_current_cycle_pair({ %case, coarse_note => 15 });
+    my $strict = UUT::_resolve_current_cycle_pair({ %case, coarse_note => 15, hold_cut => 15 });
+    is($normal->{Ent}, $plain->{Ent}, 'normal planning: the coarse cadence does not change this cycle\'s entitlement');
+    is($normal->{VP},  $plain->{VP},  '  nor the VPs');
+    ok(!(grep { $_ eq 'COARSE_EVIDENCE' } @{ $normal->{Binding} }), '  and nothing is held');
+    is($normal->{TargetEnt}, $strict->{TargetEnt}, '  the target is the same under both policies');
+    is($strict->{Ent}, 2.00, 'strict: the cut is held');
+    my $text = UUT::_current_cycle_action_text($normal, 2.00, 2, 7);
+    like($text, qr/15-minute data cannot assess brief pool competition\./, 'normal planning: the action states what the data could not show');
+    unlike($text, qr/Hold the cut/, '  without holding the cut');
+    unlike(UUT::_current_cycle_action_text($plain, 2.00, 2, 7), qr/cannot assess/, 'fine evidence: no such sentence');
+    my $held = UUT::_current_cycle_action_text($strict, 2.00, 2, 7);
+    is(scalar(() = $held =~ /cannot assess brief pool competition/g), 1, 'strict: the sentence appears once');
+    # A rise carries no note.
+    my $up = UUT::_resolve_current_cycle_pair({ target_ent => 1.00, target_vp => 2, step_vp => 2, current_ent => 0.50, current_vp => 2, coarse_note => 15 });
+    unlike(UUT::_current_cycle_action_text($up, 0.50, 2, 7), qr/cannot assess/, 'a rise carries no resolution note');
+    # The pool-borrowing rule raised the target only for lack of resolution.
+    my $raised = UUT::_resolve_current_cycle_pair({ %case, coarse_note => 15, borrowing_by_resolution => 15 });
+    like(UUT::_current_cycle_action_text($raised, 2.00, 2, 7),
+        qr/The target includes the tier's pool-borrowing allowance only because 15-minute data cannot rule out pool competition\./,
+        'a target raised for lack of resolution says so');
+}
+
 done_testing();

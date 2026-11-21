@@ -802,6 +802,18 @@ my %POOL_USE;
 my %EVIDENCE_INTERVAL = (cadenceTolerance => 0.20, maxExemptionCadence => 1, holdCutCadence => 15);
 # The sampling interval of the current system's CPU cache, in minutes (undef when it cannot be told).
 my $SYSTEM_CPU_CADENCE;
+# --guarantee-policy normal|strict. What the current cycle does with an
+# entitlement cut where the evidence is too coarse (holdCutCadence) to assess
+# brief pool competition:
+#   strict : guarantee preservation. The cut is held; the target is kept.
+#   normal : planning. The cut is applied by the usual current-cycle rules
+#            (measured cut protection, the VP step, the ratio guard); the
+#            action states that brief pool competition could not be assessed.
+#            Pool membership and coarse data do not show that the installed
+#            entitlement is needed.
+# Either way the target is the calculated one. The default stays strict until
+# the replay of the normal-planning pairs has been read.
+my $guarantee_policy = 'strict';
 my $POOL_TRIAL_MIN_MINUTES = 15;
 my $POOL_TRIAL_MIN_DAYS    = 2;
 # Set while the profile is sized once more without the bound, to give the
@@ -872,6 +884,7 @@ GetOptions(
     'research-busy-share'        => \$research_busy_share,
     'research-pool-ceiling-replay=s' => \$research_pool_ceiling_replay,
     'uplift-exemption!'          => \$uplift_exemption_flag,
+    'guarantee-policy=s'         => \$guarantee_policy,
     'min-history-days=i'         => \$min_history_days_arg,
     'reset-seasonal-cache'       => \$reset_seasonal_cache,
     "v|verbose+"                 => \$verbose,
@@ -1695,6 +1708,7 @@ my $FLOAT_EPSILON = 1e-9;
 my $LOG_FH;
 my %open_log_files;
 
+die "--guarantee-policy takes 'normal' or 'strict'\n" unless ($guarantee_policy eq 'normal' || $guarantee_policy eq 'strict');
 my $is_seasonal_run = $apply_seasonality_event || $update_history_flag;
 $candidate_test = 1 if defined $candidate_snapshot;
 die "--candidate-proposals takes one system and uses the saved model, VM scope and sizing dates\n"
@@ -6725,6 +6739,10 @@ sub _resolve_current_cycle_pair
         push @binding, 'COARSE_EVIDENCE';
         $out{HoldCadence} = $terms->{hold_cut};
     }
+    # For the action text: the cut was sized where brief pool competition cannot be
+    # assessed, and the target was raised by the pool-borrowing rule for that reason.
+    $out{CoarseCadence}    = $terms->{coarse_note} if (defined $terms->{coarse_note} && $target_ent < $current_ent - $FLOAT_EPSILON);
+    $out{BorrowingCadence} = $terms->{borrowing_by_resolution} if defined $terms->{borrowing_by_resolution};
     my $ceil_whole = sub
     {
         my ($v) = @_;
@@ -7000,6 +7018,16 @@ sub _current_cycle_action_text
         push @sentences, sprintf('Hold the cut%s: %d-minute data cannot assess brief pool competition. Obtain finer evidence or authorise a monitored trial.',
             $names_target, $pair->{HoldCadence} // 15);
     }
+    elsif (defined $pair->{CoarseCadence} && $ent_changes && $ent < $current_ent)
+    {
+        # Normal planning: the cut goes ahead; what the data could not show is stated.
+        push @sentences, sprintf('%d-minute data cannot assess brief pool competition.', $pair->{CoarseCadence});
+    }
+    if (defined $pair->{BorrowingCadence})
+    {
+        push @sentences, sprintf('The target includes the tier\'s pool-borrowing allowance only because %d-minute data cannot rule out pool competition.',
+            $pair->{BorrowingCadence});
+    }
     if ($binding{VP_LIMIT} && defined $pair->{NeedVP} && defined $target_ent)
     {
         push @sentences, sprintf('The VP limit stops the rise; %s are needed to reach the %.2f target.',
@@ -7123,7 +7151,7 @@ sub _current_cycle_pair_from_results
         current_ent => $cfg->{entitlement},
         current_vp  => $cfg->{virtual_cpus},
         pool_size   => ($user_pool ? $cfg->{pool_cpu} : undef),
-        hold_cut    => _hold_cut_cadence($cfg->{vm_name}, $profile_name, $cfg),
+        _coarse_cycle_terms($cfg->{vm_name}, $profile_name, $cfg, (ref($core->{ProfileDebugInfo}) eq 'HASH' ? $core->{ProfileDebugInfo}{$profile_name} : undef)),
     });
 }
 
@@ -16514,10 +16542,32 @@ sub _write_standard_csv_report {
                 current_vp  => $numeric_cell->('Current - VCPU'),
                 pool_size   => ($pool_is_user_defined ? $cfg->{pool_cpu} : undef),
                 tier_floor  => _profile_tier_floor($core->{ProfileDebugInfo}{$name}, $cfg),
-                hold_cut    => _hold_cut_cadence($cfg->{vm_name}, $name, $cfg),
+                _coarse_cycle_terms($cfg->{vm_name}, $name, $cfg, $core->{ProfileDebugInfo}{$name}),
             });
         }
         $vm_map_ref->{CoreResults}{Profile_CurrentCycle} = \%cycle_pairs;
+        # Where the evidence is coarse, the pair under each guarantee policy, for the record
+        # (the stored proposal): the comparison of the two needs both from one sizing.
+        my %cycle_by_policy;
+        for my $profile (@csv_visible_profiles)
+        {
+            my $name = $profile->{name};
+            next unless ($cycle_pairs{$name} && defined _coarse_evidence_cadence($cfg->{vm_name}, $name, $cfg));
+            foreach my $policy (qw(normal strict))
+            {
+                my $alt = _resolve_current_cycle_pair({
+                    target_ent  => $numeric_cell->($name),
+                    target_vp   => $numeric_cell->("${name}_rVCPU"),
+                    step_vp     => $numeric_cell->("${name}_rVCPU_Tactical"),
+                    current_ent => $numeric_cell->('Current - ENT'),
+                    current_vp  => $numeric_cell->('Current - VCPU'),
+                    pool_size   => ($pool_is_user_defined ? $cfg->{pool_cpu} : undef),
+                    tier_floor  => _profile_tier_floor($core->{ProfileDebugInfo}{$name}, $cfg),
+                    _coarse_cycle_terms($cfg->{vm_name}, $name, $cfg, $core->{ProfileDebugInfo}{$name}, $policy),
+                });
+                $cycle_by_policy{$name}{$policy} = { entitlement => $alt->{Ent}, VPs => $alt->{VP}, status => $alt->{Status} };
+            }
+        }
 
         # Published planner cells: the planning profile, each profile's
         # current-cycle pair and the planning profile's recommendation.
@@ -16598,6 +16648,8 @@ sub _write_standard_csv_report {
                         reviewVPs   => $pair->{ReviewVP},
                         reason      => $pair->{Reason},
                     },
+                    ($cycle_by_policy{$name} ? (cycleByPolicy => $cycle_by_policy{$name}) : ()),
+                    ((defined $pair->{BorrowingCadence}) ? (borrowingByResolution => $pair->{BorrowingCadence}) : ()),
                 };
             }
             $proposals->{$vm_name} = {
@@ -24296,10 +24348,10 @@ sub _evidence_cadence_of
     return (sort { $seen->{$b} <=> $seen->{$a} || $a <=> $b } keys %$seen)[0] + 0;
 }
 
-# The cadence at which the current cycle holds an entitlement cut of this LPAR and profile
-# (%EVIDENCE_INTERVAL, holdCutCadence), or undef: an uncapped shared-pool LPAR whose pool
-# evidence arrives at that cadence or coarser.
-sub _hold_cut_cadence
+# The cadence (minutes) at which brief pool competition cannot be assessed for this LPAR and
+# profile (%EVIDENCE_INTERVAL, holdCutCadence), or undef where it can, or where the LPAR is not
+# an uncapped shared-pool LPAR. What follows from it is the guarantee policy's choice.
+sub _coarse_evidence_cadence
 {
     my ($vm, $profile, $cfg) = @_;
     return undef unless (defined $vm && defined $profile);
@@ -24346,6 +24398,25 @@ sub _cpu_cache_cadence
     return undef unless defined $spacing;
     my $minutes = int($spacing / 60 + 0.5);
     return $minutes < 1 ? 1 : $minutes;
+}
+
+# The current-cycle terms that come from coarse evidence, for _resolve_current_cycle_pair:
+#   coarse_note - the cadence, where brief pool competition cannot be assessed;
+#   hold_cut    - the same, under the strict guarantee policy ($policy overrides the run's);
+#   borrowing_by_resolution - the cadence, where the tier's pool-borrowing rule raised this
+#                 profile's target only because no competition could be ruled out at that
+#                 resolution (at one minute the same evidence would have withheld the rule).
+sub _coarse_cycle_terms
+{
+    my ($vm, $profile, $cfg, $dbg, $policy) = @_;
+    my $cadence = _coarse_evidence_cadence($vm, $profile, $cfg);
+    my %terms = (coarse_note => $cadence, hold_cut => ((($policy // $guarantee_policy) eq 'strict') ? $cadence : undef));
+    if (ref($dbg) eq 'HASH' && ($dbg->{'PeakUpliftGate'} // '') =~ /pool evidence at (\d+)-minute resolution/)
+    {
+        my $by = $1 + 0;
+        $terms{borrowing_by_resolution} = $by if (($dbg->{'BudgetFloorApplied'} // '') =~ /^Yes/);
+    }
+    return %terms;
 }
 
 # "40 minutes" at one-minute cadence; "6 of the 15-minute intervals" at a coarser one:
@@ -26106,6 +26177,16 @@ sub _protection_loss_trackers
             next unless ((ref($rec) eq 'HASH' && $rec->{cut}) || $withheld || $ruled || $leveled || $is_planning);
             my %levels = (installed => $meta->{entitlement});
             $levels{published} = $saved->{entitlement} if $is_planning;
+            if ($is_planning)
+            {
+                # This cycle's entitlement, and where the evidence was coarse the one under each guarantee policy.
+                $levels{cycle} = $saved->{currentCycle}{entitlement} if (ref($saved->{currentCycle}) eq 'HASH');
+                my $by = (ref($saved->{cycleByPolicy}) eq 'HASH') ? $saved->{cycleByPolicy} : {};
+                $levels{cycleNormal} = $by->{normal}{entitlement} if (ref($by->{normal}) eq 'HASH');
+                $levels{cycleStrict} = $by->{strict}{entitlement} if (ref($by->{strict}) eq 'HASH');
+                # A comparison run's entitlement for this cycle (dev/protection-replay --reference-records).
+                $levels{cycleReference} = $saved->{referenceCycle} if defined $saved->{referenceCycle};
+            }
             %levels = (%levels, clNoRule => $cl->{noRule}, clCandidate => $cl->{candidate}, clPublished => $saved->{entitlement})
                 if $leveled;
             %levels = (%levels, target => $rec->{target}, map { ($_ => $rec->{adjusted}{$_}) } qw(busy ladder consumed))
@@ -28219,6 +28300,12 @@ Model behaviour depends on the event configuration:
                                               target is raised to the highest protected level seen while the LPAR's
                                               pool was scarce and other LPARs were busy, never above installed; see the
                                               "Cut Protection" section. --no-cut-protection leaves the cuts as sized.
+
+  --guarantee-policy <normal|strict>        : What the current cycle does with an entitlement cut of an uncapped shared-pool
+                                              LPAR when the data is at 15 minutes or coarser, where brief pool competition
+                                              cannot be assessed. strict (default): the cut is held and the target kept.
+                                              normal: the cut is applied by the usual current-cycle rules and the action
+                                              says what the data could not show.
 
   --[no-]uplift-exemption                   : Standard runs (default on). The tier's pool-borrowing rule, which pulls an
                                               entitlement towards the LPAR's peak, is not applied where the pool evidence

@@ -123,6 +123,8 @@ class ThinReplayTest(unittest.TestCase):
         case = root / 'case'
         case.mkdir()
         pr.THIN.update(minutes=15, mode='mean')
+        pr.REFERENCE.update({('case-member-001', p): 0.33 for p in ('P-99W1', 'G3-95W15', 'O3-95W15', 'B3-95W15', 'G2-95W15', 'O2-95W15', 'G1-99W5', 'O1-99W5', 'B1-99W5')})
+        self.addCleanup(pr.REFERENCE.clear)
         try:
             snapshot, replay = pr.run_case(app, case, source, ('2026-09-01', '2026-09-01', '2026-09-02', '2026-09-02'), pr.perl_env())
         finally:
@@ -137,6 +139,16 @@ class ThinReplayTest(unittest.TestCase):
         labels = {l: t for t in replay['trackers'] if t['vm'] == 'vmA' for level in t['levels'] for l in level['labels']}
         self.assertIn(planning + '/published', labels)
         self.assertGreater(labels[planning + '/published']['pairedMinutes'], 96)         # minutes, not intervals
+        # Coarse evidence: this cycle's entitlement under both guarantee policies is recorded and scored,
+        # with the comparison run's (--reference-records).
+        by = snapshot['members']['vmA']['profiles'][planning].get('cycleByPolicy')
+        self.assertTrue(by, 'the coarse sizing records both policies')
+        self.assertLessEqual(by['normal']['entitlement'], by['strict']['entitlement'])
+        self.assertEqual(snapshot['members']['vmA']['profiles'][planning]['currentCycle']['entitlement'], by['strict']['entitlement'])   # the default
+        values = {l: level['value'] for t in replay['trackers'] if t['vm'] == 'vmA' for level in t['levels'] for l in level['labels']}
+        self.assertEqual(values[planning + '/cycleNormal'], by['normal']['entitlement'])
+        self.assertEqual(values[planning + '/cycleStrict'], by['strict']['entitlement'])
+        self.assertEqual(values.get(planning + '/cycleReference'), 0.33)
         # Without a data revision in the manifest the replay could not accept the proposal: refused at the start.
         manifest = source / '.nfit.cache.manifest'
         manifest.write_text('\n'.join(l for l in manifest.read_text().splitlines() if not l.startswith('data_revision')) + '\n')
