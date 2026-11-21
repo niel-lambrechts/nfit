@@ -21,7 +21,7 @@ for my $constant (qw($POOL_TRIAL_MIN_MINUTES $POOL_TRIAL_MIN_DAYS))
     $src =~ /^(my \Q$constant\E\s*=.*?;)/m or die "could not extract $constant\n";
     $code .= "$1\n";
 }
-for my $name (qw(_pool_use_findings _pool_use_resolve _pool_use_report _pool_quantile _pool_units_text))
+for my $name (qw(_pool_use_findings _pool_use_resolve _pool_use_report _pool_quantile _pool_units_text _evidence_count_text _rationale_wrap))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n\n";
@@ -125,7 +125,26 @@ like($buffer, qr/^Pool Use$/m, 'section heading');
 like($buffer, qr/^\s+7\s+4\s+2\.00\s+3\.50\s+4\.00\s+4\.00\s+40 minutes on 3 days \(longest 25\)$/m, 'pool row: maximum, median, P95, P99, peak, fullness');
 like($buffer, qr/^\s+12\s+8\s+2\.00\s+2\.00\s+2\.00\s+2\.00\s+never$/m, 'an open pool row');
 like($buffer, qr/No pool reduction is derived here\./, 'no reduction is derived');
-like($buffer, qr/Pressure on capped LPARs is not\n\s+evaluated by this check \(which is not a finding that there is none\)/, 'capped LPARs: not evaluated, not absent');
+like(join(' ', split(' ', $buffer)), qr/Pressure on capped LPARs is not evaluated by this check \(which is not a finding that there is none\)/, 'capped LPARs: not evaluated, not absent');
+
+# A coarse cadence: counts are intervals, no longest run is given, and the resolution is stated.
+{
+    my $use = $pool->(4, 40, 3, 25, @busy);
+    $use->{spacing} = { 900 => 950 };                              # observations 15 minutes apart
+    my $coarse = UUT::_pool_use_findings({ 7 => $use }, [ $tracker->('lpA', 7, 'none', 12, 8, 0) ]);
+    is($coarse->{7}{Cadence}, 15, 'the pool cadence is taken from the spacing of its observations');
+    my $text = '';
+    open my $fh2, '>', \$text or die;
+    my $r = UUT::_pool_use_report($fh2, $coarse, []);
+    close $fh2;
+    like($r->{Actions}[0], qr/The pool was at its maximum of 4 in 40 of the 15-minute intervals on 3 days,/, 'the trial counts intervals');
+    like($r->{Members}{lpA}, qr/busy work above its entitlement in 20 of the 15-minute intervals over 2 days:/, 'so does the LPAR sentence');
+    like($text, qr/40 of the 15-minute intervals on 3 days$/m, 'the table gives no longest run');
+    my $flat = join(' ', split(' ', $text));
+    like($flat, qr/Resolution: pool observations arrive every 15 minutes\. Counts are intervals, not minutes above a threshold;/, 'the resolution is stated');
+    like($flat, qr/Pool reduction not assessed: 15-minute data can hide short peaks\. Collect one-minute data\./, 'and the pool reduction is not assessed');
+    unlike($buffer, qr/Resolution:/, 'nothing of this at one minute');
+}
 
 is_deeply(UUT::_pool_use_findings(undef, []), {}, 'no evidence: nothing');
 is_deeply(UUT::_pool_use_report(undef, {}, [])->{Actions}, [], 'nothing to report');

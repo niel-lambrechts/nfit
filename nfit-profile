@@ -772,6 +772,23 @@ my %CUT_PROTECTION_EVIDENCE;
 # { pool => { Maximum, Observed, Full, FullDays, Longest, P50, P95, P99, Peak,
 #             Pressured => [ { vm, minutes, days } ], Verdict } }
 my %POOL_USE;
+# Interval-aware evidence (v10 stage 3.4). The evidence pass counts
+# observations as they were recorded: one LPAR sample and its pool's reading
+# of the same interval. At one-minute cadence that is the minute, as before.
+# At a coarser cadence:
+#   - nothing is spread or repeated into minute buckets; an observation is one
+#     sample, and coverage is measured against what the cadence can give;
+#   - the pool reading is the one nearest the LPAR sample, within half an
+#     interval, and only when LPAR and pool arrive at a compatible cadence
+#     (within cadenceTolerance). Otherwise the minute is unclassified and
+#     counted as misaligned: thin or mismatched evidence takes the fallback;
+#   - an LPAR's busy work and its pool's state are associated by interval;
+#     that they coincided inside it is not shown, and texts say so;
+#   - the absence of competition does not enable the pool-borrowing
+#     exemption (maxExemptionCadence), because short competition is not seen;
+#   - one credible contested observation may still limit a cut (never above
+#     installed), as precaution.
+my %EVIDENCE_INTERVAL = (cadenceTolerance => 0.20, maxExemptionCadence => 1);
 my $POOL_TRIAL_MIN_MINUTES = 15;
 my $POOL_TRIAL_MIN_DAYS    = 2;
 # Set while the profile is sized once more without the bound, to give the
@@ -4094,8 +4111,11 @@ sub log_profile_rationale
                     ? sprintf('not applied: no pool competition observed (%.1f%% of the profile hours classified); the profile figure stands',
                               100 * ($calc_debug_info_ref->{'PeakUpliftClassifiedShare'} // 0))
                 : $gate eq 'applied (contested)'
-                    ? sprintf('applies: the pool was contested in %d minute%s (legacy policy for the amount)',
-                              $calc_debug_info_ref->{'PeakUpliftContested'} // 0, (($calc_debug_info_ref->{'PeakUpliftContested'} // 0) == 1 ? '' : 's'))
+                    ? sprintf('applies: the pool was contested in %s (legacy policy for the amount)',
+                              _evidence_count_text($calc_debug_info_ref->{'PeakUpliftContested'} // 0,
+                                  $calc_debug_info_ref->{'PeakUpliftCadence'}))
+                : $gate =~ /^applied \(legacy: pool evidence at (\d+)-minute resolution\)$/
+                    ? sprintf('applies as legacy policy: no pool competition was observed, but at %d-minute resolution short competition is not seen', $1)
                 : $gate eq 'applied (legacy: pool evidence insufficient)'
                     ? sprintf('applies as legacy policy: pool evidence insufficient (%.1f%% classified, lowest day %.0f%%)',
                               100 * ($calc_debug_info_ref->{'PeakUpliftClassifiedShare'} // 0), 100 * ($calc_debug_info_ref->{'PeakUpliftWorstDay'} // 0))
@@ -4267,9 +4287,13 @@ sub log_profile_rationale
         my ($sf_cp_share) = _protection_share_of($profile_being_adjusted);
         $sf_glance->('Cut protection',
             ($calc_debug_info_ref->{'CutProtectionLimited'} // '') ne ''
-                ? sprintf('profile %.2f limited to %s (share %.2f); %d contested minute%s over %d day%s in pool %s',
-                    $sf_cp_own, $calc_debug_info_ref->{'CutProtectionLimited'}, $sf_cp_share, $sf_cp_min, ($sf_cp_min == 1 ? '' : 's'),
-                    $sf_cp_days, ($sf_cp_days == 1 ? '' : 's'), $sf_cp->{pool} // $na)
+                ? ((_evidence_cadence_of($sf_cp) > 1)
+                    ? sprintf('profile %.2f limited to %s (share %.2f); busy demand and pool pressure in %s over %d day%s in pool %s; overlap within an interval is unknown',
+                        $sf_cp_own, $calc_debug_info_ref->{'CutProtectionLimited'}, $sf_cp_share, _evidence_count_text($sf_cp_min, _evidence_cadence_of($sf_cp)),
+                        $sf_cp_days, ($sf_cp_days == 1 ? '' : 's'), $sf_cp->{pool} // $na)
+                    : sprintf('profile %.2f limited to %s (share %.2f); %d contested minute%s over %d day%s in pool %s',
+                        $sf_cp_own, $calc_debug_info_ref->{'CutProtectionLimited'}, $sf_cp_share, $sf_cp_min, ($sf_cp_min == 1 ? '' : 's'),
+                        $sf_cp_days, ($sf_cp_days == 1 ? '' : 's'), $sf_cp->{pool} // $na))
             : $sf_cp_bound eq 'none' ? 'no pool competition observed in the profile hours; the profile target stands'
             : sprintf('not limiting (protected level %s, share %.2f)', $sf_cp_bound, $sf_cp_share));
     }
@@ -7320,8 +7344,14 @@ sub _peak_uplift_gate
     my $t = $CUT_PROTECTION_EVIDENCE{$vm} ? $CUT_PROTECTION_EVIDENCE{$vm}{$profile} : undef;
     return ('applied (legacy: no pool evidence for the current state)')
         unless (ref($t) eq 'HASH' && ref($t->{protection}) eq 'HASH');
-    return _peak_uplift_gate_of($t->{protection}{contested} // 0,
-        [ map { [ $_->{expected} // 0, $_->{classified} // 0 ] } values %{ $t->{daily} // {} } ]);
+    # Coverage is measured against the observations the cadence can give.
+    my @gate = _peak_uplift_gate_of($t->{protection}{contested} // 0,
+        [ map { [ $_->{expectedObs} // $_->{expected} // 0, $_->{classified} // 0 ] } values %{ $t->{daily} // {} } ]);
+    # At a coarse cadence short competition is not seen: its absence does not remove the rule.
+    my $cadence = _evidence_cadence_of($t);
+    $gate[0] = sprintf('applied (legacy: pool evidence at %d-minute resolution)', $cadence)
+        if ($gate[0] =~ /^withheld/ && $cadence > $EVIDENCE_INTERVAL{maxExemptionCadence});
+    return (@gate[0 .. 3], $cadence);
 }
 
 # The decision itself, from the contested minutes and each day's (expected,
@@ -8054,7 +8084,7 @@ sub calculate_runq_modified_physc
     $debug_info{'GuaranteedDispatchThreads'} = sprintf("%.1f", $guaranteed_lcpus);
     $debug_info{'ReachableDispatchThreads'}  = sprintf("%.1f", $reachable_lcpus);
     $debug_info{'DispatchBudgetFraction'}    = sprintf("%.2f", $dispatch_budget);
-    @debug_info{qw(PeakUpliftGate PeakUpliftContested PeakUpliftClassifiedShare PeakUpliftWorstDay)} = _peak_uplift_gate($vm_name, $profile_name);
+    @debug_info{qw(PeakUpliftGate PeakUpliftContested PeakUpliftClassifiedShare PeakUpliftWorstDay PeakUpliftCadence)} = _peak_uplift_gate($vm_name, $profile_name);
     $debug_info{'SmallEntitlementHandlerActive'} = ($curr_ent_numeric < 1.0 && $max_cpu_for_lpar_numeric > $curr_ent_numeric) ? "Yes" : "No";
 
     # =========================
@@ -14656,6 +14686,9 @@ sub _pool_use_findings
             Observed => $use->{observed}, Full => $use->{full}, FullDays => $full_days, Longest => $use->{longest},
             P50 => _pool_quantile(\@sorted, 0.50), P95 => _pool_quantile(\@sorted, 0.95), P99 => _pool_quantile(\@sorted, 0.99),
             Peak => $sorted[-1], FullFrameScarce => $use->{fullFrameScarce} // 0,
+            # The cadence most of the pool's observations arrived at, in minutes.
+            Cadence => (%{ $use->{spacing} // {} }
+                ? max(1, int((sort { $use->{spacing}{$b} <=> $use->{spacing}{$a} || $a <=> $b } keys %{ $use->{spacing} })[0] / 60 + 0.5)) : 1),
             Members => { map { ($_ => $counts{$_}) } grep { defined $counts{$_}{pool} && $counts{$_}{pool} == $pool } keys %counts },
         }, {});
     }
@@ -14706,6 +14739,7 @@ sub _pool_use_report
     return \%result unless (ref($pool_use) eq 'HASH' && %$pool_use);
     my %required = map { ($_->{PoolId} => $_) } grep { ref($_) eq 'HASH' } @{ $structural_pools // [] };
     my $plural = sub { return $_[0] == 1 ? '' : 's'; };
+    my $any_coarse;
     my @out = ('', '=' x 70, 'Pool Use', '=' x 70,
         "  Each user-defined pool's measured use against its maximum, in cores, over the analysis window.",
         '  A pool that was repeatedly at its maximum while its LPARs had busy work above their entitlement,',
@@ -14718,24 +14752,28 @@ sub _pool_use_report
     {
         my $u = $pool_use->{$pool};
         $result{Covered}{ $pool + 0 } = 1;
+        my $coarse = (($u->{Cadence} // 1) > 1) ? 1 : 0;
+        $any_coarse = $u->{Cadence} if $coarse;
         my $max = _pool_units_text($u->{Maximum});
         push @out, sprintf('    %-6s %8s %8.2f %8.2f %8.2f %8.2f  %s', $pool, $max, $u->{P50}, $u->{P95}, $u->{P99}, $u->{Peak},
-            $u->{Full} ? sprintf('%d minute%s on %d day%s (longest %d)', $u->{Full}, $plural->($u->{Full}), $u->{FullDays},
-                                 $plural->($u->{FullDays}), $u->{Longest}) : 'never');
-        my $full = sprintf('at its maximum of %s in %d minute%s on %d day%s', $max, $u->{Full}, $plural->($u->{Full}),
+            !$u->{Full} ? 'never'
+            : $coarse ? sprintf('%s on %d day%s', _evidence_count_text($u->{Full}, $u->{Cadence}), $u->{FullDays}, $plural->($u->{FullDays}))
+            : sprintf('%d minute%s on %d day%s (longest %d)', $u->{Full}, $plural->($u->{Full}), $u->{FullDays},
+                      $plural->($u->{FullDays}), $u->{Longest}));
+        my $full = sprintf('at its maximum of %s in %s on %d day%s', $max, _evidence_count_text($u->{Full}, $u->{Cadence}),
                            $u->{FullDays}, $plural->($u->{FullDays}));
         # Fewer minutes than a trial needs are still evidence, and are stated.
         my @seldom = sort { $b->{minutes} <=> $a->{minutes} || $a->{vm} cmp $b->{vm} } @{ $u->{Seldom} // [] };
-        my $seldom = @seldom ? sprintf(' Busy work was above entitlement in those minutes on %d LPAR%s (most: %s, %d minute%s on %d day%s).',
-            scalar(@seldom), $plural->(scalar @seldom), $seldom[0]{vm}, $seldom[0]{minutes}, $plural->($seldom[0]{minutes}),
+        my $those = $coarse ? 'intervals' : 'minutes';
+        my $seldom = @seldom ? sprintf(' Busy work was above entitlement in those %s on %d LPAR%s (most: %s, %s on %d day%s).',
+            $those, scalar(@seldom), $plural->(scalar @seldom), $seldom[0]{vm}, _evidence_count_text($seldom[0]{minutes}, $u->{Cadence}),
             $seldom[0]{days}, $plural->($seldom[0]{days})) : '';
         my @outside = @{ $u->{Outside} // [] };
-        $seldom .= sprintf(' Outside their profile hours, %d LPAR%s had busy work above entitlement in those minutes; this is reported, not acted on.',
-            scalar(@outside), $plural->(scalar @outside)) if @outside;
+        $seldom .= sprintf(' Outside their profile hours, %d LPAR%s had busy work above entitlement in those %s; this is reported, not acted on.',
+            scalar(@outside), $plural->(scalar @outside), $those) if @outside;
         # Pool full and frame without spare cores in the same minutes: both need attention.
         my $frame = ($u->{FullFrameScarce} // 0)
-            ? sprintf(' The frame had no spare cores in %d of those minute%s: check the frame\'s capacity as well.', $u->{FullFrameScarce},
-                      $plural->($u->{FullFrameScarce})) : '';
+            ? sprintf(' The frame had no spare cores in %d of those %s: check the frame\'s capacity as well.', $u->{FullFrameScarce}, $those) : '';
         if ($u->{Verdict} eq 'trial')
         {
             my @who = @{ $u->{Pressured} };
@@ -14751,9 +14789,9 @@ sub _pool_use_report
                 push @{ $result{Actions} }, sprintf("Pool %s: trial increase of the pool maximum from %s to %s processing units, then re-measure. "
                     . "The pool was %s, with busy work above entitlement on %d LPAR%s in %s profile hours (%s). A trial, not a measured requirement. Check licensing.%s",
                     $pool, $max, _pool_units_text($u->{Maximum} + 1), $full, scalar(@who), $plural->(scalar @who), (@who == 1 ? 'its' : 'their'), $names, $frame);
-                $result{Members}{ $_->{vm} } = sprintf('Pool %s was at its maximum with this LPAR\'s busy work above its entitlement on %d minute%s over %d day%s: '
-                    . 'a trial increase of the pool to %s is recommended.', $pool, $_->{minutes}, $plural->($_->{minutes}), $_->{days},
-                    $plural->($_->{days}), _pool_units_text($u->{Maximum} + 1)) for @who;
+                $result{Members}{ $_->{vm} } = sprintf('Pool %s was at its maximum with this LPAR\'s busy work above its entitlement %s %s over %d day%s: '
+                    . 'a trial increase of the pool to %s is recommended.', $pool, ($coarse ? 'in' : 'on'), _evidence_count_text($_->{minutes}, $u->{Cadence}),
+                    $_->{days}, $plural->($_->{days}), _pool_units_text($u->{Maximum} + 1)) for @who;
             }
         }
         elsif ($u->{Verdict} eq 'fullNoPressure')
@@ -14768,9 +14806,13 @@ sub _pool_use_report
         push @{ $result{Observed} }, sprintf('Pool %s reported more than one maximum in the period (%s to %s); each minute is judged against the '
             . 'maximum of that minute.', $pool, map { _pool_units_text($_) } @{ $u->{MaximumChanged} }) if $u->{MaximumChanged};
     }
-    push @out, '', sprintf('    Recurrence needed for a trial: %d minutes on %d days (provisional), counted in the minutes the pool', $POOL_TRIAL_MIN_MINUTES,
-        $POOL_TRIAL_MIN_DAYS), '    was at its maximum. Fewer minutes are reported as observations. Pressure on capped LPARs is not',
-        '    evaluated by this check (which is not a finding that there is none); they count in the pool\'s', '    measured use. The default pool (0) is assessed with the frame.', '';
+    push @out, '', sprintf('    Recurrence needed for a trial: %d observations on %d days (provisional), counted where the pool was', $POOL_TRIAL_MIN_MINUTES,
+        $POOL_TRIAL_MIN_DAYS), '    at its maximum. Fewer are reported as observations. Pressure on capped LPARs is not evaluated by',
+        '    this check (which is not a finding that there is none); they count in the pool\'s measured use.', '    The default pool (0) is assessed with the frame.', '';
+    push @out, _rationale_wrap(sprintf('Resolution: pool observations arrive every %d minutes. Counts are intervals, not minutes above a threshold; '
+        . 'peaks shorter than an interval are not seen; an LPAR\'s busy work and its pool\'s state are matched by interval, and that they '
+        . 'coincided inside it is not shown. Pool reduction not assessed: %d-minute data can hide short peaks. Collect one-minute data.',
+        $any_coarse, $any_coarse), '    ', '    '), '' if $any_coarse;
     print {$log_fh} join("\n", @out), "\n" if (defined $log_fh && ref($log_fh));
     return \%result;
 }
@@ -16468,10 +16510,18 @@ sub _write_standard_csv_report {
             {
                 my $p = $cp_tracker->{protection};
                 my ($minutes, $days) = ($p->{contested}, scalar(keys %{ $p->{days} }));
-                $action = sprintf('Cut limited to %s (profile %.2f): busy work reached this level while pool %s was contested, on %d minute%s over %d day%s.%s',
-                    $cp_dbg->{CutProtectionLimited},
-                    _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
-                    $minutes, ($minutes == 1 ? '' : 's'), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''));
+                my $cp_cadence = _evidence_cadence_of($cp_tracker);
+                # At a coarse cadence the limit is a precaution: busy demand and pool pressure
+                # fell in the same interval; that they coincided inside it is not shown.
+                $action = ($cp_cadence > 1)
+                    ? sprintf('Cut limited to %s (profile %.2f): busy demand and pressure in pool %s observed in %s over %d day%s; overlap within the interval is unknown.%s',
+                        $cp_dbg->{CutProtectionLimited},
+                        _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
+                        _evidence_count_text($minutes, $cp_cadence), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''))
+                    : sprintf('Cut limited to %s (profile %.2f): busy work reached this level while pool %s was contested, on %d minute%s over %d day%s.%s',
+                        $cp_dbg->{CutProtectionLimited},
+                        _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
+                        $minutes, ($minutes == 1 ? '' : 's'), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''));
             }
             # XRQ on the planning profile: an increase rests on a run queue far
             # beyond today's limit; its cause is found before the increase is applied.
@@ -24179,6 +24229,51 @@ sub _exposure_trackers
 #             Days are processed in ascending order, so a joint run carries
 #             across midnight.
 # ==============================================================================
+# The cadence of one day's observations, in whole minutes: the median spacing
+# of the minute keys of $minutes_href. undef with fewer than two.
+sub _evidence_cadence
+{
+    my ($minutes_href) = @_;
+    my @at = sort { $a <=> $b } keys %{ $minutes_href // {} };
+    return undef if (@at < 2);
+    my @gaps = sort { $a <=> $b } map { $at[$_] - $at[ $_ - 1 ] } 1 .. $#at;
+    my $cadence = int($gaps[ int($#gaps / 2) ] / 60 + 0.5);
+    return $cadence < 1 ? 1 : $cadence;
+}
+
+# The record nearest to a minute within $reach minutes either side (the earlier one on a tie), or undef.
+sub _evidence_nearest
+{
+    my ($minutes_href, $minute, $reach) = @_;
+    return undef unless $minutes_href;
+    return $minutes_href->{$minute} if exists $minutes_href->{$minute};
+    foreach my $step (1 .. $reach)
+    {
+        return $minutes_href->{ $minute - 60 * $step } if exists $minutes_href->{ $minute - 60 * $step };
+        return $minutes_href->{ $minute + 60 * $step } if exists $minutes_href->{ $minute + 60 * $step };
+    }
+    return undef;
+}
+
+# The cadence most of a tracker's observations arrived at (minutes; 1 when it has none).
+sub _evidence_cadence_of
+{
+    my ($tracker) = @_;
+    my $seen = (ref($tracker) eq 'HASH') ? $tracker->{observations} : undef;
+    return 1 unless (ref($seen) eq 'HASH' && %$seen);
+    return (sort { $seen->{$b} <=> $seen->{$a} || $a <=> $b } keys %$seen)[0] + 0;
+}
+
+# "40 minutes" at one-minute cadence; "6 of the 15-minute intervals" at a coarser one:
+# a count of observations, never a measured time above a threshold.
+sub _evidence_count_text
+{
+    my ($n, $cadence) = @_;
+    $n //= 0;
+    return sprintf('%d minute%s', $n, ($n == 1 ? '' : 's')) unless (defined $cadence && $cadence > 1);
+    return sprintf('%d of the %d-minute intervals', $n, $cadence);
+}
+
 sub _exposure_process_day
 {
     my ($trackers_aref, $day, $cpu_href, $pool_minutes_href, $physical_href) = @_;
@@ -24186,7 +24281,7 @@ sub _exposure_process_day
     my $eps = 1e-9;
     my ($day_start, $day_end) = ($day * 86400, ($day + 1) * 86400);
     my $day_of_week = ($day + 4) % 7;          # 1970-01-01 was a Thursday
-    my %admits;
+    my (%admits, %cadence_of_vm, %cadence_of_pool);
     foreach my $tracker (@$trackers_aref)
     {
         my $from = max($tracker->{from}, $day_start);
@@ -24205,19 +24300,36 @@ sub _exposure_process_day
         };
         my ($ent, $vp, $capped) = @{$tracker}{qw(entitlement vp capped)};
 
+        # Interval-aware evidence: the day's cadence of this LPAR and of its pool. A day
+        # without enough samples keeps the LPAR's last cadence, so that its missing
+        # observations are counted at the rate they would have arrived.
+        $cadence_of_vm{ $tracker->{vm} } = [ _evidence_cadence($member_minutes) ] unless $cadence_of_vm{ $tracker->{vm} };
+        my $cadence = $cadence_of_vm{ $tracker->{vm} }[0] // $tracker->{cadenceLast} // 1;
+        $tracker->{cadenceLast} = $cadence;
+        my $coarse = ($cadence > 1) ? 1 : 0;
+        $cadence_of_pool{ $tracker->{pool} } = [ _evidence_cadence($pool_minutes) ] unless $cadence_of_pool{ $tracker->{pool} };
+        my $pool_cadence = $cadence_of_pool{ $tracker->{pool} }[0];
+        my $compatible = (!$coarse || (defined $pool_cadence
+            && abs($pool_cadence - $cadence) <= $EVIDENCE_INTERVAL{cadenceTolerance} * $cadence)) ? 1 : 0;
+        my $reach = int($cadence / 2);
+        $acc->{expectedObs} //= 0;
+
         for (my $minute = $from; $minute < $to; $minute += 60)
         {
             next unless $flags->[ ($minute - $day_start) / 60 ];
             $acc->{expected}++;
+            $acc->{expectedObs} += 1 / $cadence;
             my $sample = $member_minutes->{$minute};
             next unless ($sample && $sample->[2]);
             my $c = $sample->[1] / $sample->[0];
             my $b = $sample->[3] / $sample->[2];
             $acc->{paired}++;
+            $tracker->{observations}{$cadence}++;
+            $acc->{misaligned}++ unless $compatible;
 
-            # Pool classification of the minute.
+            # Pool classification of the minute (of the interval, at a coarse cadence).
             my ($local, $others) = ('unknown', undef);
-            my $record  = $pool_minutes->{$minute};
+            my $record  = !$coarse ? $pool_minutes->{$minute} : $compatible ? _evidence_nearest($pool_minutes, $minute, $reach) : undef;
             my $ceiling = $tracker->{ceiling} // ($record ? $record->{size} : undef);
             if ($record && defined $record->{value} && defined $ceiling && $ceiling > 0)
             {
@@ -24226,7 +24338,8 @@ sub _exposure_process_day
                 $others = $record->{value} - $c;
             }
             my $physical = 'unknown';
-            my $layer = $physical_href ? $physical_href->{$minute} : undef;
+            my $layer = !$physical_href ? undef : !$coarse ? $physical_href->{$minute}
+                      : $compatible ? _evidence_nearest($physical_href, $minute, $reach) : undef;
             if ($layer && defined $layer->{idle})
             {
                 $physical = ($layer->{idle} <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $layer->{size}) + $eps)
@@ -24449,6 +24562,8 @@ sub _exposure_evaluate_window
                 my $record = $minutes->{$pool}{$minute};
                 next unless (defined $record->{value} && defined $record->{size} && $record->{size} > 0);
                 $use->{observed}++;
+                $use->{spacing}{ $minute - $use->{lastObserved} }++ if (defined $use->{lastObserved} && $minute - $use->{lastObserved} <= 3600);
+                $use->{lastObserved} = $minute;
                 $use->{values} .= pack('f<', $record->{value});
                 $use->{sizes}{ $record->{size} + 0 } = 1;
                 $use->{size} = $record->{size} + 0;                 # the latest reported maximum
@@ -24461,7 +24576,7 @@ sub _exposure_evaluate_window
                 my $layer = $physical->{$minute};
                 $use->{fullFrameScarce}++ if ($layer && defined $layer->{idle} && $layer->{idle}
                     <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $layer->{size}) + 1e-9);
-                $use->{run} = (defined $use->{last} && $minute == $use->{last} + 60) ? $use->{run} + 1 : 1;
+                $use->{run} = (defined $use->{last} && $minute == $use->{last} + 60) ? $use->{run} + 1 : 1;      # consecutive minutes only
                 $use->{last} = $minute;
                 $use->{longest} = $use->{run} if ($use->{run} > $use->{longest});
             }
