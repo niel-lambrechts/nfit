@@ -195,8 +195,9 @@ class CutProtectionTest(unittest.TestCase):
         self.assertRegex(flat, r'Pool 9 was at its maximum of 2 in \d+ minutes on 1 day: too seldom to act on\.')
         self.assertNotIn('Pool 7 was at its maximum in', flat)        # the older observation line gives way
 
-    def test_contested_level_is_recorded_and_changes_nothing_published(self):
-        # Research switch (stage 3.4 candidate): the record is added, the CSV figures stay.
+    def test_contested_level_floor_and_its_research_record(self):
+        # The research switch adds its record; with the fixture's contested minutes on one day only, no floor
+        # applies and the CSV figures stay.
         _, plain = self.standard()
         shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
         _, text = self.standard('--research-contested-level', '--research-busy-share')
@@ -220,17 +221,44 @@ class CutProtectionTest(unittest.TestCase):
             else:
                 self.assertEqual(c['candidate'], c['noRule'], name)                  # thin evidence or no gain: unchanged
         # The fixture's contested minutes fall on one day. With the day requirement of the
-        # copied program lowered to 1, the floor is applied in the recorded sizing: above
-        # the installed 2.0, and still nothing published moves.
+        # copied program lowered to 1, the evidence is sufficient: the floor raises the published
+        # target above the installed 2.0 (a requirement is not limited by today's configuration),
+        # the record says what it rests on, and --no-contested-level gives the earlier figures.
         prog = self.root / 'nfit-profile'
         source = prog.read_text(encoding='utf-8')
         self.assertEqual(source.count('my $CONTESTED_LEVEL_MIN_DAYS    = 2;'), 1)
         prog.write_text(source.replace('my $CONTESTED_LEVEL_MIN_DAYS    = 2;', 'my $CONTESTED_LEVEL_MIN_DAYS    = 1;'), encoding='utf-8')
         shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
+        _, off = self.standard('--no-contested-level')
+        self.assertEqual(cells(plain), cells(off))
+        self.assertEqual(json.loads(self.snapshot().read_text())['settings']['contestedLevel'], 'off')
+        shutil.rmtree(self.cache / '.nfit.store' / 'proposals', ignore_errors=True)
         _, text = self.standard('--research-contested-level')
-        self.assertEqual(cells(plain), cells(text))
+        self.assertNotEqual(cells(plain), cells(text))
         snap = self.snapshot()
+        self.assertEqual(json.loads(snap.read_text())['settings']['contestedLevel'], 'contested-level-1')
         profiles = json.loads(snap.read_text())['members']['vmA']['profiles']
+        published = 0
+        for name, v in profiles.items():
+            floor = v.get('contestedFloor')
+            if not floor or not floor['applied']:
+                continue
+            self.assertGreaterEqual(v['entitlement'], floor['level'] - 1e-9, name)       # the published target carries the floor
+            self.assertGreater(v['entitlement'], 2.0, name)                              # above the installed entitlement
+            self.assertGreater(floor['level'], floor['originalTarget'], name)
+            self.assertEqual((floor['finalTarget'], floor['rule'], floor['cadenceMinutes'], floor['pool']), (v['entitlement'], 'contested-level-1', 1, 7), name)
+            self.assertGreaterEqual(floor['observations'], 15, name)
+            self.assertTrue(floor['stateStartUTC'], name)
+            # the current cycle is resolved apart from the requirement: a valid pair that does not exceed the target
+            cycle = v['currentCycle']
+            self.assertLessEqual(cycle['entitlement'], v['entitlement'] + 1e-9, name)
+            self.assertLessEqual(cycle['entitlement'], cycle['VPs'] + 1e-9, name)
+            published += 1
+        self.assertGreater(published, 0)
+        row = next(r for r in csv.DictReader(text.splitlines()) if r['VM'] == 'vmA')
+        if (profiles[row['Planning Profile']].get('contestedFloor') or {}).get('applied'):
+            self.assertRegex(row['NFIT - Action'], r'Target raised to \d+\.\d\d: profile-level protection of observed work during pool competition; '
+                                                   r'\d+ observations over 1 day\.')
         raised = 0
         for name, c in ((p, v['contestedLevel']) for p, v in profiles.items() if 'contestedLevel' in v):
             self.assertEqual(c['sufficient'], c['minutes'] >= 15, name)

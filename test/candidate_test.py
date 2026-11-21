@@ -26,7 +26,7 @@ class CandidateTest(unittest.TestCase):
     def replay(self, *flags):
         for path in (self.root/'output').glob('*.log'):
             path.unlink()
-        run(str(self.root), str(self.cache), '--config', str(self.cfg), '--candidate-test', *flags)
+        run(str(self.root), str(self.cache), '--config', str(self.cfg), '--candidate-test', '--no-contested-level', *flags)   # the fixture needs vmA's cut candidate as sized without the floor
         log, = (self.root/'output').glob('*.log')
         return log.read_text().split('Shadow entitlement candidates')[-1]
 

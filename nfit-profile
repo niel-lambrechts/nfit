@@ -662,7 +662,19 @@ my $peak_uplift_suspended = 0;                # set while a profile is sized wit
 my $research_contested_level;
 my $CONTESTED_LEVEL_MIN_MINUTES = 15;
 my $CONTESTED_LEVEL_MIN_DAYS    = 2;
-my $contested_floor_value;                    # set while a profile is sized with the candidate floor for the record
+my $contested_floor_value;                    # set while a profile is sized with the contested level as a floor
+# The contested level as a floor on the planning target (v10 stage 3.4, F21b;
+# --[no-]contested-level, on by default). Where a profile has enough contested
+# observations in its own hours, its target is not below the profile's
+# percentile of the protected level over those observations. It is an
+# additional floor: the tier's pool-borrowing rule and cut protection are
+# unchanged. It is a requirement, so it is not limited by the installed
+# entitlement, VPs or pool; the current cycle resolves what can be set now.
+# Acceptance evidence: one-minute data, three systems; every planning profile
+# it changed there was tier 3.
+my $contested_level_flag;
+my $CONTESTED_LEVEL_RULE = 'contested-level-1';
+my $contested_floor_context;                  # the evidence of the floor in force, for the record
 # --research-busy-share (research only; stage 3.4 design note, section 3.1).
 # The busy share is PhysB / PhysC. For each LPAR state and profile-hours
 # population, minutes under pressure (contested pool; pool scarce by the LPAR
@@ -887,6 +899,7 @@ GetOptions(
     'research-no-peak-uplift'    => \$research_no_peak_uplift,
     'research-gated-peak-uplift' => \$research_gated_peak_uplift,
     'research-contested-level'   => \$research_contested_level,
+    'contested-level!'           => \$contested_level_flag,
     'research-busy-share'        => \$research_busy_share,
     'research-pool-ceiling-replay=s' => \$research_pool_ceiling_replay,
     'research-pool-coarse-evidence=s' => \$research_pool_coarse_evidence,
@@ -2843,7 +2856,15 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                     }
                 }
 
+                # The contested level as a floor on the sizing that stands.
+                my $cl_live = (_contested_level_on() && $CUT_PROTECTION_EVIDENCE{$vm_name})
+                            ? $CUT_PROTECTION_EVIDENCE{$vm_name}{$profile_name} : undef;
+                my $cl_floor = $cl_live ? _contested_floor_for($cl_live, $profile_name, $profile->{flags}) : undef;
+                ($contested_floor_value, $contested_floor_context) = $cl_floor ? ($cl_floor->{level}, $cl_floor) : (undef, undef);
                 my ($adjusted_physc, $debug_info_ref) = $size_profile->(0);
+                ($contested_floor_value, $contested_floor_context) = (undef, undef);
+                $debug_info_ref->{'ContestedLevelFloor'}{finalTarget} = _structural_shown_value($adjusted_physc)
+                    if (ref($debug_info_ref) eq 'HASH' && ref($debug_info_ref->{'ContestedLevelFloor'}) eq 'HASH');
                 $debug_info_ref->{'ContestedLevelRecord'} = { %contested_record }
                     if (ref($debug_info_ref) eq 'HASH' && %contested_record);
                 # Research (busy share): the matched comparisons of the profile's hours.
@@ -2862,8 +2883,12 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                     # raised the demand but not the final target limited nothing.
                     my ($cp_own, $cp_final) = map { _structural_shown_value($_) } ($cp_unprotected, $adjusted_physc);
                     $debug_info_ref->{'CutProtectionUnprotected'} = sprintf('%.4f', $cp_unprotected);
+                    # A target raised by the contested level is above the installed entitlement (the cut-protection
+                    # bound is the highest protected level, held at the installed value; the contested level is a
+                    # percentile of the same readings): it is an increase, not a limited cut.
+                    my $cl_raised = (ref($debug_info_ref->{'ContestedLevelFloor'}) eq 'HASH' && $debug_info_ref->{'ContestedLevelFloor'}{applied}) ? 1 : 0;
                     $debug_info_ref->{'CutProtectionLimited'} =
-                        (defined $cp_own && defined $cp_final && $cp_final > $cp_own + $STRUCTURAL_ENT_TOLERANCE)
+                        (!$cl_raised && defined $cp_own && defined $cp_final && $cp_final > $cp_own + $STRUCTURAL_ENT_TOLERANCE)
                         ? sprintf('%.2f', $cp_final) : '';
                 }
 
@@ -4332,6 +4357,17 @@ sub log_profile_rationale
     }
     $sf_glance->('Target', sprintf('%s; VPs governed by %s',
         ($sf_pair_text->($sf_target_ent, $sf_strat_n) // $na), ($sf_re->{StrategicGovernor} // $na)));
+    # The contested level, where it raised this profile's target.
+    if (ref($calc_debug_info_ref->{'ContestedLevelFloor'}) eq 'HASH' && $calc_debug_info_ref->{'ContestedLevelFloor'}{applied})
+    {
+        my $sf_cl = $calc_debug_info_ref->{'ContestedLevelFloor'};
+        my $sf_cl_cadence = $sf_cl->{cadenceMinutes} // 1;
+        $sf_glance->('Contested level', sprintf('%.2f raised to %.2f: the %sth percentile of the protected level (busy work plus %.0f%% of the rest of consumption) over %s on %d day%s '
+            . 'of pool competition in the profile hours (pool %s)%s', $sf_cl->{originalTarget}, $sf_cl->{level}, $sf_cl->{percentile}, 100 * $sf_cl->{share},
+            ($sf_cl_cadence > 1 ? _evidence_count_text($sf_cl->{observations}, $sf_cl_cadence) : sprintf('%d observations', $sf_cl->{observations})),
+            $sf_cl->{days}, ($sf_cl->{days} == 1 ? '' : 's'), $sf_cl->{pool} // $na,
+            ($sf_cl_cadence > 1 ? sprintf('; %d-minute data, where the rule is not validated', $sf_cl_cadence) : '')));
+    }
     # Cut protection (v10 stage 3.3), for a profile with contested-minute evidence.
     my $sf_cp_vm = $vm_map_ref->{Configuration}{vm_name} // '';
     my $sf_cp = ($CUT_PROTECTION_EVIDENCE{$sf_cp_vm} // {})->{$profile_being_adjusted};
@@ -8833,12 +8869,18 @@ sub calculate_runq_modified_physc
         }
     }
 
-    # Research (--research-contested-level): the candidate floor, for the
-    # recorded sizing only. Not limited by the installed entitlement.
-    if (defined $contested_floor_value && !$cut_protection_suspended && $contested_floor_value > $calculated_demand + $FLOAT_EPSILON)
+    # The contested level as a floor (see $contested_level_flag; also the research
+    # candidate's recorded sizing). Not limited by the installed entitlement.
+    if (defined $contested_floor_value && !$cut_protection_suspended)
     {
-        $debug_info{'ContestedLevelApplied'} = sprintf('%.4f -> %.2f', $calculated_demand, $contested_floor_value);
-        $calculated_demand = $contested_floor_value;
+        my $raises = ($contested_floor_value > $calculated_demand + $FLOAT_EPSILON) ? 1 : 0;
+        $debug_info{'ContestedLevelFloor'} = { %$contested_floor_context, originalTarget => 0 + sprintf('%.4f', $calculated_demand),
+            applied => ($raises ? JSON::true : JSON::false) } if (ref($contested_floor_context) eq 'HASH');
+        if ($raises)
+        {
+            $debug_info{'ContestedLevelApplied'} = sprintf('%.4f -> %.2f', $calculated_demand, $contested_floor_value);
+            $calculated_demand = $contested_floor_value;
+        }
     }
 
     # Dispatch width reference (v10 step 3b correction): see %WIDTH_FLOOR.
@@ -16824,6 +16866,12 @@ sub _write_standard_csv_report {
                         _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
                         $minutes, ($minutes == 1 ? '' : 's'), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''));
             }
+            # The contested level raised the planning target: say so, with its support.
+            if (ref($cp_dbg) eq 'HASH' && ref($cp_dbg->{'ContestedLevelFloor'}) eq 'HASH')
+            {
+                my $cl_text = _contested_floor_text($cp_dbg->{'ContestedLevelFloor'}, $numeric_cell->($planning_profile_name));
+                $action = join(' ', $cl_text, ($action ne '' ? $action : ())) if ($cl_text ne '');
+            }
             # XRQ on the planning profile: an increase rests on a run queue far
             # beyond today's limit; its cause is found before the increase is applied.
             my $cp_pair = $cycle_pairs{$planning_profile_name};
@@ -16869,6 +16917,8 @@ sub _write_standard_csv_report {
                     },
                     ($cycle_by_policy{$name} ? (cycleByPolicy => $cycle_by_policy{$name}) : ()),
                     ((defined $pair->{BorrowingCadence}) ? (borrowingByResolution => $pair->{BorrowingCadence}) : ()),
+                    ((ref(($core->{ProfileDebugInfo}{$name} // {})->{'ContestedLevelFloor'}) eq 'HASH')
+                        ? (contestedFloor => $core->{ProfileDebugInfo}{$name}{'ContestedLevelFloor'}) : ()),
                 };
             }
             $proposals->{$vm_name} = {
@@ -16999,7 +17049,8 @@ sub _publish_tactical_proposals
         schemaVersion => 2, system => basename($cache), model => $model, window => {start => $start, end => $end},
         inputRevision => $revision, settings => { argv => \@original_argv, filesSHA256 => \%hashes,
             analysisReferenceDate => $nfit_analysis_reference_date_str, vmFilter => $target_vm_name,
-            guaranteePolicy => $guarantee_policy },
+            guaranteePolicy => $guarantee_policy,
+            contestedLevel => (_contested_level_on() ? $CONTESTED_LEVEL_RULE : 'off') },
         members => $members,
     });
     my $dir = File::Spec->catdir($cache, '.nfit.store', 'proposals', 'v1', $model);
@@ -26041,7 +26092,7 @@ sub _protection_add_minute
     my $eps = 1e-9;
     $p->{contested}++;
     $p->{days}{ int($minute / 86400) } = 1;
-    push @{ $p->{all} }, [ $busy, $consumed ] if $research_contested_level;
+    push @{ $p->{all} }, [ $busy, $consumed ];      # every contested observation: the contested level is their percentile
     unless (grep { $_->[0] >= $busy - $eps && $_->[1] >= $consumed - $eps } @{ $p->{frontier} })
     {
         @{ $p->{frontier} } = ((grep { !($_->[0] <= $busy + $eps && $_->[1] <= $consumed + $eps) } @{ $p->{frontier} }),
@@ -26174,6 +26225,41 @@ sub _contested_level
     $up++ if ($cents - $up > 1e-6);
     my $days = scalar(keys %{ $p->{days} // {} });
     return ($up / 100, $n, $days, ($n >= $CONTESTED_LEVEL_MIN_MINUTES && $days >= $CONTESTED_LEVEL_MIN_DAYS) ? 1 : 0);
+}
+
+sub _contested_level_on
+{
+    return (!defined $contested_level_flag || $contested_level_flag) ? 1 : 0;
+}
+
+# The contested-level floor of one profile from its evidence tracker, or undef where the
+# evidence is not sufficient: the level with what it rests on (percentile, share,
+# observations, days, cadence, pool, configuration state, rule version).
+sub _contested_floor_for
+{
+    my ($tracker, $profile_name, $flags) = @_;
+    return undef unless (ref($tracker) eq 'HASH' && ref($tracker->{protection}) eq 'HASH');
+    my ($share, $tier) = _protection_share_of($profile_name);
+    my $percentile = (($flags // '') =~ /(?:-p|--percentile)\s+([0-9.]+)/) ? $1 + 0 : $DEFAULT_PERCENTILE + 0;
+    my ($level, $n, $days, $enough) = _contested_level($tracker->{protection}, $share, $percentile);
+    return undef unless (defined $level && $enough);
+    return { rule => $CONTESTED_LEVEL_RULE, level => $level, percentile => $percentile, share => $share, tier => $tier,
+             observations => $n, days => $days, cadenceMinutes => _evidence_cadence_of($tracker), pool => $tracker->{pool},
+             stateStartUTC => (defined $tracker->{stateStart} ? _pool_iso($tracker->{stateStart}) : undef),
+             minObservations => $CONTESTED_LEVEL_MIN_MINUTES, minDays => $CONTESTED_LEVEL_MIN_DAYS };
+}
+
+# The planner sentence for a target raised by the contested level. The level is a percentile of
+# the observations: it does not say that each of them reached it.
+sub _contested_floor_text
+{
+    my ($floor, $target) = @_;
+    return '' unless (ref($floor) eq 'HASH' && $floor->{applied} && defined $target);
+    my $cadence = $floor->{cadenceMinutes} // 1;
+    return sprintf('Target raised to %.2f: profile-level protection of observed work during pool competition; %s over %d day%s%s.',
+        $target, ($cadence > 1 ? _evidence_count_text($floor->{observations}, $cadence) : sprintf('%d observation%s', $floor->{observations}, ($floor->{observations} == 1 ? '' : 's'))),
+        $floor->{days}, ($floor->{days} == 1 ? '' : 's'),
+        ($cadence > 1 ? sprintf(' (%d-minute data: the rule is validated on one-minute data only)', $cadence) : ''));
 }
 
 # The share and tier of a profile: P-... is tier P, [OGB]n-... is tier n.
@@ -28604,6 +28690,12 @@ Model behaviour depends on the event configuration:
                                               target is raised to the highest protected level seen while the LPAR's
                                               pool was scarce and other LPARs were busy, never above installed; see the
                                               "Cut Protection" section. --no-cut-protection leaves the cuts as sized.
+
+  --[no-]contested-level                    : Standard runs (default on). Where a profile has at least 15 observations of pool
+                                              competition on 2 days in its own hours, its target is not below the profile's
+                                              percentile of the work observed then (busy work plus the tier's share of the
+                                              remainder of consumption). An addition to cut protection and the pool-borrowing
+                                              rule; not limited by the installed entitlement. Validated on one-minute data.
 
   --guarantee-policy <normal|strict>        : What the current cycle does with an entitlement cut of an uncapped shared-pool
                                               LPAR when the data is at 15 minutes or coarser, where brief pool competition

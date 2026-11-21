@@ -163,7 +163,8 @@ class PressureRemedyTest(unittest.TestCase):
             for vm in ('vmA', 'vmB', 'vmS'):
                 e, vp, pool, _ = self.config[vm]
                 w.writerow([vm, mx.SERIAL, 'AIX', 'pool', pool, e, vp])
-        run(str(self.root), str(self.cache), '--config', str(self.cfg), '--candidate-test', '--runq-perc-behavior=match')
+        run(str(self.root), str(self.cache), '--config', str(self.cfg), '--candidate-test', '--runq-perc-behavior=match',
+            '--no-contested-level')      # the cases are built on the proposals as sized without the contested-level floor
         log, = [p for p in (self.root / 'output').glob('*.log') if 'state-based' in p.name and '.decisions.' not in p.name]
         text = log.read_text()
         start = text.index('Pressure and remedy')

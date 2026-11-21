@@ -71,4 +71,49 @@ ok((UUT::_contested_level({ all => [ map { [ 2.0, 3.0 ] } 1 .. 15 ], days => { 1
 is((UUT::_contested_level($flat->(14, 1, 2), 0.85, 99))[0], (UUT::_contested_level($flat->(15, 1, 2), 0.85, 99))[0],
    'the same readings give the same level on either side of the boundary');
 
+# --- The floor on the planning target (--contested-level): every tier and percentile -------------
+{
+    my $code2 = '';
+    for my $name (qw(_contested_level _contested_floor_for _contested_floor_text _protection_share_of _evidence_cadence_of
+                     _evidence_count_text _pool_iso))
+    {
+        $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
+        $code2 .= "$1\n\n";
+    }
+    my ($shares) = $src =~ /^(my %CUT_PROTECTION_SHARE\s*=.*?\);)/ms or die "shares not found\n";
+    my ($rule) = $src =~ /^my \$CONTESTED_LEVEL_RULE\s*=\s*'([^']+)';/m or die "rule version not found\n";
+    eval "package UUT2; use Time::Piece; my \$CONTESTED_LEVEL_MIN_MINUTES = $min_minutes; my \$CONTESTED_LEVEL_MIN_DAYS = $min_days;\n"
+       . "my \$DEFAULT_PERCENTILE = 99.75; my \$CONTESTED_LEVEL_RULE = '$rule';\n$shares\n$code2\n1;" or die "harness eval failed: $@\n";
+
+    # 100 observations on 5 days: busy work 1.00 .. 1.99, consumption one core above.
+    my $tracker = { pool => 7, stateStart => 1788220800, protection => { all => [ map { [ 1 + $_ / 100, 2 + $_ / 100 ] } 0 .. 99 ],
+                                                                         days => { map { $_ => 1 } 1 .. 5 } } };
+    # share by tier (P 0.95, 1 0.85, 2 0.65, 3 0.40, 4 0) and the profile's own percentile
+    my %want = ('P-99W1' => [ 99, 0.95, 2.94 ], 'G1-99W5' => [ 99, 0.85, 2.84 ], 'O2-95W15' => [ 95, 0.65, 2.60 ],
+                'G3-95W15' => [ 95, 0.40, 2.35 ], 'B3-95W15' => [ 95, 0.40, 2.35 ], 'G4-90W15' => [ 90, 0, 1.90 ]);
+    foreach my $profile (sort keys %want)
+    {
+        my ($percentile, $share, $level) = @{ $want{$profile} };
+        my $floor = UUT2::_contested_floor_for($tracker, $profile, "-p $percentile -w 15");
+        ok($floor && abs($floor->{level} - $level) < 0.0051, "$profile: floor $level (share $share, P$percentile)") or diag($floor ? $floor->{level} : 'none');
+        is($floor->{share}, $share, "  $profile: the tier's share");
+    }
+    my $floor = UUT2::_contested_floor_for($tracker, 'G3-95W15', '-p 95 -w 15');
+    is_deeply([ @{$floor}{qw(rule observations days cadenceMinutes pool percentile minObservations minDays)} ], [ $rule, 100, 5, 1, 7, 95, 15, 2 ],
+        'the floor carries its support, cadence, pool and rule version');
+    like($floor->{stateStartUTC}, qr/^2026-09-01T00:00:00Z$/, '  and the configuration state it was measured in');
+    is(UUT2::_contested_floor_for({ protection => { all => [ @{ $tracker->{protection}{all} }[0 .. 13] ], days => { 1 => 1, 2 => 1 } } }, 'G3-95W15', '-p 95'),
+       undef, 'fewer than 15 observations: no floor');
+    is(UUT2::_contested_floor_for({ protection => { all => $tracker->{protection}{all}, days => { 1 => 1 } } }, 'G3-95W15', '-p 95'), undef, 'one day only: no floor');
+    is(UUT2::_contested_floor_for($tracker, 'Peak', '-p 99'), undef, 'a profile without a tier: no floor');
+
+    # The planner sentence states a percentile's support, not that each observation reached the level.
+    is(UUT2::_contested_floor_text({ %$floor, applied => 1 }, 2.35),
+       'Target raised to 2.35: profile-level protection of observed work during pool competition; 100 observations over 5 days.', 'action sentence at one minute');
+    is(UUT2::_contested_floor_text({ %$floor, applied => 0 }, 2.35), '', 'a floor that did not raise the target says nothing');
+    is(UUT2::_contested_floor_text({ %$floor, applied => 1, cadenceMinutes => 15, observations => 20 }, 2.35),
+       'Target raised to 2.35: profile-level protection of observed work during pool competition; 20 of the 15-minute intervals over 5 days '
+       . '(15-minute data: the rule is validated on one-minute data only).', 'coarse data: counted in intervals, and not presented as equally validated');
+}
+
 done_testing();
