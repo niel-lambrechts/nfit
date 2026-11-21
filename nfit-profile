@@ -2377,6 +2377,14 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
     # The _build_adaptive_thresholds_hash function returns the new values, which are stored
     # in local variables. This avoids modifying the global defaults.
     my $adaptive_thresholds_href = _build_adaptive_thresholds_hash($detected_interval_secs, $log_fh_for_system);
+    # One interval per file is assumed by the engine and by the evidence rules: say so when the data disagrees.
+    my $mixed_interval_text = _mixed_interval_text(_sampling_interval_survey($data_cache_file), $detected_interval_secs);
+    if (defined $mixed_interval_text)
+    {
+        print STDERR "  [WARN] $mixed_interval_text\n";
+        print {$log_fh_for_system} join("\n", _rationale_wrap("Sampling interval: $mixed_interval_text", '  ', '  ')), "\n\n"
+            if (defined $log_fh_for_system && ref($log_fh_for_system));
+    }
     my $adaptive_runq_saturation_thresh     = $adaptive_thresholds_href->{saturation};
     # Task 5: 'target' and 'max_reduction' are no longer unpacked or plumbed. Both
     # configured the retired entitlement reduction and neither was read by any
@@ -19187,6 +19195,10 @@ sub _store_model_forecast_to_history {
 
             # Statistical Context
             sampling_interval_seconds => ($analysis_context->{interval} // 0) + 0, # Ensure numeric
+            # How EMA smoothing treated the interval: 'elapsed-time' from engine L2 format 5 (the decay level is
+            # converted to the sampling interval). A record without this key was smoothed per sample: at one
+            # minute the two agree; at a coarser interval they do not, and such a record is not comparable.
+            smoothing_time_basis      => 'elapsed-time',
             analysis_window_days      => $window_days_calc,
             adaptive_horizon_days     => ($horizon_meta->{days} // 0) + 0,
 
@@ -24623,6 +24635,73 @@ sub _cpu_cache_cadence
     return undef unless defined $spacing;
     my $minutes = int($spacing / 60 + 0.5);
     return $minutes < 1 ? 1 : $minutes;
+}
+
+# The sampling intervals found in a CPU cache, surveyed at its start, middle and end and for
+# several LPARs (the engine and the evidence rules work with one interval per file, taken from
+# the first LPAR's first samples). Returns { intervals => [seconds, ascending], mixed => 0|1,
+# where => { start|middle|end => { seconds => LPARs } } }, or undef when nothing could be read.
+# An interval is an LPAR's commonest spacing within one part, from at least five spacings;
+# spacings within 3 seconds of 1, 5, 10 or 15 minutes are read as that interval.
+sub _sampling_interval_survey
+{
+    my ($file) = @_;
+    return undef unless (defined $file && -f $file && -s $file);
+    open my $in, '<', $file or return undef;
+    require Time::Local;
+    my $size = -s $file;
+    my $span = int($size / 3);                                 # bytes read at each position: a third of the file, at most 4 MB
+    $span = 4_000_000 if ($span > 4_000_000);
+    my %starts = (start => 0, middle => int($size / 2), end => $size - $span);
+    my (%where, %seen);
+    foreach my $part (qw(start middle end))
+    {
+        seek($in, $starts{$part}, 0) or next;
+        <$in>;                                                 # the header, or a partial line
+        my (%at, $read);
+        $read = 0;
+        while (my $line = <$in>)
+        {
+            $read += length($line);
+            last if ($read > $span);
+            my ($y, $mo, $d, $h, $mi, $sec, $vm) = $line =~ /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2}),([^,]+)/ or next;
+            next if (!$at{$vm} && keys(%at) >= 12);            # a dozen LPARs is enough
+            next if ($at{$vm} && @{ $at{$vm} } >= 60);
+            push @{ $at{$vm} }, Time::Local::timegm($sec, $mi, $h, $d, $mo - 1, $y);
+        }
+        foreach my $vm (keys %at)
+        {
+            my @t = sort { $a <=> $b } @{ $at{$vm} };
+            my %count;
+            foreach my $i (1 .. $#t)
+            {
+                my $delta = $t[$i] - $t[ $i - 1 ];
+                next unless ($delta > 10 && $delta < 1810);
+                my ($snap) = grep { abs($delta - $_) <= 3 } (60, 300, 600, 900);
+                $count{ $snap // $delta }++;
+            }
+            my ($best) = sort { $count{$b} <=> $count{$a} || $a <=> $b } keys %count;
+            next unless (defined $best && $count{$best} >= 5);
+            $where{$part}{$best}++;
+            $seen{$best} = 1;
+        }
+    }
+    close $in;
+    return undef unless %seen;
+    my @intervals = sort { $a <=> $b } keys %seen;
+    return { intervals => \@intervals, mixed => (@intervals > 1 ? 1 : 0), where => \%where };
+}
+
+# What the planner is told when a cache holds more than one sampling interval.
+sub _mixed_interval_text
+{
+    my ($survey, $used_seconds) = @_;
+    return undef unless (ref($survey) eq 'HASH' && $survey->{mixed});
+    my $minutes = sub { my ($s) = @_; return ($s % 60) ? sprintf('%.1f', $s / 60) : sprintf('%d', $s / 60); };
+    return sprintf('The data holds more than one sampling interval (%s minutes). Smoothing and the pool evidence rules use %s minute%s throughout: '
+        . 'figures from the part sampled at another interval are less reliable. Analyse each period on its own, or restage the data at one interval.',
+        join(', ', map { $minutes->($_) } @{ $survey->{intervals} }),
+        (defined $used_seconds ? $minutes->($used_seconds) : 'one'), ((defined $used_seconds && $used_seconds != 60) ? 's' : ''));
 }
 
 # The current-cycle terms that come from coarse evidence, for _resolve_current_cycle_pair:

@@ -24,7 +24,7 @@ for my $block ('my %MEMBER_EXPOSURE_RULES', 'my @MEMBER_EXPOSURE_COLUMNS', 'my %
 }
 for my $name (qw(_exposure_process_day _exposure_population_admits _exposure_tolerance _evidence_cadence _evidence_nearest
                  _evidence_cadence_of _evidence_count_text _protection_add_minute _protection_loss_minute _protection_borrow_minute
-                 _busy_share_add_minute _pressure_add_minute))
+                 _busy_share_add_minute _pressure_add_minute _sampling_interval_survey _mixed_interval_text))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n\n";
@@ -122,5 +122,46 @@ is($t->{daily}{ $DAY + 1 }{paired}, 0, 'and has none');
 
 is(UUT::_evidence_cadence({ 0 => 1 }), undef, 'one sample gives no cadence');
 is(UUT::_evidence_cadence({ map { (900 * $_ => 1) } 0 .. 9 }), 15, 'median spacing in minutes');
+
+# --- More than one sampling interval in a CPU cache ---
+{
+    require File::Temp;
+    require POSIX;
+    my $write = sub
+    {
+        my (@blocks) = @_;                       # [first epoch, step seconds, samples, LPARs]
+        my ($fh, $path) = File::Temp::tempfile(UNLINK => 1);
+        print {$fh} "Timestamp,VMName,PhysC,RunQ,PhysB\n";
+        foreach my $b (@blocks)
+        {
+            my ($from, $step, $n, @vms) = @$b;
+            foreach my $i (0 .. $n - 1)
+            {
+                print {$fh} POSIX::strftime('%Y-%m-%d %H:%M:%S', gmtime($from + $i * $step)), ",$_,1.0000,1.0000,0.5000\n" for @vms;
+            }
+        }
+        close $fh;
+        return $path;
+    };
+    my $one = UUT::_sampling_interval_survey($write->([ $T0, 60, 600, 'a', 'b' ]));
+    is_deeply($one->{intervals}, [60], 'survey: one-minute data throughout');
+    is($one->{mixed}, 0, '  not mixed');
+    is(UUT::_mixed_interval_text($one, 60), undef, '  nothing to say');
+    my $coarse = UUT::_sampling_interval_survey($write->([ $T0, 900, 600, 'a', 'b' ]));
+    is_deeply($coarse->{intervals}, [900], 'survey: 15-minute data throughout is one interval');
+    # The collection interval was changed part-way: the first samples say one minute, the later ones fifteen.
+    my $changed = UUT::_sampling_interval_survey($write->([ $T0, 60, 600, 'a', 'b' ], [ $T0 + 600 * 60, 900, 600, 'a', 'b' ]));
+    is_deeply($changed->{intervals}, [60, 900], 'survey: a change of interval part-way is found');
+    is($changed->{mixed}, 1, '  and reported as mixed');
+    like(UUT::_mixed_interval_text($changed, 60), qr/^The data holds more than one sampling interval \(1, 15 minutes\)\. Smoothing and the pool evidence rules use 1 minute throughout/,
+        '  the planner is told which interval was used');
+    # Two LPARs collected at different intervals.
+    my $two = UUT::_sampling_interval_survey($write->([ $T0, 60, 600, 'a' ], [ $T0, 300, 600, 'b' ]));
+    is_deeply($two->{intervals}, [60, 300], 'survey: LPARs sampled at different intervals are found');
+    # Jitter and a gap do not make an interval.
+    my $jitter = UUT::_sampling_interval_survey($write->([ $T0, 61, 300, 'a' ], [ $T0 + 86400, 59, 300, 'a' ]));
+    is_deeply($jitter->{intervals}, [60], 'survey: a second of jitter and a day\'s gap are still one minute');
+    is(UUT::_sampling_interval_survey('/nonexistent'), undef, 'survey: no file, no finding');
+}
 
 done_testing();
