@@ -111,19 +111,184 @@ def invoke(app, case, label, args, env):
 
 
 EXTRA_ARGS: list = []      # --profile-args: extra nfit-profile options for the sizing run
+THIN = {'minutes': 0, 'mode': 'mean'}     # --thin-minutes / --thin-mode: the sizing run reads a coarser copy of the capture
+THIN_SHARE = 0.80                          # a mean needs this share of the interval's minutes; else the interval is a gap
+POOL_MEAN_COLUMNS = ('idle_cores', 'busy_cores', 'scaled_busy_cores', 'global_pool_busy_cores')
 
 
-def run_case(app, case, source, dates, env):
+def _minute_of(stamp, bases):
+    """Epoch minute of 'YYYY-MM-DD HH:MM:SS' (UTC)."""
+    base = bases.get(stamp[:10])
+    if base is None:
+        import calendar
+        base = bases[stamp[:10]] = calendar.timegm((int(stamp[0:4]), int(stamp[5:7]), int(stamp[8:10]), 0, 0, 0)) // 60
+    return base + int(stamp[11:13]) * 60 + int(stamp[14:16])
+
+
+def thin_data(src, dst, minutes, mode):
+    """A coarser copy of the CPU cache (Timestamp,VMName,numeric columns...), as a collector with an interval of
+    `minutes` would have recorded it. mode 'point': the samples of every Nth minute are kept as they are.
+    mode 'mean': each LPAR's samples in an interval are averaged column by column and stamped at the start of
+    the interval; an interval with too few of its minutes present is left out (a gap stays a gap). The rows
+    must be in time order. Returns (rows read, rows written)."""
+    import time as _time
+    bases, read, written = {}, 0, 0
+    with open(src) as fin, open(dst, 'w') as fout:
+        header = fin.readline()
+        fout.write(header)
+        width = len(header.rstrip('\n').split(','))
+        current, acc = None, {}
+
+        def flush():
+            nonlocal written
+            if current is None:
+                return
+            stamp = _time.strftime('%Y-%m-%d %H:%M:%S', _time.gmtime(current * minutes * 60))
+            for vm, (sums, counts, seen) in acc.items():
+                if len(seen) < THIN_SHARE * minutes:
+                    continue
+                cells = [('%.4f' % (sums[i] / counts[i])) if counts[i] else '' for i in range(width - 2)]
+                fout.write(','.join([stamp, vm] + cells) + '\n')
+                written += 1
+            acc.clear()
+
+        for line in fin:
+            line = line.rstrip('\n')
+            if not line:
+                continue
+            read += 1
+            minute = _minute_of(line, bases)
+            if mode == 'point':
+                if minute % minutes == 0:
+                    fout.write(line + '\n')
+                    written += 1
+                continue
+            bucket = minute // minutes
+            if current is None or bucket > current:
+                flush()
+                current = bucket
+            elif bucket < current:
+                raise RuntimeError('the CPU cache is not in time order; use --thin-mode point')
+            parts = line.split(',')
+            entry = acc.get(parts[1])
+            if entry is None:
+                entry = acc[parts[1]] = ([0.0] * (width - 2), [0] * (width - 2), set())
+            entry[2].add(minute)
+            for i, cell in enumerate(parts[2:width]):
+                if cell:
+                    try:
+                        entry[0][i] += float(cell)
+                        entry[1][i] += 1
+                    except ValueError:
+                        pass
+        if mode != 'point':
+            flush()
+    return read, written
+
+
+def thin_pool(src, dst, minutes, mode):
+    """A coarser copy of the pool observations (gzip CSV with time_ns, host, series_id, pool_id, ...). 'point':
+    the observations of every Nth minute are kept. 'mean': per reporter and series, the busy and idle columns
+    are averaged over the interval and the other columns take the interval's last value; the row is stamped
+    30 seconds into the interval's first minute. Rows may be out of order by up to one interval."""
+    import gzip
+    read = written = 0
+    with gzip.open(src, 'rt') as fin, gzip.open(dst, 'wt') as fout:
+        header = fin.readline()
+        fout.write(header)
+        names = header.rstrip('\n').split(',')
+        i_time = names.index('time_ns')
+        key_cols = [names.index(c) for c in ('host', 'series_id', 'pool_id') if c in names]
+        mean_cols = [names.index(c) for c in POOL_MEAN_COLUMNS if c in names]
+        open_buckets, newest, flushed_to = {}, None, None
+
+        def flush(bucket):
+            nonlocal written
+            for (last, sums, counts, seen) in open_buckets.pop(bucket, {}).values():
+                if len(seen) < THIN_SHARE * minutes:
+                    continue
+                row = list(last)
+                row[i_time] = str((bucket * minutes * 60 + 30) * 1_000_000_000)
+                for c in mean_cols:
+                    row[c] = ('%.4f' % (sums[c] / counts[c])) if counts.get(c) else ''
+                fout.write(','.join(row) + '\n')
+                written += 1
+
+        for line in fin:
+            line = line.rstrip('\n')
+            if not line:
+                continue
+            read += 1
+            parts = line.split(',')
+            minute = int(parts[i_time]) // 60_000_000_000
+            if mode == 'point':
+                if minute % minutes == 0:
+                    fout.write(line + '\n')
+                    written += 1
+                continue
+            bucket = minute // minutes
+            if flushed_to is not None and bucket <= flushed_to:
+                raise RuntimeError('the pool observations are not in time order; use --thin-mode point')
+            if newest is None or bucket > newest:
+                newest = bucket
+                for old in sorted(b for b in open_buckets if b < newest - 1):
+                    flush(old)
+                    flushed_to = old if flushed_to is None else max(flushed_to, old)
+            entry = open_buckets.setdefault(bucket, {}).get(tuple(parts[c] for c in key_cols))
+            if entry is None:
+                entry = open_buckets[bucket][tuple(parts[c] for c in key_cols)] = [parts, {}, {}, set()]
+            entry[0] = parts
+            entry[3].add(minute)
+            for c in mean_cols:
+                if c < len(parts) and parts[c]:
+                    try:
+                        entry[1][c] = entry[1].get(c, 0.0) + float(parts[c])
+                        entry[2][c] = entry[2].get(c, 0) + 1
+                    except ValueError:
+                        pass
+        for old in sorted(open_buckets):
+            flush(old)
+    return read, written
+
+
+def thin_stage(case, source, minutes, mode):
+    """The sizing run's stage: the capture with its CPU cache and pool observations made coarser."""
+    # The held-out replay accepts a proposal only for the same data revision; a capture whose manifest
+    # carries none is identified by its file, which the coarser copy cannot match.
+    if 'data_revision' not in (source / '.nfit.cache.manifest').read_text():
+        raise RuntimeError('the capture manifest carries no data revision: a proposal sized on a coarser copy cannot be replayed on it')
+    stage = case / 'thin' / 'stage' / source.name
+    stage.mkdir(parents=True, exist_ok=True)
+    for name in INPUTS:
+        src = source / name
+        if not src.is_file():
+            raise RuntimeError('a required capture input is missing')
+        if name == '.nfit.cache.data':
+            thin_data(src, stage / name, minutes, mode)
+        elif name.endswith('pool.observations.csv.gz'):
+            thin_pool(src, stage / name, minutes, mode)
+        else:
+            (stage / name).symlink_to(src)
+    return stage
+
+
+def run_case(app, case, source, dates, env, training_app=None):
     """Training (sizing) run, then the held-out replay of its saved proposal.
     Returns (snapshot, replay) as parsed JSON."""
     start, cutoff, later, end = dates
     stage = link_stage(case, source)
+    # The sizing run may read a coarser copy and may use an earlier commit's programs; the
+    # held-out replay always reads the capture as recorded, with the working tree's programs.
+    sizing_stage = thin_stage(case, source, THIN['minutes'], THIN['mode']) if THIN['minutes'] > 1 else stage
+    sizing_app = training_app or app
     base = ['--nmondir', str(stage), '--config', str(app / 'config.csv')]
-    for p in (app / 'output').glob('*'):
-        p.unlink()
-    invoke(app, case, 'training', base + ['--candidate-test', '--startdate', start, '--enddate', cutoff,
-                                         '--analysis-reference-date', cutoff, '--runq-perc-behavior=match'] + EXTRA_ARGS, env)
-    snaps = list((stage / '.nfit.store' / 'proposals' / 'v1').glob('*/*.json'))
+    for a in {app, sizing_app}:
+        for p in (a / 'output').glob('*'):
+            p.unlink()
+    invoke(sizing_app, case, 'training', ['--nmondir', str(sizing_stage), '--config', str(sizing_app / 'config.csv'),
+                                          '--candidate-test', '--startdate', start, '--enddate', cutoff,
+                                          '--analysis-reference-date', cutoff, '--runq-perc-behavior=match'] + EXTRA_ARGS, env)
+    snaps = list((sizing_stage / '.nfit.store' / 'proposals' / 'v1').glob('*/*.json'))
     if len(snaps) != 1:
         raise RuntimeError('expected one proposal snapshot in the isolated case')
     for p in (app / 'output').glob('*'):
@@ -170,7 +335,7 @@ def anonymise(label, snapshot, replay, dates):
                 'pair': {k: (p.get('currentCycle') or {}).get(k) for k in ('entitlement', 'VPs', 'status', 'binding')},
                 'published': p.get('entitlement'),
                 'later': {plan: losses.get((vm, profile, plan)) for plan in PLANS + ('installed', 'rule', 'recommended', 'ruleFull', 'noRule', 'q25', 'q50', 'q75',
-                                                                                  'clNoRule', 'clCandidate', 'clPublished')
+                                                                                  'clNoRule', 'clCandidate', 'clPublished', 'published')
                           if plan in PLANS + ('installed',) or (vm, profile, plan) in losses},
             }
             records.append(row)
@@ -417,11 +582,18 @@ def main():
     ap.add_argument('--profile-args', default='', help='extra nfit-profile options for the sizing run, as one string')
     ap.add_argument('--records-only', action='store_true',
                     help='write <out>/protection-replay.json with the records only: no reconciliation, no tables')
+    ap.add_argument('--thin-minutes', type=int, default=0,
+                    help='the sizing run reads the capture made coarser to this interval; the held-out replay stays at the recorded resolution')
+    ap.add_argument('--thin-mode', choices=('mean', 'point'), default='mean',
+                    help="mean: interval averages (an interval missing over 20%% of its minutes is a gap); point: every Nth minute's samples")
+    ap.add_argument('--training-commit', default=None,
+                    help='the sizing run uses nfit and nfit-profile as committed at REV; the held-out replay uses the working tree')
     a = ap.parse_args()
+    THIN.update(minutes=a.thin_minutes, mode=a.thin_mode)
     import shlex
     EXTRA_ARGS[:] = shlex.split(a.profile_args)
     wanted = {x.strip() for x in a.systems.split(',')} if a.systems else None
-    if (wanted or EXTRA_ARGS) and not a.records_only:
+    if (wanted or EXTRA_ARGS or a.thin_minutes > 1 or a.training_commit) and not a.records_only:
         sys.exit('protection-replay: --systems and --profile-args need --records-only and their own --out '
                  '(the acceptance tables describe the full, unmodified replay)')
     os.umask(0o077)
@@ -439,6 +611,18 @@ def main():
     work.mkdir(parents=True, exist_ok=True)
     env = perl_env()
     app = setup_app(work, config)
+    training_app = None
+    if a.training_commit:
+        training_app = work / 'app-training'
+        if training_app.is_dir():
+            shutil.rmtree(training_app)
+        shutil.copytree(app, training_app)
+        for name in EXECUTABLES:
+            blob = subprocess.run(['git', '-C', str(REPO), 'show', f'{a.training_commit}:{name}'], capture_output=True)
+            if blob.returncode:
+                sys.exit(f'protection-replay: cannot read {name} at {a.training_commit}')
+            (training_app / name).write_bytes(blob.stdout)
+            os.chmod(training_app / name, 0o700)
     systems, records = [], []
     for cohort in (('P10', 'P9') if a.cohort == 'all' else (a.cohort,)):
         folder, expected, *dates = COHORTS[cohort]
@@ -454,7 +638,7 @@ def main():
             if case.exists():
                 shutil.rmtree(case)
             case.mkdir()
-            snapshot, replay = run_case(app, case, source, dates, env)
+            snapshot, replay = run_case(app, case, source, dates, env, training_app)
             entry = anonymise(label, snapshot, replay, dates)
             entry['recordCount'] = len(entry['records'])
             records.extend(entry.pop('records'))
@@ -464,6 +648,8 @@ def main():
     if a.records_only:
         target = out / 'protection-replay.json'
         target.write_text(json.dumps({'generated': generated, 'commit': git_identity(), 'profileArgs': EXTRA_ARGS,
+                                      'thinMinutes': a.thin_minutes, 'thinMode': a.thin_mode if a.thin_minutes > 1 else None,
+                                      'trainingCommit': a.training_commit,
                                       'systems': systems, 'records': records}, indent=1) + '\n')
         audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
         print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')

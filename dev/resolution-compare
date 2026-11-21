@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/resolution-compare
+# PURPOSE  : Research report: the same LPARs sized from one-minute data and from
+#            a coarser copy of it (dev/protection-replay --thin-minutes), each
+#            judged on the same held-out period at one minute. Optionally a
+#            third run: the coarse copy sized by an earlier commit
+#            (--training-commit), to show what interval-aware evidence changed.
+#            LPARs are grouped by what the one-minute run saw in training, in
+#            the planning profile's hours:
+#              relaxed           : no contested minute;
+#              short burst       : contested, on fewer than 15 minutes or 1 day;
+#              sustained pressure: contested on 15 minutes or more over 2 days.
+#            For each group and run: the profile figure, the published
+#            entitlement, how many LPARs moved against the one-minute run, how
+#            the pool-borrowing rule was gated, how many cuts were limited, and
+#            the later busy work above the published figure in contested
+#            minutes and in all minutes.
+#            The profile figure itself depends on the resolution (the engine
+#            reads fewer, averaged samples), so a difference is not only the
+#            evidence rules' doing; the profile column shows that part.
+# USAGE    : dev/resolution-compare --reference DIR --coarse DIR [--old DIR] [--out DIR]
+# OUTPUT   : <out>/resolution-compare.md (research labels only)
+# ==============================================================================
+import argparse
+import collections
+import json
+import subprocess
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+GROUPS = ('relaxed', 'short burst', 'sustained pressure')
+
+
+def table(lines, header, body):
+    lines.append('| ' + ' | '.join(header) + ' |')
+    lines.append('|' + '|'.join('---' for _ in header) + '|')
+    lines.extend('| ' + ' | '.join(str(c) for c in row) + ' |' for row in body)
+    lines.append('')
+
+
+def load(path):
+    data = json.loads((Path(path) / 'protection-replay.json').read_text())
+    rows = {(r['member'], r['profile']): r for r in data['records'] if r.get('planning')}
+    return data, rows
+
+
+def group_of(rec):
+    s = rec.get('support') or {}
+    minutes, days = s.get('contestedMinutes') or 0, s.get('contestedDays') or 0
+    return 'relaxed' if not minutes else 'sustained pressure' if (minutes >= 15 and days >= 2) else 'short burst'
+
+
+def later(rec, scope):
+    b = (((rec.get('later') or {}).get('published') or {}).get('borrow') or {}).get(scope) or {}
+    return b.get('minutes', 0), b.get('coreMinutes', 0.0)
+
+
+def gate_of(rec):
+    g = (rec.get('tierFloor') or {}).get('gate') or ''
+    return ('withheld' if g.startswith('withheld') else 'applied: contested' if g == 'applied (contested)'
+            else 'legacy: coarse' if 'resolution' in g else 'legacy: other' if g.startswith('applied (legacy') else 'rule did not bind' if not g else g)
+
+
+def limited(rec):
+    a = (rec.get('adjusted') or {}).get('ladder')
+    return bool(rec.get('cut') and rec.get('status') == 'bound' and a is not None and rec.get('target') is not None and a > rec['target'] + 0.005)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--reference', required=True, help='records of the one-minute run')
+    ap.add_argument('--coarse', required=True, help='records of the coarse run (working tree)')
+    ap.add_argument('--old', default=None, help='records of the coarse run sized by an earlier commit')
+    ap.add_argument('--out', default=None)
+    a = ap.parse_args()
+    out = Path(a.out or a.coarse)
+    out.mkdir(parents=True, exist_ok=True)
+    runs = [('one minute', *load(a.reference)), ('coarse', *load(a.coarse))]
+    if a.old:
+        runs.append(('coarse, earlier commit', *load(a.old)))
+    ref = runs[0][2]
+    keys = sorted(k for k in ref if all(k in rows for _, _, rows in runs))
+    scored = [k for k in keys if all((rows[k].get('later') or {}).get('published') for _, _, rows in runs)]
+    groups = {k: group_of(ref[k]) for k in keys}
+    describe = lambda d: (f'{d.get("thinMinutes")}-minute {d.get("thinMode")}' if (d.get('thinMinutes') or 0) > 1 else 'as recorded') \
+        + (f', sized at {d["trainingCommit"]}' if d.get('trainingCommit') else '') + f', commit {str(d.get("commit"))[:7]}'
+    lines = ['# Resolution comparison: the same LPARs sized from one-minute and from coarser data', '',
+             'Every run is judged on the same held-out period at one minute. Planning profiles only.', '']
+    lines += [f'- **{name}:** {describe(d)}; systems {", ".join(s["system"] for s in d["systems"])}.' for name, d, _ in runs]
+    lines += ['', f'{len(keys)} LPARs appear in every run; {len(scored)} of them are scored in the held-out period in every run.',
+              'Groups are set by what the one-minute run saw in training, in the planning profile\'s hours.', '']
+
+    lines += ['## 1. By group', '']
+    body = []
+    for g in GROUPS:
+        ks = [k for k in keys if groups[k] == g]
+        sc = [k for k in scored if groups[k] == g]
+        for name, _, rows in runs:
+            moved = [rows[k]['published'] - ref[k]['published'] for k in ks
+                     if rows[k].get('published') is not None and ref[k].get('published') is not None]
+            gates = collections.Counter(gate_of(rows[k]) for k in ks)
+            body.append([g, name, len(ks),
+                         f'{sum(rows[k].get("target") or 0 for k in ks):.2f}', f'{sum(rows[k].get("published") or 0 for k in ks):.2f}',
+                         f'{sum(1 for x in moved if x < -0.005)} / {sum(1 for x in moved if x > 0.005)}',
+                         sum(1 for k in ks if ((rows[k].get('support') or {}).get('contestedMinutes') or 0) > 0),
+                         sum(1 for k in ks if limited(rows[k])),
+                         '; '.join(f'{k2} {n}' for k2, n in sorted(gates.items())),
+                         len(sc), '{} / {:.2f}'.format(sum(later(rows[k], 'contested')[0] for k in sc), sum(later(rows[k], 'contested')[1] for k in sc)),
+                         '{} / {:.2f}'.format(sum(later(rows[k], 'all')[0] for k in sc), sum(later(rows[k], 'all')[1] for k in sc))])
+    table(lines, ['Group', 'Run', 'LPARs', 'Profile figure (sum)', 'Published (sum)', 'Lower / higher than one minute', 'With contested observations',
+                  'Cuts limited', 'Pool-borrowing rule', 'Scored later', 'Later contested busy work above published (min / core-min)',
+                  'Later, all minutes (min / core-min)'], body)
+    lines += ['"Profile figure" is the planning profile before cut protection. It moves with the resolution through the engine,',
+              'before any evidence rule acts.', '']
+
+    lines += ['## 2. LPARs whose published entitlement differs from the one-minute run', '']
+    body = []
+    for k in keys:
+        cells, differs = [], False
+        for name, _, rows in runs:
+            r = rows[k]
+            s = r.get('support') or {}
+            differs = differs or abs((r.get('published') or 0) - (ref[k].get('published') or 0)) > 0.005
+            lc = later(r, 'contested') if (r.get('later') or {}).get('published') else None
+            cells += [f'{r.get("target")}', f'{r.get("published")}', f'{s.get("contestedMinutes") or 0} / {s.get("contestedDays") or 0}',
+                      gate_of(r) + (', cut limited' if limited(r) else ''), '{} / {:.2f}'.format(*lc) if lc else 'not scored']
+        if differs:
+            body.append([k[0], k[1], groups[k], ref[k].get('installed')] + cells)
+    header = ['LPAR', 'Profile', 'Group', 'Installed']
+    for name, _, _ in runs:
+        header += [f'{name}: profile figure', 'published', 'contested observations / days', 'rule', 'later contested above (min / core-min)']
+    table(lines, header, sorted(body, key=lambda r: (GROUPS.index(r[2]), r[0])) or [['none'] + [''] * (len(header) - 1)])
+
+    lines += ['## 3. What the coarse run could not see', '',
+              'LPARs with contested minutes in the one-minute run and no contested observation in the coarse run.', '']
+    coarse = runs[1][2]
+    missed = [k for k in keys if groups[k] != 'relaxed' and not ((coarse[k].get('support') or {}).get('contestedMinutes') or 0)]
+    table(lines, ['Group', 'LPARs', 'Not seen at the coarse resolution', 'Of those, published lower than at one minute',
+                  'Their later contested busy work above the coarse published figure (min / core-min)'],
+          [[g, sum(1 for k in keys if groups[k] == g), sum(1 for k in missed if groups[k] == g),
+            sum(1 for k in missed if groups[k] == g and (coarse[k].get('published') or 0) < (ref[k].get('published') or 0) - 0.005),
+            '{} / {:.2f}'.format(sum(later(coarse[k], 'contested')[0] for k in missed if groups[k] == g and k in scored),
+                                 sum(later(coarse[k], 'contested')[1] for k in missed if groups[k] == g and k in scored))]
+           for g in GROUPS[1:]])
+    target = out / 'resolution-compare.md'
+    target.write_text('\n'.join(lines) + '\n')
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
