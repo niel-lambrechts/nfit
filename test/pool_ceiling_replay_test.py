@@ -233,6 +233,7 @@ class PoolCeilingReplayTest(unittest.TestCase):
         p = pools[20]
         self.assertEqual((p['cadenceMinutes'], p['coverage'], p['members'], p['cappedMembers'], p['installedEntitlement'], p['virtualProcessors'],
                           p['maximaSeen'], p['configurationSegments']), (1, 1, 2, 1, 3.5, 6, [8], 1))
+        self.assertEqual(p['configurationStates'], [{'days': 30, 'members': 2, 'installedEntitlement': 3.5, 'maximum': 8, 'entitlementShareOfMaximum': 0.4375}])
         everything = p['populations']['none']
         self.assertEqual((everything['max'], everything['maxShareOfMaximum'], everything['leastHeadroom']), (4.6, 0.575, 3.4))
         self.assertEqual((everything['daysAtShare']['0.50'], everything['observationsAtShare']['0.50'], everything['daysAtShare']['0.60']), (1, 8, 0))

@@ -100,6 +100,11 @@ class PoolEvidenceReportTest(unittest.TestCase):
         self.assertIn('max', facts['allHours'])
         # The standby's cut is released by normal planning and held by strict: it is counted, scored or not.
         self.assertGreaterEqual(sum(r['scoredCuts'] + r['unscoredCuts'] for r in data['rows']), 1)
+        self.assertTrue(facts['configurationStates'] and facts['configurationStates'][-1]['entitlementShareOfMaximum'] is not None)
+        report = (root / 'out' / 'pool-evidence.md').read_text()
+        self.assertIn('## 5. Review indicator under test', report)
+        self.assertIn('at least 50% of its configured maximum', report)
+        self.assertIn('Exposure missed in user-defined pools not flagged', report)
         self.assertFalse((root / '.private' / 'pool-evidence').exists())                  # the work tree is removed
 
 
