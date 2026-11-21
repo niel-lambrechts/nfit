@@ -247,4 +247,32 @@ for my $cv (1 .. 12)
 }
 is($lbad, 0, "limit sweep: $lsweeps pairs valid within every limit") or diag(join("\n", @lfirst));
 
+# --- Coarse pool evidence: the entitlement cut is held, the target is kept (v10 stage 3.4) ---
+{
+    my $held = UUT::_resolve_current_cycle_pair({ target_ent => 0.12, target_vp => 1, step_vp => 1, current_ent => 0.50, current_vp => 1,
+                                                  pool_size => 4, hold_cut => 15 });
+    is($held->{Ent}, 0.50, 'held: the installed entitlement stays this cycle');
+    is($held->{TargetEnt}, 0.12, '  and the target is as calculated');
+    ok((grep { $_ eq 'COARSE_EVIDENCE' } @{ $held->{Binding} }), '  bound by the coarse evidence');
+    is(UUT::_current_cycle_action_text($held, 0.50, 1, 7),
+       'No change. Hold the cut to 0.12: 15-minute data cannot assess brief pool competition. Obtain finer evidence or authorise a monitored trial.',
+       '  the action names the target and what would release the cut');
+
+    # With a VP reduction staged: the VPs follow the entitlement that is kept.
+    $held = UUT::_resolve_current_cycle_pair({ target_ent => 0.60, target_vp => 1, step_vp => 3, current_ent => 2.00, current_vp => 4, hold_cut => 15 });
+    is_deeply([ $held->{Ent}, $held->{VP}, $held->{Status} ], [ 2.00, 3, 'STAGED' ], 'held with a VP step: 2.00 on 3 VPs');
+    like(UUT::_current_cycle_action_text($held, 2.00, 4, 0),
+         qr/^Reduce VPs 4 to 3\. Hold the cut: 15-minute data cannot assess brief pool competition\. Obtain finer evidence or authorise a monitored trial\. Target 0\.60 entitlement on 1 VP over later cycles\./,
+         '  the staged target follows the hold');
+    $held = UUT::_resolve_current_cycle_pair({ target_ent => 0.60, target_vp => 1, step_vp => 1, current_ent => 2.00, current_vp => 4, hold_cut => 15 });
+    is($held->{VP}, 2, 'the VPs are not cut below what the kept entitlement needs');
+
+    # An increase is not held, and without the term a cut goes ahead as before.
+    my $up = UUT::_resolve_current_cycle_pair({ target_ent => 1.00, target_vp => 2, step_vp => 2, current_ent => 0.50, current_vp => 2, hold_cut => 15 });
+    is($up->{Ent}, 1.00, 'an increase goes ahead');
+    ok(!(grep { $_ eq 'COARSE_EVIDENCE' } @{ $up->{Binding} }), '  and is not marked');
+    my $cut = UUT::_resolve_current_cycle_pair({ target_ent => 0.12, target_vp => 1, step_vp => 1, current_ent => 0.50, current_vp => 1 });
+    is($cut->{Ent}, 0.12, 'without coarse evidence the cut is applied');
+}
+
 done_testing();

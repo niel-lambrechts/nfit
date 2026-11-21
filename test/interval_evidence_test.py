@@ -27,7 +27,7 @@ from one_entry_point_test import run
 STEP = 15
 
 
-def coarse_root(pool_step=STEP, member_step=STEP):
+def coarse_root(pool_step=STEP, member_step=STEP, pool_shift=0):
     """The fixture of member_exposure_test with its data file and pool observations thinned."""
     root = Path(mx.MemberExposureTests.make_root())
     cache = root / 'stage' / mx.SERIAL
@@ -37,15 +37,17 @@ def coarse_root(pool_step=STEP, member_step=STEP):
     with gzip.open(cache / '.nfit.cache.pool.observations.csv.gz', 'rt') as fh:
         head, *obs = fh.read().splitlines()
     kept = [o for o in obs if (int(o.split(',')[0]) // mx.NS // 60) % pool_step == 0]
+    if pool_shift:                                    # the pool is observed a few minutes after the LPARs
+        kept = [','.join([str(int(o.split(',')[0]) + pool_shift * mx.NS)] + o.split(',')[1:]) for o in kept]
     with gzip.open(cache / '.nfit.cache.pool.observations.csv.gz', 'wt') as fh:
         fh.write('\n'.join([head] + kept) + '\n')
     return root, cache, len(keep) // 4
 
 
 class CoarseRun:
-    def __init__(self, pool_step=STEP, enddate='2026-09-02'):
+    def __init__(self, pool_step=STEP, enddate='2026-09-02', pool_shift=0):
         mx.MemberExposureTests.roots = []
-        self.root, self.cache, self.samples_per_lpar = coarse_root(pool_step)
+        self.root, self.cache, self.samples_per_lpar = coarse_root(pool_step, pool_shift=pool_shift)
         cfg = self.root / 'vms.csv'
         with cfg.open('w') as f:
             w = csv.writer(f)
@@ -76,11 +78,13 @@ class IntervalEvidenceTest(unittest.TestCase):
     def setUpClass(cls):
         cls.coarse = CoarseRun()
         cls.mixed = CoarseRun(pool_step=5)          # pool every 5 minutes, LPARs every 15
+        cls.shifted = CoarseRun(pool_shift=180)     # pool observed three minutes after the LPAR samples
 
     @classmethod
     def tearDownClass(cls):
         cls.coarse.close()
         cls.mixed.close()
+        cls.shifted.close()
 
     def test_an_observation_is_one_sample_and_coverage_follows_the_cadence(self):
         support = [v['cutProtection']['support'] for v in self.coarse.members['vmA']['profiles'].values() if 'cutProtection' in v]
@@ -117,6 +121,26 @@ class IntervalEvidenceTest(unittest.TestCase):
         self.assertEqual(self.coarse.rows['vmA']['NFIT - ENT'], '2.00')
         self.assertRegex(self.coarse.flat, r'Cut protection : profile \d\.\d\d limited to 2\.00 \(share 0\.\d\d\); busy demand and pool pressure in '
                                            r'\d+ of the 15-minute intervals over \d days? in pool 7; overlap within an interval is unknown')
+
+    def test_a_cut_is_held_and_its_target_kept(self):
+        # The standby's own-workload target is well below its installed 1.50. With 15-minute pool evidence the
+        # entitlement stays this cycle; the target is still the calculated one.
+        row = self.coarse.rows['vmS']
+        self.assertEqual(row['NFIT - ENT'], '1.50')
+        self.assertLess(float(row[row['Planning Profile']]), 1.0)
+        self.assertRegex(row['NFIT - Action'], r'^No change\. Hold the cut to 0\.\d\d: 15-minute data cannot assess brief pool competition\. '
+                                               r'Obtain finer evidence or authorise a monitored trial\.$')
+        self.assertNotIn('Hold the cut', self.coarse.rows['vmX']['NFIT - Action'])       # a dedicated LPAR has no pool evidence
+
+    def test_pool_observations_offset_from_the_lpar_samples_are_still_matched(self):
+        # The same data with the pool read three minutes later: exact-minute pairing would find nothing.
+        for run in (self.coarse, self.shifted):
+            support = [v['cutProtection']['support'] for v in run.members['vmA']['profiles'].values() if 'cutProtection' in v]
+            self.assertTrue(all(s['classifiedMinutes'] >= 0.95 * s['pairedMinutes'] for s in support))
+        both = lambda run: sorted(v['cutProtection']['support']['contestedMinutes'] for v in run.members['vmA']['profiles'].values() if 'cutProtection' in v)
+        self.assertEqual(both(self.shifted), both(self.coarse))
+        self.assertGreater(max(both(self.shifted)), 0)
+        self.assertIn('busy demand and pressure in pool 7 observed in', self.shifted.rows['vmA']['NFIT - Action'])
 
     def test_a_full_pool_is_counted_in_intervals(self):
         self.assertRegex(self.coarse.log, r'(?m)^\s+7\s+4\s+[\d. ]+\s\d+ of the 15-minute intervals on \d days?$')
