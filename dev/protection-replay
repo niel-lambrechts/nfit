@@ -189,9 +189,12 @@ def thin_data(src, dst, minutes, mode):
 def thin_pool(src, dst, minutes, mode):
     """A coarser copy of the pool observations (gzip CSV with time_ns, host, series_id, pool_id, ...). 'point':
     the observations of every Nth minute are kept. 'mean': per reporter and series, the busy and idle columns
-    are averaged over the interval and the other columns take the interval's last value; the row is stamped
-    30 seconds into the interval's first minute. Rows may be out of order by up to one interval."""
+    are averaged over the interval and the other columns take the interval's latest value; the row is stamped
+    30 seconds into the interval's first minute, and an interval with too few of its minutes present is left
+    out. The rows may be in any order (the file is written reporter by reporter): they are first set out by
+    UTC day in temporary files, then each day is reduced on its own."""
     import gzip
+    import tempfile
     read = written = 0
     with gzip.open(src, 'rt') as fin, gzip.open(dst, 'wt') as fout:
         header = fin.readline()
@@ -200,54 +203,58 @@ def thin_pool(src, dst, minutes, mode):
         i_time = names.index('time_ns')
         key_cols = [names.index(c) for c in ('host', 'series_id', 'pool_id') if c in names]
         mean_cols = [names.index(c) for c in POOL_MEAN_COLUMNS if c in names]
-        open_buckets, newest, flushed_to = {}, None, None
-
-        def flush(bucket):
-            nonlocal written
-            for (last, sums, counts, seen) in open_buckets.pop(bucket, {}).values():
-                if len(seen) < THIN_SHARE * minutes:
+        if mode == 'point':
+            for line in fin:
+                if not line.strip():
                     continue
-                row = list(last)
-                row[i_time] = str((bucket * minutes * 60 + 30) * 1_000_000_000)
-                for c in mean_cols:
-                    row[c] = ('%.4f' % (sums[c] / counts[c])) if counts.get(c) else ''
-                fout.write(','.join(row) + '\n')
-                written += 1
-
-        for line in fin:
-            line = line.rstrip('\n')
-            if not line:
-                continue
-            read += 1
-            parts = line.split(',')
-            minute = int(parts[i_time]) // 60_000_000_000
-            if mode == 'point':
-                if minute % minutes == 0:
-                    fout.write(line + '\n')
+                read += 1
+                if (int(line.split(',', i_time + 1)[i_time]) // 60_000_000_000) % minutes == 0:
+                    fout.write(line if line.endswith('\n') else line + '\n')
                     written += 1
-                continue
-            bucket = minute // minutes
-            if flushed_to is not None and bucket <= flushed_to:
-                raise RuntimeError('the pool observations are not in time order; use --thin-mode point')
-            if newest is None or bucket > newest:
-                newest = bucket
-                for old in sorted(b for b in open_buckets if b < newest - 1):
-                    flush(old)
-                    flushed_to = old if flushed_to is None else max(flushed_to, old)
-            entry = open_buckets.setdefault(bucket, {}).get(tuple(parts[c] for c in key_cols))
-            if entry is None:
-                entry = open_buckets[bucket][tuple(parts[c] for c in key_cols)] = [parts, {}, {}, set()]
-            entry[0] = parts
-            entry[3].add(minute)
-            for c in mean_cols:
-                if c < len(parts) and parts[c]:
-                    try:
-                        entry[1][c] = entry[1].get(c, 0.0) + float(parts[c])
-                        entry[2][c] = entry[2].get(c, 0) + 1
-                    except ValueError:
-                        pass
-        for old in sorted(open_buckets):
-            flush(old)
+            return read, written
+        with tempfile.TemporaryDirectory(prefix='thin-pool-', dir=str(Path(dst).parent)) as tmp:
+            days = {}
+            for line in fin:
+                if not line.strip():
+                    continue
+                read += 1
+                day = int(line.split(',', i_time + 1)[i_time]) // 86_400_000_000_000
+                handle = days.get(day)
+                if handle is None:
+                    handle = days[day] = open(os.path.join(tmp, f'{day}.csv'), 'w')
+                handle.write(line if line.endswith('\n') else line + '\n')
+            for handle in days.values():
+                handle.close()
+            for day in sorted(days):
+                acc = {}
+                with open(os.path.join(tmp, f'{day}.csv')) as fday:
+                    for line in fday:
+                        parts = line.rstrip('\n').split(',')
+                        stamp = int(parts[i_time])
+                        minute = stamp // 60_000_000_000
+                        key = (minute // minutes, tuple(parts[c] for c in key_cols))
+                        entry = acc.get(key)
+                        if entry is None:
+                            entry = acc[key] = [stamp, parts, {}, {}, set()]
+                        elif stamp >= entry[0]:
+                            entry[0], entry[1] = stamp, parts
+                        entry[4].add(minute)
+                        for c in mean_cols:
+                            if c < len(parts) and parts[c]:
+                                try:
+                                    entry[2][c] = entry[2].get(c, 0.0) + float(parts[c])
+                                    entry[3][c] = entry[3].get(c, 0) + 1
+                                except ValueError:
+                                    pass
+                for (bucket, _key), (_stamp, last, sums, counts, seen) in sorted(acc.items(), key=lambda kv: kv[0]):
+                    if len(seen) < THIN_SHARE * minutes:
+                        continue
+                    row = list(last)
+                    row[i_time] = str((bucket * minutes * 60 + 30) * 1_000_000_000)
+                    for c in mean_cols:
+                        row[c] = ('%.4f' % (sums[c] / counts[c])) if counts.get(c) else ''
+                    fout.write(','.join(row) + '\n')
+                    written += 1
     return read, written
 
 

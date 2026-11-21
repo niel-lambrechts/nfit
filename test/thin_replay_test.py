@@ -89,6 +89,16 @@ class ThinFilesTest(unittest.TestCase):
         second = {r['host']: r for r in out if int(r['time_ns']) == (mx.DAY1 + 900 + 30) * mx.NS}
         self.assertEqual(float(second['hA']['busy_cores']), 3.0)
         self.assertEqual(second['hA']['phys_cpus_pool'], '4')                             # the size is carried, not averaged
+        # The observations are written reporter by reporter, not in time order: the result is the same.
+        grouped = sorted(rows, key=lambda r: r.split(',')[1])
+        self.assertNotEqual(grouped, rows)
+        self.assertEqual(self.pr.thin_pool(self.pool(grouped), self.dir / 'grouped.gz', 15, 'mean'), (60, 4))
+        with gzip.open(self.dir / 'grouped.gz', 'rt') as fh:
+            again = list(csv.DictReader(fh))
+        self.assertEqual(sorted((r['time_ns'], r['host'], r['busy_cores']) for r in again),
+                         sorted((r['time_ns'], r['host'], r['busy_cores']) for r in out))
+        self.assertEqual(os.listdir(self.dir).count('grouped.gz'), 1)
+        self.assertFalse([f for f in os.listdir(self.dir) if f.startswith('thin-pool-')])   # the day files are removed
         _, kept = self.pr.thin_pool(self.pool(rows), self.dir / 'point.gz', 15, 'point')
         self.assertEqual(kept, 4)                                                         # two reporters at minutes 0 and 15
 
