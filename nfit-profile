@@ -794,7 +794,14 @@ my %POOL_USE;
 #     busy work that one-minute data had protected. The target is kept and
 #     shown. Only the tested 15-minute case is covered; finer cadences
 #     between one and fifteen minutes are not held and not yet examined.
+#     The hold does not depend on where the data came from: it applies when
+#     the LPAR's samples or its pool's observations arrive that coarsely, and
+#     also when coarse LPAR samples come with no pool observations at all
+#     (for example NMON files). One-minute samples without pool observations
+#     keep the established path: there is no pool verification, and no hold.
 my %EVIDENCE_INTERVAL = (cadenceTolerance => 0.20, maxExemptionCadence => 1, holdCutCadence => 15);
+# The sampling interval of the current system's CPU cache, in minutes (undef when it cannot be told).
+my $SYSTEM_CPU_CADENCE;
 my $POOL_TRIAL_MIN_MINUTES = 15;
 my $POOL_TRIAL_MIN_DAYS    = 2;
 # Set while the profile is sized once more without the bound, to give the
@@ -2483,6 +2490,7 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
     # section is; seasonal model runs are left as they are (stage 3.6).
     %CUT_PROTECTION_EVIDENCE = ();
     %POOL_USE = ();
+    $SYSTEM_CPU_CADENCE = _cpu_cache_cadence($current_cache_path);
     if (_cut_protection_wanted($current_cache_path) && $effective_start_date_obj && $effective_end_date_obj)
     {
         _protection_evidence_before_sizing($current_cache_path, $effective_start_date_obj, $effective_end_date_obj, \@vm_order);
@@ -7115,7 +7123,7 @@ sub _current_cycle_pair_from_results
         current_ent => $cfg->{entitlement},
         current_vp  => $cfg->{virtual_cpus},
         pool_size   => ($user_pool ? $cfg->{pool_cpu} : undef),
-        hold_cut    => _hold_cut_cadence($cfg->{vm_name}, $profile_name),
+        hold_cut    => _hold_cut_cadence($cfg->{vm_name}, $profile_name, $cfg),
     });
 }
 
@@ -16506,7 +16514,7 @@ sub _write_standard_csv_report {
                 current_vp  => $numeric_cell->('Current - VCPU'),
                 pool_size   => ($pool_is_user_defined ? $cfg->{pool_cpu} : undef),
                 tier_floor  => _profile_tier_floor($core->{ProfileDebugInfo}{$name}, $cfg),
-                hold_cut    => _hold_cut_cadence($cfg->{vm_name}, $name),
+                hold_cut    => _hold_cut_cadence($cfg->{vm_name}, $name, $cfg),
             });
         }
         $vm_map_ref->{CoreResults}{Profile_CurrentCycle} = \%cycle_pairs;
@@ -24293,12 +24301,51 @@ sub _evidence_cadence_of
 # evidence arrives at that cadence or coarser.
 sub _hold_cut_cadence
 {
-    my ($vm, $profile) = @_;
-    return undef unless (defined $vm && defined $profile && $CUT_PROTECTION_EVIDENCE{$vm});
-    my $t = $CUT_PROTECTION_EVIDENCE{$vm}{$profile};
-    return undef unless (ref($t) eq 'HASH' && ref($t->{observations}) eq 'HASH' && %{ $t->{observations} });
-    my $cadence = _evidence_cadence_of($t);
-    return ($cadence >= $EVIDENCE_INTERVAL{holdCutCadence}) ? $cadence : undef;
+    my ($vm, $profile, $cfg) = @_;
+    return undef unless (defined $vm && defined $profile);
+    my $t = $CUT_PROTECTION_EVIDENCE{$vm} ? $CUT_PROTECTION_EVIDENCE{$vm}{$profile} : undef;
+    my $cadence;
+    if (ref($t) eq 'HASH' && ref($t->{observations}) eq 'HASH' && %{ $t->{observations} })
+    {
+        # With pool evidence: the coarser of the LPAR's samples and its pool's observations.
+        $cadence = max(_evidence_cadence_of($t), $t->{poolCadenceLast} // 1);
+    }
+    elsif (ref($cfg) eq 'HASH' && !($cfg->{is_capped} // 0) && defined $cfg->{pool_id} && looks_like_number($cfg->{pool_id}))
+    {
+        # Without pool evidence: an uncapped shared-pool LPAR whose own samples are coarse.
+        $cadence = $SYSTEM_CPU_CADENCE;
+    }
+    return (defined $cadence && $cadence >= $EVIDENCE_INTERVAL{holdCutCadence}) ? $cadence : undef;
+}
+
+# The sampling interval of a CPU cache, in whole minutes: the commonest spacing of the first
+# LPAR's first samples (as the engine detects it). undef when the cache cannot be read or
+# has too few samples.
+sub _cpu_cache_cadence
+{
+    my ($cache_dir) = @_;
+    return undef unless defined $cache_dir;
+    open my $in, '<', File::Spec->catfile($cache_dir, $DATA_CACHE_FILE) or return undef;
+    <$in>;
+    require Time::Local;
+    my ($first_vm, @at, $lines);
+    while (my $line = <$in>)
+    {
+        last if (++$lines > 5000 || @at >= 50);
+        my ($y, $mo, $d, $h, $mi, $s, $vm) = $line =~ /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2}),([^,]+)/ or next;
+        $first_vm //= $vm;
+        next unless ($vm eq $first_vm);
+        push @at, Time::Local::timegm($s, $mi, $h, $d, $mo - 1, $y);
+    }
+    close $in;
+    return undef if (@at < 6);
+    @at = sort { $a <=> $b } @at;
+    my %seen;
+    $seen{ $at[$_] - $at[ $_ - 1 ] }++ for 1 .. $#at;
+    my ($spacing) = sort { $seen{$b} <=> $seen{$a} || $a <=> $b } grep { $_ > 0 } keys %seen;
+    return undef unless defined $spacing;
+    my $minutes = int($spacing / 60 + 0.5);
+    return $minutes < 1 ? 1 : $minutes;
 }
 
 # "40 minutes" at one-minute cadence; "6 of the 15-minute intervals" at a coarser one:
@@ -24346,6 +24393,7 @@ sub _exposure_process_day
         my $coarse = ($cadence > 1) ? 1 : 0;
         $cadence_of_pool{ $tracker->{pool} } = [ _evidence_cadence($pool_minutes) ] unless $cadence_of_pool{ $tracker->{pool} };
         my $pool_cadence = $cadence_of_pool{ $tracker->{pool} }[0];
+        $tracker->{poolCadenceLast} = $pool_cadence if defined $pool_cadence;
         my $compatible = (!$coarse || (defined $pool_cadence
             && abs($pool_cadence - $cadence) <= $EVIDENCE_INTERVAL{cadenceTolerance} * $cadence)) ? 1 : 0;
         my $reach = int($cadence / 2);

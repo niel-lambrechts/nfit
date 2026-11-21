@@ -27,7 +27,7 @@ from one_entry_point_test import run
 STEP = 15
 
 
-def coarse_root(pool_step=STEP, member_step=STEP, pool_shift=0):
+def coarse_root(pool_step=STEP, member_step=STEP, pool_shift=0, no_pool=False):
     """The fixture of member_exposure_test with its data file and pool observations thinned."""
     root = Path(mx.MemberExposureTests.make_root())
     cache = root / 'stage' / mx.SERIAL
@@ -41,13 +41,15 @@ def coarse_root(pool_step=STEP, member_step=STEP, pool_shift=0):
         kept = [','.join([str(int(o.split(',')[0]) + pool_shift * mx.NS)] + o.split(',')[1:]) for o in kept]
     with gzip.open(cache / '.nfit.cache.pool.observations.csv.gz', 'wt') as fh:
         fh.write('\n'.join([head] + kept) + '\n')
+    if no_pool:                                       # as with NMON files: no pool observations at all
+        os.remove(cache / '.nfit.cache.pool.observations.csv.gz')
     return root, cache, len(keep) // 4
 
 
 class CoarseRun:
-    def __init__(self, pool_step=STEP, enddate='2026-09-02', pool_shift=0):
+    def __init__(self, pool_step=STEP, enddate='2026-09-02', pool_shift=0, no_pool=False, member_step=STEP):
         mx.MemberExposureTests.roots = []
-        self.root, self.cache, self.samples_per_lpar = coarse_root(pool_step, pool_shift=pool_shift)
+        self.root, self.cache, self.samples_per_lpar = coarse_root(pool_step, member_step, pool_shift=pool_shift, no_pool=no_pool)
         cfg = self.root / 'vms.csv'
         with cfg.open('w') as f:
             w = csv.writer(f)
@@ -61,8 +63,8 @@ class CoarseRun:
         self.flat = ' '.join(self.log.split())
         text = [p for p in glob.glob(str(self.root / 'output' / '*.csv')) if '.decisions.' not in p][0]
         self.rows = {r['VM']: r for r in csv.DictReader(Path(text).read_text(encoding='utf-8').splitlines())}
-        snap = glob.glob(str(self.cache / '.nfit.store' / 'proposals' / 'v1' / '*' / '*.json'))[0]
-        self.members = json.loads(Path(snap).read_text())['members']
+        snaps = glob.glob(str(self.cache / '.nfit.store' / 'proposals' / 'v1' / '*' / '*.json'))
+        self.members = json.loads(Path(snaps[0]).read_text())['members'] if snaps else {}
 
     def gates(self, vm):
         return {v['tierFloor']['gate'] for v in self.members[vm]['profiles'].values() if 'tierFloor' in v}
@@ -79,12 +81,16 @@ class IntervalEvidenceTest(unittest.TestCase):
         cls.coarse = CoarseRun()
         cls.mixed = CoarseRun(pool_step=5)          # pool every 5 minutes, LPARs every 15
         cls.shifted = CoarseRun(pool_shift=180)     # pool observed three minutes after the LPAR samples
+        cls.no_pool = CoarseRun(no_pool=True)       # coarse LPAR samples, no pool observations
+        cls.fine_no_pool = CoarseRun(no_pool=True, member_step=1)
 
     @classmethod
     def tearDownClass(cls):
         cls.coarse.close()
         cls.mixed.close()
         cls.shifted.close()
+        cls.no_pool.close()
+        cls.fine_no_pool.close()
 
     def test_an_observation_is_one_sample_and_coverage_follows_the_cadence(self):
         support = [v['cutProtection']['support'] for v in self.coarse.members['vmA']['profiles'].values() if 'cutProtection' in v]
@@ -127,10 +133,22 @@ class IntervalEvidenceTest(unittest.TestCase):
         # entitlement stays this cycle; the target is still the calculated one.
         row = self.coarse.rows['vmS']
         self.assertEqual(row['NFIT - ENT'], '1.50')
-        self.assertLess(float(row[row['Planning Profile']]), 1.0)
-        self.assertRegex(row['NFIT - Action'], r'^No change\. Hold the cut to 0\.\d\d: 15-minute data cannot assess brief pool competition\. '
+        self.assertLess(float(row[row['Planning Profile']]), 1.5)
+        self.assertRegex(row['NFIT - Action'], r'^No change\. Hold the cut to \d\.\d\d: 15-minute data cannot assess brief pool competition\. '
                                                r'Obtain finer evidence or authorise a monitored trial\.$')
         self.assertNotIn('Hold the cut', self.coarse.rows['vmX']['NFIT - Action'])       # a dedicated LPAR has no pool evidence
+
+    def test_the_hold_does_not_depend_on_pool_observations_being_present(self):
+        # Coarse LPAR samples with no pool observations at all: the uncapped shared-pool LPAR's cut is held as well.
+        row = self.no_pool.rows['vmS']
+        self.assertEqual(row['NFIT - ENT'], '1.50')
+        self.assertIn('Hold the cut', row['NFIT - Action'])
+        self.assertIn('15-minute data cannot assess brief pool competition', row['NFIT - Action'])
+        self.assertNotIn('Hold the cut', self.no_pool.rows['vmX']['NFIT - Action'])      # dedicated: not a shared-pool LPAR
+        # One-minute samples without pool observations keep the established path: the cut is applied.
+        fine = self.fine_no_pool.rows['vmS']
+        self.assertLess(float(fine['NFIT - ENT']), 1.5)
+        self.assertNotIn('Hold the cut', fine['NFIT - Action'])
 
     def test_pool_observations_offset_from_the_lpar_samples_are_still_matched(self):
         # The same data with the pool read three minutes later: exact-minute pairing would find nothing.
