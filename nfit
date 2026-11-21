@@ -60,7 +60,10 @@ my $VERSION = '9.26.219.0';
 #   3: results of caches with a PhysB column carry paired outputs (metrics.physb).
 #   4: --no-weekends excludes Saturday and Sunday (a16eb08); format-3 results
 #      were computed with the earlier rule and must not be served.
-my $L2_CACHE_FORMAT_VERSION = 4;
+#   5: the EMA weight follows the sampling interval (see $EMA_REFERENCE_INTERVAL_S).
+#      Results of data that is not at one minute differ; earlier entries must
+#      not be served. One-minute results are recomputed to the same values.
+my $L2_CACHE_FORMAT_VERSION = 5;
 
 # --- L1 data-cache schema ---
 # Versions of .nfit.cache.data this engine reads. Schema 1 is the original
@@ -90,9 +93,12 @@ my $ACTIVE_PHYSC_THRESHOLD = 0.15; # Original threshold for RunQ normalization
 my $PAIRED_GAP_FACTOR          = 1.5;          # a gap is > 1.5 x the detected interval
 my $PAIRED_B_ABOVE_C_TOLERANCE = 1e-6;         # PhysB above PhysC by more is an invalid pair
 my $PAIRED_SECONDS_PER_DAY     = 86_400;
-my $PAIRED_DERIVATION_VERSION  = 'paired-2';   # recorded in physbProvenance and history
+my $PAIRED_DERIVATION_VERSION  = 'paired-3';   # recorded in physbProvenance and history
                                                #   paired-2: plausibility rejections (non-finite,
                                                #   above the VM's virtual-processor ceiling)
+                                               #   paired-3: the EMA weight follows the sampling
+                                               #   interval, as in the ordinary path (one-minute
+                                               #   data: the same values)
 my $CALENDAR_RULES_VERSION     = 'weekday-v2'; # --no-weekends = Saturday and Sunday excluded
 my $PAIRED_CEILING_FACTOR      = 1.05;         # tolerance on the virtual-processor ceiling
 my $PAIRED_CEILING_MARGIN      = 0.05;         # cores
@@ -104,7 +110,21 @@ my $DEFAULT_PROCESS_WINDOW_UNIT = "weeks";
 my $DEFAULT_PROCESS_WINDOW_SIZE = 1;
 my $DEFAULT_DECAY_HALF_LIFE_DAYS = 30;
 
-# EMA Alpha values based on decay level
+# EMA Alpha values based on decay level. They are the weight of one sample at
+# the reference interval of one minute. At another sampling interval the
+# weight is 1 - (1 - alpha) ** (interval / reference), which keeps the same
+# decay in elapsed time: decay 'medium' fades over about 12 minutes whether
+# the data arrives every 30 seconds, every minute or every 15 minutes. With a
+# fixed weight per sample it faded over 12 samples, which is three hours of
+# 15-minute data, and the percentiles of such data were taken from a series
+# smoothed far more heavily than the profile asks for.
+# The interval is the one detected for the data file (detect_sampling_interval).
+# Every sample carries that weight: a sample after a gap is not given the time
+# since its predecessor (as in the paired transforms).
+# Not changed here, and recorded as a separate matter: the window (-w) does not
+# set the EMA's span. It only sets how many samples seed the EMA with their
+# plain average; the span comes from the decay level alone.
+my $EMA_REFERENCE_INTERVAL_S = 60;
 my %EMA_ALPHAS = (
     'low'        => 0.03,
     'medium'     => 0.08,
@@ -4300,6 +4320,8 @@ sub run_single_pass_from_manifest {
 
         # Update the manifest logic to use SAMPLES, which the engine expects
         $entry->{window} = $effective_samples;
+        # The sampling interval, for the EMA weight (ordinary and paired transforms alike).
+        $entry->{interval_seconds} = $detected_interval_secs;
     }
     # --- end of safety check ---
 
@@ -4844,6 +4866,17 @@ sub process_data_point {
     }
 }
 
+# The EMA weight of one sample at a sampling interval (seconds), from the
+# weight at the reference interval. At the reference interval, or without a
+# known interval, the reference weight itself (bit for bit).
+sub _ema_alpha_for_interval
+{
+    my ($reference_alpha, $interval_seconds) = @_;
+    return $reference_alpha unless (defined $interval_seconds && looks_like_number($interval_seconds)
+                                    && $interval_seconds > 0 && $interval_seconds != $EMA_REFERENCE_INTERVAL_S);
+    return 1 - (1 - $reference_alpha) ** ($interval_seconds / $EMA_REFERENCE_INTERVAL_S);
+}
+
 sub initialise_transform_state {
     my ($manifest_entry) = @_;
     my $method = uc($manifest_entry->{method} // '');
@@ -4856,7 +4889,7 @@ sub initialise_transform_state {
     } elsif ($method eq 'EMA') {
         $state->{prev_value} = undef;
         my $decay = lc($manifest_entry->{decay} // 'medium');
-        $state->{alpha} = $EMA_ALPHAS{$decay} // $EMA_ALPHAS{'medium'};
+        $state->{alpha} = _ema_alpha_for_interval($EMA_ALPHAS{$decay} // $EMA_ALPHAS{'medium'}, $manifest_entry->{interval_seconds});
         $state->{warmup_queue} = []; # For initial EMA value
     }
     $state->{peak_value} = undef;
@@ -6609,9 +6642,12 @@ Cache Location (provide one):
 Averaging Method (used within each window if decay enabled):
   --avg-method <method>    : Averaging method for PhysC: 'sma' or 'ema'. (Default: $DEFAULT_AVG_METHOD)
   --decay <level>          : If 'ema' for PhysC, specifies decay level: $valid_decays_usage.
-                           (Default: $DEFAULT_DECAY_LEVEL).
+                           (Default: $DEFAULT_DECAY_LEVEL). The level sets how fast the average fades, in
+                           elapsed time: its weight is that of one sample at one minute and is adjusted
+                           to the data's sampling interval.
   --runq-decay <level>     : Optional. If 'ema' for RunQ, specifies its decay level.
-  -w, --window <minutes>     : Window for SMA/EMA calculations. (Default: $DEFAULT_WINDOW_MINUTES min).
+  -w, --window <minutes>     : Window for SMA. With 'ema' it sets only how many samples seed the average;
+                           the span of an EMA comes from --decay. (Default: $DEFAULT_WINDOW_MINUTES min).
 
 RunQ Data Options:
   --smt <N>                : SMT level for RunQ normalisation (Default: $DEFAULT_SMT).

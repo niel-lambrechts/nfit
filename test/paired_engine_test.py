@@ -118,7 +118,7 @@ class PairedEngineTests(unittest.TestCase):
         self.assertEqual((tail['busyShare'], tail['meanB'], tail['meanC'], tail['meanNonBusy']), (0.5, 1.0, 2.0, 1.0))
         self.assertEqual(p['profileValueB'], {'P95': 1.0})
         self.assertEqual(o['physbProvenance']['source'], 'cpu_util.physical_busy')
-        self.assertEqual(o['physbProvenance']['derivationVersion'], 'paired-2')
+        self.assertEqual(o['physbProvenance']['derivationVersion'], 'paired-3')
         self.assertEqual(o['physbProvenance']['calendarRules'], 'weekday-v2')
         self.assertEqual(p['daily'], [{'date': '2026-10-06', 'expectedMinutes': 180.0, 'physcMinutes': 180.0,
                                        'pairedMinutes': 180.0, 'sumB': 180.0, 'sumC': 360.0, 'freqPctMean': 100.0,

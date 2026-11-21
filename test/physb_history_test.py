@@ -183,7 +183,7 @@ class PhysBHistoryTests(unittest.TestCase):
         self.assertEqual(blk['Coverage'], {'monthStart': '2026-09-01', 'monthEnd': '2026-09-30',
                                            'windowStart': '2026-09-01', 'windowEnd': '2026-09-30', 'complete': True})
         self.assertEqual((blk['Source']['derivationVersion'], blk['Source']['calendarRules'],
-                          blk['Source']['physbSource']), ('paired-2', 'weekday-v2', 'cpu_util.physical_busy'))
+                          blk['Source']['physbSource']), ('paired-3', 'weekday-v2', 'cpu_util.physical_busy'))
         pop = blk['Populations']['none']
         n = 30 * 96
         expected_c = sum(round(level(day('2026-09-01') + i * STEP), 4) for i in range(n)) * STEP / 60
@@ -398,8 +398,8 @@ class PhysBHistoryTests(unittest.TestCase):
             json.dump(part, fh)
         p = self.update(r, '--physb-history', force=False)
         self.assertIn('out of date', p.stderr)
-        self.assertEqual(self.block(r)['Source']['derivationVersion'], 'paired-2')
-        self.assertEqual(self.partition(r)[MONTH]['Metadata']['PhysB']['derivationVersion'], 'paired-2')
+        self.assertEqual(self.block(r)['Source']['derivationVersion'], 'paired-3')
+        self.assertEqual(self.partition(r)[MONTH]['Metadata']['PhysB']['derivationVersion'], 'paired-3')
 
     # -- time zones ---------------------------------------------------------------------
     def test_month_scheduling_does_not_depend_on_the_local_timezone(self):
