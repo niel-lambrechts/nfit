@@ -104,6 +104,22 @@ class PoolCeilingReplayTest(unittest.TestCase):
                 cls.text = fh.read()
         cls.data = json.loads(cls.text) if cls.text else {}
         cls.pools = {p['pool']: p for p in cls.data.get('pools', [])}
+        # The pool facts of the training period (research; no rule applied), at one minute and from a 15-minute copy.
+        coarse = os.path.join(cls.root, 'stage15', 'SYNPC')
+        shutil.copytree(cache, coarse)
+        with gzip.open(os.path.join(cache, '.nfit.cache.pool.observations.csv.gz'), 'rt') as fh:
+            lines = fh.read().splitlines()
+        kept = [l for l in lines[1:] if ((int(l.split(',')[0]) // mx.NS - 15) // 60) % 15 == 0]
+        with gzip.open(os.path.join(coarse, '.nfit.cache.pool.observations.csv.gz'), 'wt') as fh:
+            fh.write('\n'.join([lines[0]] + kept) + '\n')
+        cls.facts = {}
+        for name, where in (('minute', cache), ('coarse', coarse)):
+            run = subprocess.run(['perl', os.path.join(cls.root, 'nfit-profile'), '--nmondir', where,
+                                  '--research-pool-coarse-evidence', '2026-09-01/2026-09-30'], cwd=cls.root, capture_output=True, text=True, timeout=280)
+            path = os.path.join(cls.root, 'output', 'nfit-profile.pool-coarse-evidence.json')
+            with open(path) as fh:
+                cls.facts[name] = (run, fh.read())
+            os.remove(path)
 
     @classmethod
     def tearDownClass(cls):
@@ -207,6 +223,35 @@ class PoolCeilingReplayTest(unittest.TestCase):
         self.assertEqual(margins['minuteAll']['0.10']['exceedMinutes'], 0)
         self.assertEqual([margins['coarseMean'][k]['ceiling'] for k in ('0.00', '0.25')], [4, 5])
         self.assertEqual(self.pools[20]['candidate'], 5)                 # the reference candidate carries no margin
+
+    def test_pool_facts_describe_the_period_at_the_cadence_of_the_cache(self):
+        run, text = self.facts['minute']
+        self.assertEqual(run.returncode, 0, run.stderr[-1500:])
+        for vm in MEMBERS:
+            self.assertNotIn(f'"{vm}"', text)
+        pools = {p['pool']: p for p in json.loads(text)['pools']}
+        p = pools[20]
+        self.assertEqual((p['cadenceMinutes'], p['coverage'], p['members'], p['cappedMembers'], p['installedEntitlement'], p['virtualProcessors'],
+                          p['maximaSeen'], p['configurationSegments']), (1, 1, 2, 1, 3.5, 6, [8], 1))
+        everything = p['populations']['none']
+        self.assertEqual((everything['max'], everything['maxShareOfMaximum'], everything['leastHeadroom']), (4.6, 0.575, 3.4))
+        self.assertEqual((everything['daysAtShare']['0.50'], everything['observationsAtShare']['0.50'], everything['daysAtShare']['0.60']), (1, 8, 0))
+        self.assertEqual((everything['dayPeaks']['highest'], everything['dayPeaks']['second']), (4.6, 3.0))
+        # The peak is at 09:00 on a Sunday: inside online hours, outside the weekday-only population and batch hours.
+        self.assertEqual(p['populations']['online']['max'], 4.6)
+        self.assertEqual(p['populations']['online+no-weekends']['max'], 3.0)
+        self.assertEqual(p['populations']['batch']['max'], 3.0)
+        self.assertEqual((pools[21]['populations']['none']['observationsAtShare']['near'], pools[21]['populations']['none']['daysAtShare']['0.90']), (60, 2))
+        self.assertEqual((pools[23]['daysObserved'], pools[23]['worstDayCoverage']), (29, 0))
+        self.assertEqual(p['frame']['scarceObservations'], 0)
+
+    def test_coarse_pool_facts_count_observations_against_the_cadence(self):
+        run, text = self.facts['coarse']
+        self.assertEqual(run.returncode, 0, run.stderr[-1500:])
+        p = {q['pool']: q for q in json.loads(text)['pools']}[20]
+        self.assertEqual((p['cadenceMinutes'], p['observations'], p['coverage'], p['worstDayCoverage']), (15, 96 * 30, 1, 1))
+        # Of the eight-minute peak one observation is left: a low count is not evidence that the peak was brief or absent.
+        self.assertEqual((p['populations']['none']['max'], p['populations']['none']['observationsAtShare']['0.50']), (4.6, 1))
 
 
 if __name__ == '__main__':

@@ -687,6 +687,8 @@ my ($candidate_test, $candidate_window, $candidate_snapshot);
 # overall and 90% on every day; no minute at the maximum; the frame not
 # without spare cores; one roster and maximum throughout.
 my $research_pool_ceiling_replay;
+# START/END: the pool facts of a period as the cache's own cadence shows them (research; no sizing).
+my $research_pool_coarse_evidence;
 my %POOL_CEILING_RULES = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90,
     # A second coverage policy, recorded beside the first for comparison: enough
     # well-covered days and a lower overall share with missing days counted.
@@ -883,6 +885,7 @@ GetOptions(
     'research-contested-level'   => \$research_contested_level,
     'research-busy-share'        => \$research_busy_share,
     'research-pool-ceiling-replay=s' => \$research_pool_ceiling_replay,
+    'research-pool-coarse-evidence=s' => \$research_pool_coarse_evidence,
     'uplift-exemption!'          => \$uplift_exemption_flag,
     'guarantee-policy=s'         => \$guarantee_policy,
     'min-history-days=i'         => \$min_history_days_arg,
@@ -1863,6 +1866,21 @@ foreach my $system_serial (@target_systems_to_process)
         print {$out} JSON->new->utf8->canonical->pretty->encode($result);
         close $out;
         print "Pool ceiling replay: $path\n";
+        next;
+    }
+
+    if (defined $research_pool_coarse_evidence)
+    {
+        my @dates = $research_pool_coarse_evidence =~ m{^(\d{4}-\d\d-\d\d)/(\d{4}-\d\d-\d\d)$};
+        die "Expected --research-pool-coarse-evidence START/END as YYYY-MM-DD dates\n" unless (@dates == 2 && $dates[0] le $dates[1]);
+        my ($from, $to) = map { Time::Piece->strptime($_, '%Y-%m-%d')->epoch } @dates;
+        my $result = _pool_coarse_evidence($current_cache_path, $from, $to + 86400);
+        $result->{window} = { start => $dates[0], end => $dates[1] };
+        my $path = File::Spec->catfile($output_dir, 'nfit-profile.pool-coarse-evidence.json');
+        open my $out, '>', $path or die "Cannot write '$path': $!\n";
+        print {$out} JSON->new->utf8->canonical->pretty->encode($result);
+        close $out;
+        print "Pool evidence: $path\n";
         next;
     }
 
@@ -14874,6 +14892,116 @@ sub _pool_use_report
         $any_coarse, $any_coarse), '    ', '    '), '' if $any_coarse;
     print {$log_fh} join("\n", @out), "\n" if (defined $log_fh && ref($log_fh));
     return \%result;
+}
+
+# Pool facts of [from, to), whole UTC days, at the cadence the cache holds
+# (research; see $research_pool_coarse_evidence). Descriptive only: no rule is
+# applied and nothing here is a threshold. A reading is judged against the
+# maximum reported with it. Each fact is given for all hours and for the hours
+# of each profile population, on the cache's UTC clock. Pools and counts only:
+# no LPAR is named.
+sub _pool_coarse_evidence
+{
+    my ($cache_dir, $from, $to) = @_;
+    my $context = _pool_history_context($cache_dir);
+    return { status => 'unavailable', reason => 'the cache holds no pool observations', pools => [] } unless $context;
+    my %rule = %MEMBER_EXPOSURE_RULES;
+    my $tmp_dir = File::Temp::tempdir('nfit_poolfacts_XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    my ($files) = _pool_day_sources($context, [ [ $from, $to ] ], $tmp_dir);
+    my $segments = _pool_segments(_exposure_load_states($cache_dir), $from, $to);
+    my @populations = qw(none online online+no-weekends batch batch+no-weekends);
+    my @shares = (0.50, 0.60, 0.70, 0.80, 0.90);
+
+    my (%pool, %frame);
+    foreach my $day (int($from / 86400) .. int(($to - 1) / 86400))
+    {
+        my ($minutes, $physical) = _pool_day_reduction($files->{$day});
+        $frame{$_} = [ $physical->{$_}{idle}, $physical->{$_}{size} ] for grep { defined $physical->{$_}{idle} } keys %$physical;
+        foreach my $id (keys %$minutes)
+        {
+            next unless looks_like_number($id);
+            my $p = $pool{ $id + 0 } //= { rows => [], sizes => {}, aboveMaximum => 0, unusable => 0 };
+            foreach my $minute (sort { $a <=> $b } keys %{ $minutes->{$id} })
+            {
+                my $r = $minutes->{$id}{$minute};
+                if (!defined $r->{value} || !defined $r->{size} || $r->{size} <= 0) { $p->{unusable}++; next; }
+                if ($r->{value} > $r->{size} + _exposure_tolerance($rule{localScarceAbsCores}, $rule{localScarceRel}, $r->{size})) { $p->{aboveMaximum}++; next; }
+                push @{ $p->{rows} }, [ $minute, $r->{value}, $r->{size} ];
+                $p->{sizes}{ $r->{size} + 0 } = 1;
+            }
+        }
+    }
+    my $round = sub { return defined($_[0]) ? 0 + sprintf('%.4f', $_[0]) : undef; };
+    my $total_days = int(($to - $from) / 86400);
+    my @rows;
+    foreach my $id (sort { $a <=> $b } keys %pool)
+    {
+        my $p = $pool{$id};
+        my @obs = @{ $p->{rows} };
+        next unless @obs;
+        my @gaps = sort { $a <=> $b } map { $obs[$_][0] - $obs[ $_ - 1 ][0] } 1 .. $#obs;
+        my $cadence = @gaps ? max(1, int($gaps[ int($#gaps / 2) ] / 60 + 0.5)) : 1;
+        my $per_day = 1440 / $cadence;
+        my %day_count;
+        $day_count{ int($_->[0] / 86400) }++ for @obs;
+        my @segs = grep { @{ $_->{members} } } @{ $segments->{$id} // [] };
+        my $roster = @segs ? $segs[-1]{members} : [];
+        my %facts;
+        foreach my $population (@populations)
+        {
+            my @in = grep { _exposure_population_admits($population, (int($_->[0] / 86400) + 4) % 7, ($_->[0] % 86400) / 60) } @obs;
+            next unless @in;
+            my @values = sort { $a <=> $b } map { $_->[1] } @in;
+            my (%day_peak, %day_share, %at, $top);
+            foreach my $o (@in)
+            {
+                my ($day, $share) = (int($o->[0] / 86400), $o->[1] / $o->[2]);
+                $day_peak{$day}  = $o->[1] if (!defined $day_peak{$day}  || $o->[1] > $day_peak{$day});
+                $day_share{$day} = $share  if (!defined $day_share{$day} || $share  > $day_share{$day});
+                $top = $o if (!$top || $o->[1] > $top->[1]);
+                foreach my $s (@shares) { $at{$s}++ if ($share >= $s - 1e-9); }
+                $at{near}++ if ($o->[2] - $o->[1] <= _exposure_tolerance($rule{localScarceAbsCores}, $rule{localScarceRel}, $o->[2]) + 1e-9);
+            }
+            my @peaks = sort { $b <=> $a } values %day_peak;
+            my @t = gmtime($top->[0]);
+            my $spare = $frame{ $top->[0] };
+            $facts{$population} = {
+                observations => scalar(@in), days => scalar(keys %day_peak),
+                max => $round->($values[-1]), p999 => $round->(_pool_quantile(\@values, 0.999)), p99 => $round->(_pool_quantile(\@values, 0.99)),
+                p95 => $round->(_pool_quantile(\@values, 0.95)), p90 => $round->(_pool_quantile(\@values, 0.90)), p50 => $round->(_pool_quantile(\@values, 0.50)),
+                maxShareOfMaximum => $round->(max(values %day_share)),
+                leastHeadroom => $round->(min(map { $_->[2] - $_->[1] } @in)),
+                dayPeaks => { highest => $round->($peaks[0]), second => $round->($peaks[1]), third => $round->($peaks[2]),
+                              median => $round->($peaks[ int($#peaks / 2) ]) },
+                # Distinct-day support: on how many days, and in how many observations, the pool reached each share of its maximum.
+                daysAtShare         => { (map { my $s = $_; (sprintf('%.2f', $s) => scalar(grep { $_ >= $s - 1e-9 } values %day_share)) } @shares) },
+                observationsAtShare => { (map { (sprintf('%.2f', $_) => ($at{$_} // 0)) } @shares), near => ($at{near} // 0) },
+                peakOnCloseDay => (($t[3] == 1 || (gmtime($top->[0] + 86400))[3] == 1) ? JSON::true : JSON::false),
+                frameIdleAtPeak => ($spare ? $round->($spare->[0]) : undef),
+            };
+        }
+        my @idle = sort { $a <=> $b } map { $frame{ $_->[0] }[0] } grep { $frame{ $_->[0] } } @obs;
+        my @frame_sizes = map { $frame{ $_->[0] }[1] } grep { $frame{ $_->[0] } && defined $frame{ $_->[0] }[1] } @obs;
+        push @rows, {
+            pool => $id + 0, defaultPool => ($id == 0 ? JSON::true : JSON::false), cadenceMinutes => $cadence,
+            observations => scalar(@obs), coverage => $round->(scalar(@obs) / ($per_day * $total_days)),
+            worstDayCoverage => $round->(min(map { ($day_count{$_} // 0) / $per_day } int($from / 86400) .. int(($to - 1) / 86400))),
+            daysObserved => scalar(keys %day_count), days => $total_days,
+            maximaSeen => [ map { $_ + 0 } sort { $a <=> $b } keys %{ $p->{sizes} } ],
+            aboveMaximumReadings => $p->{aboveMaximum}, unusableReadings => $p->{unusable},
+            configurationSegments => scalar(@segs),
+            members => scalar(@$roster), cappedMembers => scalar(grep { $_->{capped} } @$roster),
+            installedEntitlement => $round->(sum0(map { $_->{entitlement} // 0 } @$roster)),
+            virtualProcessors => sum0(map { $_->{virtualProcessors} // 0 } @$roster),
+            membersWithoutEntitlement => scalar(grep { !defined $_->{entitlement} } @$roster),
+            frame => { observations => scalar(@idle), size => (@frame_sizes ? $round->(max(@frame_sizes)) : undef),
+                       leastIdle => $round->($idle[0]), idleP01 => $round->(_pool_quantile(\@idle, 0.01)), idleP50 => $round->(_pool_quantile(\@idle, 0.50)),
+                       scarceObservations => scalar(grep { $frame{ $_->[0] } && $frame{ $_->[0] }[0]
+                           <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $frame{ $_->[0] }[1]) + 1e-9 } @obs) },
+            populations => \%facts,
+        };
+    }
+    return { status => 'evaluated', pools => \@rows };
 }
 
 # The pool ceiling replay (research; see $research_pool_ceiling_replay): the

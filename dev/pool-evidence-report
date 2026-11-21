@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/pool-evidence-report
+# PURPOSE  : Exploratory (v10 stage 3.4). Sets the training-period pool facts,
+#            as a coarse copy of the capture shows them, beside what the
+#            held-out period did to the cuts normal planning releases and
+#            strict guarantee preservation holds. It asks one question: does
+#            anything the coarse data shows about a pool tell the pools whose
+#            released cuts were later exposed from the others?
+#            No rule or threshold is applied. A high coarse reading may point
+#            at risk; a low one cannot show that brief competition is absent.
+#            The pool facts come from nfit-profile
+#            (--research-pool-coarse-evidence; no sizing) on the coarse copy
+#            the last dev/protection-replay --thin-minutes run left for the
+#            system; the copy is rebuilt only when it is not there.
+#            Facts are given in the hours of the LPARs' planning profiles
+#            (their population) and for all hours.
+# USAGE    : dev/pool-evidence-report --system P10-02 --records DIR [--out DIR]
+#            --records: a dev/protection-replay --thin-minutes --records-only output
+# OUTPUT   : <out>/pool-evidence.json and .md (research labels and pool
+#            numbers only; no LPAR is named)
+# ==============================================================================
+import argparse
+import collections
+import datetime as dt
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _load(name):
+    loader = importlib.machinery.SourceFileLoader(name.replace('-', '_'), str(REPO / 'dev' / name))
+    spec = importlib.util.spec_from_loader(name.replace('-', '_'), loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+pr = _load('protection-replay')
+SHARES = ('0.50', '0.60', '0.70', '0.80', '0.90')
+
+
+def table(lines, header, body):
+    lines.append('| ' + ' | '.join(header) + ' |')
+    lines.append('|' + '|'.join('---' for _ in header) + '|')
+    lines.extend('| ' + ' | '.join(str(c) for c in row) + ' |' for row in body)
+    lines.append('')
+
+
+def contested(rec, level):
+    """(minutes, core-minutes) of later contested busy work above a replay level, or None where it was not scored."""
+    got = (rec.get('later') or {}).get(level)
+    if not got or not got.get('borrow'):
+        return None
+    b = got['borrow'].get('contested') or {}
+    return b.get('minutes', 0), b.get('coreMinutes', 0.0)
+
+
+def outcomes(records):
+    """Per (pool, population of the planning profile): the released cuts and what the held-out period did to them.
+    Scored and unscored cuts are kept apart: an unscored cut is not a cut without exposure."""
+    groups = collections.defaultdict(lambda: collections.defaultdict(float))
+    for r in records:
+        if not r.get('planning'):
+            continue
+        g = groups[(str(r.get('pool')), r.get('population') or 'none')]
+        g['lpars'] += 1
+        by = r.get('cycleByPolicy') or {}
+        normal, strict = (by.get('normal') or {}).get('entitlement'), (by.get('strict') or {}).get('entitlement')
+        if normal is None or strict is None or strict - normal <= 0.005:
+            continue
+        n, s, one = contested(r, 'cycleNormal'), contested(r, 'cycleStrict'), contested(r, 'cycleReference')
+        if n is None or s is None:
+            g['unscoredCuts'] += 1
+            g['unscoredCores'] += strict - normal
+            continue
+        g['scoredCuts'] += 1
+        g['scoredCores'] += strict - normal
+        g['normalMinutes'] += n[0]
+        g['normalCoreMinutes'] += n[1]
+        g['strictMinutes'] += s[0]
+        g['strictCoreMinutes'] += s[1]
+        if one is not None:
+            g['referenceScored'] += 1
+            g['referenceCoreMinutes'] += one[1]
+        if n[1] > s[1] + 0.005:
+            g['exposedCuts'] += 1
+            g['exposedCores'] += strict - normal
+    return groups
+
+
+def coarse_stage(label, source, minutes, mode, work):
+    """The coarse copy left by dev/protection-replay for this system, or a new one."""
+    left = REPO / '.private' / 'protection-replay' / label / 'thin' / 'stage' / source.name
+    if all((left / name).exists() for name in pr.INPUTS):
+        return left, 'reused'
+    case = work / label
+    if case.exists():
+        shutil.rmtree(case)
+    case.mkdir(parents=True)
+    return pr.thin_stage(case, source, minutes, mode), 'rebuilt'
+
+
+def report(out, data):
+    num = lambda v, d=2: '-' if v is None else f'{v:.{d}f}'
+    rows = data['rows']
+    cuts = [r for r in rows if r['scoredCuts'] or r['unscoredCuts']]
+    lines = ['# Pool evidence at the coarse cadence against the later outcome of the released cuts (exploratory)', '',
+             f'Generated {data["generated"]}; commit {str(data["commit"])[:7]}. System {data["system"]}; pool facts from {data["window"]["start"]} to '
+             f'{data["window"]["end"]} at the cadence of the coarse copy ({data["stage"]}); outcomes from the records of {data["recordsCommit"]}.',
+             'A row is one pool in the hours of one planning-profile population. "Released" is the reduction normal planning makes this',
+             'cycle that strict guarantee preservation holds: it is relative to strict, not a saving against the installed estate.',
+             'Outcome figures cover scored cuts only; unscored cuts are counted beside them and say nothing either way.',
+             'Nothing here is a rule. A high coarse reading may point at risk; a low one cannot show that brief competition is absent.', '']
+    lines += ['## 1. Outcome of the released cuts, by pool and population', '']
+    body = []
+    for r in sorted(cuts, key=lambda r: -(r['normalCoreMinutes'] - r['strictCoreMinutes'])):
+        body.append([r['pool'], r['population'], r['lpars'], f'{r["scoredCuts"]} / {r["unscoredCuts"]}', f'{r["scoredCores"]:.2f} / {r["unscoredCores"]:.2f}',
+                     f'{r["exposedCuts"]} ({r["exposedCores"]:.2f})',
+                     f'{r["normalMinutes"]:.0f} / {r["normalCoreMinutes"]:.2f}', f'{r["strictMinutes"]:.0f} / {r["strictCoreMinutes"]:.2f}',
+                     f'{r["normalCoreMinutes"] - r["strictCoreMinutes"]:.2f}',
+                     f'{r["referenceCoreMinutes"]:.2f} ({r["referenceScored"]})'])
+    tot = lambda k: sum(r[k] for r in cuts)
+    body.append(['all', '', sum(r['lpars'] for r in rows), f'{tot("scoredCuts")} / {tot("unscoredCuts")}', f'{tot("scoredCores"):.2f} / {tot("unscoredCores"):.2f}',
+                 f'{tot("exposedCuts")} ({tot("exposedCores"):.2f})', f'{tot("normalMinutes"):.0f} / {tot("normalCoreMinutes"):.2f}',
+                 f'{tot("strictMinutes"):.0f} / {tot("strictCoreMinutes"):.2f}', f'{tot("normalCoreMinutes") - tot("strictCoreMinutes"):.2f}',
+                 f'{tot("referenceCoreMinutes"):.2f} ({tot("referenceScored")})'])
+    table(lines, ['Pool', 'Population', 'Planning LPARs', 'Released cuts: scored / unscored', 'Cores released: scored / unscored',
+                  'Scored cuts with more exposure under normal (cores)', 'Later contested above normal (min / core-min)', 'above strict',
+                  'Added by normal (core-min)', 'At the one-minute run\'s entitlement (core-min; LPARs scored)'], body)
+
+    lines += ['## 2. What the coarse training data shows of those pools', '',
+              'Consumption figures are pool busy cores at the coarse cadence, within the population\'s hours. "Share" is of the maximum',
+              'reported with the reading. "Days at" counts distinct days on which the pool reached that share.', '']
+    body = []
+    for r in sorted(cuts, key=lambda r: -(r['normalCoreMinutes'] - r['strictCoreMinutes'])):
+        f = r.get('facts')
+        if not f:
+            body.append([r['pool'], r['population'], f'{r["normalCoreMinutes"] - r["strictCoreMinutes"]:.2f}'] + ['no pool observations'] + [''] * 15)
+            continue
+        w, a = f.get('inHours') or {}, f.get('allHours') or {}
+        size = max(f['maximaSeen']) if f['maximaSeen'] else None
+        body.append([r['pool'], r['population'], f'{r["normalCoreMinutes"] - r["strictCoreMinutes"]:.2f}',
+                     '/'.join(str(x) for x in f['maximaSeen']), f'{f["members"]} ({f["cappedMembers"]})', num(f['installedEntitlement']), f['virtualProcessors'],
+                     num(f['installedEntitlement'] / size if size else None), num(f['virtualProcessors'] / size if size else None),
+                     f'{num(w.get("max"))} / {num(w.get("p99"))} / {num(w.get("p95"))}', num(w.get('maxShareOfMaximum')), num(a.get('maxShareOfMaximum')),
+                     num(w.get('leastHeadroom')), ' '.join(str((w.get('daysAtShare') or {}).get(s, 0)) for s in SHARES) + f' of {w.get("days", 0)}',
+                     (w.get('observationsAtShare') or {}).get('near', 0), num((w.get('dayPeaks') or {}).get('second')),
+                     f'{num(f["coverage"], 3)} / {num(f["worstDayCoverage"], 3)}', f'{f["configurationSegments"]} / {len(f["maximaSeen"])}',
+                     f'{num((f.get("frame") or {}).get("leastIdle"))} / {num(w.get("frameIdleAtPeak"))} / {(f.get("frame") or {}).get("scarceObservations", 0)}'])
+    table(lines, ['Pool', 'Population', 'Added by normal (core-min)', 'Maximum', 'Members (capped)', 'Entitlement (sum)', 'VPs (sum)', 'Entitlement / maximum',
+                  'VPs / maximum', 'Coarse max / P99 / P95', 'Highest share, in hours', 'all hours', 'Least headroom (cores)',
+                  'Days at 50 60 70 80 90% of maximum', 'Observations near the maximum', 'Second-highest day peak', 'Coverage / worst day',
+                  'Configuration segments / maxima seen', 'Frame idle: least / at the pool\'s peak / scarce observations'], body)
+
+    lines += ['## 3. Pools with planning LPARs and no released cut', '']
+    table(lines, ['Pool', 'Population', 'Planning LPARs', 'Maximum', 'Highest share, in hours', 'Observations near the maximum'],
+          [[r['pool'], r['population'], r['lpars'], '/'.join(str(x) for x in (r.get('facts') or {}).get('maximaSeen', [])) or '-',
+            num(((r.get('facts') or {}).get('inHours') or {}).get('maxShareOfMaximum')),
+            (((r.get('facts') or {}).get('inHours') or {}).get('observationsAtShare') or {}).get('near', '-')]
+           for r in rows if not (r['scoredCuts'] or r['unscoredCuts'])] or [['none', '', '', '', '', '']])
+    (out / 'pool-evidence.md').write_text('\n'.join(lines) + '\n')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--system', required=True, help='research label, e.g. P10-02')
+    ap.add_argument('--records', required=True, help='records of the coarse protection replay of that system')
+    ap.add_argument('--capture-root', default=str(pr.HOME / 'src' / 'nfit-data' / 'research' / 'nfit-capture'))
+    ap.add_argument('--out', default=None)
+    ap.add_argument('--report-only', action='store_true', help='rebuild the report from an existing pool-evidence.json')
+    a = ap.parse_args()
+    out = Path(a.out or a.records)
+    out.mkdir(parents=True, exist_ok=True)
+    if not a.report_only:
+        saved = json.loads((Path(a.records) / 'protection-replay.json').read_text())
+        minutes = saved.get('thinMinutes') or 0
+        if minutes <= 1:
+            sys.exit('pool-evidence-report: the records are not from a coarse (--thin-minutes) run')
+        records = [r for r in saved['records'] if r.get('system') == a.system]
+        if not records:
+            sys.exit('pool-evidence-report: the records hold nothing for that system')
+        cohort, index = a.system.rsplit('-', 1)
+        folder, expected, start, cutoff, _later, _end = pr.COHORTS[cohort]
+        sources = sorted(p.parent for p in (Path(a.capture_root) / folder / 'stage').glob('*/.nfit_stage_id'))
+        if len(sources) != expected:
+            sys.exit(f'pool-evidence-report: expected {expected} staged system(s) for {cohort}, found {len(sources)}')
+        source = sources[int(index) - 1]
+        work = REPO / '.private' / 'pool-evidence'
+        work.mkdir(parents=True, exist_ok=True)
+        (work / 'log').mkdir(exist_ok=True)
+        app = work / 'app'
+        if app.is_dir():
+            shutil.rmtree(app)
+        (app / 'etc').mkdir(parents=True)
+        (app / 'output').mkdir()
+        for name in pr.EXECUTABLES:
+            shutil.copy(REPO / name, app / name)
+            (app / name).chmod(0o700)
+        for f in sorted((REPO / 'etc').glob('nfit.*')):
+            if f.is_file():
+                shutil.copy(f, app / 'etc' / f.name)
+        stage, how = coarse_stage(a.system, source, minutes, saved.get('thinMode') or 'mean', work)
+        print(f'{a.system}: coarse copy {how}', flush=True)
+        pr.invoke(app, work / 'log', 'pool-evidence', ['--nmondir', str(stage), '--research-pool-coarse-evidence', f'{start}/{cutoff}'], pr.perl_env())
+        result = json.loads((app / 'output' / 'nfit-profile.pool-coarse-evidence.json').read_text())
+        pools = {str(p['pool']): p for p in result.get('pools', [])}
+        cadences = sorted({p['cadenceMinutes'] for p in pools.values()})
+        if cadences and cadences != [minutes]:
+            print(f'{a.system}: note - pool cadence(s) {cadences} against the records\' {minutes} minutes', flush=True)
+        rows = []
+        for (pool, population), g in sorted(outcomes(records).items()):
+            p = pools.get(pool)
+            facts = None
+            if p:
+                facts = {k: v for k, v in p.items() if k != 'populations'}
+                facts['inHours'] = p['populations'].get(population)
+                facts['allHours'] = p['populations'].get('none')
+            row = {'pool': pool, 'population': population, 'facts': facts}
+            for k in ('lpars', 'scoredCuts', 'unscoredCuts', 'exposedCuts', 'referenceScored'):
+                row[k] = int(g[k])
+            for k in ('scoredCores', 'unscoredCores', 'exposedCores', 'normalMinutes', 'normalCoreMinutes', 'strictMinutes', 'strictCoreMinutes',
+                      'referenceCoreMinutes'):
+                row[k] = round(g[k], 4)
+            rows.append(row)
+        data = {'generated': dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC'), 'commit': pr.git_identity(), 'system': a.system,
+                'window': result.get('window'), 'stage': how, 'thinMinutes': minutes, 'recordsCommit': str(saved.get('commit'))[:7], 'rows': rows}
+        (out / 'pool-evidence.json').write_text(json.dumps(data, indent=1) + '\n')
+        shutil.rmtree(work, ignore_errors=True)
+    report(out, json.loads((out / 'pool-evidence.json').read_text()))
+    for name in ('pool-evidence.json', 'pool-evidence.md'):
+        audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(out / name)], capture_output=True, text=True)
+        print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {out / "pool-evidence.md"}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
