@@ -19,7 +19,8 @@ my $src = do { local $/; <$fh> };
 close $fh;
 
 my $code = '';
-for my $name (qw(_resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text))
+for my $name (qw(_resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text _coarse_note_text _coarse_review_text
+                 _coarse_review_advisories _coarse_review_action))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
@@ -33,6 +34,8 @@ use Scalar::Util qw(looks_like_number);
 our \$FLOAT_EPSILON = 1e-9;
 our \$MIN_ENT_PER_VP = $min_ent_per_vp;
 our \$VCPU_RATIO_MAX = $ratio_max;
+our \$STRUCTURAL_ENT_TOLERANCE = 0.005;
+our \%EVIDENCE_INTERVAL = (reviewShare => 0.50);
 } . $code . "\n1;\n";
 eval $harness or die "harness eval failed: $@\n";
 
@@ -300,6 +303,43 @@ is($lbad, 0, "limit sweep: $lsweeps pairs valid within every limit") or diag(joi
     like(UUT::_current_cycle_action_text($raised, 2.00, 2, 7),
         qr/The target includes the tier's pool-borrowing allowance only because 15-minute data cannot rule out pool competition\./,
         'a target raised for lack of resolution says so');
+}
+
+# --- The coarse-data review advisory (normal planning) ---
+{
+    my $note = '15-minute data cannot assess brief pool competition.';
+    my $cut  = "Reduce entitlement from 1.00 to 0.40. $note";
+    my $pool = sub
+    {
+        my (%over) = @_;
+        return { Valid => 1, Pools => [ { PoolId => 7, Ceiling => 4, InstalledSum => 2.48, InstalledComplete => 1,
+            Members => [ { Vm => 'a', Current => 1.00, Cycle => 0.40 }, { Vm => 'b', Current => 1.48, Cycle => 1.48 } ], %over } ] };
+    };
+    my %actions = (a => $cut, b => 'No change.');
+    my $got = UUT::_coarse_review_advisories($pool->(), \%actions, 0);
+    is_deeply([ sort keys %$got ], ['a'], 'advisory: the LPAR whose entitlement is cut on coarse evidence, not its unchanged neighbour');
+    is($got->{a}{Pool}, 7, '  names the pool');
+    is(UUT::_coarse_review_action($cut, $got->{a}),
+       'Reduce entitlement from 1.00 to 0.40. Review cut: 15-minute data may hide brief competition; member guarantees total 62% of the pool maximum.',
+       '  the review sentence replaces the general one');
+    is(UUT::_coarse_review_action('No change.', $got->{a}), 'No change.', '  an action without the general sentence is left alone');
+
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(InstalledSum => 2.00), \%actions, 0) }), 1, 'boundary: exactly half the maximum is marked');
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(InstalledSum => 1.99), \%actions, 0) }), 0, 'boundary: just under half is not');
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(InstalledComplete => 0), \%actions, 0) }), 0, 'a member without a known entitlement: no advisory');
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(Ceiling => undef), \%actions, 0) }), 0, 'no single known pool maximum: no advisory');
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(), \%actions, 1) }), 0, 'a run limited to named LPARs: no advisory (membership incomplete)');
+    is(scalar(keys %{ UUT::_coarse_review_advisories({ Valid => 0, Pools => $pool->()->{Pools} }, \%actions, 0) }), 0, 'no valid pool check: no advisory');
+
+    my %other = (a => 'No change. Hold the cut to 0.40: 15-minute data cannot assess brief pool competition. Obtain finer evidence or authorise a monitored trial.');
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(), \%other, 0) }), 0, 'strict: a held cut carries no review advisory');
+    %other = (a => "Reduce entitlement from 1.00 to 0.80. Cut limited to 0.80 (profile 0.40): busy demand and pressure in pool 7 observed in 3 of the 15-minute intervals over 2 days; overlap within the interval is unknown. $note");
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(), \%other, 0) }), 0, 'measured competition already reported: not duplicated');
+    %other = (a => 'Reduce entitlement from 1.00 to 0.40.');
+    is(scalar(keys %{ UUT::_coarse_review_advisories($pool->(), \%other, 0) }), 0, 'fine evidence: no advisory');
+    my $rise = $pool->();
+    $rise->{Pools}[0]{Members}[0]{Cycle} = 1.20;
+    is(scalar(keys %{ UUT::_coarse_review_advisories($rise, \%actions, 0) }), 0, 'no entitlement cut this cycle: no advisory');
 }
 
 done_testing();

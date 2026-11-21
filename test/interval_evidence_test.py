@@ -46,6 +46,9 @@ def coarse_root(pool_step=STEP, member_step=STEP, pool_shift=0, no_pool=False):
     return root, cache, len(keep) // 4
 
 
+STRICT = ('--guarantee-policy', 'strict')
+
+
 class CoarseRun:
     def __init__(self, pool_step=STEP, enddate='2026-09-02', pool_shift=0, no_pool=False, member_step=STEP, extra=()):
         mx.MemberExposureTests.roots = []
@@ -65,6 +68,7 @@ class CoarseRun:
         self.rows = {r['VM']: r for r in csv.DictReader(Path(text).read_text(encoding='utf-8').splitlines())}
         snaps = glob.glob(str(self.cache / '.nfit.store' / 'proposals' / 'v1' / '*' / '*.json'))
         self.members = json.loads(Path(snaps[0]).read_text())['members'] if snaps else {}
+        self.settings = json.loads(Path(snaps[0]).read_text())['settings'] if snaps else {}
 
     def gates(self, vm):
         return {v['tierFloor']['gate'] for v in self.members[vm]['profiles'].values() if 'tierFloor' in v}
@@ -78,12 +82,12 @@ class IntervalEvidenceTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.coarse = CoarseRun()
+        cls.coarse = CoarseRun(extra=STRICT)        # the hold is the explicit strict policy
         cls.mixed = CoarseRun(pool_step=5)          # pool every 5 minutes, LPARs every 15
         cls.shifted = CoarseRun(pool_shift=180)     # pool observed three minutes after the LPAR samples
-        cls.no_pool = CoarseRun(no_pool=True)       # coarse LPAR samples, no pool observations
+        cls.no_pool = CoarseRun(no_pool=True, extra=STRICT)       # coarse LPAR samples, no pool observations
         cls.fine_no_pool = CoarseRun(no_pool=True, member_step=1)
-        cls.normal = CoarseRun(extra=('--guarantee-policy', 'normal'))
+        cls.normal = CoarseRun()                    # the default: normal planning
 
     @classmethod
     def tearDownClass(cls):
@@ -146,7 +150,16 @@ class IntervalEvidenceTest(unittest.TestCase):
         self.assertEqual(normal[profile], strict[profile])                               # the target does not depend on the policy
         self.assertLess(float(normal['NFIT - ENT']), 1.5)
         self.assertNotIn('Hold the cut', normal['NFIT - Action'])
-        self.assertEqual(normal['NFIT - Action'].count('15-minute data cannot assess brief pool competition.'), 1)
+        # Pool 9 holds 1.50 of guarantees under a maximum of 2: the cut is marked for review, in place of the general sentence.
+        self.assertEqual(normal['NFIT - Action'].count('Review cut: 15-minute data may hide brief competition; member guarantees total 75% of the pool maximum.'), 1)
+        self.assertNotIn('cannot assess brief pool competition', normal['NFIT - Action'])
+        self.assertNotIn('Review cut', strict['NFIT - Action'])                          # a held cut needs no review advisory
+        self.assertIn('Pool 9: review the entitlement cut of vmS before applying it. 15-minute data may hide brief competition; member guarantees '
+                      'total 75% of the pool maximum. Pools not listed here are not shown to be free of it.', self.normal.flat)
+        self.assertNotIn('review the entitlement cut', self.coarse.flat)
+        self.assertEqual(self.normal.members['vmS'].get('coarseReview'), {'pool': 9, 'share': 0.75})
+        self.assertNotIn('NFIT_COARSE', normal.get('VM_Comments', ''))                   # no comment tag for the indicator
+        self.assertEqual((self.normal.settings['guaranteePolicy'], self.coarse.settings['guaranteePolicy']), ('normal', 'strict'))
         self.assertNotIn('cannot assess', self.normal.rows['vmX']['NFIT - Action'])      # dedicated
         # Both policies' pairs are recorded by either run, and agree with what each run published.
         for run_, policy in ((self.coarse, 'strict'), (self.normal, 'normal')):

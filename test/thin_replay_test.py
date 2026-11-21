@@ -144,7 +144,7 @@ class ThinReplayTest(unittest.TestCase):
         by = snapshot['members']['vmA']['profiles'][planning].get('cycleByPolicy')
         self.assertTrue(by, 'the coarse sizing records both policies')
         self.assertLessEqual(by['normal']['entitlement'], by['strict']['entitlement'])
-        self.assertEqual(snapshot['members']['vmA']['profiles'][planning]['currentCycle']['entitlement'], by['strict']['entitlement'])   # the default
+        self.assertEqual(snapshot['members']['vmA']['profiles'][planning]['currentCycle']['entitlement'], by['normal']['entitlement'])   # the default is normal planning
         values = {l: level['value'] for t in replay['trackers'] if t['vm'] == 'vmA' for level in t['levels'] for l in level['labels']}
         self.assertEqual(values[planning + '/cycleNormal'], by['normal']['entitlement'])
         self.assertEqual(values[planning + '/cycleStrict'], by['strict']['entitlement'])

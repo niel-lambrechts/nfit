@@ -801,7 +801,7 @@ my %POOL_USE;
 #     also when coarse LPAR samples come with no pool observations at all
 #     (for example NMON files). One-minute samples without pool observations
 #     keep the established path: there is no pool verification, and no hold.
-my %EVIDENCE_INTERVAL = (cadenceTolerance => 0.20, maxExemptionCadence => 1, holdCutCadence => 15);
+my %EVIDENCE_INTERVAL = (cadenceTolerance => 0.20, maxExemptionCadence => 1, holdCutCadence => 15, reviewShare => 0.50);
 # The sampling interval of the current system's CPU cache, in minutes (undef when it cannot be told).
 my $SYSTEM_CPU_CADENCE;
 # --guarantee-policy normal|strict. What the current cycle does with an
@@ -813,9 +813,13 @@ my $SYSTEM_CPU_CADENCE;
 #            action states that brief pool competition could not be assessed.
 #            Pool membership and coarse data do not show that the installed
 #            entitlement is needed.
-# Either way the target is the calculated one. The default stays strict until
-# the replay of the normal-planning pairs has been read.
-my $guarantee_policy = 'strict';
+# Either way the target is the calculated one. Normal is the default: a
+# planning-policy choice, not a finding that cuts sized from coarse data keep
+# every short peak covered.
+my $guarantee_policy = 'normal';
+# The coarse-data review advisory (normal planning): the LPARs of the system
+# being written whose cut carries it, { LPAR => { Pool, Share, Cadence } }.
+my %COARSE_REVIEW;
 my $POOL_TRIAL_MIN_MINUTES = 15;
 my $POOL_TRIAL_MIN_DAYS    = 2;
 # Set while the profile is sized once more without the bound, to give the
@@ -3100,7 +3104,7 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             # Recommended Actions: what the checks above ask of the planner.
             my $pool_use_report = _pool_use_report($open_log_files{$system_identifier}, \%POOL_USE,
                 (ref($structural_summary->{Findings}) eq 'HASH' ? $structural_summary->{Findings}{Pools} : undef));
-            my $action_count = _log_recommended_actions($open_log_files{$system_identifier}, $structural_summary, $exposure_summary, $pool_use_report);
+            my $action_count = _log_recommended_actions($open_log_files{$system_identifier}, $structural_summary, $exposure_summary, $pool_use_report, \%COARSE_REVIEW);
             printf STDERR "  [INFO] Recommended actions: %d (see rationale)\n", $action_count;
             _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
                 $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals);
@@ -7039,7 +7043,7 @@ sub _current_cycle_action_text
     elsif (defined $pair->{CoarseCadence} && $ent_changes && $ent < $current_ent)
     {
         # Normal planning: the cut goes ahead; what the data could not show is stated.
-        push @sentences, sprintf('%d-minute data cannot assess brief pool competition.', $pair->{CoarseCadence});
+        push @sentences, _coarse_note_text($pair->{CoarseCadence});
     }
     if (defined $pair->{BorrowingCadence})
     {
@@ -15314,6 +15318,64 @@ sub _pool_ceiling_replay
              pools => \@rows };
 }
 
+# The general coarse-data sentence of a current-cycle action, and the review sentence that
+# replaces it where the advisory applies.
+sub _coarse_note_text
+{
+    my ($cadence) = @_;
+    return sprintf('%d-minute data cannot assess brief pool competition.', $cadence);
+}
+
+sub _coarse_review_text
+{
+    my ($cadence, $share) = @_;
+    return sprintf('Review cut: %d-minute data may hide brief competition; member guarantees total %.0f%% of the pool maximum.', $cadence, 100 * $share);
+}
+
+# The coarse-data review advisory (normal planning). { LPAR => { Pool, Share, Cadence } } for
+# the LPARs whose entitlement is cut this cycle on coarse evidence, in a user-defined pool
+# whose members' installed entitlements total at least reviewShare of its maximum.
+# From the pool check's configuration only: no telemetry is read. It is a prompt to
+# review, changes no figure, and says nothing of the pools it does not mark. The share
+# describes configured guarantees, not occupied or spare capacity.
+# Not given where: the pool's maximum is not one known value, a member's installed
+# entitlement is not known, the run was limited to named LPARs (the membership is then
+# incomplete), the cut is held (strict), or the action already reports measured competition.
+sub _coarse_review_advisories
+{
+    my ($findings, $action_of, $partial_run) = @_;
+    my %out;
+    return \%out unless (ref($findings) eq 'HASH' && $findings->{Valid} && ref($action_of) eq 'HASH' && !$partial_run);
+    foreach my $pool (@{ $findings->{Pools} // [] })
+    {
+        next unless (defined $pool->{Ceiling} && $pool->{Ceiling} > 0 && $pool->{InstalledComplete} && @{ $pool->{Members} // [] });
+        my $share = $pool->{InstalledSum} / $pool->{Ceiling};
+        next unless ($share >= $EVIDENCE_INTERVAL{reviewShare} - $FLOAT_EPSILON);
+        foreach my $row (@{ $pool->{Members} })
+        {
+            next unless (defined $row->{Vm} && defined $row->{Current} && defined $row->{Cycle}
+                && $row->{Cycle} < $row->{Current} - $STRUCTURAL_ENT_TOLERANCE);
+            my $action = $action_of->{ $row->{Vm} } // '';
+            next if ($action =~ /Hold the cut/ || $action =~ /Cut limited to \S+ \(profile /);
+            my ($cadence) = $action =~ /(\d+)-minute data cannot assess brief pool competition\./ or next;
+            $out{ $row->{Vm} } = { Pool => $pool->{PoolId}, Share => $share, Cadence => $cadence + 0 };
+        }
+    }
+    return \%out;
+}
+
+# An action with the general coarse-data sentence replaced by the review sentence.
+sub _coarse_review_action
+{
+    my ($action, $review) = @_;
+    return $action unless (defined $action && ref($review) eq 'HASH');
+    my ($general, $specific) = (_coarse_note_text($review->{Cadence}), _coarse_review_text($review->{Cadence}, $review->{Share}));
+    my $at = index($action, $general);
+    return $action if ($at < 0);
+    substr($action, $at, length($general)) = $specific;
+    return $action;
+}
+
 # The pool prerequisite of each LPAR's planning action (plan 8.2: increases
 # raise the pool first, then the members): { LPAR => { First => sentence,
 # Later => sentence } }. First where this cycle's entitlements exceed the pool
@@ -15419,7 +15481,7 @@ sub _pool_exposure_reason
 
 sub _log_recommended_actions
 {
-    my ($log_fh, $structural, $exposure, $pool_use) = @_;
+    my ($log_fh, $structural, $exposure, $pool_use, $coarse_review) = @_;
     return 0 unless (defined $log_fh && ref($log_fh));
     my $findings = (ref($structural) eq 'HASH') ? $structural->{Findings} : undef;
     $pool_use = { Actions => [], Observed => [] } unless (ref($pool_use) eq 'HASH');
@@ -15441,6 +15503,19 @@ sub _log_recommended_actions
     }
     push @actions, @{ $pool_use->{Actions} // [] };
     push @observed, @{ $pool_use->{Observed} // [] };
+    if (ref($coarse_review) eq 'HASH' && %$coarse_review)
+    {
+        my %by_pool;
+        push @{ $by_pool{ $coarse_review->{$_}{Pool} } }, $_ for sort keys %$coarse_review;
+        foreach my $pool (sort { $a <=> $b } keys %by_pool)
+        {
+            my $r = $coarse_review->{ $by_pool{$pool}[0] };
+            push @actions, sprintf('Pool %s: review the entitlement cut%s of %s before applying %s. %d-minute data may hide brief competition; '
+                . 'member guarantees total %.0f%% of the pool maximum. Pools not listed here are not shown to be free of it.',
+                $pool, (@{ $by_pool{$pool} } > 1 ? 's' : ''), join(', ', @{ $by_pool{$pool} }), (@{ $by_pool{$pool} } > 1 ? 'them' : 'it'),
+                $r->{Cadence}, 100 * $r->{Share});
+        }
+    }
     my $status = (ref($exposure) eq 'HASH') ? ($exposure->{Status} // '') : 'notRequested';
     my %advised_pool;
     if ($status eq 'evaluated')
@@ -16818,11 +16893,24 @@ sub _write_standard_csv_report {
         # A pool on a trial increase: the LPARs that were above their entitlement in it say so.
         my $trial = _pool_use_report(undef, \%POOL_USE, $structural_findings->{Pools})->{Members};
         $pool_first->{$_}{Trial} = $trial->{$_} for keys %$trial;
+        # Coarse-data cuts in a pool whose guarantees take half or more of its maximum are marked for review.
+        %COARSE_REVIEW = %{ _coarse_review_advisories($structural_findings,
+            { map { ($_->[0] => (ref($_->[2]) eq 'HASH' ? $_->[2]{'NFIT - Action'} : undef)) } @pending_csv_rows }, defined $target_vm_name) };
+    }
+    else
+    {
+        %COARSE_REVIEW = ();
     }
     my ($idx_vm_comments) = grep { $header_for_this_report[$_] eq 'VM_Comments' } 0..$#header_for_this_report;
     foreach my $pending (@pending_csv_rows)
     {
         my ($row_vm, $row, $planner_cells) = @$pending;
+        if (ref($planner_cells) eq 'HASH' && $COARSE_REVIEW{$row_vm})
+        {
+            $planner_cells->{'NFIT - Action'} = _coarse_review_action($planner_cells->{'NFIT - Action'}, $COARSE_REVIEW{$row_vm});
+            $proposals->{$row_vm}{coarseReview} = { pool => $COARSE_REVIEW{$row_vm}{Pool}, share => $COARSE_REVIEW{$row_vm}{Share} }
+                if (ref($proposals) eq 'HASH' && ref($proposals->{$row_vm}) eq 'HASH');
+        }
         # The pool is raised before its members (v10 stage 3.4): the planning
         # action names the pool change its increase waits for.
         if (ref($planner_cells) eq 'HASH' && $pool_first->{$row_vm} && ($planner_cells->{'NFIT - Action'} // '') ne ''
@@ -16902,7 +16990,8 @@ sub _publish_tactical_proposals
     my $payload = JSON->new->utf8->canonical->encode({
         schemaVersion => 2, system => basename($cache), model => $model, window => {start => $start, end => $end},
         inputRevision => $revision, settings => { argv => \@original_argv, filesSHA256 => \%hashes,
-            analysisReferenceDate => $nfit_analysis_reference_date_str, vmFilter => $target_vm_name },
+            analysisReferenceDate => $nfit_analysis_reference_date_str, vmFilter => $target_vm_name,
+            guaranteePolicy => $guarantee_policy },
         members => $members,
     });
     my $dir = File::Spec->catdir($cache, '.nfit.store', 'proposals', 'v1', $model);
@@ -28439,9 +28528,12 @@ Model behaviour depends on the event configuration:
 
   --guarantee-policy <normal|strict>        : What the current cycle does with an entitlement cut of an uncapped shared-pool
                                               LPAR when the data is at 15 minutes or coarser, where brief pool competition
-                                              cannot be assessed. strict (default): the cut is held and the target kept.
-                                              normal: the cut is applied by the usual current-cycle rules and the action
-                                              says what the data could not show.
+                                              cannot be assessed. normal (default): the cut is applied by the usual
+                                              current-cycle rules and the action says what the data could not show; in a
+                                              pool whose member guarantees total half or more of its maximum the cut is
+                                              marked for review. strict: the cut is held and the target kept.
+                                              The default is a planning choice: coarse data cannot show that every
+                                              short peak stays covered.
 
   --[no-]uplift-exemption                   : Standard runs (default on). The tier's pool-borrowing rule, which pulls an
                                               entitlement towards the LPAR's peak, is not applied where the pool evidence
