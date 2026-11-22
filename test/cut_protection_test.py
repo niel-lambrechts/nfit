@@ -236,7 +236,7 @@ class CutProtectionTest(unittest.TestCase):
         _, text = self.standard('--research-contested-level')
         self.assertNotEqual(cells(plain), cells(text))
         snap = self.snapshot()
-        self.assertEqual(json.loads(snap.read_text())['settings']['contestedLevel'], 'contested-level-1')
+        self.assertEqual(json.loads(snap.read_text())['settings']['contestedLevel'], 'contested-level-2')
         profiles = json.loads(snap.read_text())['members']['vmA']['profiles']
         published = 0
         for name, v in profiles.items():
@@ -246,7 +246,7 @@ class CutProtectionTest(unittest.TestCase):
             self.assertGreaterEqual(v['entitlement'], floor['level'] - 1e-9, name)       # the published target carries the floor
             self.assertGreater(v['entitlement'], 2.0, name)                              # above the installed entitlement
             self.assertGreater(floor['level'], floor['originalTarget'], name)
-            self.assertEqual((floor['finalTarget'], floor['rule'], floor['cadenceMinutes'], floor['pool']), (v['entitlement'], 'contested-level-1', 1, 7), name)
+            self.assertEqual((floor['finalTarget'], floor['rule'], floor['cadenceMinutes'], floor['pool']), (v['entitlement'], 'contested-level-2', 1, 7), name)
             self.assertGreaterEqual(floor['observations'], 15, name)
             self.assertTrue(floor['stateStartUTC'], name)
             # the current cycle is resolved apart from the requirement: a valid pair that does not exceed the target

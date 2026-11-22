@@ -106,6 +106,14 @@ is((UUT::_contested_level($flat->(14, 1, 2), 0.85, 99))[0], (UUT::_contested_lev
        undef, 'fewer than 15 observations: no floor');
     is(UUT2::_contested_floor_for({ protection => { all => $tracker->{protection}{all}, days => { 1 => 1 } } }, 'G3-95W15', '-p 95'), undef, 'one day only: no floor');
     is(UUT2::_contested_floor_for($tracker, 'Peak', '-p 99'), undef, 'a profile without a tier: no floor');
+    # The observations must be able to resolve the percentile: one of them, at least, lies above it.
+    my $thin = { pool => 7, protection => { all => [ @{ $tracker->{protection}{all} }[0 .. 31] ], days => { 1 => 1, 2 => 1, 3 => 1 } } };
+    is(UUT2::_contested_floor_for($thin, 'P-99W1', '-p 99'), undef, '32 observations cannot resolve a 99th percentile: no floor');
+    is(UUT2::_contested_floor_for($thin, 'G2-98W10', '-p 98'), undef, '  nor a 98th (50 needed)');
+    ok(UUT2::_contested_floor_for($thin, 'G3-95W15', '-p 95'), '  a 95th is resolved by 20');
+    my $nineteen = { pool => 7, protection => { all => [ @{ $tracker->{protection}{all} }[0 .. 18] ], days => { 1 => 1, 2 => 1 } } };
+    is(UUT2::_contested_floor_for($nineteen, 'G3-95W15', '-p 95'), undef, '19 observations do not resolve a 95th percentile');
+    ok(UUT2::_contested_floor_for($nineteen, 'G4-90W15', '-p 90'), '  they resolve a 90th');
 
     # The planner sentence states a percentile's support, not that each observation reached the level.
     is(UUT2::_contested_floor_text({ %$floor, applied => 1 }, 2.35),
