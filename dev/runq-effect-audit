@@ -1,0 +1,669 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/runq-effect-audit
+# PURPOSE  : Research (no sizing figure changes). Asks whether nFit's run-queue
+#            rules materially depend on a high run-queue reading where PhysC and
+#            busy share (PhysB / PhysC) show little accompanying pressure
+#            (research note "Thread Density, Busy Share and Run-Queue Load on
+#            Entitlement", section 13).
+#              1. Verifies the stored standard proposal of a kept work tree
+#                 against the staged data and the programs, and sizes the same
+#                 window again with the current programs and the research
+#                 trace (--research-runq-trace, --research-busy-share).
+#              2. From the samples (current configuration state, planning
+#                 hours): where the run queue is high, by regime, with busy
+#                 share against the LPAR's own ordinary level.
+#              3. From the trace: for each run-queue rule, whether it was
+#                 triggered, held back by an existing gate, passed through
+#                 without setting the figure, or set it.
+#              4. Only when the run-queue additive reached a figure: a second
+#                 sizing without it (--research-no-runq-additive), so that its
+#                 effect is the difference of two runs.
+#            Aggregates only: no LPAR, pool or system is named.
+# INPUT    : a work tree kept by dev/history-integration-check --keep
+# USAGE    : dev/runq-effect-audit [--work DIR] [--label L] [--out DIR]
+# OUTPUT   : <out>/runq-effect-<label>.json and tables
+# ==============================================================================
+import argparse
+import calendar
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+from array import array
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def _module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+sys.dont_write_bytecode = True
+pr = _module('protection_replay', REPO / 'dev' / 'protection-replay')
+td = _module('thread_density', REPO / 'dev' / 'thread-density-explore')
+
+# Descriptive boundaries (not sizing thresholds), written into the result.
+SPARE_VPS = 0.70                 # PhysC / VPs below this: VPs spare
+NEAR_CEILING = 0.90              # PhysC / VPs at or above this: near the VP count
+HIGH_QUEUE_PER_VP = 2.0          # run queue / VPs at or above this is a high-queue minute
+ORDINARY_QUEUE_PER_VP = 1.0      # below this the minute counts towards the LPAR's ordinary busy share
+NORM_HIGH = 2.0                  # run queue / (PhysC x SMT) above this, with the run queue at least SMT: nFit's own workload-pressure form
+LOW_CORES = 0.25                 # minutes below this are counted, and reported, as low consumption
+MIN_MINUTES, MIN_DATES = 30, 2   # a cell counts for an LPAR with this many minutes on this many dates
+LIFT = 0.10                      # busy share this far above the LPAR's ordinary level is called a lift
+EPS = 0.005
+RUNQ_REASONS = ('material RunQ/workload pressure is present', 'RunQ pathology', 'hot-thread/pathological workload signal is active')
+OTHER_BLOCKS = ('current VP count unavailable', 'current entitlement unavailable', 'capacity-censoring', 'capacity is consistently close',
+                'strategic guarantee invariant', 'applicable demand', 'cannot hold or validate', '(BLOCK at')
+
+
+def sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest() if Path(path).is_file() else None
+
+
+def num(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and abs(v) != float('inf') else None
+
+
+def input_revision(stage):
+    """As nfit-profile's _proposal_revision: the revisions of the manifest, else size and modification time."""
+    meta = {}
+    manifest = stage / '.nfit.cache.manifest'
+    if manifest.is_file():
+        for line in manifest.read_text(errors='replace').splitlines():
+            hit = re.match(r'^\s*(\w+)\s*:\s*(.*?)\s*$', line)
+            if hit:
+                meta[hit.group(1)] = hit.group(2)
+    out = {}
+    for source in ('data', 'states'):
+        rev = meta.get(source + '_revision')
+        path = stage / ('.nfit.cache.' + source)
+        out[source] = ('rev:' + rev) if rev else ('stat:%d:%d' % (path.stat().st_size, int(path.stat().st_mtime)) if path.exists() else 'absent')
+    return out
+
+
+def snapshots(stage):
+    out = []
+    for path in sorted((stage / '.nfit.store' / 'proposals' / 'v1').glob('*/*.json')):
+        try:
+            doc = json.loads(path.read_text())
+        except ValueError:
+            continue
+        if isinstance(doc.get('members'), dict):
+            out.append((path.stat().st_mtime, path, doc))
+    return sorted(out, key=lambda x: x[0])
+
+
+def is_plain_standard(doc):
+    argv = ((doc.get('settings') or {}).get('argv')) or []
+    return bool(argv) and not any(a == '--apply-seasonality' or a.startswith(('--apply-seasonality=', '--research-', '--candidate-', '--update-history',
+                                                                              '--no-cut-protection', '--seasonal')) for a in argv)
+
+
+def published(member):
+    """The planning recommendation an LPAR is given: its role's pair when a role sized it, else the planning profile's current-cycle pair."""
+    profile = (member.get('profiles') or {}).get(member.get('planningProfile')) or {}
+    cycle = profile.get('currentCycle') or {}
+    role = member.get('role') if isinstance(member.get('role'), dict) else None
+    source = role if role else cycle
+    return {'entitlement': num(source.get('entitlement')), 'VPs': num(source.get('VPs')), 'role': (role or {}).get('type'),
+            'ownEntitlement': num(cycle.get('entitlement')), 'ownVPs': num(cycle.get('VPs')), 'target': num(profile.get('entitlement')),
+            'recommendedVPs': num(profile.get('recommendedVPs'))}
+
+
+def reproduction(stored, replay):
+    """How far the replay with the current programs reproduces the stored proposal, over every LPAR and profile both hold."""
+    same = different = pairs_missing = 0
+    largest = 0.0
+    for vm, m in stored.items():
+        for name, p in (m.get('profiles') or {}).items():
+            q = ((replay.get(vm) or {}).get('profiles') or {}).get(name)
+            if q is None:
+                pairs_missing += 1
+                continue
+            a = (num(p.get('entitlement')), num(p.get('recommendedVPs')), num(p.get('tacticalVPs')),
+                 num((p.get('currentCycle') or {}).get('entitlement')), num((p.get('currentCycle') or {}).get('VPs')))
+            b = (num(q.get('entitlement')), num(q.get('recommendedVPs')), num(q.get('tacticalVPs')),
+                 num((q.get('currentCycle') or {}).get('entitlement')), num((q.get('currentCycle') or {}).get('VPs')))
+            if all((x is None and y is None) or (x is not None and y is not None and abs(x - y) < EPS) for x, y in zip(a, b)):
+                same += 1
+            else:
+                different += 1
+                if a[0] is not None and b[0] is not None:
+                    largest = max(largest, abs(a[0] - b[0]))
+    return {'lparProfilesCompared': same + different, 'identical': same, 'different': different, 'notInReplay': pairs_missing,
+            'largestEntitlementDifference': round(largest, 2)}
+
+
+# ----------------------------------------------------------------------------- samples
+def cell():
+    return {'n': 0, 'b': 0.0, 'c': 0.0, 'q': 0.0, 'qvp': 0.0, 'low': 0, 'dates': set(), 'norm': array('f'), 'cores': array('f')}
+
+
+def read_cells(stage, states, members):
+    """One pass: per uncapped shared LPAR, current state, planning hours. Minutes by regime and queue class."""
+    current, hours = {}, {}
+    for vm, ss in states.items():
+        ss = sorted((s for s in ss if s.get('start_epoch') is not None), key=lambda s: s['start_epoch'])
+        if not ss or vm not in members:
+            continue
+        md = ss[-1].get('metadata') or {}
+        try:
+            ent, vps, smt = float(md.get('entitlement')), float(md.get('virtual_cpus')), int(md.get('smt') or 8)
+        except (TypeError, ValueError):
+            continue
+        if str(md.get('capped')) != '0' or md.get('pool_id') is None or ent <= 0 or vps <= 0:
+            continue
+        current[vm] = (ss[-1]['start_epoch'], ent, vps, smt)
+        m = members[vm]
+        profile = m.get('planningProfile') or ''
+        hours[vm] = ((((m.get('profiles') or {}).get(profile) or {}).get('cutProtection') or {}).get('population')
+                     or td.POPULATION_OF_LETTER.get(profile[:1], 'none'))
+    cells, days = {}, {}
+    counts = {'rows': 0, 'eligible': 0}
+    with (stage / '.nfit.cache.data').open(encoding='utf-8', errors='replace') as fh:
+        header = fh.readline().rstrip('\n').split(',')
+        try:
+            col = {name: header.index(name) for name in ('Timestamp', 'VMName', 'PhysC', 'RunQ', 'PhysB')}
+        except ValueError:
+            sys.exit('runq-effect-audit: the staged data has no PhysB or run-queue column')
+        width = max(col.values()) + 1
+        for line in fh:
+            parts = line.rstrip('\n').split(',')
+            if len(parts) < width:
+                continue
+            counts['rows'] += 1
+            vm = parts[col['VMName']]
+            state = current.get(vm)
+            if state is None:
+                continue
+            stamp = parts[col['Timestamp']]
+            day = days.get(stamp[:10])
+            try:
+                if day is None:
+                    midnight = calendar.timegm((int(stamp[0:4]), int(stamp[5:7]), int(stamp[8:10]), 0, 0, 0))
+                    day = days[stamp[:10]] = (midnight, (midnight // 86400 + 4) % 7)
+                minute = int(stamp[11:13]) * 60 + int(stamp[14:16])
+                c, q, b = float(parts[col['PhysC']]), float(parts[col['RunQ']]), float(parts[col['PhysB']])
+            except ValueError:
+                continue
+            start, ent, vps, smt = state
+            if day[0] + minute * 60 < start or not td.admits(hours[vm], day[1], minute):
+                continue
+            if c <= 0 or q < 0 or b < 0 or b > c * 1.02 + 1e-6:
+                continue
+            counts['eligible'] += 1
+            per_vp, norm, sat = q / vps, q / (c * smt), c / vps
+            regime = 'ceiling' if sat >= NEAR_CEILING else 'above' if c > ent + 1e-9 else 'spare' if sat < SPARE_VPS else 'between'
+            high_vp, high_norm = per_vp >= HIGH_QUEUE_PER_VP, (norm > NORM_HIGH and q >= smt)
+            names = []
+            if regime == 'spare' and per_vp < ORDINARY_QUEUE_PER_VP and not high_norm:
+                names.append('ordinary')
+            if regime != 'between':
+                if high_vp:
+                    names.append(regime + '.perVP')
+                if high_norm:
+                    names.append(regime + '.normalised')
+                names.append(regime + '.all')
+            for name in names:
+                x = cells.setdefault(vm, {}).setdefault(name, cell())
+                x['n'] += 1
+                x['b'] += b
+                x['c'] += c
+                x['q'] += q
+                x['qvp'] += per_vp
+                x['low'] += c < LOW_CORES
+                x['dates'].add(day[0])
+                if not name.endswith('.all') and name != 'ordinary':
+                    x['norm'].append(norm)
+                    x['cores'].append(c)
+    return cells, current, counts
+
+
+def enough(x):
+    return bool(x) and x['n'] >= MIN_MINUTES and len(x['dates']) >= MIN_DATES and x['c'] > 0
+
+
+def cohort(cells, current, name):
+    """Per LPAR with the cell supported: its facts; then the summary across LPARs."""
+    rows = {}
+    for vm, by in cells.items():
+        x, base, everything = by.get(name), by.get('ordinary'), by.get(name.split('.')[0] + '.all')
+        if not enough(x):
+            continue
+        smt = current[vm][3]
+        share = x['b'] / x['c']
+        ordinary = (base['b'] / base['c']) if enough(base) else None
+        rows[vm] = {'busyShare': share, 'ordinary': ordinary, 'difference': (share - ordinary) if ordinary is not None else None,
+                    'meanPhysC': x['c'] / x['n'], 'medianPhysC': td.quantile(sorted(x['cores']), 0.5), 'meanPhysB': x['b'] / x['n'],
+                    'meanRunQ': x['q'] / x['n'], 'runQPerVP': x['qvp'] / x['n'], 'runQPerConsumedThreadOfSums': x['q'] / (x['c'] * smt),
+                    'runQPerConsumedThreadMedianMinute': td.quantile(sorted(x['norm']), 0.5), 'belowLowCores': x['low'] / x['n'],
+                    'shareOfRegimeMinutes': x['n'] / everything['n'] if everything and everything['n'] else None, 'minutes': x['n']}
+    column = lambda key: td.summary([r[key] for r in rows.values() if r[key] is not None])
+    with_reference = [r for r in rows.values() if r['difference'] is not None]
+    summary = {'lpars': len(rows), 'minutes': sum(r['minutes'] for r in rows.values()),
+               'withOrdinaryLevel': len(with_reference),
+               'busyShareAtOrdinaryLevel': sum(1 for r in with_reference if r['difference'] < LIFT),
+               'busyShareLifted': sum(1 for r in with_reference if r['difference'] >= LIFT)}
+    for key in ('busyShare', 'ordinary', 'difference', 'meanPhysC', 'medianPhysC', 'meanPhysB', 'meanRunQ', 'runQPerVP', 'runQPerConsumedThreadOfSums',
+                'runQPerConsumedThreadMedianMinute', 'belowLowCores', 'shareOfRegimeMinutes'):
+        summary[key] = column(key)
+    return rows, summary
+
+
+def contention(members):
+    """The matched comparisons nfit-profile recorded from pool observations (--research-busy-share), planning profile."""
+    out = {}
+    names = {'contested': 'pool contested', 'solitary': 'pool filled by the LPAR alone', 'vpCeiling': 'pool open, at the VP count'}
+    for m in members.values():
+        rows = ((m.get('profiles') or {}).get(m.get('planningProfile')) or {}).get('busyShare') or []
+        for row in rows:
+            if not row.get('sufficient'):
+                continue
+            key = '%s, %s entitlement' % (names.get(row.get('condition'), row.get('condition')), row.get('regime'))
+            slot = out.setdefault(key, {'share': [], 'queue': [], 'both': 0, 'queueBase': []})
+            share = row['busySharePressured'] - row['busyShareRelaxed']
+            slot['share'].append(share)
+            if row.get('runqPerVpPressured') is not None and row.get('runqPerVpRelaxed') is not None:
+                queue = row['runqPerVpPressured'] - row['runqPerVpRelaxed']
+                slot['queue'].append(queue)
+                slot['queueBase'].append(row['runqPerVpPressured'])
+                slot['both'] += share > 0.01 and queue > 0
+    return {key: {'lpars': len(v['share']), 'busyShareChange': td.summary(v['share']), 'withRunQueue': len(v['queue']),
+                  'runQPerVPChange': td.summary(v['queue']), 'runQPerVPPressured': td.summary(v['queueBase']), 'bothRise': v['both']}
+            for key, v in sorted(out.items())}
+
+
+# ----------------------------------------------------------------------------- the rules
+def additive_class(d):
+    """The run-queue additive on the entitlement (Section D), from the stored terms of one sized profile."""
+    pressure = d.get('IsRunQPressure') == 'True' or d.get('IsWorkloadPressure') == 'True'
+    if d.get('ResearchNoRunQAdditive'):
+        return 'switchedOff'
+    if not pressure:
+        return 'not triggered'
+    raw, final = num(d.get('AdditiveRawUncorroborated')), num(d.get('FinalAdditive')) or 0.0
+    if not raw or raw <= 0:
+        return 'triggered: queue within the dispatch allowance'
+    if final > 0:
+        return 'applied'
+    if num(d.get('AdditiveCorroborationFactor')) == 0:
+        return 'triggered: withheld, peak PhysC well below reachable capacity'
+    if str(d.get('TacticalDeadbandApplied', '')).startswith('True'):
+        return 'triggered: withheld, below the smallest entitlement step'
+    return 'triggered: withheld by dampening or caps'
+
+
+def width_class(d):
+    """The recommended VP count: which term set it, and how many VPs rest on the run-queue width."""
+    raw, low, high, final = (num(d.get(k)) for k in ('rVCPU_Raw', 'rVCPU_Min', 'rVCPU_Max', 'rVCPU_Final'))
+    if raw is None or final is None or low is None or high is None:
+        return 'not evaluated', 0
+    floors = [f for f in (num(d.get('rVCPU_P99W1Floor')), num(d.get('rVCPU_ConfiguredBurstFloor'))) if f is not None]
+    override = d.get('rVCPU_RunQEnvelopeOverride') == 'Yes'
+    ceiling = num(d.get('rVCPU_OrigMax')) if override and num(d.get('rVCPU_OrigMax')) is not None else high
+    without = min(ceiling, max([low] + floors))                      # what the entitlement range and the peak floors give without the queue width
+    resting = int(max(0, final - without))
+    if override:
+        return 'set the VP count, range widened on the queue', resting
+    if raw <= without:
+        return 'passed through: entitlement range or peak floor set it', 0
+    if raw > high:
+        return ('limited by the ENT:VP range' if resting > 0 else 'withheld by the ENT:VP range'), resting
+    return 'set the VP count', resting
+
+
+def safety_class(d):
+    """The reduction-safety rule on the VP count of this cycle: (class, VPs, which queue signal)."""
+    current, before, after = (num(d.get(k)) for k in ('rVCPU_CurrentVPs', 'rVCPU_TacticalPreSafety', 'rVCPU_Tactical'))
+    if current is None or before is None or after is None or before >= current:
+        return 'no VP reduction was on the table', 0, None
+    reasons = [r.strip() for r in str(d.get('rVCPU_ReductionSafetyReasons') or '').split(';') if r.strip()]
+    queue = [r for r in reasons if r.startswith(RUNQ_REASONS)]
+    others = [r for r in reasons if not r.startswith(RUNQ_REASONS) and any(mark in r for mark in OTHER_BLOCKS)]
+    held = int(current - before)
+    flag = None
+    if queue:
+        flag = ('queue above the dispatch allowance' if d.get('IsRunQPressure') == 'True' else
+                'queue per consumed thread' if d.get('IsWorkloadPressure') == 'True' else 'other queue signal')
+    if d.get('rVCPU_ReductionSafetyState') == 'BLOCK' and after >= current:
+        if queue and not others:
+            return 'reduction held by the run-queue signal alone', held, flag
+        if queue:
+            return 'reduction held by the run-queue signal and other evidence', held, flag
+        return 'reduction held by other evidence', held, None
+    if after > before:
+        return 'reduction limited by caution', int(after - before), None
+    return 'reduction allowed', 0, None
+
+
+def guarantee_class(d):
+    """The guarantee demand behind the tier floor: whether the yield-adjusted peak (which uses the paired
+    run-queue density, and can never exceed the measured peak PhysC) governed it, and what the entitlement gained."""
+    source = str(d.get('GuaranteeDemandSource') or '')
+    base, final = num(d.get('BasePlanningDemand')), num(d.get('FinalAdjustedPhysC'))
+    gained = round(final - base, 4) if base is not None and final is not None and final > base + EPS else 0.0
+    if 'YieldAdjustedPeakDemand' not in source:
+        return ('profile demand or the peak witness governs' if source else 'not evaluated'), 0.0
+    return ('yield-adjusted peak governs, entitlement raised above the profile demand' if gained else
+            'yield-adjusted peak governs, entitlement not raised'), gained
+
+
+def trace_tables(trace, members, spare_rows, cf_members):
+    """Planning profiles (with magnitudes) and every other sized profile (counts of LPAR-profile pairs only)."""
+    planning = {'additive': {}, 'guarantee': {}, 'width': {}, 'safety': {}, 'safetyHeldAloneBySignal': {}}
+    others = {'additive': {}, 'guarantee': {}, 'width': {}, 'safety': {}}
+    by_role, cross = {}, {}
+    totals = {'lpars': 0, 'installedVPs': 0, 'publishedVPs': 0, 'installedEntitlement': 0.0, 'publishedEntitlement': 0.0}
+
+    def add(table, key, **amounts):
+        slot = table.setdefault(key, {'count': 0})
+        slot['count'] += 1
+        for name, value in amounts.items():
+            slot[name] = round(slot.get(name, 0) + value, 4)
+
+    for vm, t in trace.items():
+        m = members.get(vm)
+        if not m:
+            continue
+        pub = published(m)
+        installed_vps = num(m.get('installedVPs'))
+        for name, d in (t.get('profiles') or {}).items():
+            a = additive_class(d)
+            w, w_vps = width_class(d)
+            s, s_vps, s_flag = safety_class(d)
+            g, g_cores = guarantee_class(d)
+            if name != t.get('planningProfile'):
+                add(others['additive'], a)
+                add(others['guarantee'], g)
+                add(others['width'], w)
+                add(others['safety'], s)
+                continue
+            totals['lpars'] += 1
+            for key, value in (('installedVPs', installed_vps), ('publishedVPs', pub['VPs']),
+                               ('installedEntitlement', num(m.get('installedEntitlement'))), ('publishedEntitlement', pub['entitlement'])):
+                totals[key] = round(totals[key] + (value or 0), 2)
+            additive = num(d.get('FinalAdditive')) or 0.0
+            add(planning['additive'], a, additiveCores=additive)
+            add(planning['guarantee'], g, coresAboveProfileDemand=g_cores)
+            add(planning['width'], w, recommendedVPsRestingOnQueue=w_vps)
+            add(planning['safety'], s, VPs=s_vps)
+            alone = s == 'reduction held by the run-queue signal alone'
+            if alone:
+                add(planning['safetyHeldAloneBySignal'], s_flag or 'unknown', VPs=s_vps)
+            r = by_role.setdefault(pub['role'] or 'none', {'lpars': 0, 'additiveApplied': 0, 'reductionHeldByQueueAlone': 0, 'VPsHeldByQueueAlone': 0,
+                                                           'publishedDiffersFromOwnPair': 0})
+            r['lpars'] += 1
+            r['additiveApplied'] += a == 'applied'
+            r['reductionHeldByQueueAlone'] += alone
+            r['VPsHeldByQueueAlone'] += s_vps if alone else 0
+            r['publishedDiffersFromOwnPair'] += (pub['role'] is not None and ((pub['VPs'] or 0) != (pub['ownVPs'] or 0)
+                                                                               or abs((pub['entitlement'] or 0) - (pub['ownEntitlement'] or 0)) > EPS))
+            # The central question: high queue within the entitlement with VPs spare, against what the rules did.
+            evidence = spare_rows.get(vm)
+            group = ('no high-queue minutes with VPs spare' if evidence is None else
+                     'high queue, no ordinary level to compare' if evidence['difference'] is None else
+                     'high queue, busy share at its ordinary level' if evidence['difference'] < LIFT else 'high queue, busy share lifted')
+            x = cross.setdefault(group, {'lpars': 0, 'additiveApplied': 0, 'additiveCores': 0.0, 'queueWidthInRecommendedVPs': 0,
+                                         'recommendedVPsRestingOnQueue': 0, 'reductionHeldByQueueAlone': 0, 'VPsHeldByQueueAlone': 0,
+                                         'reductionHeldWithOtherEvidence': 0, 'ofThoseHeldAlonePublishedAtInstalledVPs': 0})
+            x['lpars'] += 1
+            x['additiveApplied'] += a == 'applied'
+            x['additiveCores'] = round(x['additiveCores'] + additive, 4)
+            x['queueWidthInRecommendedVPs'] += w_vps > 0
+            x['recommendedVPsRestingOnQueue'] += w_vps
+            x['reductionHeldByQueueAlone'] += alone
+            x['VPsHeldByQueueAlone'] += s_vps if alone else 0
+            x['reductionHeldWithOtherEvidence'] += s == 'reduction held by the run-queue signal and other evidence'
+            x['ofThoseHeldAlonePublishedAtInstalledVPs'] += (alone and pub['VPs'] is not None and installed_vps is not None and pub['VPs'] >= installed_vps)
+    result = {'planningProfiles': planning, 'otherSizedProfiles': others, 'byRole': by_role, 'highQueueWithSpareVPsAgainstTheRules': cross, 'totals': totals}
+    if cf_members is not None:
+        result['withoutTheAdditive'] = additive_effect(trace, members, cf_members)
+    return result
+
+
+def additive_effect(trace, members, cf_members):
+    """The additive's effect as the difference of two sizings (with it, and with --research-no-runq-additive)."""
+    out = {'planningProfiles': {'applied': 0, 'setTheTarget': 0, 'passedThrough': 0, 'targetCores': 0.0, 'publishedEntitlementChanged': 0,
+                                'publishedCores': 0.0, 'publishedVPsChanged': 0, 'publishedVPs': 0, 'reductionPrevented': 0, 'throughARole': 0},
+           'otherSizedProfiles': {'applied': 0, 'setTheTarget': 0, 'passedThrough': 0}}
+    for vm, t in trace.items():
+        m, c = members.get(vm), cf_members.get(vm)
+        if not m or not c:
+            continue
+        for name, d in (t.get('profiles') or {}).items():
+            if additive_class(d) != 'applied':
+                continue
+            is_planning = name == t.get('planningProfile')
+            slot = out['planningProfiles' if is_planning else 'otherSizedProfiles']
+            slot['applied'] += 1
+            with_, without = (num(((x.get('profiles') or {}).get(name) or {}).get('entitlement')) for x in (m, c))
+            moved = with_ is not None and without is not None and abs(with_ - without) >= EPS
+            slot['setTheTarget' if moved else 'passedThrough'] += 1
+            if not is_planning:
+                continue
+            slot['targetCores'] = round(slot['targetCores'] + ((with_ - without) if moved else 0.0), 2)
+            a, b = published(m), published(c)
+            if a['entitlement'] is not None and b['entitlement'] is not None and abs(a['entitlement'] - b['entitlement']) >= EPS:
+                slot['publishedEntitlementChanged'] += 1
+                slot['publishedCores'] = round(slot['publishedCores'] + a['entitlement'] - b['entitlement'], 2)
+                installed = num(m.get('installedEntitlement'))
+                slot['reductionPrevented'] += installed is not None and b['entitlement'] < installed - EPS and a['entitlement'] >= installed - EPS
+                slot['throughARole'] += a['role'] is not None
+            if a['VPs'] is not None and b['VPs'] is not None and a['VPs'] != b['VPs']:
+                slot['publishedVPsChanged'] += 1
+                slot['publishedVPs'] += int(a['VPs'] - b['VPs'])
+    return out
+
+
+# ----------------------------------------------------------------------------- report
+def mid(s, fmt='%.2f'):
+    return (fmt % s['median']) if s and s.get('n') else '-'
+
+
+def report(result):
+    v = result['verification']
+    yes = lambda flag: 'yes' if flag else 'NO'
+    print()
+    print(f"Run-queue effect audit: {result['label']} ({result['lparsInScope']} uncapped shared LPARs in scope; {result['samples']['eligible']:,} minutes in the "
+          f"current state and planning hours)")
+    print(f"  Stored standard proposal: window {v['window']['start']} to {v['window']['end']}; data revision matches: {yes(v['dataRevisionMatches'])}; "
+          f"states: {yes(v['statesRevisionMatches'])}; profiles file unchanged: {yes(v['profilesFileUnchanged'])}; tiers file: {yes(v['tiersFileUnchanged'])}")
+    print(f"    sized by the current nfit-profile: {yes(v['profilerIsTheCurrentProgram'])}; by the current nfit: {yes(v['engineIsTheCurrentProgram'])} "
+          f"(the trace needs the current nfit-profile, so the window was sized again)")
+    r = v['replay']
+    print(f"  Replay against the stored proposal: {r['identical']} of {r['lparProfilesCompared']} LPAR-profiles identical, {r['different']} different "
+          f"(largest entitlement difference {r['largestEntitlementDifference']:.2f}), {r['notInReplay']} not in the replay")
+    print()
+    print('1 and 2.  High run queue by regime (per-LPAR values; median across LPARs). Busy share is the sum of PhysB over the sum of PhysC.')
+    print('    %-30s %5s %9s  %-21s %6s %6s %6s %7s %9s %9s %6s' % ('regime, form of "high"', 'LPARs', 'minutes', 'busy: high/own/diff', 'PhysC', 'PhysB',
+                                                                      'RunQ', 'RunQ/VP', 'Q/(CxSMT)', 'per min', '<0.25'))
+    names = {'spare': 'within ENT, VPs spare', 'above': 'above ENT', 'ceiling': 'near the VP count'}
+    for key, c in result['highQueueByRegime'].items():
+        regime, form = key.split('.')
+        print('    %-30s %5d %9s  %5s /%5s /%6s  %6s %6s %6s %7s %9s %9s %6s' % (
+            '%s, %s' % (names[regime], 'per VP' if form == 'perVP' else 'norm.'), c['lpars'], format(c['minutes'], ','),
+            mid(c['busyShare']), mid(c['ordinary']), mid(c['difference'], '%+.2f'), mid(c['meanPhysC']), mid(c['meanPhysB']), mid(c['meanRunQ'], '%.1f'),
+            mid(c['runQPerVP']), mid(c['runQPerConsumedThreadOfSums']), mid(c['runQPerConsumedThreadMedianMinute']), mid(c['belowLowCores'])))
+        if c['lpars']:
+            print('    %-30s busy share at the ordinary level (lift below %.2f) in %d LPARs, lifted in %d, no ordinary level in %d' % (
+                '', LIFT, c['busyShareAtOrdinaryLevel'], c['busyShareLifted'], c['lpars'] - c['withOrdinaryLevel']))
+    print('    Spare VPs or "above ENT" say nothing about the pool: the pool state is not joined in this table.')
+    print()
+    print('2.  Measured pool conditions (matched comparisons from pool observations, planning profile; pressured against relaxed minutes of the same consumption)')
+    if not result['measuredPoolConditions']:
+        print('    none recorded with sufficient support')
+    for key, c in result['measuredPoolConditions'].items():
+        print('    %-52s %3d LPARs  busy share %s  RunQ/VP %s (pressured %s; %d with a run queue)  both rise %d' % (
+            key, c['lpars'], mid(c['busyShareChange'], '%+.3f'), mid(c['runQPerVPChange'], '%+.2f'), mid(c['runQPerVPPressured']), c['withRunQueue'], c['bothRise']))
+    rules = result['rules']
+    t = rules['totals']
+    print()
+    print(f"3 and 4.  The run-queue rules on the planning profile of {t['lpars']} LPARs (installed {t['installedEntitlement']:.2f} cores, {t['installedVPs']:.0f} VPs; "
+          f"published {t['publishedEntitlement']:.2f} cores, {t['publishedVPs']:.0f} VPs)")
+    for title, key, amount, unit in (('Entitlement: the run-queue additive', 'additive', 'additiveCores', 'cores'),
+                                     ('Entitlement: the guarantee demand (yield-adjusted peak; never above the measured peak PhysC)', 'guarantee',
+                                      'coresAboveProfileDemand', 'cores above the profile demand, all floors together'),
+                                     ('Recommended VPs: the run-queue dispatch width', 'width', 'recommendedVPsRestingOnQueue', 'VPs resting on the queue'),
+                                     ('VPs of this cycle: the reduction-safety rule', 'safety', 'VPs', 'VPs'),
+                                     ('  ... held by the queue signal alone, by signal', 'safetyHeldAloneBySignal', 'VPs', 'VPs')):
+        print('    ' + title)
+        for name, c in sorted(rules['planningProfiles'][key].items(), key=lambda kv: -kv[1]['count']):
+            print('      %-62s %4d LPARs   %s %s' % (name, c['count'], ('%.2f' % c[amount]) if 'ores' in amount else ('%d' % c.get(amount, 0)), unit))
+    if 'withoutTheAdditive' in rules:
+        w = rules['withoutTheAdditive']['planningProfiles']
+        print(f"    The additive by a second sizing without it: applied on {w['applied']} planning profiles; set the target on {w['setTheTarget']} "
+              f"({w['targetCores']:+.2f} cores), passed through on {w['passedThrough']}; published entitlement changed on {w['publishedEntitlementChanged']} "
+              f"({w['publishedCores']:+.2f} cores; {w['reductionPrevented']} reductions prevented; {w['throughARole']} through a role); "
+              f"published VPs changed on {w['publishedVPsChanged']} ({w['publishedVPs']:+d})")
+        o = rules['withoutTheAdditive']['otherSizedProfiles']
+        print(f"      other sized profiles (LPAR-profile pairs): applied {o['applied']}, set the target {o['setTheTarget']}, passed through {o['passedThrough']}")
+    else:
+        print('    The additive reached no sized profile: no second sizing was needed.')
+    print('    Other sized profiles (counts of LPAR-profile pairs; entitlements are not added across profiles)')
+    for key in ('additive', 'guarantee', 'width', 'safety'):
+        print('      %-9s %s' % (key, '; '.join('%s %d' % (n, c['count']) for n, c in sorted(rules['otherSizedProfiles'][key].items(), key=lambda kv: -kv[1]['count']))))
+    print('    By role of the LPAR (a role sizes the published pair after the profile)')
+    for role, c in sorted(rules['byRole'].items()):
+        print('      %-10s %3d LPARs  additive applied %d  reduction held by the queue alone %d (%d VPs)  published differs from own pair %d' % (
+            role, c['lpars'], c['additiveApplied'], c['reductionHeldByQueueAlone'], c['VPsHeldByQueueAlone'], c['publishedDiffersFromOwnPair']))
+    print()
+    print('The question: high queue within the entitlement with VPs spare, against what the rules did (planning profiles)')
+    print('    %-46s %5s %9s %14s %16s %12s' % ('', 'LPARs', 'additive', 'queue in rVCPU', 'cut held (queue', 'held with'))
+    print('    %-46s %5s %9s %14s %16s %12s' % ('', '', 'applied', 'LPARs (VPs)', 'alone) (VPs)', 'other'))
+    for group, c in sorted(rules['highQueueWithSpareVPsAgainstTheRules'].items()):
+        print('    %-46s %5d %4d %4.2f %8d (%3d) %10d (%3d) %12d' % (group, c['lpars'], c['additiveApplied'], c['additiveCores'], c['queueWidthInRecommendedVPs'],
+                                                                   c['recommendedVPsRestingOnQueue'], c['reductionHeldByQueueAlone'], c['VPsHeldByQueueAlone'],
+                                                                   c['reductionHeldWithOtherEvidence']))
+
+
+# ----------------------------------------------------------------------------- main
+def find_run(stage, args):
+    hits = [doc for _mtime, _path, doc in snapshots(stage) if ((doc.get('settings') or {}).get('argv')) == args]
+    return hits[-1] if hits else None
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='a work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'runq-effect'))
+    ap.add_argument('--label', help='a label for the result file (default: the name of the work tree)')
+    a = ap.parse_args()
+    work = Path(a.work).resolve()
+    app, case = work / 'app', work / 'case'
+    stage = next(iter(sorted((case / 'stage').glob('*'))), None) if (case / 'stage').is_dir() else None
+    if stage is None or not (stage / '.nfit.cache.data').exists() or not app.is_dir():
+        sys.exit('runq-effect-audit: no kept work tree with a staged system (run dev/history-integration-check --keep first)')
+    label = a.label or work.name
+
+    # 1. The stored standard proposal, against the data and the programs.
+    stored = [x for x in snapshots(stage) if is_plain_standard(x[2])]
+    if not stored:
+        sys.exit('runq-effect-audit: the work tree holds no stored standard proposal')
+    stored_doc = stored[-1][2]
+    settings = stored_doc.get('settings') or {}
+    revision = input_revision(stage)
+    hashes = settings.get('filesSHA256') or {}
+    verification = {
+        'storedStandardProposals': len(stored), 'window': stored_doc.get('window'), 'model': stored_doc.get('model'),
+        'dataRevisionMatches': (stored_doc.get('inputRevision') or {}).get('data') == revision['data'],
+        'statesRevisionMatches': (stored_doc.get('inputRevision') or {}).get('states') == revision['states'],
+        'profilerIsTheCurrentProgram': hashes.get('profiler') == sha256(REPO / 'nfit-profile'),
+        'engineIsTheCurrentProgram': hashes.get('engine') == sha256(REPO / 'nfit'),
+        'profilesFileUnchanged': hashes.get('profiles') == sha256(app / 'etc' / 'nfit.profiles.cfg'),
+        'tiersFileUnchanged': hashes.get('tiers') == sha256(app / 'etc' / 'nfit.vms.cfg'),
+        'commit': pr.git_identity()}
+
+    # The same window again with the current programs and the research trace.
+    for name in pr.EXECUTABLES:
+        shutil.copy(REPO / name, app / name)
+        (app / name).chmod(0o700)
+    env = pr.perl_env()
+    seconds = {}
+    trace_path = work / 'runq-trace.private.json'
+    args = list(settings['argv']) + ['--research-busy-share', '--research-runq-trace', str(trace_path)]
+    print(f'{label}: sizing the stored window again with the research trace', flush=True)
+    trace_path.unlink(missing_ok=True)
+    t0 = time.time()
+    pr.invoke(app, case, 'runq-trace', args, env)
+    seconds['traceRun'] = round(time.time() - t0, 1)
+    replay = find_run(stage, args)
+    if replay is None or not trace_path.is_file():
+        sys.exit('runq-effect-audit: the replay stored no proposal or wrote no trace')
+    members = replay['members']
+    trace = json.loads(trace_path.read_text())['members']
+    verification['replay'] = dict(reproduction(stored_doc['members'], members),
+                                  inputRevisionMatches=(replay.get('inputRevision') or {}) == revision,
+                                  profilerIsTheCurrentProgram=((replay.get('settings') or {}).get('filesSHA256') or {}).get('profiler') == sha256(REPO / 'nfit-profile'))
+
+    # 4. Without the additive, only where it reached a figure.
+    cf_members = None
+    applied = sum(1 for t in trace.values() for d in (t.get('profiles') or {}).values() if additive_class(d) == 'applied')
+    if applied:
+        cf_trace = work / 'runq-trace-no-additive.private.json'
+        cf_args = list(settings['argv']) + ['--research-busy-share', '--research-runq-trace', str(cf_trace), '--research-no-runq-additive']
+        print(f'{label}: the additive reached {applied} sized profile(s): sizing once more without it', flush=True)
+        t0 = time.time()
+        pr.invoke(app, case, 'runq-no-additive', cf_args, env)
+        seconds['runWithoutAdditive'] = round(time.time() - t0, 1)
+        cf = find_run(stage, cf_args)
+        if cf is None:
+            sys.exit('runq-effect-audit: the run without the additive stored no proposal')
+        cf_members = cf['members']
+
+    # 2. The samples.
+    states = json.loads((stage / '.nfit.cache.states').read_text())
+    t0 = time.time()
+    cells, current, counts = read_cells(stage, states, members)
+    seconds['samples'] = round(time.time() - t0, 1)
+    cohorts, rows_of = {}, {}
+    for name in ('spare.perVP', 'spare.normalised', 'above.perVP', 'above.normalised', 'ceiling.perVP', 'ceiling.normalised'):
+        rows_of[name], cohorts[name] = cohort(cells, current, name)
+    # For the cross-table: an LPAR with high-queue minutes under either form, VPs spare; the per-VP form where both exist.
+    spare_rows = dict(rows_of['spare.normalised'])
+    spare_rows.update(rows_of['spare.perVP'])
+
+    result = {
+        'label': label,
+        'method': {'scope': 'uncapped shared LPARs, current configuration state, planning-profile hours of the replayed proposal',
+                   'regimes': {'spare': 'PhysC at or below the entitlement and below %.2f x VPs (pool state not joined)' % SPARE_VPS,
+                               'above': 'PhysC above the entitlement and below %.2f x VPs (pool state not joined)' % NEAR_CEILING,
+                               'ceiling': 'PhysC at or above %.2f x VPs' % NEAR_CEILING},
+                   'highQueue': {'perVP': 'run queue / VPs at or above %.1f' % HIGH_QUEUE_PER_VP,
+                                 'normalised': 'run queue / (PhysC x SMT) above %.1f with the run queue at least SMT' % NORM_HIGH},
+                   'ordinary': 'the same LPAR, regime spare, run queue / VPs below %.1f and not high in the normalised form: sum of PhysB over sum of PhysC'
+                               % ORDINARY_QUEUE_PER_VP,
+                   'support': '%d minutes on %d dates' % (MIN_MINUTES, MIN_DATES), 'lift': LIFT, 'lowCores': LOW_CORES,
+                   'contention': 'the matched comparisons nfit-profile records from pool observations (--research-busy-share)',
+                   'rules': 'from the debug record of each sized profile (--research-runq-trace); the additive by a second sizing without it'},
+        'verification': verification, 'samples': counts, 'lparsInScope': len(current),
+        'highQueueByRegime': cohorts, 'measuredPoolConditions': contention(members),
+        'rules': trace_tables(trace, members, spare_rows, cf_members), 'seconds': seconds}
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / ('runq-effect-%s.json' % re.sub(r'[^A-Za-z0-9_.-]', '_', label))
+    target.write_text(json.dumps(result, indent=1) + '\n')
+    report(result)
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
