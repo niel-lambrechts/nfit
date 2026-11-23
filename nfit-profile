@@ -728,6 +728,7 @@ my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
 # support are in MemberExposure; a day evaluated there and absent here had no contested observation.
 my $CONTESTED_BUSY_PROJECTION = 'contested-busy-1';
 my $CONTESTED_BUSY_FEATURE    = 'ContestedBusy-1';
+my $CONTESTED_BUSY_READER     = 'contested-busy-reader-1';
 # Pool reconciliation (v10 milestone 2.3): illustrative budgets on minutes any
 # member is exposed / longest run / excess core-minutes (those of the candidate
 # test), and the most cuts in one pool searched exhaustively (four levels each).
@@ -19964,6 +19965,13 @@ sub update_monthly_history {
 sub _generate_monthly_and_seasonal_history {
     my ($system_cache_dir, $months_to_process_aref, $seasonality_config, $all_historical_peaks_aref, $history_data_href, $adaptive_runq_saturation_thresh, $cache_start_obj, $physb) = @_;
 
+    # How this run's series were made (Metadata.Derivation): the sampling interval(s) of the cache.
+    my $derivation_file     = File::Spec->catfile($system_cache_dir, $DATA_CACHE_FILE);
+    my $derivation_survey   = _sampling_interval_survey($derivation_file);
+    my $derivation_interval = detect_sampling_interval($derivation_file);
+    my @derivation_intervals = ($derivation_survey && @{ $derivation_survey->{intervals} // [] })
+        ? @{ $derivation_survey->{intervals} } : (defined $derivation_interval ? ($derivation_interval) : ());
+
     foreach my $month_job (@$months_to_process_aref) {
         my $month_key = $month_job->{key};
         my $start_str = $month_job->{start_obj}->strftime('%Y-%m-%d');
@@ -19984,6 +19992,7 @@ sub _generate_monthly_and_seasonal_history {
                         keys %$workload_analysis;
         my $physb_stats = _graft_physb_metrics($workload_analysis, \%new_physb, $previous_mwa);
 
+        my %peak_dates;      # LPAR => { stored => { date }, added => { date } }
         # --- Merge DailyPeakSeries: first-write-wins against existing history ---
         # Capture the existing DailyPeakSeries from this month's partition before the
         # wholesale overwrite below.  For each (VM, profile) in the new L1 output,
@@ -19997,6 +20006,7 @@ sub _generate_monthly_and_seasonal_history {
             my $existing_mwa = _safe_dig($history_data_href, $month_key, 'MonthlyWorkloadAnalysis') // {};
             my $total_added   = 0;
             my $total_skipped = 0;
+            %peak_dates = ();
 
             foreach my $vm_name (keys %$workload_analysis) {
                 my $l1_dps = $workload_analysis->{$vm_name}{DailyPeakSeries};
@@ -20007,6 +20017,10 @@ sub _generate_monthly_and_seasonal_history {
                     my $existing_series = _safe_dig($existing_mwa, $vm_name, 'DailyPeakSeries', $profile_name);
 
                     my ($merged_aref, $stats) = _merge_daily_peak_series($existing_series, $l1_series);
+                    # For the series' provenance: which days were stored before, which this run adds.
+                    my %stored = map { ($_->{date} // '') => 1 } grep { ref($_) eq 'HASH' } @{ (ref($existing_series) eq 'ARRAY') ? $existing_series : [] };
+                    $peak_dates{$vm_name}{stored}{$_} = 1 for keys %stored;
+                    $peak_dates{$vm_name}{added}{ $_->{date} } = 1 for grep { !$stored{ $_->{date} } } @$merged_aref;
 
                     $total_added   += $stats->{added};
                     $total_skipped += $stats->{skipped};
@@ -20040,6 +20054,8 @@ sub _generate_monthly_and_seasonal_history {
                 LastUpdated        => localtime()->datetime(),
             }
         };
+        $history_data_href->{$month_key}{Metadata}{Derivation} =
+            _history_derivation($previous_metadata->{Derivation}, \%peak_dates, \@derivation_intervals);
         if (ref($previous_pool_history) eq 'HASH' && ref($previous_metadata->{PoolEvidence}) eq 'HASH')
         {
             $history_data_href->{$month_key}{PoolHistory}            = $previous_pool_history;
@@ -20635,6 +20651,68 @@ sub _merge_daily_profile_series {
             last_date     => $last_date,
             ProcessedDays => $processed_days,
         },
+    };
+}
+
+# ==============================================================================
+# SUBROUTINE: _history_derivation
+# PURPOSE:    Metadata.Derivation of a month: how its PhysC series were made.
+#
+#   MonthlyWorkloadAnalysis  recomputed whole with every analysis of the month,
+#       so it carries one label: the sampling interval(s) of the cache it was
+#       built from (seconds) and the smoothing basis ('elapsed-time': the EMA
+#       decay follows elapsed time). A month without this label was smoothed
+#       per sample: comparable only when sampled at exactly 60 seconds.
+#   DailyPeakSeries          first-write-wins: a stored day is never replaced,
+#       so a month can hold days from different runs. Per LPAR, compact groups
+#       of consecutive days with the sampling interval of the run that wrote
+#       them. The series is an unsmoothed daily maximum: its values depend on
+#       the interval (the maximum of interval averages), not on smoothing.
+#
+# A day keeps the label it was written with. A day stored before labels existed
+# stays unlabelled: it is never given the label of a later run. A day is also
+# left unlabelled where it cannot be given one truthfully: when this run adds
+# values to a day that already held values of another or unknown interval, or
+# when the cache holds more than one interval. Unlabelled means unknown.
+#
+# Holds no timestamp: an unchanged month is written identically.
+# ==============================================================================
+sub _history_derivation
+{
+    my ($previous, $peak_dates_href, $intervals_aref) = @_;
+    my @intervals = map { $_ + 0 } @{ $intervals_aref // [] };
+    my $single = (@intervals == 1) ? $intervals[0] : undef;
+    my %groups;
+    foreach my $vm (sort keys %{ $peak_dates_href // {} })
+    {
+        my %label;
+        foreach my $group (@{ _safe_dig($previous, 'DailyPeakSeries', 'dayGroups', $vm) // [] })
+        {
+            my ($from, $to, $seconds) = @{$group}{qw(from to samplingIntervalS)};
+            next unless (defined $from && defined $to && defined $seconds);
+            for (my $t = Time::Piece->strptime($from, '%Y-%m-%d'); $t->ymd le $to; $t += 86400) { $label{ $t->ymd } = $seconds + 0; }
+        }
+        my ($stored, $added) = @{ $peak_dates_href->{$vm} }{qw(stored added)};
+        delete @label{ grep { !$stored->{$_} } keys %label };                    # a label only for a day still stored
+        foreach my $date (keys %{ $added // {} })
+        {
+            if (!$stored->{$date}) { $label{$date} = $single if defined $single; }
+            elsif (!defined $single || ($label{$date} // -1) != $single) { delete $label{$date}; }
+        }
+        my @out;
+        foreach my $date (sort keys %label)
+        {
+            my $last = $out[-1];
+            if ($last && $last->{samplingIntervalS} == $label{$date}
+                && (Time::Piece->strptime($last->{to}, '%Y-%m-%d') + 86400)->ymd eq $date) { $last->{to} = $date; }
+            else { push @out, { from => $date, to => $date, samplingIntervalS => $label{$date} }; }
+        }
+        $groups{$vm} = \@out if @out;
+    }
+    return {
+        MonthlyWorkloadAnalysis => { samplingIntervalsS => \@intervals, smoothingTimeBasis => 'elapsed-time' },
+        DailyPeakSeries         => { smoothingTimeBasis => 'none', value => 'maximum of interval averages',
+                                     unlabelled => 'a day in no group has an unknown sampling interval', dayGroups => \%groups },
     };
 }
 
@@ -25100,8 +25178,6 @@ sub _exposure_process_day
     return;
 }
 
-# The MemberExposure block of one window from its trackers:
-# (block hashref, hashref of counts).
 # The durable contested record of a month from its exposure trackers (see $CONTESTED_BUSY_PROJECTION).
 # { LPAR => [ per configuration state: { stateStartUTC, fromUTC, toUTCExclusive, populations => {
 #     population => { profiles, cadenceMinutes, cadenceByDate (days at another interval), evaluatedDays,
@@ -25174,6 +25250,198 @@ sub _contested_block
     return (\%block, \%counts);
 }
 
+# ==============================================================================
+# Reader of the durable contested record (reader contested-busy-reader-1)
+# ------------------------------------------------------------------------------
+# What stored history says about one LPAR's work during pool competition, in the
+# hours of one population, over the UTC days [from, toExclusive). Read-only.
+#
+# A day counts only where three things agree: the month's contested record has a
+# projection and schema this reader knows; the month's MemberExposure block was
+# written from the same data (rules, pool, states and data revisions, window);
+# and the day has a MemberExposure row for the same configuration state. That
+# row is the day's support: without it a day absent from the readings says
+# nothing, and is reported as unavailable, never as a day without competition.
+#
+# Counts are of observations. MemberExposure's expectedMinutes is elapsed
+# eligible time, so the observations a day could have given are
+# expectedMinutes / the day's sampling interval (cadenceMinutes, cadenceByDate):
+# a fully sampled 15-minute day is fully covered. A day record with fewer
+# pool-classified observations than that is partial and stays visible as such.
+#
+# status   complete     every day of the window is evaluated and fully covered
+#          partial      some evidence, with days missing, unavailable or partly
+#                       covered (see days, dayRecords, reasons, coverage)
+#          unavailable  no evaluated day; reason says why
+# contestedObserved is undef when unavailable; false means no contested
+# observation in the evidence read, which with status partial is not the whole
+# window.
+# ==============================================================================
+
+# Why a month's contested record cannot be used ('' when it can).
+sub _contested_month_reason
+{
+    my ($month_data) = @_;
+    my $marker  = _safe_dig($month_data, 'Metadata', 'ContestedBusyEvidence');
+    my $support = _safe_dig($month_data, 'Metadata', 'MemberExposureEvidence');
+    return 'the month holds no contested record'
+        unless (ref($marker) eq 'HASH' && ref(_safe_dig($month_data, 'ContestedBusy')) eq 'HASH');
+    return 'the contested record has a version this reader does not know'
+        unless (($marker->{projection} // '') eq $CONTESTED_BUSY_PROJECTION && ($marker->{schemaVersion} // 0) == 1);
+    return 'the member exposure supporting the contested record has a version this reader does not know'
+        unless (ref($support) eq 'HASH' && ($support->{projection} // '') eq $MEMBER_EXPOSURE_PROJECTION
+                && ($support->{schemaVersion} // 0) == 1);
+    foreach my $key (qw(rulesHash poolRevision statesRevision dataRevision windowStart windowEndExclusive))
+    {
+        return 'the contested record and its support were written from different data'
+            if (($marker->{$key} // '') ne ($support->{$key} // ''));
+    }
+    return '';
+}
+
+# The evidence of one LPAR and population over [from_date, to_exclusive) ('YYYY-MM-DD'),
+# from months given as [ [ month key, month data ], ... ].
+sub _contested_history_read
+{
+    my ($months_aref, $vm, $population, $from_date, $to_exclusive) = @_;
+    my %result = (reader => $CONTESTED_BUSY_READER, vm => $vm, population => $population,
+                  window => { from => $from_date, toExclusive => $to_exclusive },
+                  status => 'unavailable', reason => '', contestedObserved => undef);
+    my (%dates, %reasons, %cells, %cadences, %contested_dates);
+    my %records = (evaluated => 0, full => 0, partial => 0, unavailable => 0, contested => 0);
+    my %obs = (expected => 0, paired => 0, classified => 0, contested => 0);
+    my $contested_minutes = 0;
+    foreach my $pair (sort { $a->[0] cmp $b->[0] } @{ $months_aref // [] })
+    {
+        my $data = $pair->[1];
+        my $states = _safe_dig($data, 'MemberExposure', $vm);
+        next unless (ref($states) eq 'ARRAY');
+        my $month_reason = _contested_month_reason($data);
+        my $record_states = $month_reason ? [] : (_safe_dig($data, 'ContestedBusy', $vm) // []);
+        foreach my $state (@$states)
+        {
+            my $support = _safe_dig($state, 'populations', $population);
+            next unless (ref($support) eq 'HASH');
+            my ($match) = grep { ($_->{fromUTC} // '') eq ($state->{fromUTC} // '')
+                                 && ($_->{stateStartUTC} // '') eq ($state->{stateStartUTC} // '') } @$record_states;
+            my $record = $match ? _safe_dig($match, 'populations', $population) : undef;
+            my %supported;
+            foreach my $day (@{ $support->{daily} // [] })
+            {
+                my $date = $day->{date} // '';
+                next unless ($date ge $from_date && $date lt $to_exclusive);
+                $dates{$date} = 1;
+                my $why = $month_reason;
+                if (!$why && !($day->{classifiedMinutes} // 0))
+                {
+                    $why = (ref($record) eq 'HASH' && ($record->{unavailable} // {})->{$date})
+                        || (($day->{pairedMinutes} // 0) ? 'no pool verdict for any sample' : 'no sample with PhysB');
+                }
+                $why ||= 'the day has support and no contested record' unless (ref($record) eq 'HASH');
+                my $cadence = $why ? undef : (($record->{cadenceByDate} // {})->{$date} // $record->{cadenceMinutes});
+                $why ||= 'the day has no sampling interval recorded' unless ($cadence);
+                if ($why)
+                {
+                    $records{unavailable}++;
+                    $reasons{$why}++;
+                    next;
+                }
+                $supported{$date} = 1;
+                my $expected = ($day->{expectedMinutes} // 0) / $cadence;       # elapsed time into observations
+                $records{evaluated}++;
+                $cadences{ $cadence + 0 } = 1;
+                $obs{expected}   += $expected;
+                $obs{paired}     += $day->{pairedMinutes} // 0;
+                $obs{classified} += $day->{classifiedMinutes};
+                if ($day->{classifiedMinutes} < $expected - 0.5) { $records{partial}++; } else { $records{full}++; }
+                my $readings = ($record->{readings} // {})->{$date} // [];
+                next unless @$readings;
+                $records{contested}++;
+                $contested_dates{$date} = 1;
+                foreach my $r (@$readings)
+                {
+                    $cells{ sprintf('%.0f,%.0f', $r->[0] * 100, $r->[1] * 100) } += $r->[2];
+                    $obs{contested}    += $r->[2];
+                    $contested_minutes += $r->[2] * $cadence;
+                }
+            }
+            # Readings on a day without support are not evidence: said so, not used.
+            foreach my $date (grep { $_ ge $from_date && $_ lt $to_exclusive && !$supported{$_} }
+                              keys %{ (ref($record) eq 'HASH' ? $record->{readings} : undef) // {} })
+            {
+                $reasons{'contested readings without matching support'}++;
+            }
+        }
+    }
+    my $window_days = int((Time::Piece->strptime($to_exclusive, '%Y-%m-%d')->epoch
+                         - Time::Piece->strptime($from_date, '%Y-%m-%d')->epoch) / 86400 + 0.5);
+    $window_days = 0 if ($window_days < 0);
+    my $with_history = scalar(keys %dates);
+    $result{days} = { window => $window_days, withHistory => $with_history,
+                      withoutHistory => ($window_days > $with_history ? $window_days - $with_history : 0),
+                      contested => scalar(keys %contested_dates) };
+    $result{dayRecords}   = \%records;
+    $result{reasons}      = \%reasons;
+    $result{observations} = { %obs, expected => 0 + sprintf('%.2f', $obs{expected}) };
+    $result{coverage}     = $obs{expected} > 0 ? 0 + sprintf('%.4f', $obs{classified} / $obs{expected}) : undef;
+    $result{cadenceMinutes}   = [ sort { $a <=> $b } keys %cadences ];
+    $result{contestedMinutes} = $contested_minutes;
+    $result{readings} = [ map { my ($b, $c) = split /,/, $_; [ $b / 100, $c / 100, $cells{$_} ] }
+                          sort { my @x = split /,/, $a; my @y = split /,/, $b; $x[0] <=> $y[0] || $x[1] <=> $y[1] } keys %cells ];
+    if (!$records{evaluated})
+    {
+        $result{reason} = join('; ', sort keys %reasons)
+            || ($with_history ? 'no evaluated day in the window' : 'history holds no member exposure for this LPAR, population and window');
+        return \%result;
+    }
+    $result{status} = ($records{unavailable} || $records{partial} || $result{days}{withoutHistory} || %reasons) ? 'partial' : 'complete';
+    $result{contestedObserved} = $obs{contested} ? JSON::true : JSON::false;
+    return \%result;
+}
+
+# The highest protected level of stored readings for a tier share (busy plus the share of the
+# gap to consumed), rounded up to 0.01: the cut-protection bound before the installed limit.
+sub _contested_history_bound
+{
+    my ($readings_aref, $share) = @_;
+    return undef unless (ref($readings_aref) eq 'ARRAY' && @$readings_aref && defined $share);
+    my $cents = max(map { $_->[0] + $share * ($_->[1] - $_->[0]) } @$readings_aref) * 100;
+    my $up = int($cents);
+    $up++ if ($cents - $up > 1e-6);
+    return $up / 100;
+}
+
+# The contested level of stored readings: the percentile of the protected level over every
+# observation (each reading weighted by its count), rounded up to 0.01. Returns (level,
+# observations); the level is undef without a reading. The same interpolation as the level
+# of the samples themselves.
+sub _contested_history_level
+{
+    my ($readings_aref, $share, $percentile) = @_;
+    return (undef, 0) unless (ref($readings_aref) eq 'ARRAY' && @$readings_aref && defined $share && defined $percentile);
+    my @sorted = sort { $a->[0] <=> $b->[0] } map { [ $_->[0] + $share * ($_->[1] - $_->[0]), $_->[2] ] } @$readings_aref;
+    my $n = 0;
+    $n += $_->[1] for @sorted;
+    return (undef, 0) unless ($n > 0);
+    my $rank  = ($n - 1) * $percentile / 100;
+    my $lower = int($rank);
+    my $upper = ($lower + 1 < $n) ? $lower + 1 : $lower;
+    my ($seen, $low_value, $high_value) = (0);
+    foreach my $entry (@sorted)
+    {
+        $seen += $entry->[1];
+        $low_value  //= $entry->[0] if ($seen > $lower);
+        $high_value //= $entry->[0] if ($seen > $upper);
+        last if defined $high_value;
+    }
+    my $cents = ($low_value + ($high_value - $low_value) * ($rank - $lower)) * 100;
+    my $up = int($cents);
+    $up++ if ($cents - $up > 1e-6);
+    return ($up / 100, $n);
+}
+
+# The MemberExposure block of one window from its trackers:
+# (block hashref, hashref of counts).
 sub _exposure_block
 {
     my ($trackers_aref, $serial) = @_;

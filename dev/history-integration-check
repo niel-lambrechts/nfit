@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/history-integration-check
+# PURPOSE  : One system-month check of the durable history (pool, member
+#            exposure and contested record) end to end:
+#              1. writes history for the system twice (--update-history
+#                 --pool-history); the second run must leave every month file
+#                 byte-identical;
+#              2. sizes the chosen month with a standard run and compares what
+#                 that run computed from the samples with what the history
+#                 readers give for the same LPAR, hours and configuration
+#                 state: observation counts, the cut-protection bound and the
+#                 contested level (declared precision: never below, at most
+#                 0.01 cores above);
+#              3. runs nfit-profile's and nfit-forecast's readers on every
+#                 LPAR and population of the month and requires identical
+#                 results;
+#              4. reports the size of the month file by block and the run times.
+#            Nothing is installed or changed outside the private work tree.
+# USAGE    : dev/history-integration-check --system P10-02 [--month YYYY-MM]
+#            dev/history-integration-check --stage DIR [--config FILE]      (any staged system)
+# OUTPUT   : <out>/integration-<label>.json and a summary (aggregates; no LPAR,
+#            pool or system is named)
+# ==============================================================================
+import argparse
+import calendar
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import shutil
+import subprocess
+import sys
+import time
+from datetime import date, timedelta
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+_loader = importlib.machinery.SourceFileLoader('protection_replay', str(REPO / 'dev' / 'protection-replay'))
+_spec = importlib.util.spec_from_loader('protection_replay', _loader)
+pr = importlib.util.module_from_spec(_spec)
+_loader.exec_module(pr)
+sys.path.insert(0, str(REPO / 'test'))
+import contested_reader_test as readers                    # the shared reader harness (production source, extracted)
+
+PRECISION = 0.01
+EPS = 1e-9
+HISTORY_ARGS = ['--update-history', '--pool-history', '--min-history-days', '1']
+
+
+def digests(history):
+    return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(history.glob('nfit.hist.*.json'))}
+
+
+def timed(app, case, label, args, env):
+    t0 = time.time()
+    pr.invoke(app, case, label, args, env)
+    return round(time.time() - t0, 1)
+
+
+def compact(value):
+    return len(json.dumps(value, separators=(',', ':')))
+
+
+def round_up(level):
+    """To the 0.01-core grid, as the published bound and level are."""
+    cents = level * 100
+    up = int(cents)
+    return (up + 1 if cents - up > 1e-6 else up) / 100
+
+
+def spread(values):
+    """How far the history figures lie above the raw ones."""
+    if not values:
+        return {'compared': 0}
+    return {'compared': len(values), 'identical': sum(1 for v in values if abs(v) <= EPS),
+            'aboveWithinPrecision': sum(1 for v in values if EPS < v <= PRECISION + EPS),
+            'below': sum(1 for v in values if v < -EPS), 'abovePrecision': sum(1 for v in values if v > PRECISION + EPS),
+            'largest': round(max(values), 4), 'smallest': round(min(values), 4)}
+
+
+def prepare(a, ap):
+    """(work, app, case, stage, label, base arguments)."""
+    if bool(a.system) == bool(a.stage):
+        sys.exit('history-integration-check: give --system or --stage')
+    config = Path(a.config)
+    if a.system:
+        if not config.is_file():
+            sys.exit('history-integration-check: VM configuration file not found (see --config)')
+        cohort, index = a.system.rsplit('-', 1)
+        folder, expected = pr.COHORTS[cohort][:2]
+        sources = sorted(p.parent for p in (Path(a.capture_root) / folder / 'stage').glob('*/.nfit_stage_id'))
+        if len(sources) != expected:
+            sys.exit(f'history-integration-check: expected {expected} staged system(s) for {cohort}, found {len(sources)}')
+        source, label = sources[int(index) - 1], a.system
+    else:
+        source, label = Path(a.stage).resolve(), 'stage'
+    work = Path(a.work)
+    if work.exists():
+        shutil.rmtree(work)
+    work.mkdir(parents=True)
+    use_config = config.is_file() and (a.system or a.config != ap.get_default('config'))
+    if not use_config:
+        config = work / 'config.csv'
+        config.write_text('')
+    app = pr.setup_app(work, config)
+    case = work / 'case'
+    case.mkdir()
+    stage = pr.link_stage(case, source)
+    base = ['--nmondir', str(stage)] + (['--config', str(app / 'config.csv')] if use_config else [])
+    return work, app, case, stage, label, base
+
+
+def month_facts(metadata, year, mon):
+    marker = metadata.get('ContestedBusyEvidence') or {}
+    return {'processedDays': metadata.get('ProcessedDays'), 'ofDaysInMonth': calendar.monthrange(year, mon)[1],
+            'features': metadata.get('Features') or [],
+            'memberExposureStatus': (metadata.get('MemberExposureEvidence') or {}).get('status'),
+            'contestedRecordStatus': marker.get('status'),
+            'contestedRecordCounts': {k: marker.get(k) for k in ('vms', 'contestedVMs', 'observations', 'pairs', 'contestedDayRecords',
+                                                                 'evaluatedDayRecords', 'unavailableDayRecords')},
+            'samplingIntervalsS': ((metadata.get('Derivation') or {}).get('MonthlyWorkloadAnalysis') or {}).get('samplingIntervalsS')}
+
+
+def sizes(path, data):
+    blocks = {k: compact(v) for k, v in data.items() if k != 'MonthlyWorkloadAnalysis'}
+    mwa = data.get('MonthlyWorkloadAnalysis') or {}
+    physb = sum(compact(v[k]) for v in mwa.values() if isinstance(v, dict) for k in v if k.startswith('PhysB'))
+    blocks['MonthlyWorkloadAnalysis (PhysC)'] = compact(mwa) - physb
+    blocks['MonthlyWorkloadAnalysis (PhysB blocks)'] = physb
+    return {'fileBytes': path.stat().st_size, 'compactBytesByBlock': dict(sorted(blocks.items(), key=lambda kv: -kv[1])),
+            'derivationBytes': compact((data.get('Metadata') or {}).get('Derivation') or {})}
+
+
+def raw_against_history(members, data, month, first_day, after):
+    """What the standard run computed from the samples against the history readers."""
+    slim = {k: data.get(k) for k in ('Metadata', 'MemberExposure', 'ContestedBusy') if k in data}
+    skipped = {'noCutProtectionRecord': 0, 'noHistoryForLpar': 0, 'stateNotInHistory': 0}
+    groups = {}                                            # (LPAR, state) -> [(query, cut protection, floor, share)]
+    for vm, member in sorted(members.items()):
+        seen = set()
+        for name, profile in sorted((member.get('profiles') or {}).items()):
+            cp = profile.get('cutProtection') or {}
+            pop = cp.get('population')
+            if not pop or not isinstance(cp.get('support'), dict):
+                skipped['noCutProtectionRecord'] += 1
+                continue
+            floor = profile.get('contestedFloor') or {}
+            key = (pop, cp.get('share'), floor.get('percentile'))
+            if key in seen:
+                continue
+            seen.add(key)
+            states = (data.get('MemberExposure') or {}).get(vm)
+            if not states:
+                skipped['noHistoryForLpar'] += 1
+                continue
+            if not any(s.get('stateStartUTC') == cp.get('stateStartUTC') for s in states):
+                skipped['stateNotInHistory'] += 1
+                continue
+            share = cp.get('share') if cp.get('share') is not None else 0
+            query = {'vm': vm, 'population': pop, 'from': first_day, 'to': after,
+                     'figures': [[share, floor.get('percentile') if floor.get('percentile') is not None else 100]]}
+            groups.setdefault((vm, cp.get('stateStartUTC')), []).append((query, cp, floor, share))
+    counts = {k: {'equal': 0, 'different': 0} for k in ('expected', 'paired', 'classified', 'contested', 'contestedDays')}
+    bound_diff, level_diff, obs_equal, obs_different, statuses, comparisons = [], [], 0, 0, {}, 0
+    for (vm, state_start), group in groups.items():
+        # The standard run reads the configuration state in force: the history of that state only.
+        keep = lambda block: {vm: [s for s in ((data.get(block) or {}).get(vm) or []) if s.get('stateStartUTC') == state_start]}
+        one = dict(slim, MemberExposure=keep('MemberExposure'), ContestedBusy=keep('ContestedBusy'))
+        answers = readers.perl_read([[month, one]], [g[0] for g in group])
+        for (query, cp, floor, share), answer in zip(group, answers):
+            comparisons += 1
+            r, s = answer['result'], cp['support']
+            statuses[r['status']] = statuses.get(r['status'], 0) + 1
+            pairs = [('paired', s.get('pairedMinutes'), r['observations']['paired']),
+                     ('classified', s.get('classifiedMinutes'), r['observations']['classified']),
+                     ('contested', s.get('contestedMinutes'), r['observations']['contested']),
+                     ('contestedDays', s.get('contestedDays'), r['days']['contested'])]
+            if len(r['cadenceMinutes']) == 1:              # elapsed minutes against observations x the interval
+                pairs.append(('expected', s.get('expectedMinutes'), r['observations']['expected'] * r['cadenceMinutes'][0]))
+            for key, raw, stored in pairs:
+                if raw is not None:
+                    counts[key]['equal' if abs(raw - stored) <= 0.5 else 'different'] += 1
+            bound, level, n = answer['figures'][0]
+            if cp.get('frontier') and bound is not None:
+                bound_diff.append(bound - round_up(max(b + share * (c - b) for b, c, *_ in cp['frontier'])))
+            if floor.get('level') is not None and level is not None:
+                level_diff.append(level - floor['level'])
+                if n == floor.get('observations'):
+                    obs_equal += 1
+                else:
+                    obs_different += 1
+    return {'comparisons': comparisons, 'lpars': len({vm for vm, _ in groups}), 'skipped': skipped, 'readerStatus': statuses,
+            'supportCounts': counts, 'cutProtectionBound': spread(bound_diff),
+            'contestedLevel': dict(spread(level_diff), observationsEqual=obs_equal, observationsDifferent=obs_different)}
+
+
+def reader_parity(data, month, first_day, after, seconds):
+    """Both readers on every LPAR and population of the month: (parity, view)."""
+    slim = {k: data.get(k) for k in ('Metadata', 'MemberExposure', 'ContestedBusy') if k in data}
+    queries = [{'vm': vm, 'population': pop, 'from': first_day, 'to': after, 'figures': [[0, 90], [0.4, 95], [0.65, 98], [1, 99]]}
+               for vm, states in sorted((data.get('MemberExposure') or {}).items())
+               for pop in sorted({p for s in states for p in (s.get('populations') or {})})]
+    t0 = time.time()
+    perl = readers.perl_read([[month, slim]], queries) if queries else []
+    seconds['perlReaderAllQueries'] = round(time.time() - t0, 1)
+    forecast = readers.load_forecast_reader()
+    if forecast and queries:
+        t0 = time.time()
+        python = readers.python_read(forecast, [[month, slim]], queries)
+        seconds['pythonReaderAllQueries'] = round(time.time() - t0, 1)
+        different = sum(1 for x, y in zip(perl, python) if readers.same(x, y))
+        parity = {'queries': len(queries), 'identical': len(queries) - different, 'different': different}
+    else:
+        parity = {'queries': len(queries), 'note': 'the nfit-forecast reader was not found; parity not checked'}
+    by_status, coverage = {}, []
+    for answer in perl:
+        r = answer['result']
+        by_status[r['status']] = by_status.get(r['status'], 0) + 1
+        if r['coverage'] is not None:
+            coverage.append(r['coverage'])
+    view = {'byStatus': by_status,
+            'partialDayRecords': sum(x['result']['dayRecords']['partial'] for x in perl),
+            'unavailableDayRecords': sum(x['result']['dayRecords']['unavailable'] for x in perl),
+            'coverageLowest': min(coverage) if coverage else None,
+            'coverageMedian': sorted(coverage)[len(coverage) // 2] if coverage else None,
+            'withContestedObservations': sum(1 for x in perl if x['result']['contestedObserved'])}
+    return parity, view
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--system', help='research label, e.g. P10-02')
+    ap.add_argument('--stage', help='a staged system directory, instead of --system')
+    ap.add_argument('--month', help='the month to compare (default: the stored month with the most days)')
+    ap.add_argument('--config', default=str(pr.HOME / 'Downloads' / 'config-all-26.csv'))
+    ap.add_argument('--capture-root', default=str(pr.HOME / 'src' / 'nfit-data' / 'research' / 'nfit-capture'))
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'history'))
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check'))
+    a = ap.parse_args()
+    work, app, case, stage, label, base = prepare(a, ap)
+    history = case / 'history' / stage.name
+    env = pr.perl_env()
+    result = {'label': label, 'commit': pr.git_identity(), 'precisionCores': PRECISION, 'seconds': {}}
+    seconds = result['seconds']
+
+    # 1. History twice: the second run must change nothing.
+    print(f'{label}: writing history (first run)', flush=True)
+    seconds['historyFirstRun'] = timed(app, case, 'history-1', base + HISTORY_ARGS + ['--force'], env)     # no sizing run precedes it
+    first = digests(history)
+    if not first:
+        sys.exit('history-integration-check: no month file was written')
+    print(f'{label}: writing history (second run)', flush=True)
+    seconds['historySecondRun'] = timed(app, case, 'history-2', base + HISTORY_ARGS, env)
+    second = digests(history)
+    result['secondRun'] = {'monthFiles': len(first), 'unchanged': sum(1 for k in first if second.get(k) == first[k]),
+                           'changed': sum(1 for k in first if second.get(k) != first[k]), 'added': len(set(second) - set(first))}
+
+    # The month to compare.
+    months = {}
+    for p in sorted(history.glob('nfit.hist.*.json')):
+        key = p.name[len('nfit.hist.'):-len('.json')]
+        months[key] = (json.loads(p.read_text()).get(key) or {})
+    month = a.month or max(sorted(months), key=lambda m: (months[m].get('Metadata') or {}).get('ProcessedDays') or 0)
+    if month not in months:
+        sys.exit('history-integration-check: the month is not in the written history')
+    data = months[month]
+    metadata = data.get('Metadata') or {}
+    year, mon = (int(x) for x in month.split('-'))
+    # The days the month holds, as a half-open window of UTC days.
+    start, end = metadata.get('ProcessedStartDate'), metadata.get('ProcessedEndDate')
+    first_day, after = start, (date.fromisoformat(end) + timedelta(days=1)).isoformat()
+    result['month'] = month_facts(metadata, year, mon)
+    result['size'] = sizes(history / f'nfit.hist.{month}.json', data)
+
+    # 2. The month sized from the samples, against history.
+    print(f'{label}: sizing the month from the samples', flush=True)
+    seconds['standardRun'] = timed(app, case, 'standard', base + ['--startdate', start, '--enddate', end,
+                                   '--analysis-reference-date', end, '--runq-perc-behavior=match'], env)
+    snaps = sorted((stage / '.nfit.store' / 'proposals' / 'v1').glob('*/*.json'), key=lambda p: p.stat().st_mtime)
+    if not snaps:
+        sys.exit('history-integration-check: the standard run stored no proposal')
+    t0 = time.time()
+    raw = result['rawAgainstHistory'] = raw_against_history(json.loads(snaps[-1].read_text()).get('members') or {},
+                                                            data, month, first_day, after)
+    seconds['rawComparisonReads'] = round(time.time() - t0, 1)
+
+    # 3. Reader parity on everything the month holds.
+    result['readerParity'], result['readerView'] = reader_parity(data, month, first_day, after, seconds)
+
+    failures = []
+    if result['secondRun']['changed'] or result['secondRun']['added']:
+        failures.append('the second history run changed a month file')
+    for name in ('cutProtectionBound', 'contestedLevel'):
+        if raw[name].get('below') or raw[name].get('abovePrecision'):
+            failures.append(f'{name}: history outside the declared precision')
+    if raw['contestedLevel'].get('observationsDifferent'):
+        failures.append('contested level: observation counts differ')
+    if any(v['different'] for v in raw['supportCounts'].values()):
+        failures.append('support counts differ between the samples and history')
+    if result['readerParity'].get('different'):
+        failures.append('the two readers disagree')
+    if not raw['comparisons']:
+        failures.append('nothing could be compared between the samples and history')
+    result['verdict'] = 'pass' if not failures else 'fail'
+    result['failures'] = failures
+
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / f'integration-{label}.json'
+    target.write_text(json.dumps(result, indent=1) + '\n')
+    shutil.rmtree(work, ignore_errors=True)
+
+    mb = lambda n: '%.2f MB' % (n / 1e6)
+    print()
+    print(f"History integration check: {label}, one month of {result['month']['processedDays']} day(s), commit {result['commit']}")
+    print(f"  Second run       : {result['secondRun']['unchanged']} of {result['secondRun']['monthFiles']} month file(s) byte-identical")
+    print(f"  Raw v. history   : {raw['comparisons']} comparison(s) on {raw['lpars']} LPAR(s); skipped {raw['skipped']}")
+    print('    support counts : ' + ', '.join(f"{k} {v['equal']}/{v['equal'] + v['different']}" for k, v in raw['supportCounts'].items()))
+    for name, text in (('cutProtectionBound', 'bound'), ('contestedLevel', 'contested level')):
+        d = raw[name]
+        if d['compared']:
+            print(f"    {text:<15}: {d['compared']} compared; identical {d['identical']}, above by up to {PRECISION} {d['aboveWithinPrecision']}, "
+                  f"below {d['below']}, above the precision {d['abovePrecision']} (range {d['smallest']:+.4f} to {d['largest']:+.4f})")
+        else:
+            print(f"    {text:<15}: nothing to compare")
+    p = result['readerParity']
+    print('  Reader parity    : ' + (f"{p['identical']} of {p['queries']} identical" if 'identical' in p else p['note']))
+    v = result['readerView']
+    print(f"  Reader view      : {v['byStatus']}; partial day records {v['partialDayRecords']}, unavailable {v['unavailableDayRecords']}; "
+          f"coverage lowest {v['coverageLowest']}, median {v['coverageMedian']}")
+    print(f"  Size             : month file {mb(result['size']['fileBytes'])}; " +
+          ', '.join(f'{k} {mb(n)}' for k, n in result['size']['compactBytesByBlock'].items()))
+    print('  Seconds          : ' + ', '.join(f'{k} {n}' for k, n in seconds.items()))
+    print(f"  Verdict          : {result['verdict']}" + (' (' + '; '.join(failures) + ')' if failures else ''))
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0 if not failures else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

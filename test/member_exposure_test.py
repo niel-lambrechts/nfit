@@ -29,6 +29,8 @@ import unittest
 from collections import defaultdict
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in __import__('sys').path:
+    __import__('sys').path.insert(0, HERE)       # contested_reader_test: the shared reader harness
 REPO = os.path.abspath(os.path.join(HERE, '..'))
 TRACKED_ETC = ('nfit.profiles.cfg', 'nfit.profiles.cfg.default', 'nfit.mgsys.cfg.default',
                'nfit.scenarios.cfg.default')
@@ -413,6 +415,85 @@ class MemberExposureTests(unittest.TestCase):
             stored = max(b + share * (c - b) for b, c in pairs)
             self.assertGreaterEqual(stored, raw - 1e-9, share)
             self.assertLessEqual(stored, raw + 0.01 + 1e-9, share)
+
+    def test_history_gives_the_contested_level_of_the_raw_data_within_one_increment(self):
+        # Count-weighted percentile agreement: the standard run takes each profile's percentile of the protected
+        # level over the contested samples; both history readers must give it from the counted pairs, at most
+        # 0.01 above and never below, on the same number of observations.
+        import contested_reader_test as C
+        self.run_profile(self.root)
+        snaps = glob.glob(os.path.join(self.root, 'stage', SERIAL, '.nfit.store', 'proposals', 'v1', '*', '*.json'))
+        with open(sorted(snaps, key=os.path.getmtime)[-1]) as fh:
+            profiles = json.load(fh)['members']['vmA']['profiles']
+        floors = [(name, v['cutProtection']['population'], v['contestedFloor']) for name, v in sorted(profiles.items()) if v.get('contestedFloor')]
+        self.assertGreaterEqual(len({pop for _, pop, _ in floors}), 2)                 # all hours and an online window
+        months = [[MONTH, self.month()]]
+        queries = [{'vm': 'vmA', 'population': pop, 'from': '2026-09-01', 'to': '2026-09-03',
+                    'figures': [[f['share'], f['percentile']]]} for _, pop, f in floors]
+        perl = C.perl_read(months, queries)
+        reader = C.load_forecast_reader()
+        if reader:
+            self.assertEqual(C.same(perl, C.python_read(reader, months, queries)), '')
+        for (name, pop, floor), answer in zip(floors, perl):
+            (bound, level, n), = answer['figures']
+            self.assertEqual(n, floor['observations'], name)
+            self.assertGreaterEqual(level, floor['level'] - 1e-9, name)
+            self.assertLessEqual(level, floor['level'] + 0.01 + 1e-9, name)
+            self.assertEqual(answer['result']['days']['contested'], floor['days'], name)
+
+    def test_readers_agree_on_written_history_and_keep_partial_coverage_visible(self):
+        import contested_reader_test as C
+        months = [[MONTH, self.month()]]
+        queries = [{'vm': vm, 'population': pop, 'from': '2026-09-01', 'to': '2026-09-03', 'figures': [[0.4, 95]]}
+                   for vm in ('vmA', 'vmB', 'vmS', 'vmX') for pop in ('none', 'online+no-weekends', 'batch')]
+        perl = C.perl_read(months, queries)
+        reader = C.load_forecast_reader()
+        if reader:
+            self.assertEqual(C.same(perl, C.python_read(reader, months, queries)), '')
+        by = {(q['vm'], q['population']): a['result'] for q, a in zip(queries, perl)}
+        whole = by[('vmS', 'none')]
+        self.assertEqual((whole['status'], whole['coverage'], whole['contestedObserved']), ('complete', 1.0, True))
+        self.assertEqual(whole['observations']['expected'], 2880)
+        part = by[('vmA', 'none')]                                                     # six minutes without PhysB, ten without a pool verdict
+        self.assertEqual((part['status'], part['observations']['paired'], part['observations']['classified'], part['coverage']),
+                         ('partial', 2874, 2864, round(2864 / 2880, 4)))
+        self.assertEqual(part['dayRecords'], {'evaluated': 2, 'full': 1, 'partial': 1, 'unavailable': 0, 'contested': 2})
+        self.assertEqual(by[('vmS', 'batch')]['contestedObserved'], False)             # supported hours, no competition seen
+        self.assertEqual((by[('vmX', 'none')]['status'], by[('vmX', 'none')]['contestedObserved']), ('unavailable', None))
+
+    def test_series_provenance_is_written_per_day_group_and_never_relabels(self):
+        d = self.month()['Metadata']['Derivation']
+        self.assertEqual(d['MonthlyWorkloadAnalysis'], {'samplingIntervalsS': [60], 'smoothingTimeBasis': 'elapsed-time'})
+        self.assertEqual(d['DailyPeakSeries']['dayGroups']['vmA'], [{'from': '2026-09-01', 'to': '2026-09-02', 'samplingIntervalS': 60}])
+        self.assertNotIn('written', json.dumps(d))                                     # nothing that changes on an unchanged run
+        code = r"""
+            my $in = decode_json(do { local $/; <STDIN> });
+            print JSON->new->canonical->encode([ map { _history_derivation(@$_) } @$in ]);
+        """
+        with open(os.path.join(REPO, 'nfit-profile')) as fh:
+            source = fh.read()
+        subs = ''.join(re.search(r'^(sub %s\s*\{.*?^\})' % name, source, re.S | re.M).group(1) + '\n' for name in ('_history_derivation', '_safe_dig'))
+        old = {'DailyPeakSeries': {'dayGroups': {'a': [{'from': '2026-09-03', 'to': '2026-09-04', 'samplingIntervalS': 60}]}}}
+        dates = lambda *days: {'2026-09-%02d' % n: 1 for n in days}
+        cases = [
+            # Days 1-2 stored before labels existed, 3-4 labelled at one minute, 5-7 added now at 15 minutes.
+            [old, {'a': {'stored': dates(1, 2, 3, 4), 'added': dates(5, 6, 7)}}, [900]],
+            # A cache with more than one interval labels nothing new; what was labelled stays.
+            [old, {'a': {'stored': dates(3, 4), 'added': dates(5)}}, [60, 900]],
+            # Values added to a stored day at another interval: the day cannot be labelled truthfully.
+            [old, {'a': {'stored': dates(3, 4), 'added': dates(4, 5)}}, [900]],
+            # A gap in the calendar starts a new group; a day no longer stored loses its label.
+            [old, {'a': {'stored': dates(3), 'added': dates(5, 6, 9)}}, [60]],
+        ]
+        out = subprocess.run(['perl', '-e', 'use strict; use warnings; use JSON; use Time::Piece;\n' + subs + code],
+                             input=json.dumps(cases), capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr[-800:])
+        g = lambda a, b, s: {'from': '2026-09-%02d' % a, 'to': '2026-09-%02d' % b, 'samplingIntervalS': s}
+        groups = [r['DailyPeakSeries']['dayGroups'].get('a') for r in json.loads(out.stdout)]
+        self.assertEqual(groups[0], [g(3, 4, 60), g(5, 7, 900)])                       # days 1-2 stay unlabelled
+        self.assertEqual(groups[1], [g(3, 4, 60)])
+        self.assertEqual(groups[2], [g(3, 3, 60), g(5, 5, 900)])
+        self.assertEqual(groups[3], [g(3, 3, 60), g(5, 6, 60), g(9, 9, 60)])
 
     def test_a_day_that_could_not_be_evaluated_is_named_not_counted_as_quiet(self):
         code = r"""
