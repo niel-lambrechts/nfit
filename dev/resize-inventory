@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/resize-inventory
+# PURPOSE  : Research (no sizing figure changes). Counts the configuration
+#            changes recorded for the LPARs of a staged system, and how many of
+#            them have enough one-minute data on both sides to evaluate a
+#            VP-width review screen (research note "Thread Density, Busy Share
+#            and Run-Queue Load on Entitlement", section 11).
+#            A change is the boundary between two consecutive configuration
+#            states of an LPAR. It is classed by what changed:
+#              vpOnly            the VP count, nothing else;
+#              entitlementOnly   the entitlement, nothing else;
+#              combined          entitlement and VP count;
+#              otherConfiguration capping, pool, SMT mode or processor mode
+#                                (with or without a size change);
+#              noSizeChange      none of these facts.
+#            It only counts. It scores nothing and names no LPAR, pool or system.
+# INPUT    : a work tree kept by dev/history-integration-check --keep, or a
+#            staged system directory (--stage).
+# USAGE    : dev/resize-inventory [--work DIR | --stage DIR] [--label L] [--out DIR]
+# OUTPUT   : <out>/resize-inventory-<label>.json and a table (counts only)
+# ==============================================================================
+import argparse
+import bisect
+import calendar
+import json
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+ACTIVITY_FLOOR = 0.25            # cores of PhysC below which a minute is not counted as near the VP ceiling
+BUSY_TOLERANCE = 1.02            # PhysB may exceed PhysC by this factor (accounting tolerance)
+NEAR_CEILING = 0.90              # PhysC / VPs at or above this is a near-ceiling minute
+NEAR_MIN_MINUTES = 30            # a state "approached its width" with this many near-ceiling minutes ...
+NEAR_MIN_DATES = 2               # ... on at least this many dates
+DAY_MIN_SAMPLES = 720            # a day counts with valid samples for at least half of its minutes
+DAYS_EACH_SIDE = (7, 14, 28)     # days required before and after the change; the middle value is the working one
+WORKING_DAYS = 14
+ONE_MINUTE_SHARE = 0.95          # share of the steps between consecutive samples that are 60 seconds
+SIZE_KINDS = ('vpOnly', 'entitlementOnly', 'combined')
+
+
+def generation_of(metadata):
+    text = '%s %s' % (metadata.get('proc_type') or '', metadata.get('proc_version') or '')
+    hit = re.search(r'POWER\s*_?(\d+)', text, re.I)
+    return int(hit.group(1)) if hit else None
+
+
+def facts_of(state):
+    """The facts of a configuration state that this inventory compares, or None when the size is not readable."""
+    md = state.get('metadata') or {}
+    try:
+        size = (float(md.get('entitlement')), int(float(md.get('virtual_cpus'))))
+    except (TypeError, ValueError):
+        return None
+    if size[0] <= 0 or size[1] <= 0:
+        return None
+    capped = str(md.get('capped')) if md.get('capped') is not None else None
+    pool = str(md.get('pool_id')) if md.get('pool_id') is not None else None
+    return {'entitlement': size[0], 'vps': size[1], 'capped': capped, 'pool': pool, 'smt': str(md.get('smt')),
+            'mode': generation_of(md), 'uncappedShared': capped == '0' and pool is not None}
+
+
+def kind_of(before, after):
+    """(kind, direction) of the change between two states."""
+    if before is None or after is None:
+        return 'notReadable', '-'
+    entitlement = after['entitlement'] - before['entitlement']
+    vps = after['vps'] - before['vps']
+    entitlement = 0.0 if abs(entitlement) < 1e-6 else entitlement
+    if any(before[k] != after[k] for k in ('capped', 'pool', 'smt', 'mode')):
+        return 'otherConfiguration', '-'
+    if entitlement and vps:
+        return 'combined', ('bothUp' if entitlement > 0 and vps > 0 else 'bothDown' if entitlement < 0 and vps < 0 else 'opposed')
+    if vps:
+        return 'vpOnly', ('up' if vps > 0 else 'down')
+    if entitlement:
+        return 'entitlementOnly', ('up' if entitlement > 0 else 'down')
+    return 'noSizeChange', '-'
+
+
+def read_evidence(stage, states, facts):
+    """One pass over the staged samples. Per LPAR and state: valid samples per day, near-ceiling minutes and
+    their dates, and the steps between consecutive samples (60 seconds or not)."""
+    evidence, last, days = {}, {}, {}
+    starts = {vm: [s['start_epoch'] for s in ss] for vm, ss in states.items()}
+    counts = {'rows': 0, 'withoutState': 0, 'invalid': 0, 'sameSecond': 0, 'valid': 0}
+    with (stage / '.nfit.cache.data').open(encoding='utf-8', errors='replace') as fh:
+        header = fh.readline().rstrip('\n').split(',')
+        try:
+            col = {name: header.index(name) for name in ('Timestamp', 'VMName', 'PhysC', 'PhysB')}
+        except ValueError:
+            sys.exit('resize-inventory: the staged data has no PhysB column')
+        width = max(col.values()) + 1
+        for line in fh:
+            parts = line.rstrip('\n').split(',')
+            if len(parts) < width:
+                continue
+            counts['rows'] += 1
+            stamp, vm = parts[col['Timestamp']], parts[col['VMName']]
+            midnight = days.get(stamp[:10])
+            try:
+                if midnight is None:
+                    midnight = days[stamp[:10]] = calendar.timegm((int(stamp[0:4]), int(stamp[5:7]), int(stamp[8:10]), 0, 0, 0))
+                epoch = midnight + int(stamp[11:13]) * 3600 + int(stamp[14:16]) * 60 + int(stamp[17:19] or 0)
+                consumed, busy = float(parts[col['PhysC']]), float(parts[col['PhysB']])
+            except ValueError:
+                counts['invalid'] += 1
+                continue
+            vm_starts = starts.get(vm)
+            i = bisect.bisect_right(vm_starts, epoch) - 1 if vm_starts else -1
+            if i < 0 or facts[vm][i] is None:
+                counts['withoutState'] += 1
+                continue
+            if busy < 0 or consumed < 0 or busy > consumed * BUSY_TOLERANCE + 1e-6:
+                counts['invalid'] += 1
+                continue
+            slot = evidence.setdefault((vm, i), {'days': {}, 'near': 0, 'nearDates': set(), 'minuteSteps': 0, 'otherSteps': 0})
+            previous = last.get(vm)
+            last[vm] = (i, epoch)
+            if previous and previous[0] == i:
+                step = epoch - previous[1]
+                if step == 0:
+                    counts['sameSecond'] += 1
+                    continue                               # a repeated second is counted once
+                slot['minuteSteps' if step == 60 else 'otherSteps'] += 1
+            counts['valid'] += 1
+            slot['days'][midnight] = slot['days'].get(midnight, 0) + 1
+            if consumed >= ACTIVITY_FLOOR and consumed >= NEAR_CEILING * facts[vm][i]['vps']:
+                slot['near'] += 1
+                slot['nearDates'].add(midnight)
+    return evidence, counts
+
+
+def side(slot, fact):
+    """What one side of a change offers: full days, whether it is one-minute data, whether it approached its width."""
+    slot = slot or {'days': {}, 'near': 0, 'nearDates': (), 'minuteSteps': 0, 'otherSteps': 0}
+    steps = slot['minuteSteps'] + slot['otherSteps']
+    return {'days': sum(1 for n in slot['days'].values() if n >= DAY_MIN_SAMPLES),
+            'oneMinute': steps > 0 and slot['minuteSteps'] >= ONE_MINUTE_SHARE * steps,
+            'sampled': steps > 0,
+            'approachedWidth': slot['near'] >= NEAR_MIN_MINUTES and len(slot['nearDates']) >= NEAR_MIN_DATES,
+            'uncappedShared': bool(fact and fact['uncappedShared'])}
+
+
+def reason_unusable(before, after, days):
+    if not (before['uncappedShared'] and after['uncappedShared']):
+        return 'notUncappedShared'
+    if (before['sampled'] and not before['oneMinute']) or (after['sampled'] and not after['oneMinute']):
+        return 'coarseSampling'
+    if before['days'] < days:
+        return 'tooFewDaysBefore'
+    if after['days'] < days:
+        return 'tooFewDaysAfter'
+    return None
+
+
+def inventory(states, facts, evidence):
+    table, reasons, lpars_changed = {}, {}, set()
+    boundaries = 0
+    for vm, vm_states in states.items():
+        for i in range(len(vm_states) - 1):
+            boundaries += 1
+            kind, direction = kind_of(facts[vm][i], facts[vm][i + 1])
+            cell = table.setdefault(kind, {}).setdefault(direction, {'events': 0, 'lpars': set(), 'usable': {d: [0, set()] for d in DAYS_EACH_SIDE},
+                                                                    'beforeApproachedWidth': 0, 'beforeDidNotApproachWidth': 0, 'relative': []})
+            cell['events'] += 1
+            cell['lpars'].add(vm)
+            if kind not in SIZE_KINDS:
+                continue
+            lpars_changed.add(vm)
+            before, after = side(evidence.get((vm, i)), facts[vm][i]), side(evidence.get((vm, i + 1)), facts[vm][i + 1])
+            for days in DAYS_EACH_SIDE:
+                why = reason_unusable(before, after, days)
+                if why is None:
+                    cell['usable'][days][0] += 1
+                    cell['usable'][days][1].add(vm)
+                if days == WORKING_DAYS:
+                    if why is None:
+                        cell['beforeApproachedWidth' if before['approachedWidth'] else 'beforeDidNotApproachWidth'] += 1
+                        key = 'vps' if kind != 'entitlementOnly' else 'entitlement'
+                        cell['relative'].append(abs(facts[vm][i + 1][key] - facts[vm][i][key]) / facts[vm][i][key])
+                    else:
+                        reasons.setdefault(kind, {}).setdefault(why, 0)
+                        reasons[kind][why] += 1
+    out = {}
+    for kind, directions in sorted(table.items()):
+        for direction, cell in sorted(directions.items()):
+            relative = sorted(cell['relative'])
+            out.setdefault(kind, {})[direction] = {
+                'events': cell['events'], 'lpars': len(cell['lpars']),
+                'usableByDaysEachSide': {str(d): {'events': n, 'lpars': len(who)} for d, (n, who) in cell['usable'].items()} if kind in SIZE_KINDS else None,
+                'usableAtWorkingDays': ({'beforeApproachedWidth': cell['beforeApproachedWidth'], 'beforeDidNotApproachWidth': cell['beforeDidNotApproachWidth'],
+                                         'medianRelativeChange': round(relative[len(relative) // 2], 3) if relative else None}
+                                        if kind in SIZE_KINDS else None)}
+    return out, reasons, boundaries, len(lpars_changed)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='a work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--stage', help='a staged system directory, instead of a work tree')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'vp-width'))
+    ap.add_argument('--label', help='a label for the result file (default: the name of the work tree or stage directory, which may be a serial: give one)')
+    a = ap.parse_args()
+    if a.stage:
+        stage = Path(a.stage).resolve()
+    else:
+        work = Path(a.work).resolve()
+        stage = next(iter(sorted((work / 'case' / 'stage').glob('*'))), None) if (work / 'case' / 'stage').is_dir() else None
+    if stage is None or not (stage / '.nfit.cache.data').exists() or not (stage / '.nfit.cache.states').exists():
+        sys.exit('resize-inventory: no staged system found (a kept work tree with --work, or a staged system directory with --stage)')
+    if a.stage and not a.label:
+        sys.exit('resize-inventory: give --label with --stage (the directory name is not used, as it may identify the system)')
+    label = a.label or Path(a.work).resolve().name
+
+    states = json.loads((stage / '.nfit.cache.states').read_text())
+    for vm in states:
+        states[vm] = sorted((s for s in states[vm] if s.get('start_epoch') is not None), key=lambda s: s['start_epoch'])
+    facts = {vm: [facts_of(s) for s in ss] for vm, ss in states.items()}
+    t0 = time.time()
+    evidence, counts = read_evidence(stage, states, facts)
+    seconds = round(time.time() - t0, 1)
+    table, reasons, boundaries, lpars_changed = inventory(states, facts, evidence)
+
+    result = {
+        'label': label,
+        'method': {'change': 'the boundary between two consecutive configuration states of an LPAR',
+                   'kinds': {'vpOnly': 'the VP count, nothing else', 'entitlementOnly': 'the entitlement, nothing else',
+                             'combined': 'entitlement and VP count', 'otherConfiguration': 'capping, pool, SMT mode or processor mode',
+                             'noSizeChange': 'none of these facts', 'notReadable': 'entitlement or VP count missing on a side'},
+                   'usable': 'both sides uncapped shared, one-minute data, and the stated number of days with at least %d valid samples' % DAY_MIN_SAMPLES,
+                   'daysEachSide': list(DAYS_EACH_SIDE), 'workingDays': WORKING_DAYS, 'oneMinuteShare': ONE_MINUTE_SHARE,
+                   'approachedWidth': 'at least %d minutes with PhysC at or above %.2f x VPs (and %.2f cores) on %d dates, all hours'
+                                      % (NEAR_MIN_MINUTES, NEAR_CEILING, ACTIVITY_FLOOR, NEAR_MIN_DATES),
+                   'scope': 'all hours of each state; no planning profile is applied in this inventory'},
+        'samples': counts,
+        'lpars': {'withStates': len(states), 'withMoreThanOneState': sum(1 for ss in states.values() if len(ss) > 1), 'withASizeChange': lpars_changed},
+        'boundaries': boundaries, 'changes': table, 'notUsableAtWorkingDays': reasons, 'seconds': seconds}
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / ('resize-inventory-%s.json' % re.sub(r'[^A-Za-z0-9_.-]', '_', label))
+    target.write_text(json.dumps(result, indent=1) + '\n')
+
+    print(f"Configuration changes: {label} ({counts['rows']:,} samples read in {seconds} s; {counts['valid']:,} valid, "
+          f"{counts['sameSecond']:,} repeated seconds, {counts['withoutState']:,} without a readable state)")
+    print(f"  LPARs: {len(states)} with states, {result['lpars']['withMoreThanOneState']} with more than one state, {lpars_changed} with a size change; "
+          f"{boundaries} state boundaries")
+    print()
+    print('  %-19s %-9s %7s %6s   %-28s %s' % ('change', 'direction', 'events', 'LPARs', 'usable events (LPARs) with', 'at %d days: before the change the LPAR' % WORKING_DAYS))
+    print('  %-19s %-9s %7s %6s   %-28s %s' % ('', '', '', '', ' / '.join('%d' % d for d in DAYS_EACH_SIDE) + ' days each side', 'approached its width / did not'))
+    for kind, directions in table.items():
+        for direction, cell in directions.items():
+            if cell['usableByDaysEachSide'] is None:
+                print('  %-19s %-9s %7d %6d   %s' % (kind, direction, cell['events'], cell['lpars'], '-'))
+                continue
+            usable = ' / '.join('%d (%d)' % (cell['usableByDaysEachSide'][str(d)]['events'], cell['usableByDaysEachSide'][str(d)]['lpars']) for d in DAYS_EACH_SIDE)
+            at = cell['usableAtWorkingDays']
+            print('  %-19s %-9s %7d %6d   %-28s %d / %d' % (kind, direction, cell['events'], cell['lpars'], usable, at['beforeApproachedWidth'], at['beforeDidNotApproachWidth']))
+    if reasons:
+        print()
+        print('  Size changes not usable at %d days each side, by the first reason:' % WORKING_DAYS)
+        for kind, why in sorted(reasons.items()):
+            print('    %-19s %s' % (kind, ', '.join('%s %d' % (k, n) for k, n in sorted(why.items()))))
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
