@@ -7605,9 +7605,11 @@ sub _tier_floor_record
 # undef when the sizing recorded no demand or budget.
 sub _profile_tier_floor
 {
-    my ($dbg, $cfg) = @_;
+    my ($dbg, $cfg, $though_withheld) = @_;
     return undef unless (ref($dbg) eq 'HASH' && ref($cfg) eq 'HASH' && !($cfg->{is_capped} // 0));
-    return undef if (($dbg->{'PeakUpliftGate'} // '') =~ /^withheld/);
+    # $though_withheld: the floor the allowance would have given, for a caller that reports what
+    # a withheld allowance leaves to borrowing (the event-window plan).
+    return undef if (!$though_withheld && ($dbg->{'PeakUpliftGate'} // '') =~ /^withheld/);
     my ($demand, $budget) = ($dbg->{'GuaranteeDemand'}, $dbg->{'DispatchBudgetFraction'});
     return undef unless (defined $demand && looks_like_number($demand) && $demand > 0
                          && defined $budget && looks_like_number($budget));
@@ -25830,10 +25832,19 @@ sub _seasonal_plan_and_snapshot
             "  The checks below run on the figures of the event window, not on a standing target.\n";
     }
     my $structural = _log_structural_feasibility($log_fh, $map_ref, \@vm_order, \@profiles, \%vm_tier_overrides);
+    # VIOS groups are sized by their configured policy on the event's own targets, as in a standard run.
+    _log_vios_pairs($log_fh, $map_ref, \@vm_order);
     print {$log_fh} map { "$_\n" } _event_window_plan_lines($event_name, $plan) if (defined $log_fh && ref($log_fh));
     foreach my $vm (keys %{ $plan->{Members} })
     {
         $proposals->{$vm}{eventWindow} = $plan->{Members}{$vm} if (ref($proposals->{$vm}) eq 'HASH');
+    }
+    # How a role result was reached (VIOS group, PowerHA), where there is one: the planning figure of
+    # such an LPAR follows its group's own targets, not its own alone.
+    foreach my $vm (keys %$proposals)
+    {
+        my $role = _safe_dig($map_ref, $vm, 'CoreResults', 'RoleResult');
+        $proposals->{$vm}{roleSource} = $role->{Source} if (ref($role) eq 'HASH' && defined $role->{Source} && ref($proposals->{$vm}) eq 'HASH');
     }
     # What the evidence pass found for each LPAR it assessed, per profile-hours population. An LPAR
     # without this record was not assessed: not an uncapped shared-pool LPAR in its current state.
@@ -25870,17 +25881,28 @@ sub _event_window_plan
             my $dbg = _safe_dig($map_ref, $row->{Vm}, 'CoreResults', 'ProfileDebugInfo', $row->{PlanningProfile} // '');
             my %member = (pool => $pool->{PoolId}, planningProfile => $row->{PlanningProfile}, entitlement => 0 + $ent,
                           allowanceWithheld => JSON::false, borrowingReliedOn => 0);
-            if (ref($dbg) eq 'HASH' && $dbg->{'TierFloorWithheld'} && looks_like_number($dbg->{'TierFloorValue'} // ''))
+            if (ref($dbg) eq 'HASH' && ($dbg->{'PeakUpliftGate'} // '') =~ /^withheld/)
             {
-                my $above = _structural_shown_value($dbg->{'TierFloorValue'}) - $ent;
-                $above = 0 if ($above < 0);
-                @member{qw(allowanceWithheld borrowingReliedOn)} = (JSON::true, 0 + sprintf('%.2f', $above));
-                $relied += $above;
-                $withheld++;
+                # What the allowance would have guaranteed: the floor the sizing recorded, and the tier floor at
+                # the profile's VP target (the allowance also acts where the entitlement-and-VP pair is resolved).
+                my $core = _safe_dig($map_ref, $row->{Vm}, 'CoreResults') // {};
+                my $cfg  = _safe_dig($map_ref, $row->{Vm}, 'Configuration') // {};
+                my $vps  = _safe_dig($core, 'Profile_rVCPU', $row->{PlanningProfile} // '');
+                $vps = $cfg->{virtual_cpus} unless (looks_like_number($vps // '') && $vps >= 1);
+                my $floor_of = _profile_tier_floor($dbg, $cfg, 1);
+                my @floors = grep { defined && looks_like_number($_) }
+                    ((looks_like_number($dbg->{'TierFloorValue'} // '') ? $dbg->{'TierFloorValue'} : undef),
+                     ($floor_of && looks_like_number($vps // '') ? $floor_of->($vps) : undef));
+                my $above = @floors ? (_structural_shown_value(max(@floors)) // 0) - $ent : 0;
+                if ($above > $STRUCTURAL_ENT_TOLERANCE)
+                {
+                    @member{qw(allowanceWithheld borrowingReliedOn)} = (JSON::true, 0 + sprintf('%.2f', $above));
+                    $relied += $above;
+                    $withheld++;
+                }
             }
             $members{ $row->{Vm} } = \%member;
         }
-        next if ($pool->{PoolId} == 0);                    # the default pool is assessed with the frame, not here
         my $ceiling = $pool->{Ceiling};
         my $requirement = $guarantees + $relied;
         push @pools, { PoolId => $pool->{PoolId}, Ceiling => $ceiling, Members => scalar(@{ $pool->{Members} // [] }),
@@ -25889,13 +25911,23 @@ sub _event_window_plan
                                 : ($guarantees > $ceiling + $STRUCTURAL_ENT_TOLERANCE) ? 'guaranteesExceedMaximum'
                                 : ($requirement > $ceiling + $STRUCTURAL_ENT_TOLERANCE) ? 'borrowingUnresolved' : 'withinMaximum' };
     }
-    return { Pools => \@pools, Members => \%members };
+    # The frame: every shared-pool LPAR draws on the same shared processors, whatever its pool. The
+    # default pool's size, as its members report it, is taken as that number.
+    my ($default) = grep { $_->{PoolId} == 0 } @pools;
+    my %frame = (Guarantees => sum0(map { $_->{Guarantees} } @pools), Relied => sum0(map { $_->{Relied} } @pools),
+                 Withheld => sum0(map { $_->{Withheld} } @pools), Members => sum0(map { $_->{Members} } @pools),
+                 Ceiling => ($default ? $default->{Ceiling} : undef), Known => ((grep { !$_->{Known} } @pools) ? 0 : 1));
+    $frame{Requirement} = $frame{Guarantees} + $frame{Relied};
+    $frame{Verdict} = (!$frame{Known} || !defined $frame{Ceiling}) ? 'unknown'
+                    : ($frame{Guarantees} > $frame{Ceiling} + $STRUCTURAL_ENT_TOLERANCE) ? 'guaranteesExceedMaximum'
+                    : ($frame{Requirement} > $frame{Ceiling} + $STRUCTURAL_ENT_TOLERANCE) ? 'borrowingUnresolved' : 'withinMaximum';
+    return { Pools => \@pools, Members => \%members, Frame => \%frame };
 }
 
 sub _event_window_plan_lines
 {
     my ($event_name, $plan) = @_;
-    my @lines = ('', "Event requirements by pool (event $event_name)",
+    my @lines = ('', "Event requirements by pool and for the frame (event $event_name)",
         '  Guarantees are the planning entitlements for the event. Borrowing relied on is the event demand',
         '  above the entitlement of members whose pool-borrowing allowance was withheld because their past',
         '  occurrences showed no competition. Past quiet occurrences permit that; they do not show that the',
@@ -25903,11 +25935,11 @@ sub _event_window_plan_lines
     my @pools = @{ $plan->{Pools} // [] };
     if (!@pools)
     {
-        push @lines, '  No user-defined pool with a recommendation in this run.', '';
+        push @lines, '  No shared-pool LPAR with a recommendation in this run.', '';
         return @lines;
     }
     push @lines, sprintf('  %-6s %8s %8s %11s %9s %12s  %s', 'Pool', 'Members', 'Maximum', 'Guarantees', 'Withheld', 'Relied on', 'Reading');
-    foreach my $p (@pools)
+    foreach my $p (@pools, (ref($plan->{Frame}) eq 'HASH' ? { %{ $plan->{Frame} }, Frame => 1, PoolId => -1 } : ()))
     {
         my $reading = {
             withinMaximum            => 'guarantees and relied-on borrowing fit under the pool maximum',
@@ -25916,17 +25948,23 @@ sub _event_window_plan_lines
             guaranteesExceedMaximum  => 'the guarantees alone exceed the pool maximum (see Pool and VP Checks)',
             unknown                  => 'not assessed: the pool maximum or a member\'s entitlement is unknown',
         }->{ $p->{Verdict} };
-        push @lines, sprintf('  %-6s %8d %8s %11.2f %9d %12.2f  %s', $p->{PoolId}, $p->{Members},
+        push @lines, sprintf('  %-6s %8d %8s %11.2f %9d %12.2f  %s', ($p->{Frame} ? 'Frame' : $p->{PoolId} == 0 ? '0 (def)' : $p->{PoolId}), $p->{Members},
             (defined $p->{Ceiling} ? sprintf('%.2f', $p->{Ceiling}) : 'unknown'), $p->{Guarantees}, $p->{Withheld}, $p->{Relied}, $reading);
     }
     my $unresolved = scalar(grep { $_->{Verdict} eq 'borrowingUnresolved' || $_->{Verdict} eq 'unknown' } @pools);
+    my $frame_verdict = (ref($plan->{Frame}) eq 'HASH') ? $plan->{Frame}{Verdict} : 'unknown';
+    push @lines, '', ($frame_verdict eq 'withinMaximum' ? '  Frame: the guarantees and the relied-on borrowing of all shared-pool LPARs fit the shared processors.'
+        : $frame_verdict eq 'borrowingUnresolved' ? '  Frame: the relied-on borrowing does not fit the shared processors if peaks coincide: unresolved.'
+        : $frame_verdict eq 'guaranteesExceedMaximum' ? '  Frame: the guarantees alone exceed the shared processors.'
+        : '  Frame: not assessed (the size of the default pool, or a member\'s entitlement, is unknown).');
     push @lines, '',
         ($unresolved
             ? sprintf('  %d pool%s with future borrowing capacity unresolved. Before the event: raise the pool maximum, restore the', $unresolved, ($unresolved == 1 ? '' : 's'))
             : '  No pool is short at its maximum on these figures.'),
         ($unresolved ? '  guarantee of the members concerned for the event window, or accept the reliance knowingly.' : ()),
-        '  Not assessed here: the default pool and the frame (shared processors against all pools together),',
-        '  and whether the forecast level will meet competition that past occurrences did not.', '';
+        '  Frame: every shared-pool LPAR of this system against the size of the default pool as its members report',
+        '  it. Dedicated processors, other reservations and activations are not in these figures.',
+        '  Not assessed: whether the forecast level will meet competition that past occurrences did not.', '';
     return @lines;
 }
 

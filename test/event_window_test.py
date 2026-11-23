@@ -139,9 +139,9 @@ class EventWindowTests(unittest.TestCase):
         self.assertNotIn('cutProtection', self.no_history['snapshot']['members']['vmB']['profiles']['G3-95W15'])
         log = self.with_history['log']
         self.assertIn('Event-Window Plan (event ev)', log)
-        self.assertIn('Event requirements by pool (event ev)', log)
+        self.assertIn('Event requirements by pool and for the frame (event ev)', log)
+        self.assertRegex(log, r'\n  Frame\s+3\s+unknown\s+3\.49\s+0\s+0\.00  not assessed')      # no default pool in this system
         self.assertRegex(log, r'\n  7\s+2\s+4\.00\s+2\.97\s+0\s+0\.00  guarantees and relied-on borrowing fit under the pool maximum')
-        self.assertIn('Not assessed here: the default pool and the frame', log)
         self.assertIn('whether the forecast level will meet competition that past occurrences did not', log)
 
     def test_one_quiet_occurrence_is_not_enough_when_the_model_requires_three(self):
