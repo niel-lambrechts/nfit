@@ -789,6 +789,7 @@ my $CUT_PROTECTION_TOP_READINGS = 32;
 # { LPAR => { profile => tracker } } (the tracker is shared by the profiles of
 # one population). Empty when the evidence is not available.
 my %CUT_PROTECTION_EVIDENCE;
+my $EVENT_EVIDENCE_STATUS;     # seasonal runs: the outcome of the event-window evidence pass
 # Pool use (v10 stage 3.4; plan 8.2, "a pool that was full"). From the same
 # evidence pass: each user-defined pool's measured busy series against its
 # maximum, and whether its members had busy work above their entitlement
@@ -2468,6 +2469,20 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         if ($requested_model_type eq 'adaptive_peak') {
             die "[ERROR] The 'adaptive_peak' forecasting model can only be executed using the `nfit-forecast` program.\n" .
                 "        Please use the command: ./nfit-forecast --nmondir $current_cache_path --apply-seasonality $apply_seasonality_event\n";
+        }
+
+        # Seasonal models (stage 3.6): cut protection and the contested level use the evidence of the
+        # event's own past windows, from history. Gathered once, before the event is sized.
+        %CUT_PROTECTION_EVIDENCE = ();
+        $EVENT_EVIDENCE_STATUS = undef;
+        if (_event_protection_wanted() && $effective_end_date_obj)
+        {
+            $EVENT_EVIDENCE_STATUS = _protection_evidence_from_history($current_cache_path, $apply_seasonality_event,
+                $requested_event_config, $effective_end_date_obj);
+            print STDERR "  ↳  Event-window evidence not used: $EVENT_EVIDENCE_STATUS->{Reason}\n"
+                if ($EVENT_EVIDENCE_STATUS->{Status} ne 'evaluated');
+            print {$log_fh_for_system} map { "$_\n" } _event_evidence_report_lines($apply_seasonality_event, $EVENT_EVIDENCE_STATUS)
+                if (defined $log_fh_for_system && ref($log_fh_for_system));
         }
 
         _execute_automatic_seasonal_discovery(
@@ -7526,6 +7541,14 @@ sub _peak_uplift_gate
     # Coverage is measured against the observations the cadence can give.
     my @gate = _peak_uplift_gate_of($t->{protection}{contested} // 0,
         [ map { [ $_->{expectedObs} // $_->{expected} // 0, $_->{classified} // 0 ] } values %{ $t->{daily} // {} } ]);
+    if (ref($t->{eventEvidence}) eq 'HASH')
+    {
+        # Seasonal runs: the verdict over the event's past windows, days missing from history included.
+        my $e = $t->{eventEvidence};
+        @gate = (($e->{status} eq 'contested' ? 'applied (contested)' : $e->{status} eq 'noCompetition' ? 'withheld (no contested minute)'
+                  : 'applied (legacy: event-window evidence insufficient)'),
+                 $e->{observations}{contested}, $e->{coverage} // 0, $e->{worstDayShare} // 0);
+    }
     # At a coarse cadence short competition is not seen: its absence does not remove the rule.
     my $cadence = _evidence_cadence_of($t);
     $gate[0] = sprintf('applied (legacy: pool evidence at %d-minute resolution)', $cadence)
@@ -16935,17 +16958,18 @@ sub _write_standard_csv_report {
                 my $p = $cp_tracker->{protection};
                 my ($minutes, $days) = ($p->{contested}, scalar(keys %{ $p->{days} }));
                 my $cp_cadence = _evidence_cadence_of($cp_tracker);
+                my $cp_where = (ref($cp_tracker->{eventEvidence}) eq 'HASH') ? ' of past event windows' : '';
                 # At a coarse cadence the limit is a precaution: busy demand and pool pressure
                 # fell in the same interval; that they coincided inside it is not shown.
                 $action = ($cp_cadence > 1)
-                    ? sprintf('Cut limited to %s (profile %.2f): busy demand and pressure in pool %s observed in %s over %d day%s; overlap within the interval is unknown.%s',
+                    ? sprintf('Cut limited to %s (profile %.2f): busy demand and pressure in pool %s observed in %s over %d day%s%s; overlap within the interval is unknown.%s',
                         $cp_dbg->{CutProtectionLimited},
                         _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
-                        _evidence_count_text($minutes, $cp_cadence), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''))
-                    : sprintf('Cut limited to %s (profile %.2f): busy work reached this level while pool %s was contested, on %d minute%s over %d day%s.%s',
+                        _evidence_count_text($minutes, $cp_cadence), $days, ($days == 1 ? '' : 's'), $cp_where, ($action ne '' ? " $action" : ''))
+                    : sprintf('Cut limited to %s (profile %.2f): busy work reached this level while pool %s was contested, on %d minute%s over %d day%s%s.%s',
                         $cp_dbg->{CutProtectionLimited},
                         _structural_shown_value($cp_dbg->{CutProtectionUnprotected} // $cp_dbg->{CutProtectionTarget}) // 0, $cp_tracker->{pool},
-                        $minutes, ($minutes == 1 ? '' : 's'), $days, ($days == 1 ? '' : 's'), ($action ne '' ? " $action" : ''));
+                        $minutes, ($minutes == 1 ? '' : 's'), $days, ($days == 1 ? '' : 's'), $cp_where, ($action ne '' ? " $action" : ''));
             }
             # The contested level raised the planning target: say so, with its support.
             if (ref($cp_dbg) eq 'HASH' && ref($cp_dbg->{'ContestedLevelFloor'}) eq 'HASH')
@@ -25315,7 +25339,10 @@ sub _contested_month_reason
 # from months given as [ [ month key, month data ], ... ].
 sub _contested_history_read
 {
-    my ($months_aref, $vm, $population, $from_date, $to_exclusive) = @_;
+    my ($months_aref, $vm, $population, $from_date, $to_exclusive, $opts) = @_;
+    # $opts (nfit-profile only): days => 1 adds dayRows, one per evaluated day record; state => coderef
+    # decides per stored configuration state whether its days are evidence (see event-window evidence).
+    my @day_rows;
     my %result = (reader => $CONTESTED_BUSY_READER, vm => $vm, population => $population,
                   window => { from => $from_date, toExclusive => $to_exclusive },
                   status => 'unavailable', reason => '', contestedObserved => undef);
@@ -25337,6 +25364,8 @@ sub _contested_history_read
             my ($match) = grep { ($_->{fromUTC} // '') eq ($state->{fromUTC} // '')
                                  && ($_->{stateStartUTC} // '') eq ($state->{stateStartUTC} // '') } @$record_states;
             my $record = $match ? _safe_dig($match, 'populations', $population) : undef;
+            my $state_reason = (ref($opts) eq 'HASH' && $opts->{state} && !$opts->{state}->($state))
+                             ? 'configuration state not comparable with the current one' : '';
             my %supported;
             foreach my $day (@{ $support->{daily} // [] })
             {
@@ -25344,7 +25373,7 @@ sub _contested_history_read
                 next unless ($date ge $from_date && $date lt $to_exclusive);
                 $dates{$date} = 1;
                 $eligible_minutes += $day->{expectedMinutes} // 0;              # every stored day, evaluated or not
-                my $why = $month_reason;
+                my $why = $month_reason || $state_reason;
                 if (!$why && !($day->{classifiedMinutes} // 0))
                 {
                     $why = (ref($record) eq 'HASH' && ($record->{unavailable} // {})->{$date})
@@ -25375,6 +25404,9 @@ sub _contested_history_read
                 $classified_minutes += $day->{classifiedMinutes} * $cadence;
                 if ($day->{classifiedMinutes} < $expected - 0.5) { $records{partial}++; } else { $records{full}++; }
                 my $readings = ($record->{readings} // {})->{$date} // [];
+                push @day_rows, { date => $date, expectedMinutes => $day->{expectedMinutes} // 0, expectedObservations => $expected,
+                                  paired => $day->{pairedMinutes} // 0, classified => $day->{classifiedMinutes}, cadence => $cadence + 0,
+                                  readings => $readings } if (ref($opts) eq 'HASH' && $opts->{days});
                 next unless @$readings;
                 $records{contested}++;
                 $contested_dates{$date} = 1;
@@ -25387,7 +25419,7 @@ sub _contested_history_read
             }
             # Readings on a day without support are not evidence: said so, not used.
             foreach my $date (grep { $_ ge $from_date && $_ lt $to_exclusive && !$supported{$_} }
-                              keys %{ (ref($record) eq 'HASH' ? $record->{readings} : undef) // {} })
+                              keys %{ (ref($record) eq 'HASH' && !$state_reason ? $record->{readings} : undef) // {} })
             {
                 $reasons{'contested readings without matching support'}++;
             }
@@ -25402,6 +25434,7 @@ sub _contested_history_read
                       contested => scalar(keys %contested_dates) };
     $result{dayRecords}   = \%records;
     $result{reasons}      = \%reasons;
+    $result{dayRows}      = \@day_rows if (ref($opts) eq 'HASH' && $opts->{days});
     $result{observations} = { %obs, expectedOnEvaluatedDays => 0 + sprintf('%.2f', $obs{expectedOnEvaluatedDays}) };
     $result{eligibleMinutes}   = $eligible_minutes;
     $result{classifiedMinutes} = $classified_minutes;
@@ -25444,8 +25477,8 @@ sub _contested_history_read
 # days); whether a percentile can be resolved is for the caller, who knows the percentile.
 sub _contested_event_evidence
 {
-    my ($months_aref, $vm, $population, $windows_aref) = @_;
-    my @windows;
+    my ($months_aref, $vm, $population, $windows_aref, $opts) = @_;
+    my (@windows, @day_rows);
     foreach my $w (sort { $a->[0] cmp $b->[0] } grep { ref($_) eq 'ARRAY' && defined $_->[0] && defined $_->[1] && $_->[0] lt $_->[1] } @{ $windows_aref // [] })
     {
         if (@windows && $w->[0] le $windows[-1][1]) { $windows[-1][1] = $w->[1] if ($w->[1] gt $windows[-1][1]); }
@@ -25458,7 +25491,8 @@ sub _contested_event_evidence
     my $worst;
     foreach my $w (@windows)
     {
-        my $r = _contested_history_read($months_aref, $vm, $population, @$w);
+        my $r = _contested_history_read($months_aref, $vm, $population, @$w, $opts);
+        push @day_rows, @{ $r->{dayRows} // [] };
         push @{ $out{windows} }, { from => $w->[0], toExclusive => $w->[1], status => $r->{status}, reason => $r->{reason},
                                    coverage => $r->{coverage}, worstDayShare => $r->{worstDayShare},
                                    daysWithoutHistory => $r->{days}{withoutHistory},
@@ -25493,9 +25527,248 @@ sub _contested_event_evidence
     my $absence_supported = (@windows && $out{windowsWithEvidence} == @windows && !$sum{daysWithoutHistory}
         && $sum{eligibleMinutes} > 0 && $sum{classifiedMinutes} / $sum{eligibleMinutes} >= $PEAK_UPLIFT_GATE_MIN_CLASSIFIED - 1e-9
         && defined $worst && $worst >= $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED - 1e-9) ? 1 : 0;
+    $out{dayRows} = \@day_rows if (ref($opts) eq 'HASH' && $opts->{days});
     $out{levelSupported} = ($sum{contested} >= $CONTESTED_LEVEL_MIN_MINUTES && $sum{contestedDays} >= $CONTESTED_LEVEL_MIN_DAYS) ? JSON::true : JSON::false;
     $out{status} = !$out{windowsWithEvidence} ? 'unavailable' : $sum{contested} ? 'contested' : $absence_supported ? 'noCompetition' : 'insufficient';
     return \%out;
+}
+
+# ==============================================================================
+# Event-window cut protection (v10 stage 3.6; seasonal models)
+# ------------------------------------------------------------------------------
+# A seasonal run sizes for an event. Its cut protection and contested level use
+# the contested evidence of the event's own past windows, read from history
+# (ContestedBusy), not the samples of the ordinary weeks before the run: spare
+# capacity in a normal month does not stand in for month-end.
+#
+# The evidence enters the sizing chain in the shape the standard models use (a
+# tracker per LPAR and profile-hours population in %CUT_PROTECTION_EVIDENCE),
+# so the bound, the contested level and the pool-borrowing gate are the same
+# rules. An LPAR without event-window evidence has no tracker and is sized as
+# seasonal runs were before.
+#
+# Which states count: a past window counts where the LPAR was then, as now, an
+# uncapped member of the same pool. Entitlement and VP changes do not exclude a
+# window (the evidence is observed busy work in cores; the bound stays limited
+# by today's entitlement). Days in another pool or capped are not evidence:
+# they are counted as days without usable evidence and reported, never reused.
+# ==============================================================================
+
+# Whether a seasonal run reads event-window evidence: not switched off.
+sub _event_protection_wanted
+{
+    return 0 unless $apply_seasonality_event;
+    return 0 if (defined $pool_exposure_flag && !$pool_exposure_flag);
+    return 0 if (defined $cut_protection_flag && !$cut_protection_flag);
+    return 1;
+}
+
+# The past windows of an event up to a date, as [ [from, toExclusive], ... ] of UTC days, from
+# the first month history holds. Only windows that ended on or before the date count.
+sub _event_past_windows
+{
+    my ($event_name, $event_config, $first_month, $asof_obj) = @_;
+    return [] unless (ref($event_config) eq 'HASH' && defined $first_month && $first_month =~ /^(\d{4})-(\d{2})$/ && $asof_obj);
+    my $first_obj = Time::Piece->strptime("$first_month-01", '%Y-%m-%d');
+    my @periods = grep { ref($_) eq 'ARRAY' && $_->[0] && $_->[1] }
+                  find_all_historical_periods({ $event_name => $event_config }, $first_obj, $asof_obj);
+    my %seen;
+    return [ sort { $a->[0] cmp $b->[0] }
+             grep { !$seen{"$_->[0]/$_->[1]"}++ && $_->[0] ge $first_obj->ymd && $_->[1] le ($asof_obj + ONE_DAY)->ymd }
+             map { [ $_->[0]->ymd, ($_->[1] + ONE_DAY)->ymd ] } @periods ];
+}
+
+# Evidence trackers of the LPARs' current states from history, for the given windows.
+# Returns (trackers, { LPAR => { population => evidence summary } }).
+sub _event_protection_trackers
+{
+    my ($months_aref, $db, $vms_href, $asof, $windows_aref, $populations) = @_;
+    my (@trackers, %summary);
+    my $day_of = sub { return int(Time::Piece->strptime($_[0], '%Y-%m-%d')->epoch / 86400); };
+    foreach my $vm (sort keys %{ $vms_href // {} })
+    {
+        my @states = sort { $a->{start_epoch} <=> $b->{start_epoch} }
+            grep { defined $_->{start_epoch} && defined $_->{end_epoch} && $_->{start_epoch} < $asof } @{ $db->{$vm} // [] };
+        my $s = $states[-1] or next;
+        my $m = $s->{metadata} // {};
+        next if (defined $m->{shared_enabled} && !$m->{shared_enabled});
+        next unless (defined $m->{capped} && "$m->{capped}" eq '0' && defined $m->{pool_id} && looks_like_number($m->{entitlement} // ''));
+        my $comparable = sub {
+            my ($state) = @_;
+            return 0 if ($state->{capped});
+            return ((split /:/, ($state->{pool} // ''))[-1] // '') eq "$m->{pool_id}" ? 1 : 0;
+        };
+        foreach my $population (sort keys %{ $populations // {} })
+        {
+            my $e = _contested_event_evidence($months_aref, $vm, $population, $windows_aref, { days => 1, state => $comparable });
+            my $rows = delete $e->{dayRows};
+            $summary{$vm}{$population} = $e;
+            next if ($e->{status} eq 'unavailable');
+            my (%daily, %seen, %days, @all);
+            foreach my $row (@{ $rows // [] })
+            {
+                my $day = $day_of->($row->{date});
+                my $acc = $daily{$day} //= { expected => 0, expectedObs => 0, paired => 0, classified => 0, scarce => 0,
+                                             exposure => [ [ (0) x scalar(@MEMBER_EXPOSURE_COLUMNS) ] ] };
+                $acc->{expected}    += $row->{expectedMinutes};
+                $acc->{expectedObs} += $row->{expectedObservations};
+                $acc->{paired}      += $row->{paired};
+                $acc->{classified}  += $row->{classified};
+                $acc->{cadence}      = $row->{cadence};
+                $seen{ $row->{cadence} } += $row->{classified};
+                foreach my $r (@{ $row->{readings} })
+                {
+                    $days{$day} = 1;
+                    push @all, ([ $r->[0], $r->[1], $day ]) x $r->[2];
+                }
+            }
+            # The frontier: the readings no other reading reaches in both busy and consumed.
+            my (@frontier, $highest);
+            foreach my $r (sort { $b->[0] <=> $a->[0] || $b->[1] <=> $a->[1] } @{ $e->{readings} })
+            {
+                next if (defined $highest && $r->[1] <= $highest);
+                $highest = $r->[1];
+                push @frontier, [ $r->[0], $r->[1], 0 ];
+            }
+            # A reading's day: the first stored day it was seen on.
+            my %first_day;
+            $first_day{"$_->[0],$_->[1]"} //= $_->[2] for sort { $a->[2] <=> $b->[2] } @all;
+            $_->[2] = ($first_day{"$_->[0],$_->[1]"} // 0) * 86400 for @frontier;
+            my @top = map { [ $_->[0], $_->[1], ($first_day{"$_->[0],$_->[1]"} // 0) * 86400 ] }
+                      sort { $b->[0] <=> $a->[0] || $b->[1] <=> $a->[1] } @{ $e->{readings} };
+            $#top = $CUT_PROTECTION_TOP_READINGS - 1 if (@top > $CUT_PROTECTION_TOP_READINGS);
+            my ($usual) = sort { $seen{$b} <=> $seen{$a} || $a <=> $b } keys %seen;
+            push @trackers, {
+                vm => $vm, pool => $m->{pool_id}, population => $population, profiles => $populations->{$population},
+                entitlement => $m->{entitlement} + 0, vp => $m->{virtual_cpus}, capped => 0,
+                stateStart => $s->{start_epoch},
+                from => $day_of->($windows_aref->[0][0]) * 86400, to => $day_of->($windows_aref->[-1][1]) * 86400,
+                thresholds => [ { value => $m->{entitlement} + 0, basis => 'installedEntitlement', profiles => [] } ],
+                daily => \%daily, observations => \%seen, cadenceLast => $usual // 1, poolCadenceLast => $usual // 1,
+                protection => { contested => $e->{observations}{contested}, days => \%days, frontier => \@frontier, top => \@top, all => \@all },
+                eventEvidence => $e,
+            };
+        }
+    }
+    return (\@trackers, \%summary);
+}
+
+# One profile sized by a seasonal model whose value comes from the sizing chain (multiplicative
+# seasonal, predictive peak). Without event-window evidence for the LPAR and profile it is the
+# plain sizing call. With it, as the standard models do: the figure without cut protection is
+# kept (a cut is called limited only where the published figure moved), the contested level is
+# a floor where its evidence suffices, and it is said to have raised the target only where the
+# published figure is higher with it.
+sub _event_sized_profile
+{
+    my ($vm_name, $vm_map_ref, $profile, $pressure_href, $thresholds_href) = @_;
+    my @args = ($vm_name, $vm_map_ref, $profile, $pressure_href, $thresholds_href);
+    my $name = $profile->{name};
+    my $tracker = $CUT_PROTECTION_EVIDENCE{$vm_name} ? $CUT_PROTECTION_EVIDENCE{$vm_name}{$name} : undef;
+    return calculate_runq_modified_physc(@args) unless (ref($tracker) eq 'HASH' && ref($tracker->{eventEvidence}) eq 'HASH');
+    $cut_protection_suspended = 1;
+    my ($unprotected) = calculate_runq_modified_physc(@args);
+    $cut_protection_suspended = 0;
+    my $floor = _contested_level_on() ? _contested_floor_for($tracker, $name, $profile->{flags}) : undef;
+    my ($without) = $floor ? calculate_runq_modified_physc(@args) : ();
+    ($contested_floor_value, $contested_floor_context) = $floor ? ($floor->{level}, $floor) : (undef, undef);
+    my ($value, $dbg) = calculate_runq_modified_physc(@args);
+    ($contested_floor_value, $contested_floor_context) = (undef, undef);
+    return ($value, $dbg) unless (ref($dbg) eq 'HASH');
+    my $raised = 0;
+    if (ref($dbg->{'ContestedLevelFloor'}) eq 'HASH')
+    {
+        my ($before, $after) = map { _structural_shown_value($_) } ($without, $value);
+        $raised = (defined $before && defined $after && $after > $before + $STRUCTURAL_ENT_TOLERANCE) ? 1 : 0;
+        @{ $dbg->{'ContestedLevelFloor'} }{qw(originalTarget finalTarget applied)} = ($before, $after, ($raised ? JSON::true : JSON::false));
+    }
+    if (looks_like_number($unprotected // ''))
+    {
+        my ($own, $final) = map { _structural_shown_value($_) } ($unprotected, $value);
+        $dbg->{'CutProtectionUnprotected'} = sprintf('%.4f', $unprotected);
+        $dbg->{'CutProtectionLimited'} = (!$raised && defined $own && defined $final && $final > $own + $STRUCTURAL_ENT_TOLERANCE)
+            ? sprintf('%.2f', $final) : '';
+    }
+    return ($value, $dbg);
+}
+
+# The evidence pass of a seasonal run: fills %CUT_PROTECTION_EVIDENCE from history for the
+# event's past windows. Returns a status hashref (Status, Reason, Windows, Counts).
+sub _protection_evidence_from_history
+{
+    my ($cache_dir, $event_name, $event_config, $asof_obj, $vms_aref) = @_;
+    %CUT_PROTECTION_EVIDENCE = ();
+    my $history = read_unified_history($cache_dir);
+    my @months = map { [ $_, $history->{$_} ] } sort grep { /^\d{4}-\d{2}$/ && ref($history->{$_}) eq 'HASH' } keys %{ $history // {} };
+    return { Status => 'unavailable', Reason => 'history holds no contested record (run --update-history with pool evidence first)' }
+        unless (grep { ref($_->[1]{ContestedBusy}) eq 'HASH' } @months);
+    my $windows = _event_past_windows($event_name, $event_config, $months[0][0], $asof_obj);
+    return { Status => 'noWindows', Reason => 'history holds no past window of this event' } unless @$windows;
+    _step('Event-window evidence');
+    my $states = _exposure_load_states($cache_dir);
+    my ($trackers, $summary) = _event_protection_trackers(\@months, $states,
+        { map { $_ => 1 } @{ $vms_aref // [ keys %{ $states // {} } ] } }, $asof_obj->epoch + 86400, $windows, _exposure_populations());
+    foreach my $t (@$trackers)
+    {
+        $CUT_PROTECTION_EVIDENCE{ $t->{vm} }{$_} = $t for @{ $t->{profiles} };
+    }
+    # One line of counts per status, over LPARs (an LPAR's all-hours population where it has one).
+    my %counts = map { $_ => 0 } qw(contested noCompetition insufficient unavailable);
+    my $excluded = 0;
+    foreach my $vm (keys %$summary)
+    {
+        my ($pop) = grep { $summary->{$vm}{$_} } ('none', sort keys %{ $summary->{$vm} });
+        $counts{ $summary->{$vm}{$pop}{status} }++;
+        $excluded += $summary->{$vm}{$pop}{reasons}{'configuration state not comparable with the current one'} // 0;
+    }
+    _task(sprintf('%d past window%s of %s (%s to %s): %d LPAR(s) contested, %d without competition, %d with too little evidence, %d without evidence',
+        scalar(@$windows), (@$windows == 1 ? '' : 's'), $event_name, $windows->[0][0], (Time::Piece->strptime($windows->[-1][1], '%Y-%m-%d') - ONE_DAY)->ymd,
+        @counts{qw(contested noCompetition insufficient unavailable)}));
+    return { Status => 'evaluated', Trackers => $trackers, Windows => $windows, Counts => \%counts, ExcludedStateDays => $excluded,
+             Summary => $summary };
+}
+
+# The "Event-Window Evidence" rationale section of a seasonal run: what history holds for the
+# event's past windows, and for which LPARs it is used. Its effect on a figure is in NFIT - Action.
+sub _event_evidence_report_lines
+{
+    my ($event_name, $status) = @_;
+    my @lines = ('', "Event-Window Evidence (event $event_name)",
+        '  Cut protection and the contested level of this run use the pool-competition evidence of the',
+        "  event's own past windows, read from history. Ordinary weeks are not read: spare capacity in a",
+        '  normal month does not stand in for the event.');
+    if (ref($status) ne 'HASH' || $status->{Status} ne 'evaluated')
+    {
+        push @lines, '  Not used: ' . ((ref($status) eq 'HASH' && $status->{Reason}) || 'no evidence') . '.',
+                     '  The event is sized without cut protection, as before.', '';
+        return @lines;
+    }
+    my ($windows, $counts, $summary) = @{$status}{qw(Windows Counts Summary)};
+    push @lines, sprintf('  Past windows   : %d (%s)', scalar(@$windows),
+        join(', ', map { my $last = (Time::Piece->strptime($_->[1], '%Y-%m-%d') - ONE_DAY)->ymd; $_->[0] eq $last ? $last : "$_->[0] to $last" } @$windows));
+    push @lines, sprintf('  LPARs          : %d with work during pool competition, %d without competition, %d with too little evidence, %d without evidence',
+        @{$counts}{qw(contested noCompetition insufficient unavailable)});
+    push @lines, sprintf('  Not comparable : %d day record(s) from a time the LPAR was capped or in another pool; not used.', $status->{ExcludedStateDays})
+        if $status->{ExcludedStateDays};
+    push @lines, '  Too little evidence: the absence of competition is not shown (a day missing from history or',
+                 '  not evaluated); the tier\'s pool-borrowing allowance stays, and no cut is deepened on it.'
+        if $counts->{insufficient};
+    my $width = max(map { length } keys %$summary, 'LPAR');
+    foreach my $vm (sort keys %$summary)
+    {
+        my ($pop) = grep { $summary->{$vm}{$_} } ('none', sort keys %{ $summary->{$vm} });
+        my $e = $summary->{$vm}{$pop};
+        next unless ($e->{status} eq 'contested' || $e->{status} eq 'insufficient');
+        my $cover = defined $e->{coverage} ? sprintf('%.1f%% of eligible time classified', 100 * $e->{coverage}) : 'no eligible time';
+        my $gaps = $e->{daysWithoutHistory} ? sprintf(', %d day%s missing from history', $e->{daysWithoutHistory}, ($e->{daysWithoutHistory} == 1 ? '' : 's')) : '';
+        push @lines, sprintf("  %-${width}s  %s", $vm, ($e->{status} eq 'contested')
+            ? sprintf('contested: %d observation%s over %d day%s in %d of %d window%s; %s%s', $e->{observations}{contested},
+                      ($e->{observations}{contested} == 1 ? '' : 's'), $e->{contestedDays}, ($e->{contestedDays} == 1 ? '' : 's'),
+                      scalar(grep { $_->{contestedObservations} } @{ $e->{windows} }), $e->{windowsRequested}, ($e->{windowsRequested} == 1 ? '' : 's'), $cover, $gaps)
+            : sprintf('too little evidence: %s%s', $cover, $gaps));
+    }
+    push @lines, '';
+    return @lines;
 }
 
 # The highest protected level of stored readings for a tier share (busy plus the share of the
@@ -27125,6 +27398,7 @@ sub _contested_floor_for
     return { rule => $CONTESTED_LEVEL_RULE, level => $level, percentile => $percentile, share => $share, tier => $tier,
              observations => $n, days => $days, cadenceMinutes => _evidence_cadence_of($tracker), pool => $tracker->{pool},
              stateStartUTC => (defined $tracker->{stateStart} ? _pool_iso($tracker->{stateStart}) : undef),
+             (ref($tracker->{eventEvidence}) eq 'HASH' ? (eventWindows => $tracker->{eventEvidence}{windowsWithEvidence}) : ()),
              minObservations => $CONTESTED_LEVEL_MIN_MINUTES, minDays => $CONTESTED_LEVEL_MIN_DAYS };
 }
 
@@ -27135,9 +27409,10 @@ sub _contested_floor_text
     my ($floor, $target) = @_;
     return '' unless (ref($floor) eq 'HASH' && $floor->{applied} && defined $target);
     my $cadence = $floor->{cadenceMinutes} // 1;
-    return sprintf('Target raised to %.2f: profile-level protection of observed work during pool competition; %s over %d day%s%s.',
+    my $where = $floor->{eventWindows} ? sprintf(' of %d past event window%s', $floor->{eventWindows}, ($floor->{eventWindows} == 1 ? '' : 's')) : '';
+    return sprintf('Target raised to %.2f: profile-level protection of observed work during pool competition; %s over %d day%s%s%s.',
         $target, ($cadence > 1 ? _evidence_count_text($floor->{observations}, $cadence) : sprintf('%d observation%s', $floor->{observations}, ($floor->{observations} == 1 ? '' : 's'))),
-        $floor->{days}, ($floor->{days} == 1 ? '' : 's'),
+        $floor->{days}, ($floor->{days} == 1 ? '' : 's'), $where,
         ($cadence > 1 ? sprintf(' (%d-minute data: the rule is validated on one-minute data only)', $cadence) : ''));
 }
 
@@ -27312,7 +27587,15 @@ sub _protection_results
             } keys %bound;
             my %record = (
                 rule => $CUT_PROTECTION_RULE,
-                status => (!$total->{classified} ? 'unavailable' : $p->{contested} ? 'bound' : 'noCompetition'),
+                status => (ref($t->{eventEvidence}) eq 'HASH'
+                           ? ({ contested => 'bound', noCompetition => 'noCompetition' }->{ $t->{eventEvidence}{status} } // 'insufficient')
+                           : !$total->{classified} ? 'unavailable' : $p->{contested} ? 'bound' : 'noCompetition'),
+                # Seasonal runs: the evidence is that of the event's past windows, read from history.
+                (ref($t->{eventEvidence}) eq 'HASH' ? (evidence => 'eventWindows', eventWindows => {
+                    rule => $t->{eventEvidence}{rule}, windows => $t->{eventEvidence}{windows},
+                    windowsWithEvidence => $t->{eventEvidence}{windowsWithEvidence}, coverage => $t->{eventEvidence}{coverage},
+                    worstDayShare => $t->{eventEvidence}{worstDayShare}, daysWithoutHistory => $t->{eventEvidence}{daysWithoutHistory},
+                    reasons => $t->{eventEvidence}{reasons} }) : ()),
                 tier => $tier, share => $share, population => $t->{population}, pool => $t->{pool},
                 stateStartUTC => $iso->($t->{stateStart}), fromUTC => $iso->($t->{from}), toUTCExclusive => $iso->($t->{to}),
                 installed => $installed, target => $target, cut => ($cut ? JSON::true : JSON::false),
@@ -32162,7 +32445,7 @@ sub _execute_multiplicative_seasonal {
             my %adaptive_thresholds = %{ $exec_ctx->{adaptive_thresholds_href} // {} };
             $adaptive_thresholds{saturation}    //= $exec_ctx->{adaptive_saturation_thresh};
 
-            my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+            my ($adjusted_physc, $debug_info_ref) = _event_sized_profile(
                 $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
             );
 
@@ -33476,7 +33759,7 @@ sub _execute_predictive_peak {
             my %adaptive_thresholds = %{ $args_href->{adaptive_thresholds_href} // {} };
             $adaptive_thresholds{saturation}    //= $args_href->{adaptive_saturation_thresh};
 
-            my ($adjusted_physc, $debug_info_ref) = calculate_runq_modified_physc(
+            my ($adjusted_physc, $debug_info_ref) = _event_sized_profile(
                 $vm_name, $vm_map_ref, $profile, \%pressure_flags, \%adaptive_thresholds
             );
 
