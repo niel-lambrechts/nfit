@@ -26349,6 +26349,12 @@ sub _contested_record_measure
     # Second form, measured beside the first: each day keeps its exact frontier on the 0.01 grid (so the
     # cut-protection bound is unchanged), and its counted pairs on the finest grid of a fixed ladder
     # that leaves no more than a given number of pairs. Nothing is dropped; the step is the error bound.
+    # Third form: each day keeps its exact frontier, and for each share of a fixed list (the tier shares, with
+    # 0 = busy and 1 = consumed) the counts of the protected level on the 0.01 grid, as a run of counts from the
+    # day's lowest level. The level is rounded up once; nothing is dropped. For a share not in the list the
+    # percentile lies between those of its neighbours, because the level never falls as the share rises.
+    my @share_list = sort { $a <=> $b } uniq(0, 1, values %CUT_PROTECTION_SHARE);
+    my %per_share = (classBytes => {}, text => '', worstDayBytes => 0, levels => [], longestRun => 0);
     my @caps = (32, 64, 128, 256);
     my @ladder = (0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1, 2, 5, 10, 20, 50);
     my $on_grid = sub { my ($v, $step) = @_; my $c = $v / $step; my $i = int($c); $i++ if ($c - $i > 1e-6); return $i * $step; };
@@ -26470,6 +26476,59 @@ sub _contested_record_measure
                     installedEntitlement => $t->{entitlement}, class => $kind };
             }
         }
+        # The per-share form.
+        {
+            my (%cols, %cents_of);
+            %cols = (dates => $columns{dates}, shares => \@share_list,
+                     map { ($_ => $columns{$_}) } qw(expected paired classified scarce contested lparCadenceSeconds poolCadenceSeconds));
+            foreach my $day (sort { $a <=> $b } keys %raw_of)
+            {
+                my $date = gmtime($day * 86400)->ymd;
+                my @runs;
+                foreach my $i (0 .. $#share_list)
+                {
+                    my %count;
+                    foreach my $r (@{ $raw_of{$day} })
+                    {
+                        my $c = ($r->[0] + $share_list[$i] * ($r->[1] - $r->[0])) * 100;
+                        my $k = int($c);
+                        $k++ if ($c - $k > 1e-6);
+                        $count{$k}++;
+                        $cents_of{$i}{$k}++;
+                    }
+                    my @keys = sort { $a <=> $b } keys %count;
+                    my @dense  = ($keys[0], [ map { $count{$_} // 0 } $keys[0] .. $keys[-1] ]);
+                    my @sparse = map { [ $_, $count{$_} ] } @keys;
+                    # Whichever is shorter: the run of counts from the lowest level, or the (level, count) pairs.
+                    push @runs, (length($json->encode(\@dense)) <= length($json->encode(\@sparse))) ? \@dense : { pairs => \@sparse };
+                    $per_share{longestRun} = $keys[-1] - $keys[0] + 1 if ($keys[-1] - $keys[0] + 1 > $per_share{longestRun});
+                }
+                $cols{levels}{$date} = \@runs;
+                $cols{frontier}{$date} = [ map { [ $_->[0] + 0, $_->[1] + 0 ] } @{ $frontier_of{$day} } ];
+                my $day_bytes = length($json->encode([ \@runs, $cols{frontier}{$date} ]));
+                $per_share{worstDayBytes} = $day_bytes if ($day_bytes > $per_share{worstDayBytes});
+            }
+            my $line = $json->encode(\%cols) . "\n";
+            $per_share{classBytes}{$kind} += length($line);
+            $per_share{text} .= $line;
+            if ($contested_days)
+            {
+                foreach my $profile (@{ $t->{profiles} // [] })
+                {
+                    my ($share, $tier) = _protection_share_of($profile);
+                    next unless defined $share;
+                    my ($i) = grep { abs($share_list[$_] - $share) < 1e-9 } 0 .. $#share_list;
+                    next unless defined $i;
+                    my $perc = $percentile_of{$profile} // $DEFAULT_PERCENTILE + 0;
+                    my ($level, $n, undef, $enough) = _contested_level($p, $share, $perc);
+                    next unless (defined $level && $enough && $n * (1 - $perc / 100) >= 1 - 1e-9);
+                    my @flat = map { my $k = $_; ([ $k / 100, $k / 100 ]) x $cents_of{$i}{$k} } keys %{ $cents_of{$i} };
+                    my ($level_h) = _contested_level({ all => \@flat, days => $p->{days} }, $share, $perc);
+                    push @{ $per_share{levels} }, { difference => 0 + sprintf('%.2f', $level_h - $level), level => $level, tier => "$tier",
+                        installedEntitlement => $t->{entitlement}, class => $kind };
+                }
+            }
+        }
         # Precision: the bound and the level from the rounded pairs against the observed readings.
         next unless $contested_days;
         my @rounded = map { my $day = $_; map { my ($b, $c) = split /,/, $_; ([ $b + 0, $c + 0, $day ]) x $by_day{$day}{$_} } keys %{ $by_day{$day} } } keys %by_day;
@@ -26513,6 +26572,16 @@ sub _contested_record_measure
                    columnBytesPer30Days => int(30 * length($text{'all:columns'} // '') / $days_all + 0.5),
                    bytesPer30Days => int(30 * length($all_text) / $days_all + 0.5), gzipBytesPer30Days => int(30 * ($gz->($all_text) // 0) / $days_all + 0.5) },
         worstDayRecord => \%worst,
+        perShareForm => {
+            description => 'exact daily frontier on the 0.01 grid; for each listed share the counts of the protected level on the 0.01 grid',
+            shares => \@share_list,
+            columnBytesPer30DaysByClass => { map { ($_ => int(30 * $per_share{classBytes}{$_} / $days_all + 0.5)) } keys %{ $per_share{classBytes} } },
+            columnBytesPer30Days => int(30 * length($per_share{text}) / $days_all + 0.5),
+            columnGzipBytesPer30Days => int(30 * ($gz->($per_share{text}) // 0) / $days_all + 0.5),
+            worstDayBytes => $per_share{worstDayBytes}, longestRunOfLevels => $per_share{longestRun},
+            contestedLevelDifferenceWhereTheFloorIsInForce => $spread->('difference', @{ $per_share{levels} }),
+            profilesInForce => scalar(@{ $per_share{levels} }),
+        },
         cappedForm => { map {
             my ($cap, $v) = ($_, $capped{$_});
             my @lv = @{ $v->{levels} };
