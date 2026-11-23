@@ -165,9 +165,10 @@ class ContestedReaderTests(unittest.TestCase):
                   readings={'2026-09-02': [[0.5, 0.8, 3]]})
         r, _ = self.read([['2026-09', m]])
         self.assertEqual((r['status'], r['coverage'], r['cadenceMinutes']), ('complete', 1.0, [15]))
-        self.assertEqual(r['observations'], {'expected': 192, 'paired': 192, 'classified': 192, 'contested': 3})
+        self.assertEqual(r['observations'], {'expectedOnEvaluatedDays': 192, 'paired': 192, 'classified': 192, 'contested': 3})
         self.assertEqual(r['dayRecords'], {'evaluated': 2, 'full': 2, 'partial': 0, 'unavailable': 0, 'contested': 1})
         self.assertEqual(r['contestedMinutes'], 45)                      # three observations of 15 minutes
+        self.assertEqual((r['eligibleMinutes'], r['classifiedMinutes']), (2880, 2880))
         self.assertIs(r['contestedObserved'], True)
         # The same support at other intervals: five and ten minutes are coarse too, and read the same way.
         for cadence, n in ((5, 288), (10, 144)):
@@ -229,7 +230,29 @@ class ContestedReaderTests(unittest.TestCase):
         r, _ = self.read([['2026-09', m]], end='2026-09-04')
         self.assertEqual(r['status'], 'partial')
         self.assertEqual(r['reasons'], {'no sample with PhysB': 1, 'no pool verdict for any sample': 1})
-        self.assertEqual((r['dayRecords']['evaluated'], r['dayRecords']['unavailable'], r['coverage']), (1, 2, 1.0))
+        # One day of three was classified: the two unavailable days stay in the denominator.
+        self.assertEqual((r['dayRecords']['evaluated'], r['dayRecords']['unavailable'], r['coverage']), (1, 2, round(1 / 3, 4)))
+        self.assertEqual((r['eligibleMinutes'], r['classifiedMinutes'], r['observations']['expectedOnEvaluatedDays']), (4320, 1440, 1440))
+
+    def test_a_day_without_physb_stays_in_the_coverage_denominator(self):
+        # Two eligible days, one sampled in full and one with no PhysB sample at all: half the eligible
+        # time was classified, at any interval. The evaluated day's own count is whole and is reported apart.
+        for cadence, n in ((1, 1440), (5, 288), (15, 96)):
+            m = month([('2026-09-01', 1440, n, n), ('2026-09-02', 1440, 0, 0)], cadence=cadence)
+            r, _ = self.read([['2026-09', m]])
+            self.assertEqual((r['status'], r['coverage']), ('partial', 0.5), cadence)
+            self.assertEqual((r['eligibleMinutes'], r['classifiedMinutes']), (2880, 1440), cadence)
+            self.assertEqual((r['observations']['expectedOnEvaluatedDays'], r['observations']['classified']), (n, n), cadence)
+            self.assertEqual(r['dayRecords'], {'evaluated': 1, 'full': 1, 'partial': 0, 'unavailable': 1, 'contested': 0})
+            self.assertEqual(r['reasons'], {'no sample with PhysB': 1})
+            self.assertIs(r['contestedObserved'], False)                 # nothing seen, in half the eligible time
+        # The same when the month's record cannot be used at all: the days are eligible, none is classified.
+        m = month([('2026-09-01', 1440, 1440, 1440), ('2026-09-02', 1440, 1440, 1440)], marker={'dataRevision': 'd2'})
+        r, _ = self.read([['2026-09', m]])
+        self.assertEqual((r['status'], r['coverage'], r['eligibleMinutes'], r['classifiedMinutes']), ('unavailable', 0.0, 2880, 0))
+        # A day the history does not hold has no known eligible time: counted apart, not in the denominator.
+        r, _ = self.read([['2026-09', month([('2026-09-01', 1440, 1440, 1440)])]])
+        self.assertEqual((r['coverage'], r['eligibleMinutes'], r['days']['withoutHistory'], r['status']), (1.0, 1440, 1, 'partial'))
 
     def test_days_at_another_interval_and_months_are_merged(self):
         first = month([('2026-09-29', 1440, 1440, 1440), ('2026-09-30', 1440, 96, 96)], by_date={'2026-09-30': 15},
@@ -238,7 +261,7 @@ class ContestedReaderTests(unittest.TestCase):
         r, figures = self.read([['2026-10', second], ['2026-09', first]], start='2026-09-29', end='2026-10-03', figures=[(1, 100), (0, 50)])
         self.assertEqual(r['readings'], [[0.5, 0.8, 3], [0.6, 0.9, 5], [0.7, 0.7, 1]])
         self.assertEqual((r['cadenceMinutes'], r['contestedMinutes']), ([1, 5, 15], 3 * 1 + 1 * 15 + 5 * 5))
-        self.assertEqual(r['observations'], {'expected': 1440 + 96 + 288, 'paired': 1824, 'classified': 1824, 'contested': 9})
+        self.assertEqual(r['observations'], {'expectedOnEvaluatedDays': 1440 + 96 + 288, 'paired': 1824, 'classified': 1824, 'contested': 9})
         self.assertEqual(r['days'], {'window': 4, 'withHistory': 3, 'withoutHistory': 1, 'contested': 3})
         self.assertEqual(r['status'], 'partial')                         # one day of the window is not in history
         self.assertEqual(figures, [[0.9, 0.9, 9], [0.7, 0.6, 9]])

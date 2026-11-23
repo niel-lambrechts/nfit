@@ -453,7 +453,7 @@ class MemberExposureTests(unittest.TestCase):
         by = {(q['vm'], q['population']): a['result'] for q, a in zip(queries, perl)}
         whole = by[('vmS', 'none')]
         self.assertEqual((whole['status'], whole['coverage'], whole['contestedObserved']), ('complete', 1.0, True))
-        self.assertEqual(whole['observations']['expected'], 2880)
+        self.assertEqual((whole['observations']['expectedOnEvaluatedDays'], whole['eligibleMinutes'], whole['classifiedMinutes']), (2880, 2880, 2880))
         part = by[('vmA', 'none')]                                                     # six minutes without PhysB, ten without a pool verdict
         self.assertEqual((part['status'], part['observations']['paired'], part['observations']['classified'], part['coverage']),
                          ('partial', 2874, 2864, round(2864 / 2880, 4)))
