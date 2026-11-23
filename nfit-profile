@@ -26344,19 +26344,26 @@ sub _contested_record_measure
     my $json = JSON->new->utf8->canonical;
     my $up = sub { my ($v) = @_; my $c = $v * 100; my $i = int($c); $i++ if ($c - $i > 1e-6); return $i / 100; };
     my %percentile_of = map { ($_->{name} => ((($_->{flags} // '') =~ /(?:-p|--percentile)\s+([0-9.]+)/) ? $1 + 0 : $DEFAULT_PERCENTILE + 0)) } @profiles;
-    my (%class, %text, @rows, @errors, $all_text, %worst);
+    my (%class, %text, @rows, @errors, $all_text, %worst, %capped);
     $all_text = '';
+    # Second form, measured beside the first: each day keeps its exact frontier on the 0.01 grid (so the
+    # cut-protection bound is unchanged), and its counted pairs on the finest grid of a fixed ladder
+    # that leaves no more than a given number of pairs. Nothing is dropped; the step is the error bound.
+    my @caps = (32, 64, 128, 256);
+    my @ladder = (0.01, 0.02, 0.05, 0.10, 0.20, 0.50, 1, 2, 5, 10, 20, 50);
+    my $on_grid = sub { my ($v, $step) = @_; my $c = $v / $step; my $i = int($c); $i++ if ($c - $i > 1e-6); return $i * $step; };
     my $index = 0;
     foreach my $t (@{ $trackers // [] })
     {
         my $p = $t->{protection} or next;
         $index++;
-        my (%by_day, %raw_n);
+        my (%by_day, %raw_n, %raw_of);
         foreach my $r (@{ $p->{all} // [] })
         {
             my ($b, $c, $day) = ($up->($r->[0]), $up->($r->[1]), $r->[2]);
             $by_day{$day}{ sprintf('%.2f,%.2f', $b, $c) }++;
             $raw_n{$day}++;
+            push @{ $raw_of{$day} }, $r;
         }
         my ($bytes, $days, $contested_days, $max_pairs, $max_obs, $pairs_total, $text) = (0, 0, 0, 0, 0, 0, '');
         my %columns = (dates => [], expected => [], paired => [], classified => [], scarce => [], contested => [], readings => {});
@@ -26404,6 +26411,65 @@ sub _contested_record_measure
             days => $days, contestedDays => $contested_days, observations => scalar(@{ $p->{all} // [] }), pairs => $pairs_total,
             mostPairsInADay => $max_pairs, mostObservationsInADay => $max_obs, bytes => $bytes,
             bytesPer30Days => ($days ? int(30 * $bytes / $days + 0.5) : 0) };
+        # The exact frontier of each day on the 0.01 grid: the pairs no other pair of the day exceeds in both values.
+        my %frontier_of;
+        foreach my $day (keys %by_day)
+        {
+            my ($highest, @kept) = (-1);
+            foreach my $q (sort { $b->[0] <=> $a->[0] || $b->[1] <=> $a->[1] } map { [ split /,/, $_ ] } keys %{ $by_day{$day} })
+            {
+                next unless ($q->[1] > $highest);
+                $highest = $q->[1];
+                push @kept, $q;
+            }
+            $frontier_of{$day} = \@kept;
+        }
+        # The capped form: per day the exact frontier, and the pairs on the finest grid within the cap.
+        foreach my $cap (@caps)
+        {
+            my $v = ($capped{$cap} //= { steps => {}, classBytes => {}, text => '', worstDayBytes => 0, levels => [], largestStepShareOfEntitlement => 0 });
+            my (%cols, @expanded);
+            %cols = (dates => $columns{dates}, map { ($_ => $columns{$_}) } qw(expected paired classified scarce contested lparCadenceSeconds poolCadenceSeconds));
+            foreach my $day (sort { $a <=> $b } keys %raw_of)
+            {
+                my ($step, %cells);
+                foreach my $try (@ladder)
+                {
+                    %cells = ();
+                    $cells{ sprintf('%.2f,%.2f', $on_grid->($_->[0], $try), $on_grid->($_->[1], $try)) }++ for @{ $raw_of{$day} };
+                    $step = $try;
+                    last if (keys(%cells) <= $cap);
+                }
+                $v->{steps}{ sprintf('%.2f', $step) }++;
+                my $share_of_ent = ($t->{entitlement} ? $step / $t->{entitlement} : 0);
+                $v->{largestStepShareOfEntitlement} = $share_of_ent if ($step > 0.01 && $share_of_ent > $v->{largestStepShareOfEntitlement});
+                my @pairs = map { my ($b, $c) = split /,/, $_; [ $b + 0, $c + 0, $cells{$_} ] } sort keys %cells;
+                my @frontier = @{ $frontier_of{$day} };
+                my $date = gmtime($day * 86400)->ymd;
+                $cols{readings}{$date} = \@pairs;
+                $cols{frontier}{$date} = [ map { [ $_->[0] + 0, $_->[1] + 0 ] } @frontier ];
+                $cols{resolution}{$date} = $step if ($step > 0.01);
+                my $day_bytes = length($json->encode([ \@pairs, $cols{frontier}{$date} ]));
+                $v->{worstDayBytes} = $day_bytes if ($day_bytes > $v->{worstDayBytes});
+                push @expanded, map { my $q = $_; ([ $q->[0], $q->[1], $day ]) x $q->[2] } @pairs;
+            }
+            my $line = $json->encode(\%cols) . "\n";
+            $v->{classBytes}{$kind} += length($line);
+            $v->{text} .= $line;
+            next unless $contested_days;
+            my %grid = (all => \@expanded, days => $p->{days});
+            foreach my $profile (@{ $t->{profiles} // [] })
+            {
+                my ($share, $tier) = _protection_share_of($profile);
+                next unless defined $share;
+                my $perc = $percentile_of{$profile} // $DEFAULT_PERCENTILE + 0;
+                my ($level, $n, undef, $enough) = _contested_level($p, $share, $perc);
+                next unless (defined $level && $enough && $n * (1 - $perc / 100) >= 1 - 1e-9);
+                my ($level_g) = _contested_level(\%grid, $share, $perc);
+                push @{ $v->{levels} }, { difference => 0 + sprintf('%.2f', $level_g - $level), level => $level, tier => "$tier",
+                    installedEntitlement => $t->{entitlement}, class => $kind };
+            }
+        }
         # Precision: the bound and the level from the rounded pairs against the observed readings.
         next unless $contested_days;
         my @rounded = map { my $day = $_; map { my ($b, $c) = split /,/, $_; ([ $b + 0, $c + 0, $day ]) x $by_day{$day}{$_} } keys %{ $by_day{$day} } } keys %by_day;
@@ -26447,6 +26513,24 @@ sub _contested_record_measure
                    columnBytesPer30Days => int(30 * length($text{'all:columns'} // '') / $days_all + 0.5),
                    bytesPer30Days => int(30 * length($all_text) / $days_all + 0.5), gzipBytesPer30Days => int(30 * ($gz->($all_text) // 0) / $days_all + 0.5) },
         worstDayRecord => \%worst,
+        cappedForm => { map {
+            my ($cap, $v) = ($_, $capped{$_});
+            my @lv = @{ $v->{levels} };
+            my @moved = sort { $b->{difference} <=> $a->{difference} } @lv;
+            ($cap => {
+                description => "exact daily frontier on the 0.01 grid; counted pairs on the finest ladder grid leaving at most $cap pairs a day",
+                columnBytesPer30DaysByClass => { map { ($_ => int(30 * $v->{classBytes}{$_} / $days_all + 0.5)) } keys %{ $v->{classBytes} } },
+                columnBytesPer30Days => int(30 * length($v->{text}) / $days_all + 0.5),
+                columnGzipBytesPer30Days => int(30 * ($gz->($v->{text}) // 0) / $days_all + 0.5),
+                worstDayBytes => $v->{worstDayBytes},
+                daysByGridStep => $v->{steps},
+                largestStepAsShareOfInstalledEntitlement => 0 + sprintf('%.3f', $v->{largestStepShareOfEntitlement}),
+                contestedLevelDifferenceWhereTheFloorIsInForce => $spread->('difference', @lv),
+                profilesInForce => scalar(@lv),
+                largestDifferences => [ map { { %$_, relative => ($_->{level} ? 0 + sprintf('%.3f', $_->{difference} / $_->{level}) : undef) } }
+                                        @moved[0 .. (@moved > 6 ? 5 : $#moved)] ],
+            })
+        } keys %capped },
         largestRecords => [ (sort { $b->{bytes} <=> $a->{bytes} } @rows)[0 .. (@rows > 12 ? 11 : $#rows)] ],
         precision => {
             profiles => scalar(@errors),
