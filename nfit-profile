@@ -720,6 +720,14 @@ my %POOL_CEILING_RULES = (minDays => 28, minCoverage => 0.99, minDayCoverage => 
     margins => [ 0, 0.05, 0.10, 0.15, 0.25 ]);
 my $MEMBER_EXPOSURE_PROJECTION = 'member-busy-exposure-1';
 my $MEMBER_EXPOSURE_FEATURE    = 'MemberExposure-1';
+# The durable contested record (v10 history; written with the member exposure block, from the same
+# trackers): per LPAR, configuration state, profile-hours population and UTC day, the counted
+# (busy, consumed) pairs of the contested observations on a 0.01-core grid, both rounded up. From
+# it a reader gets the cut-protection bound and the contested level for any share and percentile,
+# at most 0.01 core above the figure from the observations, never below. Days evaluated and their
+# support are in MemberExposure; a day evaluated there and absent here had no contested observation.
+my $CONTESTED_BUSY_PROJECTION = 'contested-busy-1';
+my $CONTESTED_BUSY_FEATURE    = 'ContestedBusy-1';
 # Pool reconciliation (v10 milestone 2.3): illustrative budgets on minutes any
 # member is exposed / longest run / excess core-minutes (those of the candidate
 # test), and the most cuts in one pool searched exhaustively (four levels each).
@@ -20020,6 +20028,7 @@ sub _generate_monthly_and_seasonal_history {
         # A stored pool or member exposure block is never lost when a month is re-analysed.
         my $previous_pool_history = _safe_dig($history_data_href, $month_key, 'PoolHistory');
         my $previous_exposure     = _safe_dig($history_data_href, $month_key, 'MemberExposure');
+        my $previous_contested    = _safe_dig($history_data_href, $month_key, 'ContestedBusy');
 
         # --- Populate the in-memory hash ---
         $history_data_href->{$month_key} = {
@@ -20042,6 +20051,13 @@ sub _generate_monthly_and_seasonal_history {
             $history_data_href->{$month_key}{MemberExposure}                   = $previous_exposure;
             $history_data_href->{$month_key}{Metadata}{MemberExposureEvidence} = $previous_metadata->{MemberExposureEvidence};
             push @{ $history_data_href->{$month_key}{Metadata}{Features} }, $MEMBER_EXPOSURE_FEATURE;
+        }
+        if (ref($previous_contested) eq 'HASH' && ref($previous_metadata->{ContestedBusyEvidence}) eq 'HASH')
+        {
+            # Carried unchanged through a re-analysis of the month, with the marker it was written with.
+            $history_data_href->{$month_key}{ContestedBusy}                   = $previous_contested;
+            $history_data_href->{$month_key}{Metadata}{ContestedBusyEvidence} = $previous_metadata->{ContestedBusyEvidence};
+            push @{ $history_data_href->{$month_key}{Metadata}{Features} }, $CONTESTED_BUSY_FEATURE;
         }
         if ($physb)
         {
@@ -24148,6 +24164,8 @@ sub _build_pool_history
                 my ($vm, $meta, $population, $profiles) = @_;
                 return _exposure_history_thresholds($mwa, $vm, $meta, $profiles);
             });
+            # The contested observations of each tracker are kept for the durable record.
+            $_->{protection} = { contested => 0, days => {}, frontier => [], top => [] } for @$trackers;
         }
         my %options = $trackers
             ? (days   => [ int($window_start / 86400) .. int(($window_end - 1) / 86400) ],
@@ -24194,6 +24212,32 @@ sub _build_pool_history
             print STDERR "  [INFO] Member exposure for $month_key ($MEMBER_EXPOSURE_PROJECTION): $exposure_counts->{vms} LPAR(s), "
                        . "$exposure_counts->{states} state(s), $exposure_counts->{pairedMinutes} paired minute(s), "
                        . "$exposure_counts->{classifiedMinutes} pool-classified.\n";
+            my ($contested_block, $contested_counts) = _contested_block($trackers);
+            $history_data_href->{$month_key}{ContestedBusy} = $contested_block;
+            $features{$CONTESTED_BUSY_FEATURE} = 1;
+            $metadata->{ContestedBusyEvidence} = {
+                %{ $exposure->{context}{signature} },
+                projection         => $CONTESTED_BUSY_PROJECTION,
+                schemaVersion      => 1,
+                rules              => { %MEMBER_EXPOSURE_RULES },
+                reading            => '[busy cores, consumed cores, observations]; both values rounded up to the grid',
+                gridCores          => 0.01,
+                maxRoundingCores   => 0.01,
+                support            => 'MemberExposure: the days evaluated and their expected, paired and classified counts',
+                zeroDay            => 'a day evaluated in MemberExposure and absent from readings had no contested observation',
+                duration           => 'an observation stands for one sampling interval of its day (cadenceMinutes, cadenceByDate); '
+                                    . 'only samples present are counted, within the configuration state and the population hours',
+                calendarRules      => 'utc-day',
+                windowStart        => _pool_iso($window_start),
+                windowEndExclusive => _pool_iso($window_end),
+                status             => ($complete ? 'complete' : 'partial'),
+                reason             => ($complete ? '' : 'the pool capture does not cover the whole window'),
+                availableAt        => gmtime()->datetime . 'Z',
+                %$contested_counts,
+            };
+            printf STDERR "  [INFO] Contested record for %s (%s): %d LPAR(s) with contested observations, %d observation(s) as %d pair(s) on %d day record(s); about %.0f KB.\n",
+                $month_key, $CONTESTED_BUSY_PROJECTION, @{$contested_counts}{qw(contestedVMs observations pairs contestedDayRecords)},
+                length(JSON->new->canonical->encode($contested_block)) / 1024;
         }
         elsif ($want_pool && $exposure && !$exposure->{context})
         {
@@ -24433,12 +24477,16 @@ sub _exposure_month_needs_block
     my ($month_data, $signature, $window_start, $window_end) = @_;
     my $marker = _safe_dig($month_data, 'Metadata', 'MemberExposureEvidence');
     return 1 unless (ref($marker) eq 'HASH' && ref(_safe_dig($month_data, 'MemberExposure')) eq 'HASH');
+
     my ($stored_start, $stored_end) = ($marker->{windowStart} // '', $marker->{windowEndExclusive} // '');
     # A wider stored window is kept (rolling retention can shorten a cache).
     return 0 if ($stored_start ne '' && $stored_end ne ''
         && $stored_start le $window_start && $stored_end ge $window_end
         && ($stored_start ne $window_start || $stored_end ne $window_end));
     return 1 if ($stored_start ne $window_start || $stored_end ne $window_end);
+    # A month written before the contested record existed gets it with its next exposure pass, when
+    # the staged data covers the same window (a wider stored window was kept above).
+    return 1 unless (ref(_safe_dig($month_data, 'Metadata', 'ContestedBusyEvidence')) eq 'HASH');
     my %expected = (%$signature, thresholdsHash => _exposure_thresholds_hash(_safe_dig($month_data, 'MonthlyWorkloadAnalysis')));
     return (grep { ($marker->{$_} // '') ne ($expected{$_} // '') } keys %expected) ? 1 : 0;
 }
@@ -24925,6 +24973,7 @@ sub _exposure_process_day
             && abs($pool_cadence - $cadence) <= $EVIDENCE_INTERVAL{cadenceTolerance} * $cadence)) ? 1 : 0;
         my $reach = int($cadence / 2);
         $acc->{expectedObs} //= 0;
+        $acc->{cadence} = $cadence;      # the day's sampling interval of this LPAR, in minutes
 
         for (my $minute = $from; $minute < $to; $minute += 60)
         {
@@ -25053,6 +25102,78 @@ sub _exposure_process_day
 
 # The MemberExposure block of one window from its trackers:
 # (block hashref, hashref of counts).
+# The durable contested record of a month from its exposure trackers (see $CONTESTED_BUSY_PROJECTION).
+# { LPAR => [ per configuration state: { stateStartUTC, fromUTC, toUTCExclusive, populations => {
+#     population => { profiles, cadenceMinutes, cadenceByDate (days at another interval), evaluatedDays,
+#                     readings => { date => [ [busy, consumed, observations], ... ] },
+#                     unavailable => { date => reason } } } } ] }
+# A population with no evaluated and no unavailable day is left out; an LPAR with none is left out.
+sub _contested_block
+{
+    my ($trackers_aref) = @_;
+    my $up = sub { my ($v) = @_; my $c = $v * 100; my $i = int($c); $i++ if ($c - $i > 1e-6); return $i / 100; };
+    my (%by_state, %counts, %contested_vm);
+    $counts{$_} = 0 for qw(observations pairs contestedDayRecords evaluatedDayRecords unavailableDayRecords);
+    foreach my $tracker (@$trackers_aref)
+    {
+        my (%cells, %cadence_days, %cadence_of, %unavailable);
+        my $evaluated = 0;
+        foreach my $day (sort { $a <=> $b } keys %{ $tracker->{daily} // {} })
+        {
+            my $acc = $tracker->{daily}{$day};
+            next unless $acc->{expected};
+            my $date = gmtime($day * 86400)->ymd;
+            if (!$acc->{classified})
+            {
+                # Not evaluated: said so for the day, with why. Never a day without competition.
+                $unavailable{$date} = !$acc->{paired} ? 'no sample with PhysB' : 'no pool verdict for any sample';
+                next;
+            }
+            $evaluated++;
+            $cadence_of{$date} = $acc->{cadence} // 1;
+            $cadence_days{ $cadence_of{$date} }++;
+        }
+        foreach my $r (@{ ($tracker->{protection} // {})->{all} // [] })
+        {
+            $cells{ $r->[2] }{ sprintf('%.2f,%.2f', $up->($r->[0]), $up->($r->[1])) }++;
+            $counts{observations}++;
+        }
+        next unless ($evaluated || %unavailable);
+        my %readings;
+        foreach my $day (sort { $a <=> $b } keys %cells)
+        {
+            my @pairs = map { my ($b, $c) = split /,/, $_; [ $b + 0, $c + 0, $cells{$day}{$_} ] }
+                        sort { my @x = split /,/, $a; my @y = split /,/, $b; $x[0] <=> $y[0] || $x[1] <=> $y[1] } keys %{ $cells{$day} };
+            $readings{ gmtime($day * 86400)->ymd } = \@pairs;
+            $counts{pairs} += scalar(@pairs);
+            $counts{contestedDayRecords}++;
+            $contested_vm{ $tracker->{vm} } = 1;
+        }
+        my ($usual) = sort { $cadence_days{$b} <=> $cadence_days{$a} || $a <=> $b } keys %cadence_days;
+        my %other = map { ($_ => $cadence_of{$_}) } grep { $cadence_of{$_} != ($usual // 1) } keys %cadence_of;
+        $counts{evaluatedDayRecords}   += $evaluated;
+        $counts{unavailableDayRecords} += scalar(keys %unavailable);
+        my $entry = $by_state{ $tracker->{vm} }{ $tracker->{from} } //= {
+            stateStartUTC  => _pool_iso($tracker->{stateStart}),
+            fromUTC        => _pool_iso($tracker->{from}),
+            toUTCExclusive => _pool_iso($tracker->{to}),
+            populations    => {},
+        };
+        $entry->{populations}{ $tracker->{population} } = {
+            profiles      => $tracker->{profiles},
+            evaluatedDays => $evaluated,
+            (defined $usual ? (cadenceMinutes => $usual + 0) : ()),
+            (%other ? (cadenceByDate => \%other) : ()),
+            (%readings ? (readings => \%readings) : ()),
+            (%unavailable ? (unavailable => \%unavailable) : ()),
+        };
+    }
+    my %block = map { my $vm = $_; ($vm => [ map { $by_state{$vm}{$_} } sort { $a <=> $b } keys %{ $by_state{$vm} } ]) } keys %by_state;
+    $counts{vms} = scalar(keys %block);
+    $counts{contestedVMs} = scalar(keys %contested_vm);
+    return (\%block, \%counts);
+}
+
 sub _exposure_block
 {
     my ($trackers_aref, $serial) = @_;

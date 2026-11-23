@@ -16,6 +16,7 @@
 # at the exact proposed entitlement, and the CSV unchanged by the option.
 # ==============================================================================
 import calendar
+import glob
 import gzip
 import json
 import os
@@ -369,6 +370,75 @@ class MemberExposureTests(unittest.TestCase):
         self.assertEqual((raw['expectedMinutes'], online['aboveMinutes']), (540, 30))       # W1 only
         batch, raw = self.columns('vmA', 'batch', '2026-09-01')
         self.assertEqual((raw['expectedMinutes'], batch['aboveMinutes']), (720, 20))        # W2 and W3 before midnight
+
+    # -- the durable contested record ----------------------------------------------------
+    def test_contested_record_is_written_with_its_marker(self):
+        m = self.month()
+        ev = m['Metadata']['ContestedBusyEvidence']
+        self.assertEqual((ev['projection'], ev['schemaVersion'], ev['gridCores'], ev['maxRoundingCores'], ev['status'], ev['dataRevision']),
+                         ('contested-busy-1', 1, 0.01, 0.01, 'complete', 'synthetic-1'))
+        self.assertIn('ContestedBusy-1', m['Metadata']['Features'])
+        self.assertNotIn('vmX', m['ContestedBusy'])                                   # dedicated: no pool
+        state, = m['ContestedBusy']['vmA']
+        everything = state['populations']['none']
+        self.assertEqual((everything['evaluatedDays'], everything['cadenceMinutes']), (2, 1))
+        self.assertNotIn('cadenceByDate', everything)
+        # Each reading: busy <= consumed, on the 0.01 grid, with a whole count; days as in the fixture.
+        self.assertEqual(sorted(everything['readings']), ['2026-09-01', '2026-09-02'])
+        for pairs in everything['readings'].values():
+            for busy, consumed, n in pairs:
+                self.assertLessEqual(busy, consumed + 1e-9)
+                self.assertAlmostEqual(busy * 100, round(busy * 100), places=6)
+                self.assertTrue(isinstance(n, int) and n > 0)
+        self.assertGreater(ev['observations'], 0)
+        self.assertGreaterEqual(ev['observations'], ev['pairs'])
+        # An online profile's record holds only its own hours: fewer observations than all hours.
+        online = state['populations']['online+no-weekends']
+        count = lambda pop: sum(n for pairs in pop.get('readings', {}).values() for _, _, n in pairs)
+        self.assertLess(count(online), count(everything))
+
+    def test_history_gives_the_bound_of_the_raw_data_within_one_increment(self):
+        # The standard run computes the cut-protection frontier from the samples; the history record must
+        # give the same highest protected level for any share, at most 0.01 above it and never below.
+        self.run_profile(self.root)
+        snaps = glob.glob(os.path.join(self.root, 'stage', SERIAL, '.nfit.store', 'proposals', 'v1', '*', '*.json'))
+        with open(sorted(snaps, key=os.path.getmtime)[-1]) as fh:
+            profiles = json.load(fh)['members']['vmA']['profiles']
+        record = next(v['cutProtection'] for v in profiles.values() if v.get('cutProtection', {}).get('population') == 'none')
+        readings = self.month()['ContestedBusy']['vmA'][0]['populations']['none']['readings']
+        pairs = [(b, c) for day in readings.values() for b, c, _ in day]
+        self.assertEqual(sum(n for day in readings.values() for _, _, n in day), record['support']['contestedMinutes'])
+        for share in (0, 0.40, 0.65, 0.85, 0.95, 1):
+            raw = max(b + share * (c - b) for b, c, _ in record['frontier'])
+            stored = max(b + share * (c - b) for b, c in pairs)
+            self.assertGreaterEqual(stored, raw - 1e-9, share)
+            self.assertLessEqual(stored, raw + 0.01 + 1e-9, share)
+
+    def test_a_day_that_could_not_be_evaluated_is_named_not_counted_as_quiet(self):
+        code = r"""
+            my $t = { vm => 'x', from => 0, to => 172800, stateStart => 0, population => 'none', profiles => ['G3-95W15'],
+                      daily => { 0 => { expected => 1440, paired => 1440, classified => 1440, cadence => 1 },
+                                 1 => { expected => 1440, paired => 0, classified => 0 },
+                                 2 => { expected => 96, paired => 96, classified => 0 },
+                                 3 => { expected => 96, paired => 96, classified => 96, cadence => 15 } },
+                      protection => { all => [ [0.501, 0.80, 0], [0.509, 0.80, 0], [1.0, 1.2, 3] ] } };
+            my ($block, $counts) = _contested_block([ $t ]);
+            print JSON->new->canonical->encode([ $block, $counts ]);
+        """
+        with open(os.path.join(REPO, 'nfit-profile')) as fh:
+            source = fh.read()
+        import re as _re
+        subs = ''.join(_re.search(r'^(sub %s\s*\{.*?^\})' % name, source, _re.S | _re.M).group(1) + '\n' for name in ('_contested_block', '_pool_iso'))
+        script = 'use strict; use warnings; use JSON; use Time::Piece;\n' + subs + code
+        out = subprocess.run(['perl', '-e', script], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr[-800:])
+        block, counts = json.loads(out.stdout)
+        pop = block['x'][0]['populations']['none']
+        self.assertEqual(pop['unavailable'], {'1970-01-02': 'no sample with PhysB', '1970-01-03': 'no pool verdict for any sample'})
+        self.assertEqual(pop['evaluatedDays'], 2)
+        self.assertEqual(pop['readings'], {'1970-01-01': [[0.51, 0.8, 2]], '1970-01-04': [[1, 1.2, 1]]})       # rounded up, counted
+        self.assertEqual((pop['cadenceMinutes'], pop['cadenceByDate']), (1, {'1970-01-04': 15}))               # a day at another interval says so
+        self.assertEqual((counts['observations'], counts['pairs'], counts['unavailableDayRecords']), (3, 2, 2))
 
     # -- re-runs and the CSV ------------------------------------------------------------
     def test_an_identical_second_run_leaves_the_partition_unchanged(self):
