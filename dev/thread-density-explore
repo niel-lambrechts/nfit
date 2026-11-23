@@ -60,6 +60,7 @@ SATURATION_EDGES = (0.70, 0.90, 0.98)                       # PhysC / VPs: below
 SATURATED_FROM = 0.90                                       # "VP-saturated" for the run-queue table
 QUEUE_PER_VP_EDGES = (1.0, 2.0, 4.0, 8.0, 16.0)             # run queue / VPs (runnable threads per VP)
 CELL_MIN_SAMPLES = 30
+RARELY_LOW_SHARE = 0.10                                     # an LPAR is "rarely below the activity floor" up to this share of its samples
 
 
 def edge_bin(value, edges):
@@ -190,6 +191,7 @@ def read_samples(stage, states, planning):
     """One pass over the staged samples: the guaranteed set and all valid samples per LPAR and
     (generation, SMT mode), and the run-queue load on the planning hours of the current state."""
     guaranteed, everything, load, pointer, days = {}, {}, {}, {}, {}
+    sums, low = {}, {}               # per LPAR and group: busy and consumed cores summed (guaranteed set, all valid); samples below the floor
     counts = {'rows': 0, 'withoutState': 0, 'withoutBusy': 0, 'invalidBusy': 0, 'belowFloor': 0, 'guaranteed': 0, 'valid': 0}
     with (stage / '.nfit.cache.data').open(encoding='utf-8', errors='replace') as fh:
         header = fh.readline().rstrip('\n').split(',')
@@ -252,6 +254,7 @@ def read_samples(stage, states, planning):
                 continue
             if consumed < ACTIVITY_FLOOR:
                 counts['belowFloor'] += 1
+                low[vm] = low.get(vm, 0) + 1
                 continue
             if busy < 0 or busy > consumed * BUSY_TOLERANCE:
                 counts['invalidBusy'] += 1
@@ -265,12 +268,49 @@ def read_samples(stage, states, planning):
             slot[2].append(consumed / vps if vps > 0 else 0.0)                    # how full the VPs are
             slot[3].append(queue / vps if vps > 0 else 0.0)                       # runnable threads per VP
             slot[4].append(1 if consumed > ent + 1e-9 else 0)                     # above the entitlement
+            total = sums.setdefault(vm, {}).setdefault(key, [0.0, 0.0, 0.0, 0.0])
+            total[2] += share * consumed
+            total[3] += consumed
             if consumed <= ent + 1e-9 and consumed <= VP_CEILING_SHARE * vps:
                 counts['guaranteed'] += 1
+                total[0] += share * consumed
+                total[1] += consumed
                 slot = guaranteed.setdefault(vm, {}).setdefault(key, (array('f'), array('f')))
                 slot[0].append(k)
                 slot[1].append(share)
-    return guaranteed, everything, load, counts
+    return guaranteed, everything, load, counts, sums, low
+
+
+def weighting_table(everything, guaranteed, sums, low, group_of):
+    """Reconciliation of two ways to state an LPAR's busy share, on the same LPARs and samples: the median
+    of the per-sample ratios against the ratio of the sums (which weights each sample by its consumed
+    cores), each in the guaranteed set and in all valid samples. Summarised across LPARs, with the
+    per-LPAR differences that separate the effect of the weighting from the effect of the two caps."""
+    rows = {'all': [], 'rarelyBelowFloor': []}
+    for vm, by_key in everything.items():
+        key = group_of[vm]
+        base = (guaranteed.get(vm) or {}).get(key)
+        total = (sums.get(vm) or {}).get(key)
+        if not base or len(base[1]) < LPAR_MIN_SAMPLES or not total or total[1] <= 0 or total[3] <= 0:
+            continue
+        row = (quantile(sorted(base[1]), 0.5), total[0] / total[1], quantile(sorted(by_key[key][1]), 0.5), total[2] / total[3])
+        rows['all'].append(row)
+        valid = sum(len(slot[1]) for slot in by_key.values())
+        if low.get(vm, 0) <= RARELY_LOW_SHARE * (low.get(vm, 0) + valid):
+            rows['rarelyBelowFloor'].append(row)
+    table = {}
+    for name, values in rows.items():
+        column = lambda f: summary([f(r) for r in values])
+        table[name] = {
+            'lpars': len(values),
+            'medianOfRatios': {'guaranteedSet': column(lambda r: r[0]), 'allValidSamples': column(lambda r: r[2])},
+            'ratioOfSums': {'guaranteedSet': column(lambda r: r[1]), 'allValidSamples': column(lambda r: r[3])},
+            'perLparDifference': {
+                'weightingWithinTheCaps': column(lambda r: r[1] - r[0]),
+                'capsLiftedMedianOfRatios': column(lambda r: r[2] - r[0]),
+                'capsLiftedRatioOfSums': column(lambda r: r[3] - r[1]),
+                'both': column(lambda r: r[3] - r[0])}}
+    return table
 
 
 def curve_table(source):
@@ -443,7 +483,7 @@ def main():
     planning, planning_source, standard_model = planning_facts(stage)
 
     t0 = time.time()
-    guaranteed, everything, load, counts = read_samples(stage, states, planning)
+    guaranteed, everything, load, counts, sums, low = read_samples(stage, states, planning)
     seconds = round(time.time() - t0, 1)
     group_of = {vm: max(by_key, key=lambda key: len(by_key[key][0])) for vm, by_key in everything.items()}
     estate_guaranteed, estate_all = curve_table(guaranteed), curve_table(everything)
@@ -452,6 +492,7 @@ def main():
     by_tier, overlap, proposed = load_table(load, planning, verdict_of)
     levels = aix_levels(a.config or (work / 'app' / 'config.csv'))
     table_a, table_b, table_c = saturation_tables(everything, guaranteed, group_of, levels)
+    table_d = weighting_table(everything, guaranteed, sums, low, group_of)
 
     result = {
         'label': label, 'method': {
@@ -472,7 +513,13 @@ def main():
                                 'saturatedFrom': SATURATED_FROM, 'runQueuePerVpEdges': list(QUEUE_PER_VP_EDGES),
                                 'cellMinSamples': CELL_MIN_SAMPLES, 'aixLevelsKnownFor': sum(1 for vm in everything if vm.lower() in levels),
                                 'processorMode': 'the processor label of the staged configuration state: the effective compatibility mode'},
-                     'A_busyShareBySaturation': table_a, 'B_saturatedByRunQueuePerVP': table_b, 'C_byModeAndAixLevel': table_c},
+                     'A_busyShareBySaturation': table_a, 'B_saturatedByRunQueuePerVP': table_b, 'C_byModeAndAixLevel': table_c,
+                     'D_weightingAndCaps': dict(table_d, method={
+                         'medianOfRatios': 'per LPAR, the median of PhysB / PhysC over its samples',
+                         'ratioOfSums': 'per LPAR, the sum of PhysB over the sum of PhysC (each sample weighted by its consumed cores)',
+                         'caps': 'the guaranteed set against all valid samples; the activity floor applies to both',
+                         'rarelyBelowFloor': 'LPARs with at most %.2f of their samples below the activity floor' % RARELY_LOW_SHARE,
+                         'lpars': 'those with %d samples in the guaranteed set, so that every figure is of the same LPARs' % LPAR_MIN_SAMPLES})},
         'seconds': seconds,
     }
     out = Path(a.out).resolve()
@@ -528,6 +575,20 @@ def main():
     for r in table_c:
         print('    %-14s %-20s %6d   %3d: %s    %3d: %s' % (r['processorMode'], r['aixLevel'], r['lpars'], r['baselineBusyShare'].get('n', 0),
                                                         fmt(r['baselineBusyShare']), r['vpSaturatedBusyShare'].get('n', 0), fmt(r['vpSaturatedBusyShare'])))
+    print()
+    print('Follow-up D  Median of per-sample ratios against ratio of sums, with and without the two caps (same LPARs; median across LPARs)')
+    print('    %-22s %5s   %-27s %-27s %s' % ('LPARs', 'n', 'median of ratios: caps/all', 'ratio of sums: caps/all', 'per LPAR: weighting, caps (sums), both'))
+    for name in ('all', 'rarelyBelowFloor'):
+        d = table_d[name]
+        if not d['lpars']:
+            continue
+        mid = lambda s: s['median']
+        print('    %-22s %5d   %5.3f / %5.3f               %5.3f / %5.3f               %+.3f, %+.3f, %+.3f' % (
+            {'all': 'all', 'rarelyBelowFloor': 'rarely below the floor'}[name], d['lpars'],
+            mid(d['medianOfRatios']['guaranteedSet']), mid(d['medianOfRatios']['allValidSamples']),
+            mid(d['ratioOfSums']['guaranteedSet']), mid(d['ratioOfSums']['allValidSamples']),
+            mid(d['perLparDifference']['weightingWithinTheCaps']), mid(d['perLparDifference']['capsLiftedRatioOfSums']),
+            mid(d['perLparDifference']['both'])))
     print()
     print('H3  Run-queue load on entitlement: P95 of run queue / (entitlement x SMT), planning hours, current state, against the tier density')
     print('    %-5s %-9s %5s %12s %10s %10s %13s   %s' % ('tier', 'class', 'LPARs', 'entitlement', 'P95 PhysC', 'P95 PhysB', 'at/above ENT', 'P95 load p25/med/p75'))

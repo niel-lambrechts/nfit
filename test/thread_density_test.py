@@ -146,5 +146,57 @@ class ThreadDensityTests(unittest.TestCase):
         self.assertEqual(follow['method']['aixLevelsKnownFor'], 4)
 
 
+class WeightingAndCapsTests(unittest.TestCase):
+    """The ratio of sums weights each sample by its consumed cores; the median of ratios does not. On the
+    same LPAR the two agree inside the guaranteed set and part only when the caps are lifted."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.scratch = tempfile.mkdtemp(prefix='thread-density-weighting-')
+        stage = os.path.join(cls.scratch, 'work', 'case', 'stage', 'SYNTD')
+        os.makedirs(stage)
+        with open(os.path.join(stage, '.nfit.cache.data'), 'w') as fh:
+            fh.write('Timestamp,VMName,PhysC,RunQ,PhysB\n')
+            for t in range(START, START + DAYS * 86400, 60):
+                stamp = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(t))
+                fourth = (t // 60) % 4 == 0
+                # Three minutes in four within the entitlement at a busy share of 0.30; one in four above it,
+                # near the VP ceiling, at 0.80.
+                fh.write('%s,peaky,%s\n' % (stamp, '3.9000,12.0000,3.1200' if fourth else '1.0000,1.0000,0.3000'))
+                # One minute in four active, the rest below the activity floor.
+                fh.write('%s,quiet,%s\n' % (stamp, '1.0000,1.0000,0.3000' if fourth else '0.1000,0.2000,0.0300'))
+        md = {'proc_type': 'PowerPC_POWER10', 'proc_version': '2.0', 'smt': 8, 'entitlement': 2.0, 'virtual_cpus': 4, 'capped': 0, 'pool_id': 0}
+        with open(os.path.join(stage, '.nfit.cache.states'), 'w') as fh:
+            json.dump({vm: [{'start_epoch': START, 'end_epoch': START + DAYS * 86400 - 60, 'metadata': md}] for vm in ('peaky', 'quiet')}, fh)
+        cls.run_ = subprocess.run([sys.executable, os.path.join(REPO, 'dev', 'thread-density-explore'), '--work',
+                                   os.path.join(cls.scratch, 'work'), '--out', os.path.join(cls.scratch, 'out'), '--label', 'weighting'],
+                                  capture_output=True, text=True, timeout=120)
+        path = os.path.join(cls.scratch, 'out', 'thread-density-weighting.json')
+        cls.result = {}
+        if os.path.exists(path):
+            with open(path) as fh:
+                cls.result = json.load(fh)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.scratch, ignore_errors=True)
+
+    def test_weighting_and_caps_are_separated_on_the_same_lpars(self):
+        self.assertEqual(self.run_.returncode, 0, self.run_.stderr)
+        d = self.result['followUp']['D_weightingAndCaps']
+        self.assertEqual((d['all']['lpars'], d['rarelyBelowFloor']['lpars']), (2, 1))   # the quiet LPAR is below the floor three minutes in four
+        peaky = d['rarelyBelowFloor']
+        self.assertAlmostEqual(peaky['medianOfRatios']['guaranteedSet']['median'], 0.30, delta=0.001)
+        self.assertAlmostEqual(peaky['medianOfRatios']['allValidSamples']['median'], 0.30, delta=0.001)      # three samples in four are at 0.30
+        self.assertAlmostEqual(peaky['ratioOfSums']['guaranteedSet']['median'], 0.30, delta=0.001)
+        self.assertAlmostEqual(peaky['ratioOfSums']['allValidSamples']['median'], (3 * 0.30 + 3.12) / (3 * 1.0 + 3.9), delta=0.001)
+        difference = peaky['perLparDifference']
+        self.assertAlmostEqual(difference['weightingWithinTheCaps']['median'], 0.0, delta=0.001)
+        self.assertAlmostEqual(difference['capsLiftedMedianOfRatios']['median'], 0.0, delta=0.001)
+        self.assertAlmostEqual(difference['capsLiftedRatioOfSums']['median'], 0.283, delta=0.001)
+        self.assertAlmostEqual(difference['both']['median'], 0.283, delta=0.001)
+        self.assertIn('Follow-up D', self.run_.stdout)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
