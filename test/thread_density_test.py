@@ -30,7 +30,10 @@ LPARS = {'single': (2.0, 4, 1.0, 1.0, 0.294, 'G3-95W15'),      # one thread per 
          'mid': (2.0, 4, 1.5, 6.0, 1.173, 'G1-99W5'),          # four threads per core: 0.78
          'wide': (3.0, 6, 2.0, 8.0, 0.8, 'G3-95W15'),          # four threads per core, busy share 0.40: below the curve
          'hot': (1.0, 4, 2.5, 20.0, 2.5, 'G3-95W15'),          # above its entitlement: not in the guaranteed set
-         'idle': (1.0, 2, 0.1, 0.2, 0.05, 'G3-95W15')}         # below the activity floor
+         'idle': (1.0, 2, 0.1, 0.2, 0.05, 'G3-95W15'),         # below the activity floor
+         'packed': (2.0, 2, 2.0, 8.0, 1.564, 'G3-95W15'),      # every VP in use, four runnable threads per VP: 0.78
+         'full': (2.0, 2, 1.98, 32.0, 1.98, 'G3-95W15')}       # every VP in use, sixteen per VP: fully busy
+AIX = {'single': '7.2 TL5', 'dense': '7300-02', 'packed': '7.3 TL1', 'full': '7.3 TL1'}
 
 
 class ThreadDensityTests(unittest.TestCase):
@@ -57,8 +60,12 @@ class ThreadDensityTests(unittest.TestCase):
         with open(os.path.join(store, 'snapshot.json'), 'w') as fh:
             json.dump({'model': 'state-based', 'members': {vm: {'planningProfile': v[5], 'profiles': {v[5]: {'entitlement': v[0]}}}
                                                          for vm, v in LPARS.items()}}, fh)
+        config = os.path.join(cls.scratch, 'config.csv')
+        with open(config, 'w') as fh:
+            fh.write('"hostname","serial","osversion"\n' + ''.join('"%s","X","%s"\n' % (vm.upper(), v) for vm, v in AIX.items()))
         cls.run_ = subprocess.run([sys.executable, os.path.join(REPO, 'dev', 'thread-density-explore'), '--work',
-                                   os.path.join(cls.scratch, 'work'), '--out', os.path.join(cls.scratch, 'out'), '--label', 'designed'],
+                                   os.path.join(cls.scratch, 'work'), '--out', os.path.join(cls.scratch, 'out'), '--label', 'designed',
+                                   '--config', config],
                                   capture_output=True, text=True, timeout=120)
         cls.text = ''
         path = os.path.join(cls.scratch, 'out', 'thread-density-designed.json')
@@ -80,7 +87,7 @@ class ThreadDensityTests(unittest.TestCase):
         samples = DAYS * 1440
         self.assertEqual(self.result['samples']['rows'], samples * len(LPARS))
         self.assertEqual(self.result['samples']['belowFloor'], samples)                 # the idle LPAR
-        self.assertEqual(self.result['samples']['guaranteed'], samples * 4)             # not the one above its entitlement
+        self.assertEqual(self.result['samples']['guaranteed'], samples * 4)             # not above entitlement, not VP-saturated
         for name in LPARS:
             self.assertNotIn('"%s"' % name, self.text)
         self.assertNotIn('SYNTD', self.text)
@@ -94,7 +101,8 @@ class ThreadDensityTests(unittest.TestCase):
         self.assertEqual((eight['lpars'], eight['predictedGeneration']), (1, 1.0))
         self.assertAlmostEqual(eight['busyShare']['median'], 1.0, delta=0.011)
         # All valid samples add the LPAR above its entitlement, at eight threads per core.
-        self.assertEqual({r['threadsPerCore']: r['lpars'] for r in self.result['H1_estateCurve']['allValidSamples']['Power10 SMT8']}['7 to 9'], 2)
+        everything = {r['threadsPerCore']: r['lpars'] for r in self.result['H1_estateCurve']['allValidSamples']['Power10 SMT8']}
+        self.assertEqual((everything['7 to 9'], everything['3.5 to 5'], everything['above 12']), (2, 3, 1))
 
     def test_the_lpar_below_the_curve_is_found_and_single_threaded_work_is_not_mistaken_for_it(self):
         fit = self.result['H1_H2_fitPerLpar']['guaranteedSet']['Power10 SMT8']
@@ -107,14 +115,35 @@ class ThreadDensityTests(unittest.TestCase):
     def test_run_queue_load_is_classed_against_the_tier_of_the_planning_profile(self):
         h3 = self.result['H3_loadOnEntitlement']
         tier3, tier1 = h3['byTier']['3'], h3['byTier']['1']
-        self.assertEqual((tier3['farBelow']['lpars'], tier3['within']['lpars'], tier3['above']['lpars']), (3, 1, 1))
+        self.assertEqual((tier3['farBelow']['lpars'], tier3['within']['lpars'], tier3['above']['lpars']), (3, 2, 2))
         self.assertEqual(tier1['within']['lpars'], 1)                                   # 0.375 of the guaranteed threads against 0.45
         self.assertEqual(tier3['above']['consumingAtOrAboveEntitlement'], 1)
         self.assertEqual(tier3['farBelow']['consumingAtOrAboveEntitlement'], 0)
         self.assertEqual(tier3['farBelow']['entitlement'], 6.0)                         # 2 + 3 + 1
         self.assertEqual(h3['againstCurveVerdict']['farBelow'], {'fits': 1, 'below': 1, 'notClassified': 1})
-        self.assertEqual(h3['againstCurveVerdict']['above'], {'notClassified': 1})
-        self.assertEqual(h3['withProposedFactor'], {'lpars': 6, 'farBelow': 5, 'within': 0, 'above': 1})
+        self.assertEqual(h3['againstCurveVerdict']['above'], {'notClassified': 2})
+        self.assertEqual(h3['withProposedFactor'], {'lpars': 8, 'farBelow': 6, 'within': 0, 'above': 2})
+
+    def test_busy_share_is_reported_by_vp_saturation_and_by_run_queue_per_vp(self):
+        follow = self.result['followUp']
+        self.assertEqual((follow['method']['saturationEdges'], follow['method']['runQueuePerVpEdges']), ([0.7, 0.9, 0.98], [1.0, 2.0, 4.0, 8.0, 16.0]))
+        a = {(r['vpSaturation'], r['entitlement']): r for r in follow['A_busyShareBySaturation']['Power10 SMT8']}
+        self.assertEqual(a[('below 0.7', 'within')]['lpars'], 4)                        # single, dense, mid, wide
+        self.assertEqual(a[('below 0.7', 'above')]['lpars'], 1)                         # the LPAR above its entitlement, on 2.5 of 4 VPs
+        saturated = a[('above 0.98', 'within')]
+        self.assertEqual(saturated['lpars'], 2)                                         # every VP in use
+        self.assertAlmostEqual(saturated['busyShare']['median'], (0.782 + 1.0) / 2, delta=0.02)
+        # VP-saturated samples by run-queue depth per VP: four per VP on the curve at 0.78, sixteen fully busy.
+        b = {r['runQueuePerVP']: r for r in follow['B_saturatedByRunQueuePerVP']['Power10 SMT8']}
+        self.assertEqual((b['4 to 8']['lpars'], b['4 to 8']['medianThreadsPerCore'], b['4 to 8']['predictedModeCurve']), (1, 4.0, 0.782))
+        self.assertAlmostEqual(b['4 to 8']['busyShare']['median'], 0.782, delta=0.011)
+        self.assertEqual((b['above 16']['lpars'], b['above 16']['predictedModeCurve']), (1, 1.0))
+        self.assertAlmostEqual(b['above 16']['busyShare']['median'], 1.0, delta=0.011)
+        # By processor mode and AIX level, names matched without regard to case.
+        c = {r['aixLevel']: r for r in follow['C_byModeAndAixLevel']}
+        self.assertEqual((c['AIX 7.2']['lpars'], c['AIX 7.3']['lpars'], c['AIX level not given']['lpars']), (1, 3, 3))
+        self.assertEqual((c['AIX 7.3']['baselineBusyShare']['n'], c['AIX 7.3']['vpSaturatedBusyShare']['n']), (1, 2))
+        self.assertEqual(follow['method']['aixLevelsKnownFor'], 4)
 
 
 if __name__ == '__main__':

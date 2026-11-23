@@ -53,6 +53,47 @@ CURVES = {                       # SMT yield by threads per core: v10 plan secti
 }
 POPULATION_OF_LETTER = {'G': 'none', 'P': 'none', 'O': 'online+no-weekends', 'B': 'batch'}
 
+# --- follow-up pass (research note, section 9), fixed before its results were read -------------
+# Does busy share rise once an LPAR can no longer unfold further VPs? All valid samples, by how
+# full the VPs are, by whether the LPAR is above its entitlement, and by run-queue depth per VP.
+SATURATION_EDGES = (0.70, 0.90, 0.98)                       # PhysC / VPs: below 0.70, 0.70-0.90, 0.90-0.98, above 0.98
+SATURATED_FROM = 0.90                                       # "VP-saturated" for the run-queue table
+QUEUE_PER_VP_EDGES = (1.0, 2.0, 4.0, 8.0, 16.0)             # run queue / VPs (runnable threads per VP)
+CELL_MIN_SAMPLES = 30
+
+
+def edge_bin(value, edges):
+    for i, edge in enumerate(edges):
+        if value < edge:
+            return i
+    return len(edges)
+
+
+def edge_label(i, edges, unit=''):
+    if i == 0:
+        return 'below %g%s' % (edges[0], unit)
+    return ('%g to %g%s' % (edges[i - 1], edges[i], unit)) if i < len(edges) else ('above %g%s' % (edges[-1], unit))
+
+
+def aix_levels(path):
+    """{LPAR name in lower case: 'AIX 7.2' | 'AIX 7.3' | ...} from the osversion column of a VM configuration file."""
+    import csv
+    levels = {}
+    if not path or not Path(path).is_file() or not Path(path).stat().st_size:
+        return levels
+    with open(path, newline='', encoding='utf-8', errors='replace') as fh:
+        reader = csv.reader(fh)
+        header = [h.strip().lower() for h in next(reader, [])]
+        if 'hostname' not in header or 'osversion' not in header:
+            return levels
+        name, version = header.index('hostname'), header.index('osversion')
+        for row in reader:
+            if len(row) <= max(name, version):
+                continue
+            hit = re.search(r'(\d)\.(\d)', row[version]) or re.match(r'\s*(\d)(\d)00', row[version])
+            levels[row[name].strip().lower()] = ('AIX %s.%s' % hit.groups()) if hit else 'AIX level unknown'
+    return levels
+
 
 def generation_of(metadata):
     text = '%s %s' % (metadata.get('proc_type') or '', metadata.get('proc_version') or '')
@@ -218,9 +259,12 @@ def read_samples(stage, states, planning):
             counts['valid'] += 1
             key = (generation_of(md), smt)
             k, share = queue / consumed, min(1.0, busy / consumed)
-            slot = everything.setdefault(vm, {}).setdefault(key, (array('f'), array('f')))
+            slot = everything.setdefault(vm, {}).setdefault(key, (array('f'), array('f'), array('f'), array('f'), array('b')))
             slot[0].append(k)
             slot[1].append(share)
+            slot[2].append(consumed / vps if vps > 0 else 0.0)                    # how full the VPs are
+            slot[3].append(queue / vps if vps > 0 else 0.0)                       # runnable threads per VP
+            slot[4].append(1 if consumed > ent + 1e-9 else 0)                     # above the entitlement
             if consumed <= ent + 1e-9 and consumed <= VP_CEILING_SHARE * vps:
                 counts['guaranteed'] += 1
                 slot = guaranteed.setdefault(vm, {}).setdefault(key, (array('f'), array('f')))
@@ -233,7 +277,8 @@ def curve_table(source):
     """Per (generation, SMT) and bin of k: per-LPAR median busy share, summarised across LPARs."""
     out = {}
     for vm, by_key in source.items():
-        for key, (ks, shares) in by_key.items():
+        for key, slot in by_key.items():
+            ks, shares = slot[0], slot[1]
             bins = {}
             for k, s in zip(ks, shares):
                 b = bins.setdefault(bin_of(k), ([], []))
@@ -269,7 +314,7 @@ def fit(source, group_of):
         key = group_of.get(vm)
         if key not in by_key or len(by_key[key][0]) < LPAR_MIN_SAMPLES:
             continue
-        ks, shares = by_key[key]
+        ks, shares = by_key[key][0], by_key[key][1]
         generation, smt = key
         group = '%s SMT%d' % key
         for name in (generation, 'default'):
@@ -286,6 +331,63 @@ def fit(source, group_of):
                                  medianAbsoluteResidual=round(quantile(sorted(abs(x) for x in residuals[group][which]), 0.5), 3))
                      for which in classes[group]} for group in sorted(classes)}
     return table, per_lpar
+
+
+def saturation_tables(everything, guaranteed, group_of, levels):
+    """The follow-up pass: (A) busy share by VP saturation and entitlement regime, (B) for VP-saturated
+    samples, busy share by run-queue depth per VP against the yield curves, (C) the baseline and the
+    saturated busy share by processor mode and AIX level. Per-LPAR medians, summarised across LPARs."""
+    a, b, c = {}, {}, {}
+    for vm, by_key in everything.items():
+        key = group_of[vm]
+        ks, shares, sats, queues, aboves = by_key[key]
+        group = '%s SMT%d' % key
+        cells_a, cells_b, saturated = {}, {}, []
+        for share, sat, queue, above in zip(shares, sats, queues, aboves):
+            cells_a.setdefault((edge_bin(sat, SATURATION_EDGES), above), []).append(share)
+            if sat >= SATURATED_FROM:
+                cells_b.setdefault(edge_bin(queue, QUEUE_PER_VP_EDGES), ([], []))
+                cells_b[edge_bin(queue, QUEUE_PER_VP_EDGES)][0].append(queue / sat if sat > 0 else queue)   # threads per consumed core
+                cells_b[edge_bin(queue, QUEUE_PER_VP_EDGES)][1].append(share)
+                saturated.append(share)
+        for cell, values in cells_a.items():
+            if len(values) >= CELL_MIN_SAMPLES:
+                slot = a.setdefault(group, {}).setdefault(cell, {'share': [], 'samples': 0})
+                slot['share'].append(quantile(sorted(values), 0.5))
+                slot['samples'] += len(values)
+        for cell, (kk, values) in cells_b.items():
+            if len(values) >= CELL_MIN_SAMPLES:
+                slot = b.setdefault(group, {}).setdefault(cell, {'share': [], 'k': [], 'samples': 0, 'key': key})
+                slot['share'].append(quantile(sorted(values), 0.5))
+                slot['k'].append(quantile(sorted(kk), 0.5))
+                slot['samples'] += len(values)
+        level = levels.get(vm.lower(), 'AIX level not given')
+        slot = c.setdefault((group, level), {'baseline': [], 'saturated': [], 'lpars': 0})
+        slot['lpars'] += 1
+        base = (guaranteed.get(vm) or {}).get(key)
+        if base and len(base[1]) >= LPAR_MIN_SAMPLES:
+            slot['baseline'].append(quantile(sorted(base[1]), 0.5))
+        if len(saturated) >= CELL_MIN_SAMPLES:
+            slot['saturated'].append(quantile(sorted(saturated), 0.5))
+    table_a = {group: [{'vpSaturation': edge_label(i, SATURATION_EDGES), 'entitlement': 'above' if above else 'within',
+                        'lpars': len(cell['share']), 'samples': cell['samples'], 'busyShare': summary(cell['share'])}
+                       for (i, above), cell in sorted(cells.items())] for group, cells in sorted(a.items())}
+    table_b = {}
+    for group, cells in sorted(b.items()):
+        rows = []
+        for i, cell in sorted(cells.items()):
+            generation, smt = cell['key']
+            k_mid = quantile(sorted(cell['k']), 0.5)
+            rows.append({'runQueuePerVP': edge_label(i, QUEUE_PER_VP_EDGES), 'medianThreadsPerCore': round(k_mid, 2), 'lpars': len(cell['share']),
+                         'samples': cell['samples'], 'busyShare': summary(cell['share']),
+                         'predictedModeCurve': (round(predicted_share(CURVES[generation], k_mid, smt), 3) if generation in CURVES else None),
+                         'predictedPower10Curve': round(predicted_share(CURVES['Power10'], k_mid, smt), 3),
+                         'predictedDefault': round(predicted_share(CURVES['default'], k_mid, smt), 3)})
+        table_b[group] = rows
+    table_c = [{'processorMode': group, 'aixLevel': level, 'lpars': cell['lpars'],
+                'baselineBusyShare': summary(cell['baseline']), 'vpSaturatedBusyShare': summary(cell['saturated'])}
+               for (group, level), cell in sorted(c.items())]
+    return table_a, table_b, table_c
 
 
 def load_table(load, planning, verdict_of):
@@ -325,6 +427,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='a work tree kept by dev/history-integration-check --keep')
     ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'thread-density'))
+    ap.add_argument('--config', help='a VM configuration file with hostname and osversion columns, for the split by AIX level '
+                                     '(default: the one in the work tree, if any)')
     ap.add_argument('--label', help='a label for the result file (default: the name of the work tree)')
     a = ap.parse_args()
     work = Path(a.work).resolve()
@@ -346,6 +450,8 @@ def main():
     fit_guaranteed, verdict_of = fit(guaranteed, group_of)
     fit_all, _ = fit(everything, group_of)
     by_tier, overlap, proposed = load_table(load, planning, verdict_of)
+    levels = aix_levels(a.config or (work / 'app' / 'config.csv'))
+    table_a, table_b, table_c = saturation_tables(everything, guaranteed, group_of, levels)
 
     result = {
         'label': label, 'method': {
@@ -362,6 +468,11 @@ def main():
         'H1_estateCurve': {'guaranteedSet': estate_guaranteed, 'allValidSamples': estate_all},
         'H1_H2_fitPerLpar': {'guaranteedSet': fit_guaranteed, 'allValidSamples': fit_all},
         'H3_loadOnEntitlement': {'byTier': by_tier, 'withProposedFactor': proposed, 'againstCurveVerdict': overlap},
+        'followUp': {'method': {'vpSaturation': 'PhysC / VPs, all valid samples', 'saturationEdges': list(SATURATION_EDGES),
+                                'saturatedFrom': SATURATED_FROM, 'runQueuePerVpEdges': list(QUEUE_PER_VP_EDGES),
+                                'cellMinSamples': CELL_MIN_SAMPLES, 'aixLevelsKnownFor': sum(1 for vm in everything if vm.lower() in levels),
+                                'processorMode': 'the processor label of the staged configuration state: the effective compatibility mode'},
+                     'A_busyShareBySaturation': table_a, 'B_saturatedByRunQueuePerVP': table_b, 'C_byModeAndAixLevel': table_c},
         'seconds': seconds,
     }
     out = Path(a.out).resolve()
@@ -394,6 +505,29 @@ def main():
                 m = c['medianResidual']
                 print(f"  {group:<14} {which + ' curve':<17} fits {c['fits']:>3}  below {c['below']:>3}  above {c['above']:>3}   "
                       f"residual p25/med/p75 {m['p25']:+.2f} / {m['median']:+.2f} / {m['p75']:+.2f}   median |residual| {c['medianAbsoluteResidual']:.2f}")
+    fmt = lambda s: ('%5.2f / %5.2f / %5.2f' % (s['p25'], s['median'], s['p75'])) if s.get('n') else '    -      -      -  '
+    print()
+    print('Follow-up A  Busy share by how full the VPs are (PhysC / VPs) and by entitlement, all valid samples (per-LPAR medians across LPARs)')
+    for group, rows in table_a.items():
+        print(f'  {group}')
+        print('    %-14s %-11s %6s %12s   %s' % ('PhysC / VPs', 'entitlement', 'LPARs', 'samples', 'busy share p25/med/p75'))
+        for r in rows:
+            print('    %-14s %-11s %6d %12s   %s' % (r['vpSaturation'], r['entitlement'], r['lpars'], format(r['samples'], ','), fmt(r['busyShare'])))
+    print()
+    print('Follow-up B  VP-saturated samples (PhysC / VPs at or above %.2f): busy share by run queue per VP, against the yield curves' % SATURATED_FROM)
+    for group, rows in table_b.items():
+        print(f'  {group}')
+        print('    %-14s %12s %6s %12s   %-22s %9s %9s %8s' % ('run queue / VP', 'threads/core', 'LPARs', 'samples', 'busy share p25/med/p75', 'mode', 'Power10', 'default'))
+        for r in rows:
+            print('    %-14s %12.2f %6d %12s   %s   %9s %9.2f %8.2f' % (
+                r['runQueuePerVP'], r['medianThreadsPerCore'], r['lpars'], format(r['samples'], ','), fmt(r['busyShare']),
+                ('%.2f' % r['predictedModeCurve']) if r['predictedModeCurve'] is not None else '-', r['predictedPower10Curve'], r['predictedDefault']))
+    print()
+    print('Follow-up C  By processor mode and AIX level: busy share in the guaranteed set (baseline) and when VP-saturated')
+    print('    %-14s %-20s %6s   %-28s %s' % ('mode', 'AIX level', 'LPARs', 'baseline n: p25/med/p75', 'VP-saturated n: p25/med/p75'))
+    for r in table_c:
+        print('    %-14s %-20s %6d   %3d: %s    %3d: %s' % (r['processorMode'], r['aixLevel'], r['lpars'], r['baselineBusyShare'].get('n', 0),
+                                                        fmt(r['baselineBusyShare']), r['vpSaturatedBusyShare'].get('n', 0), fmt(r['vpSaturatedBusyShare'])))
     print()
     print('H3  Run-queue load on entitlement: P95 of run queue / (entitlement x SMT), planning hours, current state, against the tier density')
     print('    %-5s %-9s %5s %12s %10s %10s %13s   %s' % ('tier', 'class', 'LPARs', 'entitlement', 'P95 PhysC', 'P95 PhysB', 'at/above ENT', 'P95 load p25/med/p75'))
