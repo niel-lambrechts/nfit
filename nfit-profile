@@ -24835,6 +24835,7 @@ sub _exposure_trackers
                     entitlement=> (looks_like_number($meta->{entitlement} // '')  ? $meta->{entitlement} + 0  : undef),
                     vp         => (looks_like_number($meta->{virtual_cpus} // '') ? $meta->{virtual_cpus} + 0 : undef),
                     capped     => (looks_like_number($meta->{capped} // '')       ? ($meta->{capped} ? 1 : 0) : undef),
+                    smt        => (looks_like_number($meta->{smt} // '')          ? $meta->{smt} + 0          : undef),
                     ceiling    => ((looks_like_number($meta->{pool_cpu} // '') && $meta->{pool_cpu} > 0) ? $meta->{pool_cpu} + 0 : undef),
                     population => $population,
                     profiles   => [ sort @{ $populations_href->{$population} } ],
@@ -25365,7 +25366,7 @@ sub _contested_history_read
                                  && ($_->{stateStartUTC} // '') eq ($state->{stateStartUTC} // '') } @$record_states;
             my $record = $match ? _safe_dig($match, 'populations', $population) : undef;
             my $state_reason = (ref($opts) eq 'HASH' && $opts->{state} && !$opts->{state}->($state))
-                             ? 'configuration state not comparable with the current one' : '';
+                             ? 'not the current configuration state' : '';
             my %supported;
             foreach my $day (@{ $support->{daily} // [] })
             {
@@ -25474,7 +25475,8 @@ sub _contested_history_read
 #                  window without evidence, or too little classified time).
 #   unavailable    no window has evidence.
 # levelSupported: the contested observations meet the contested level's minimum (observations and
-# days); whether a percentile can be resolved is for the caller, who knows the percentile.
+# days) and were all taken at one sampling interval (mixedCadence otherwise); whether a percentile
+# can be resolved is for the caller, who knows the percentile.
 sub _contested_event_evidence
 {
     my ($months_aref, $vm, $population, $windows_aref, $opts) = @_;
@@ -25528,7 +25530,10 @@ sub _contested_event_evidence
         && $sum{eligibleMinutes} > 0 && $sum{classifiedMinutes} / $sum{eligibleMinutes} >= $PEAK_UPLIFT_GATE_MIN_CLASSIFIED - 1e-9
         && defined $worst && $worst >= $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED - 1e-9) ? 1 : 0;
     $out{dayRows} = \@day_rows if (ref($opts) eq 'HASH' && $opts->{days});
-    $out{levelSupported} = ($sum{contested} >= $CONTESTED_LEVEL_MIN_MINUTES && $sum{contestedDays} >= $CONTESTED_LEVEL_MIN_DAYS) ? JSON::true : JSON::false;
+    # Observations at different sampling intervals are not pooled into one percentile.
+    $out{mixedCadence}   = (keys %cadences > 1) ? JSON::true : JSON::false;
+    $out{levelSupported} = (keys %cadences <= 1 && $sum{contested} >= $CONTESTED_LEVEL_MIN_MINUTES && $sum{contestedDays} >= $CONTESTED_LEVEL_MIN_DAYS)
+                         ? JSON::true : JSON::false;
     $out{status} = !$out{windowsWithEvidence} ? 'unavailable' : $sum{contested} ? 'contested' : $absence_supported ? 'noCompetition' : 'insufficient';
     return \%out;
 }
@@ -25547,11 +25552,31 @@ sub _contested_event_evidence
 # rules. An LPAR without event-window evidence has no tracker and is sized as
 # seasonal runs were before.
 #
-# Which states count: a past window counts where the LPAR was then, as now, an
-# uncapped member of the same pool. Entitlement and VP changes do not exclude a
-# window (the evidence is observed busy work in cores; the bound stays limited
-# by today's entitlement). Days in another pool or capped are not evidence:
-# they are counted as days without usable evidence and reported, never reused.
+# Which states count: the LPAR's current configuration state only, as in the
+# standard models. A past window, or the days of one, lived in an earlier state
+# is not evidence for today's configuration: its days are counted as days
+# without usable evidence and reported. They never count as quiet, and are
+# never reused.
+#
+# Recognising the current state in history. A state's start is the first sample
+# the staged data holds of it, so it moves when a rolling cache is restaged; the
+# start alone would disown the history of an unchanged LPAR. A stored state is
+# the current one when
+#   - it has the current state's start, or
+#   - everything history records of a configuration equals the current state's
+#     (entitlement, VPs, uncapped, pool, pool maximum and SMT mode, the SMT mode
+#     being recorded on both sides), and so does every state stored after it
+#     (a configuration that was changed and changed back is a different state).
+# Not recorded per state, and so not covered by this rule: the PowerHA role.
+#
+# Weighting: the readings of all usable windows are pooled, each observation
+# counting once. The bound is their maximum, so weighting does not touch it. The
+# contested level is a percentile over observations, not over occurrences: a
+# longer occurrence weighs more. Observations at different sampling intervals
+# are not pooled into one percentile: with more than one interval among the
+# evaluated days there is no automatic contested level, and the evidence is
+# treated at its coarsest interval, so that coarse windows are never given the
+# no-competition exemption of one-minute data.
 # ==============================================================================
 
 # Whether a seasonal run reads event-window evidence: not switched off.
@@ -25593,11 +25618,27 @@ sub _event_protection_trackers
         my $m = $s->{metadata} // {};
         next if (defined $m->{shared_enabled} && !$m->{shared_enabled});
         next unless (defined $m->{capped} && "$m->{capped}" eq '0' && defined $m->{pool_id} && looks_like_number($m->{entitlement} // ''));
-        my $comparable = sub {
-            my ($state) = @_;
-            return 0 if ($state->{capped});
-            return ((split /:/, ($state->{pool} // ''))[-1] // '') eq "$m->{pool_id}" ? 1 : 0;
-        };
+        my $current_start = _pool_iso($s->{start_epoch});
+        my $facts = sub { my ($ent, $vp, $capped, $pool, $ceiling, $smt) = @_;
+                          return undef unless (defined $smt && looks_like_number($smt) && looks_like_number($ent // '') && looks_like_number($vp // ''));
+                          return join('|', sprintf('%.4f', $ent), $vp + 0, ($capped ? 1 : 0), $pool // '',
+                                      (looks_like_number($ceiling // '') ? sprintf('%.4f', $ceiling) : ''), $smt + 0); };
+        my $current_facts = $facts->($m->{entitlement}, $m->{virtual_cpus}, 0, $m->{pool_id},
+                                     ((looks_like_number($m->{pool_cpu} // '') && $m->{pool_cpu} > 0) ? $m->{pool_cpu} : undef), $m->{smt});
+        my $stored_facts = sub { my ($st) = @_;
+                                 return $facts->($st->{entitlement}, $st->{virtualProcessors}, $st->{capped},
+                                                 (split /:/, ($st->{pool} // ''))[-1], $st->{poolCeiling}, $st->{smt}); };
+        # From which stored moment on the LPAR has been in its current configuration without a break.
+        my @stored = sort { ($a->{fromUTC} // '') cmp ($b->{fromUTC} // '') }
+                     map { @{ (ref($_->[1]{MemberExposure}) eq 'HASH' ? $_->[1]{MemberExposure}{$vm} : undef) // [] } } @$months_aref;
+        my %is_current;
+        foreach my $st (reverse @stored)
+        {
+            last unless ((($st->{stateStartUTC} // '') eq $current_start)
+                         || (defined $current_facts && ($stored_facts->($st) // '') eq $current_facts));
+            $is_current{ join('|', $st->{stateStartUTC} // '', $st->{fromUTC} // '') } = 1;
+        }
+        my $comparable = sub { return $is_current{ join('|', $_[0]->{stateStartUTC} // '', $_[0]->{fromUTC} // '') } ? 1 : 0; };
         foreach my $population (sort keys %{ $populations // {} })
         {
             my $e = _contested_event_evidence($months_aref, $vm, $population, $windows_aref, { days => 1, state => $comparable });
@@ -25637,14 +25678,17 @@ sub _event_protection_trackers
             my @top = map { [ $_->[0], $_->[1], ($first_day{"$_->[0],$_->[1]"} // 0) * 86400 ] }
                       sort { $b->[0] <=> $a->[0] || $b->[1] <=> $a->[1] } @{ $e->{readings} };
             $#top = $CUT_PROTECTION_TOP_READINGS - 1 if (@top > $CUT_PROTECTION_TOP_READINGS);
-            my ($usual) = sort { $seen{$b} <=> $seen{$a} || $a <=> $b } keys %seen;
+            # The evidence is read at its coarsest interval (see the weighting note above).
+            my ($coarsest) = sort { $b <=> $a } keys %seen;
+            my $classified_all = sum0(values %seen);
             push @trackers, {
                 vm => $vm, pool => $m->{pool_id}, population => $population, profiles => $populations->{$population},
                 entitlement => $m->{entitlement} + 0, vp => $m->{virtual_cpus}, capped => 0,
                 stateStart => $s->{start_epoch},
                 from => $day_of->($windows_aref->[0][0]) * 86400, to => $day_of->($windows_aref->[-1][1]) * 86400,
                 thresholds => [ { value => $m->{entitlement} + 0, basis => 'installedEntitlement', profiles => [] } ],
-                daily => \%daily, observations => \%seen, cadenceLast => $usual // 1, poolCadenceLast => $usual // 1,
+                daily => \%daily, observations => { ($coarsest // 1) => $classified_all },
+                cadenceLast => $coarsest // 1, poolCadenceLast => $coarsest // 1,
                 protection => { contested => $e->{observations}{contested}, days => \%days, frontier => \@frontier, top => \@top, all => \@all },
                 eventEvidence => $e,
             };
@@ -25692,6 +25736,46 @@ sub _event_sized_profile
     return ($value, $dbg);
 }
 
+# Event-window protection of a requirement a seasonal model assembled outside the sizing chain
+# (recency decay: base, growth and run-queue potential). The model's figure is kept as the
+# unprotected one; the cut-protection bound (never above the installed entitlement) and then the
+# contested level are applied to it. Returns (value, debug keys), or (value, undef) without
+# event-window evidence for the LPAR and profile. The pool-borrowing allowance is not touched
+# here: it acts where it is calculated, and this model's figure does not carry one.
+sub _event_protect_assembled
+{
+    my ($vm_name, $profile, $value) = @_;
+    my $name = $profile->{name};
+    my $tracker = $CUT_PROTECTION_EVIDENCE{$vm_name} ? $CUT_PROTECTION_EVIDENCE{$vm_name}{$name} : undef;
+    return ($value, undef) unless (ref($tracker) eq 'HASH' && ref($tracker->{eventEvidence}) eq 'HASH' && looks_like_number($value // ''));
+    my ($share) = _protection_share_of($name);
+    my $bound = _protection_bound($tracker->{protection}, $share, $tracker->{entitlement});
+    my %dbg = (CutProtectionTarget => sprintf('%.4f', $value), CutProtectionUnprotected => sprintf('%.4f', $value),
+               CutProtectionBound => (defined $bound ? sprintf('%.2f', $bound) : 'none'), CutProtectionApplied => 'No');
+    my $result = $value;
+    if (defined $bound && $bound > $result + $FLOAT_EPSILON)
+    {
+        $dbg{CutProtectionApplied} = sprintf('Yes: raised %.4f -> %.2f (share %.2f)', $result, $bound, $share);
+        $result = $bound;
+    }
+    my $raised = 0;
+    my $floor = _contested_level_on() ? _contested_floor_for($tracker, $name, $profile->{flags}) : undef;
+    if ($floor)
+    {
+        my $before = _structural_shown_value($result);
+        my $demand = $result;
+        $result = $floor->{level} if ($floor->{level} > $result + $FLOAT_EPSILON);
+        my $after = _structural_shown_value($result);
+        $raised = (defined $before && defined $after && $after > $before + $STRUCTURAL_ENT_TOLERANCE) ? 1 : 0;
+        $dbg{ContestedLevelFloor} = { %$floor, demandBeforeFloor => 0 + sprintf('%.4f', $demand), originalTarget => $before,
+                                      finalTarget => $after, applied => ($raised ? JSON::true : JSON::false) };
+    }
+    my ($own, $final) = map { _structural_shown_value($_) } ($value, $result);
+    $dbg{CutProtectionLimited} = (!$raised && defined $own && defined $final && $final > $own + $STRUCTURAL_ENT_TOLERANCE)
+        ? sprintf('%.2f', $final) : '';
+    return ($result, \%dbg);
+}
+
 # The evidence pass of a seasonal run: fills %CUT_PROTECTION_EVIDENCE from history for the
 # event's past windows. Returns a status hashref (Status, Reason, Windows, Counts).
 sub _protection_evidence_from_history
@@ -25719,7 +25803,7 @@ sub _protection_evidence_from_history
     {
         my ($pop) = grep { $summary->{$vm}{$_} } ('none', sort keys %{ $summary->{$vm} });
         $counts{ $summary->{$vm}{$pop}{status} }++;
-        $excluded += $summary->{$vm}{$pop}{reasons}{'configuration state not comparable with the current one'} // 0;
+        $excluded += $summary->{$vm}{$pop}{reasons}{'not the current configuration state'} // 0;
     }
     _task(sprintf('%d past window%s of %s (%s to %s): %d LPAR(s) contested, %d without competition, %d with too little evidence, %d without evidence',
         scalar(@$windows), (@$windows == 1 ? '' : 's'), $event_name, $windows->[0][0], (Time::Piece->strptime($windows->[-1][1], '%Y-%m-%d') - ONE_DAY)->ymd,
@@ -25748,7 +25832,7 @@ sub _event_evidence_report_lines
         join(', ', map { my $last = (Time::Piece->strptime($_->[1], '%Y-%m-%d') - ONE_DAY)->ymd; $_->[0] eq $last ? $last : "$_->[0] to $last" } @$windows));
     push @lines, sprintf('  LPARs          : %d with work during pool competition, %d without competition, %d with too little evidence, %d without evidence',
         @{$counts}{qw(contested noCompetition insufficient unavailable)});
-    push @lines, sprintf('  Not comparable : %d day record(s) from a time the LPAR was capped or in another pool; not used.', $status->{ExcludedStateDays})
+    push @lines, sprintf('  Earlier states : %d day record(s) from before an LPAR\'s current configuration; not used, and not counted as quiet.', $status->{ExcludedStateDays})
         if $status->{ExcludedStateDays};
     push @lines, '  Too little evidence: the absence of competition is not shown (a day missing from history or',
                  '  not evaluated); the tier\'s pool-borrowing allowance stays, and no cut is deepened on it.'
@@ -25765,7 +25849,9 @@ sub _event_evidence_report_lines
             ? sprintf('contested: %d observation%s over %d day%s in %d of %d window%s; %s%s', $e->{observations}{contested},
                       ($e->{observations}{contested} == 1 ? '' : 's'), $e->{contestedDays}, ($e->{contestedDays} == 1 ? '' : 's'),
                       scalar(grep { $_->{contestedObservations} } @{ $e->{windows} }), $e->{windowsRequested}, ($e->{windowsRequested} == 1 ? '' : 's'), $cover, $gaps)
-            : sprintf('too little evidence: %s%s', $cover, $gaps));
+            : sprintf('too little evidence: %s%s', $cover, $gaps))
+            . ($e->{mixedCadence} ? sprintf('; sampled at %s minutes: no contested level, and read as %d-minute data',
+                                            join(' and ', @{ $e->{cadenceMinutes} }), $e->{cadenceMinutes}[-1]) : '');
     }
     push @lines, '';
     return @lines;
@@ -25831,6 +25917,9 @@ sub _exposure_block
             virtualProcessors => $tracker->{vp},
             capped            => (defined $tracker->{capped} ? ($tracker->{capped} ? JSON::true : JSON::false) : undef),
             poolCeiling       => $tracker->{ceiling},
+            # The SMT mode of the state, where the cache gives it: part of what identifies a configuration
+            # when a later run asks whether stored evidence belongs to the LPAR's current one.
+            (defined $tracker->{smt} ? (smt => $tracker->{smt}) : ()),
             populations       => {},
         };
         my @days;
@@ -27387,6 +27476,8 @@ sub _contested_floor_for
 {
     my ($tracker, $profile_name, $flags) = @_;
     return undef unless (ref($tracker) eq 'HASH' && ref($tracker->{protection}) eq 'HASH');
+    # Event-window evidence at more than one sampling interval gives no automatic level.
+    return undef if (ref($tracker->{eventEvidence}) eq 'HASH' && $tracker->{eventEvidence}{mixedCadence});
     my ($share, $tier) = _protection_share_of($profile_name);
     my $percentile = (($flags // '') =~ /(?:-p|--percentile)\s+([0-9.]+)/) ? $1 + 0 : $DEFAULT_PERCENTILE + 0;
     my ($level, $n, $days, $enough) = _contested_level($tracker->{protection}, $share, $percentile);
@@ -33384,6 +33475,15 @@ sub _execute_recency_decay {
             if (defined $base_val && looks_like_number($base_val)) {
                 # Final = Base + StandardGrowth + RunQ_Potential
                 my $final_val = $base_val + $standard_growth_adj + $runq_potential;
+                # Event-window protection (stage 3.6): on the assembled requirement, before the VP
+                # targets, the current-cycle pair and the pool checks are derived from it.
+                my ($protected_val, $event_dbg) = _event_protect_assembled($vm_name, $profile, $final_val);
+                if ($event_dbg)
+                {
+                    $final_val = $protected_val;
+                    my $dbg_slot = ($vm_map_ref->{CoreResults}{ProfileDebugInfo}{$p_name} //= {});
+                    @{$dbg_slot}{ keys %$event_dbg } = values %$event_dbg;
+                }
                 $vm_map_ref->{CoreResults}{ProfileValues}{$p_name} = sprintf("%.4f", $final_val);
             }
 

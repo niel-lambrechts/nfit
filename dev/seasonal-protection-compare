@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/seasonal-protection-compare
+# PURPOSE  : What event-window cut protection changes in one seasonal run. On
+#            the work tree kept by dev/history-integration-check --keep (its
+#            stage and the history it wrote; no history is written again), the
+#            same seasonal event is sized twice with the current nfit-profile:
+#            with event-window evidence and with --no-cut-protection. Reported
+#            in aggregate: which LPARs' planning figures and profile values
+#            moved, in which direction and by how much, the actions that say
+#            why, and what the evidence pass found.
+#            The history is restored before each run, so the two runs read the
+#            same history and the kept tree is left as it was found.
+# USAGE    : dev/seasonal-protection-compare --event NAME [--work DIR] [--profile-args '...']
+#            (without --event: lists the events of the kept tree's seasonality file)
+# OUTPUT   : <out>/seasonal-protection-<event>.json and a summary (aggregates;
+#            no LPAR, pool or system is named)
+# ==============================================================================
+import argparse
+import csv
+import importlib.machinery
+import importlib.util
+import json
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+_loader = importlib.machinery.SourceFileLoader('protection_replay', str(REPO / 'dev' / 'protection-replay'))
+_spec = importlib.util.spec_from_loader('protection_replay', _loader)
+pr = importlib.util.module_from_spec(_spec)
+_loader.exec_module(pr)
+
+EPS = 0.005
+FIXED = ('VM', 'Current - ENT', 'Current - VCPU', 'NFIT - ENT', 'NFIT - VCPU', 'NFIT - Action')
+
+
+def events(path):
+    """[(name, model)] of a seasonality file."""
+    out, name = [], None
+    for line in path.read_text().splitlines():
+        hit = re.match(r'\s*\[(.+?)\]\s*$', line)
+        if hit:
+            name = hit.group(1)
+            if name not in ('Global', 'Adaptive'):
+                out.append([name, ''])
+        hit = re.match(r'\s*model\s*=\s*(\S+)', line)
+        if hit and out and out[-1][0] == name:
+            out[-1][1] = hit.group(1)
+    return out
+
+
+def number(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def one_run(app, case, stage, history, pristine, label, args, env):
+    """Sizes the event once on the pristine history: (rows by LPAR, log text, seconds)."""
+    shutil.rmtree(history)
+    shutil.copytree(pristine, history)
+    for old in (app / 'output').glob('*'):
+        if old.is_file():
+            old.unlink()
+    t0 = time.time()
+    pr.invoke(app, case, label, args, env)
+    seconds = round(time.time() - t0, 1)
+    found = sorted((app / 'output').glob('*.csv'), key=lambda p: p.stat().st_mtime)
+    rows = {}
+    if found:
+        with found[-1].open(newline='') as fh:
+            rows = {row['VM']: row for row in csv.DictReader(fh) if row.get('VM')}
+    logs = sorted((app / 'output').glob('*.log'), key=lambda p: p.stat().st_mtime)
+    return rows, (logs[-1].read_text(errors='replace') if logs else ''), seconds
+
+
+def evidence_section(log):
+    """The aggregate lines of the Event-Window Evidence section (no LPAR line)."""
+    out = {}
+    hit = re.search(r'^  Past windows   : (\d+) \((.*)\)$', log, re.M)
+    if hit:
+        out['pastWindows'] = int(hit.group(1))
+        out['windows'] = hit.group(2)
+    hit = re.search(r'^  LPARs          : (\d+) with work during pool competition, (\d+) without competition, '
+                    r'(\d+) with too little evidence, (\d+) without evidence', log, re.M)
+    if hit:
+        out['lpars'] = dict(zip(('contested', 'noCompetition', 'insufficient', 'unavailable'), map(int, hit.groups())))
+    hit = re.search(r'^  Earlier states : (\d+) day record', log, re.M)
+    out['earlierStateDayRecords'] = int(hit.group(1)) if hit else 0
+    hit = re.search(r'^  Not used: (.*)$', log, re.M)
+    if hit:
+        out['notUsed'] = hit.group(1)
+    out['mixedIntervalLpars'] = len(re.findall(r'; sampled at .* minutes: no contested level', log))
+    return out
+
+
+def movement(pairs):
+    """Counts and core totals of (before, after) figures."""
+    up = [(b, a) for b, a in pairs if a > b + EPS]
+    down = [(b, a) for b, a in pairs if a < b - EPS]
+    return {'compared': len(pairs), 'unchanged': len(pairs) - len(up) - len(down),
+            'raised': len(up), 'raisedByCores': round(sum(a - b for b, a in up), 2),
+            'largestRaise': round(max((a - b for b, a in up), default=0), 2),
+            'lowered': len(down), 'loweredByCores': round(sum(b - a for b, a in down), 2),
+            'largestReduction': round(max((b - a for b, a in down), default=0), 2),
+            'totalBefore': round(sum(b for b, _ in pairs), 2), 'totalAfter': round(sum(a for _, a in pairs), 2)}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--event', help='the seasonal event to size')
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check'), help='the work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'seasonal'))
+    ap.add_argument('--seasonality', default=str(REPO / 'etc' / 'nfit.seasonality.cfg'), help='the seasonality file to use')
+    ap.add_argument('--profile-args', default='', help='extra nfit-profile options for both runs')
+    a = ap.parse_args()
+    work = Path(a.work)
+    app, case = work / 'app', work / 'case'
+    stage = next(iter(sorted((case / 'stage').glob('*'))), None) if (case / 'stage').is_dir() else None
+    if stage is None or not (case / 'history' / stage.name).is_dir():
+        sys.exit('seasonal-protection-compare: no kept work tree with history (run dev/history-integration-check --keep first)')
+    seasonality = Path(a.seasonality)
+    if not seasonality.is_file():
+        sys.exit('seasonal-protection-compare: seasonality file not found (see --seasonality)')
+    known = events(seasonality)
+    if not a.event or a.event not in [name for name, _ in known]:
+        print('Events of the seasonality file (give one with --event):')
+        for name, model in known:
+            print(f'  {name:<28} {model}')
+        return 2
+    model = dict(known)[a.event]
+
+    # The current programs and seasonality file into the kept tree.
+    for name in pr.EXECUTABLES:
+        shutil.copy(REPO / name, app / name)
+        (app / name).chmod(0o700)
+    shutil.copy(seasonality, app / 'etc' / 'nfit.seasonality.cfg')
+    history = case / 'history' / stage.name
+    pristine = case / 'history.pristine' / stage.name
+    if not pristine.is_dir():
+        pristine.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(history, pristine)
+    env = pr.perl_env()
+    base = ['--nmondir', str(stage), '--apply-seasonality', a.event] + shlex.split(a.profile_args)
+    if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
+        base += ['--config', str(app / 'config.csv')]
+
+    print(f'{a.event} ({model}): sized without event-window protection', flush=True)
+    before, _, seconds_before = one_run(app, case, stage, history, pristine, 'seasonal-off', base + ['--no-cut-protection'], env)
+    print(f'{a.event} ({model}): sized with event-window protection', flush=True)
+    after, log, seconds_after = one_run(app, case, stage, history, pristine, 'seasonal-on', base, env)
+    shutil.rmtree(history)
+    shutil.copytree(pristine, history)                     # the kept tree as it was found
+    if not before or not after:
+        sys.exit('seasonal-protection-compare: a run produced no CSV (is the event active at the end of the staged data? '
+                 'see its private log in the work tree)')
+
+    common = sorted(set(before) & set(after))
+    profiles = [c for c in next(iter(after.values())) if re.match(r'^[POGB]\d?-', c) and '_rVCPU' not in c]
+    planning, cells, vps = [], [], []
+    for vm in common:
+        b, n = number(before[vm].get('NFIT - ENT')), number(after[vm].get('NFIT - ENT'))
+        if b is not None and n is not None:
+            planning.append((b, n))
+        b, n = number(before[vm].get('NFIT - VCPU')), number(after[vm].get('NFIT - VCPU'))
+        if b is not None and n is not None:
+            vps.append((b, n))
+        for p in profiles:
+            b, n = number(before[vm].get(p)), number(after[vm].get(p))
+            if b is not None and n is not None:
+                cells.append((b, n))
+    actions = [after[vm].get('NFIT - Action') or '' for vm in common]
+    installed = [number(after[vm].get('Current - ENT')) for vm in common]
+    result = {
+        'event': a.event, 'model': model, 'commit': pr.git_identity(),
+        'lpars': {'both': len(common), 'onlyWithout': len(set(before) - set(after)), 'onlyWith': len(set(after) - set(before))},
+        'evidence': evidence_section(log),
+        'planningEntitlement': movement(planning),
+        'planningVPs': movement(vps),
+        'profileValues': dict(movement(cells), profiles=len(profiles)),
+        'installedEntitlementTotal': round(sum(v for v in installed if v is not None), 2),
+        'actions': {'cutLimitedByPastEventWindows': sum(1 for t in actions if 'Cut limited to' in t and 'past event windows' in t),
+                    'targetRaisedByContestedLevel': sum(1 for t in actions if 'Target raised to' in t and 'past event window' in t),
+                    'actionTextChanged': sum(1 for vm in common if (before[vm].get('NFIT - Action') or '') != (after[vm].get('NFIT - Action') or ''))},
+        'seconds': {'without': seconds_before, 'with': seconds_after},
+    }
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / f'seasonal-protection-{re.sub(r"[^A-Za-z0-9_.-]", "_", a.event)}.json'
+    target.write_text(json.dumps(result, indent=1) + '\n')
+
+    e, pl, pv = result['evidence'], result['planningEntitlement'], result['profileValues']
+    print()
+    print(f"Event-window protection: event {a.event} ({model}), {len(common)} LPAR(s), commit {result['commit']}")
+    if 'notUsed' in e:
+        print(f"  Evidence         : not used: {e['notUsed']}")
+    else:
+        print(f"  Evidence         : {e.get('pastWindows', 0)} past window(s) ({e.get('windows', '')}); LPARs {e.get('lpars')}; "
+              f"earlier-state day records {e['earlierStateDayRecords']}; mixed-interval LPARs {e['mixedIntervalLpars']}")
+    for name, m in (('Planning ENT', pl), ('Planning VPs', result['planningVPs']), ('Profile values', pv)):
+        print(f"  {name:<17}: {m['compared']} compared; unchanged {m['unchanged']}; raised {m['raised']} (+{m['raisedByCores']}, largest {m['largestRaise']}); "
+              f"lowered {m['lowered']} (-{m['loweredByCores']}, largest {m['largestReduction']}); total {m['totalBefore']} -> {m['totalAfter']}")
+    print(f"  Installed ENT    : {result['installedEntitlementTotal']}")
+    print(f"  Actions          : {result['actions']}")
+    print(f"  Seconds          : {result['seconds']}")
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

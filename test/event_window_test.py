@@ -13,7 +13,11 @@
 #     evidence was not used;
 #   - only the event's windows that history can hold and that ended by the
 #     run's date are read;
-#   - a past window lived capped or in another pool is not evidence.
+#   - evidence belongs to the LPAR's current configuration state only: an
+#     earlier state is unavailable, never quiet; a restaged cache does not
+#     disown an unchanged LPAR's history;
+#   - fine and coarse occurrences are not pooled into one percentile;
+#   - a missing event day prevents the no-competition verdict.
 # ==============================================================================
 import csv
 import glob
@@ -32,7 +36,7 @@ import member_exposure_test as M
 import contested_reader_test as C
 
 EVENT = ('[Global]\nmin_history_days = 1\nseasonal_lookback_days = 1\n'
-         '[ev]\nmodel = predictive_peak\npriority = 10\ndates = %s\nbaseline_period_days = 1\n')
+         '[ev]\nmodel = %s\npriority = 10\ndates = %s\nbaseline_period_days = %d\nmin_historical_years = 0\n')
 COLUMNS = ('G3-95W15', 'O3-95W15', 'B3-95W15', 'NFIT - ENT', 'NFIT - VCPU')
 
 
@@ -46,18 +50,45 @@ class EventWindowTests(unittest.TestCase):
         cls.with_history = cls.seasonal('2026-09-01:2026-09-01', history=True)
         cls.switched_off = cls.seasonal('2026-09-01:2026-09-01', history=True, flags=['--no-cut-protection'])
         cls.no_history = cls.seasonal('2026-09-01:2026-09-01', history=False)
+        # Recency decay assembles its figure outside the sizing chain.
+        cls.recency = {name: cls.seasonal('2026-09-01:2026-09-01', model='recency_decay', **kw)
+                       for name, kw in (('with', {'history': True}), ('off', {'history': True, 'flags': ['--no-cut-protection']}),
+                                        ('none', {'history': False}))}
+        # Multiplicative seasonal needs an earlier occurrence in history: twelve days of data, the event on the
+        # first and the last, and a synthetic August partition with the event's peak and baseline.
+        dates = '2026-08-01:2026-08-01, 2026-09-01:2026-09-01, 2026-09-12:2026-09-12'
+        cls.multiplicative = {name: cls.seasonal(dates, history=True, model='multiplicative_seasonal', days=12, baseline=8, prior=True, flags=flags)
+                              for name, flags in (('with', []), ('off', ['--no-cut-protection']))}
 
     @classmethod
     def tearDownClass(cls):
         cls.fixture.tearDownClass()
 
     @classmethod
-    def seasonal(cls, dates, history, flags=()):
-        root = cls.fixture.make_root()
+    def seasonal(cls, dates, history, flags=(), model='predictive_peak', days=2, baseline=1, prior=False):
+        M.DAYS = days
+        try:
+            root = cls.fixture.make_root()
+        finally:
+            M.DAYS = 2
         with open(os.path.join(root, 'etc', 'nfit.seasonality.cfg'), 'w') as fh:
-            fh.write(EVENT % dates)
+            fh.write(EVENT % (model, dates, baseline))
         if history:
             cls.fixture.run_profile(root, '--update-history', '--min-history-days', '1', '--pool-history', '--force')
+        if prior:
+            # A synthetic earlier occurrence: the event's peak 20% above its baseline, for every profile.
+            folder = os.path.join(root, 'history', M.SERIAL)
+            with open(os.path.join(folder, 'nfit.hist.2026-09.json')) as fh:
+                analysis = json.load(fh)['2026-09']['MonthlyWorkloadAnalysis']
+            values = {vm: {k: float(v) for k, v in (block.get('ProfileValues') or {}).items()} for vm, block in analysis.items()}
+            august = {'2026-08': {
+                'Metadata': {'ProcessedStartDate': '2026-08-01', 'ProcessedEndDate': '2026-08-31', 'ProcessedDays': 31},
+                'MonthlyWorkloadAnalysis': analysis,
+                'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'periodEndDate': '2026-08-01', 'results': {
+                    'HistoricPeak': {vm: {k: round(v * 1.2, 4) for k, v in pv.items()} for vm, pv in values.items()},
+                    'HistoricBaseline': values}}}}}
+            with open(os.path.join(folder, 'nfit.hist.2026-08.json'), 'w') as fh:
+                json.dump(august, fh)
         run = cls.fixture.run_profile(root, '--apply-seasonality', 'ev', *flags)
         path, = glob.glob(os.path.join(root, 'output', '*.ev.*.csv'))
         with open(path) as fh:
@@ -78,6 +109,34 @@ class EventWindowTests(unittest.TestCase):
                          r'pool 7 was contested, on 40 minutes over 1 day of past event windows\.' % (
                              re.escape(row['G3-95W15']), re.escape(before['G3-95W15'])))
         self.assertNotIn('past event windows', before['NFIT - Action'])
+
+    def test_recency_decay_is_protected_after_its_requirement_is_assembled(self):
+        row, before = self.recency['with']['rows']['vmB'], self.recency['off']['rows']['vmB']
+        self.assertLess(float(before['G3-95W15']), float(row['G3-95W15']))
+        self.assertLessEqual(float(row['G3-95W15']), float(row['Current - ENT']))
+        self.assertRegex(row['NFIT - Action'], r'Cut limited to %s \(profile %s\): busy work reached this level while pool 7 was contested, '
+                         r'on 40 minutes over 1 day of past event windows\.' % (re.escape(row['G3-95W15']), re.escape(before['G3-95W15'])))
+        self.assertEqual(row['NFIT - ENT'], row['G3-95W15'])                           # the pair follows the protected figure
+        # An LPAR whose requirement is not a cut below a contested level is left exactly as the model had it.
+        for vm in ('vmS', 'vmX'):
+            self.assertEqual(self.figures(self.recency['with'], vm), self.figures(self.recency['off'], vm), vm)
+        # Without evidence in history the model's figures are those of the run with protection switched off.
+        for vm in ('vmA', 'vmB', 'vmS', 'vmX'):
+            self.assertEqual(self.figures(self.recency['none'], vm), self.figures(self.recency['off'], vm), vm)
+
+    def test_multiplicative_seasonal_receives_the_protection(self):
+        row, before = self.multiplicative['with']['rows']['vmB'], self.multiplicative['off']['rows']['vmB']
+        self.assertTrue(before['G3-95W15'] and row['G3-95W15'])                        # the model produced figures at all
+        self.assertLess(float(before['G3-95W15']), float(row['G3-95W15']))
+        self.assertRegex(row['NFIT - Action'], r'^Event window: Cut limited to %s \(profile %s\): .* over 1 day of past event windows\.'
+                         % (re.escape(row['G3-95W15']), re.escape(before['G3-95W15'])))
+        # Three past windows fall in the months history holds. August's partition has no contested record: its
+        # day is a day without evidence, so no LPAR is found to be without competition.
+        log = self.multiplicative['with']['log']
+        self.assertIn('Past windows   : 3 (2026-08-01, 2026-09-01, 2026-09-12)', log)
+        self.assertRegex(log, r'LPARs          : \d+ with work during pool competition, 0 without competition, [1-9]\d* with too little evidence')
+        self.assertRegex(log, r'vmB\s+contested: 40 observations over 1 day in 1 of 3 windows; .*, 1 day missing from history')
+        self.assertEqual(self.figures(self.multiplicative['with'], 'vmX'), self.figures(self.multiplicative['off'], 'vmX'))
 
     def test_the_rationale_states_the_windows_and_the_lpars_with_evidence(self):
         log = self.with_history['log']
@@ -121,35 +180,140 @@ class EventWindowTests(unittest.TestCase):
         self.assertEqual(end_october, mid_october + [['2026-10-30', '2026-11-01']])
         self.assertEqual(early, [])
 
-    def test_a_window_lived_capped_or_in_another_pool_is_not_evidence(self):
+    # -- the evidence as the sizing chain receives it (nfit-profile's tracker builder) -------------
+    FACTS = {'entitlement': 2.0, 'virtualProcessors': 4, 'capped': False, 'pool': 'SYS:7', 'poolCeiling': 4.0, 'smt': 8}
+    START = '2026-08-01T00:00:00Z'                    # the start history recorded for the state
+
+    def trackers(self, months, windows, start_epoch=1785542400, metadata=None):
+        """nfit-profile's _event_protection_trackers for one LPAR in its current state (start_epoch is
+        2026-08-01T00:00:00Z unless given): per population the tracker's figures, and the summary."""
         with open(os.path.join(REPO, 'nfit-profile'), encoding='utf-8') as fh:
             source = fh.read()
-        names = C.PERL_SUBS + ('_contested_event_evidence',)
+        names = C.PERL_SUBS + ('_contested_event_evidence', '_event_protection_trackers', '_pool_iso', '_contested_floor_for',
+                               '_contested_level', '_protection_share_of', '_protection_bound', '_evidence_cadence_of', '_contested_level_on')
         subs = ''.join(re.search(r'^(sub %s\s*\{.*?^\})' % name, source, re.S | re.M).group(1) + '\n' for name in names)
-        consts = ''.join(re.search(r'^(my \$%s\s*=.*?;)' % name, source, re.M).group(1) + '\n'
+        consts = ''.join(re.search(r'^(my [$%%@]%s\b[^;]*;)' % name, source, re.S | re.M).group(1) + '\n'
                          for name in ('CONTESTED_BUSY_PROJECTION', 'CONTESTED_BUSY_READER', 'MEMBER_EXPOSURE_PROJECTION',
                                       'PEAK_UPLIFT_GATE_MIN_CLASSIFIED', 'PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED',
-                                      'CONTESTED_LEVEL_MIN_MINUTES', 'CONTESTED_LEVEL_MIN_DAYS'))
-        script = ('use strict; use warnings; use JSON; use Time::Piece; use List::Util qw(max min);\n' + consts + subs +
-                  'local $/; my $in = decode_json(<STDIN>); '
-                  'my $same = sub { my ($s) = @_; return 0 if $s->{capped}; return ((split /:/, ($s->{pool} // ""))[-1] // "") eq "7" ? 1 : 0; }; '
-                  'print JSON->new->canonical->encode(_contested_event_evidence($in->{months}, "lpar", "none", $in->{windows}, { days => 1, state => $same }));')
+                                      'CONTESTED_LEVEL_MIN_MINUTES', 'CONTESTED_LEVEL_MIN_DAYS', 'CUT_PROTECTION_TOP_READINGS',
+                                      'DEFAULT_PERCENTILE', 'CONTESTED_LEVEL_RULE', 'contested_level_flag', 'CUT_PROTECTION_SHARE',
+                                      'MEMBER_EXPOSURE_COLUMNS'))
+        script = ('use strict; use warnings; use JSON; use Time::Piece; use List::Util qw(max min sum0); use Scalar::Util qw(looks_like_number);\n'
+                  + consts + subs + r"""
+            local $/; my $in = decode_json(<STDIN>);
+            my ($trackers, $summary) = _event_protection_trackers($in->{months}, $in->{db}, { lpar => 1 }, $in->{asof}, $in->{windows},
+                                                                  { none => [ 'G3-95W15' ] });
+            my @out = map { my $t = $_; my $floor = _contested_floor_for($t, 'G3-95W15', '-p 95');
+                            { cadence => _evidence_cadence_of($t), contested => $t->{protection}{contested},
+                              days => scalar(keys %{ $t->{protection}{days} }), observations => scalar(@{ $t->{protection}{all} }),
+                              frontier => [ map { [ $_->[0], $_->[1] ] } @{ $t->{protection}{frontier} } ],
+                              bound => _protection_bound($t->{protection}, 0.4, $t->{entitlement}),
+                              floor => ($floor ? $floor->{level} : undef), status => $t->{eventEvidence}{status} } } @$trackers;
+            print JSON->new->canonical->encode({ trackers => \@out, summary => $summary->{lpar}{none} });
+        """)
+        md = {'entitlement': 2.0, 'virtual_cpus': 4, 'capped': 0, 'pool_id': 7, 'pool_cpu': 4.0, 'smt': 8}
+        md.update(metadata or {})
+        db = {'lpar': [{'start_epoch': start_epoch, 'end_epoch': 1793491140, 'metadata': md}]}
+        out = subprocess.run(['perl', '-e', script], capture_output=True, text=True, timeout=60,
+                             input=json.dumps({'months': months, 'db': db, 'asof': 1793491200, 'windows': windows}))
+        self.assertEqual(out.returncode, 0, out.stderr[-1500:])
+        result = json.loads(out.stdout)
+        return (result['trackers'][0] if result['trackers'] else None), result['summary']
 
-        def evidence(pool, capped):
-            m = C.month([('2026-09-29', 1440, 1440, 1440), ('2026-09-30', 1440, 1440, 1440)], readings={'2026-09-30': [[0.9, 1.2, 20]]})
-            m['MemberExposure']['lpar'][0].update(pool='SYS:%s' % pool, capped=capped)
-            out = subprocess.run(['perl', '-e', script], capture_output=True, text=True, timeout=60,
-                                 input=json.dumps({'months': [['2026-09', m]], 'windows': [['2026-09-29', '2026-10-01']]}))
-            self.assertEqual(out.returncode, 0, out.stderr[-800:])
-            return json.loads(out.stdout)
+    def stored(self, days, readings=None, cadence=1, from_utc=None, state=None, **facts):
+        """One stored month with one configuration state (FACTS unless overridden; smt=None leaves it out)."""
+        m = C.month(days, readings=readings, cadence=cadence, state=state or self.START)
+        entry = m['MemberExposure']['lpar'][0]
+        entry.update({k: v for k, v in dict(self.FACTS, **facts).items() if v is not None})
+        if from_utc:
+            entry['fromUTC'] = m['ContestedBusy']['lpar'][0]['fromUTC'] = from_utc
+        return m
 
-        e = evidence(7, False)
-        self.assertEqual((e['status'], e['observations']['contested'], len(e['dayRows'])), ('contested', 20, 2))
-        for pool, capped in ((9, False), (7, True)):
-            e = evidence(pool, capped)
-            self.assertEqual((e['status'], e['readings'], e['dayRows']), ('unavailable', [], []))
-            self.assertEqual(e['reasons'], {'configuration state not comparable with the current one': 2})
-            self.assertEqual((e['eligibleMinutes'], e['classifiedMinutes']), (2880, 0))     # eligible days, nothing usable
+    @staticmethod
+    def joined(first, second):
+        """Two states in one month."""
+        for block in ('MemberExposure', 'ContestedBusy'):
+            first[block]['lpar'] += second[block]['lpar']
+        return first
+
+    SEPT = [('2026-09-29', 1440, 1440, 1440), ('2026-09-30', 1440, 1440, 1440)]
+    OCT = [('2026-10-30', 1440, 1440, 1440), ('2026-10-31', 1440, 1440, 1440)]
+    WINDOWS = [['2026-09-29', '2026-10-01'], ['2026-10-30', '2026-11-01']]
+    BUSY_SEPT = {'2026-09-29': [[0.9, 1.2, 8]], '2026-09-30': [[1.0, 1.3, 4]]}
+    BUSY_OCT = {'2026-10-30': [[1.1, 1.5, 6]], '2026-10-31': [[0.8, 0.9, 2]]}
+
+    def test_the_current_state_is_recognised_after_a_restage_and_its_windows_are_pooled(self):
+        months = [['2026-09', self.stored(self.SEPT, self.BUSY_SEPT)],
+                  ['2026-10', self.stored(self.OCT, self.BUSY_OCT, from_utc='2026-10-01T00:00:00Z')]]
+        # The same state, staged again later: its start has moved; everything recorded of it is unchanged.
+        for start_epoch in (1785542400, 1788220800):
+            t, e = self.trackers(months, self.WINDOWS, start_epoch=start_epoch)
+            self.assertEqual((t['status'], t['contested'], t['observations'], t['days'], t['cadence']), ('contested', 20, 20, 4, 1))
+            self.assertEqual(t['frontier'], [[1.1, 1.5]])
+            self.assertEqual(t['bound'], 1.26)                                         # 1.1 + 0.4 x 0.4
+            self.assertIsNotNone(t['floor'])                                           # 20 observations on 4 days resolve a 95th percentile
+            self.assertEqual(e['reasons'], {})
+
+    def test_evidence_from_before_a_configuration_change_is_unavailable_not_quiet(self):
+        # A VP reduction between the two occurrences: September's readings belong to another configuration.
+        months = [['2026-09', self.stored(self.SEPT, self.BUSY_SEPT, virtualProcessors=6)],
+                  ['2026-10', self.stored(self.OCT, state='2026-10-05T00:00:00Z', from_utc='2026-10-05T00:00:00Z')]]
+        t, e = self.trackers(months, self.WINDOWS, start_epoch=1791158400)             # the state that began on 5 October
+        self.assertEqual((t['status'], t['contested'], t['frontier'], t['floor']), ('insufficient', 0, [], None))
+        self.assertEqual(e['reasons'], {'not the current configuration state': 2})
+        self.assertEqual((e['windows'][0]['status'], e['windowsWithEvidence'], e['coverage']), ('unavailable', 1, 0.5))
+        # The same for each recorded fact, and for a state whose SMT mode was not recorded.
+        for change in ({'entitlement': 1.5}, {'pool': 'SYS:9'}, {'poolCeiling': 6.0}, {'smt': 4}, {'capped': True}, {'smt': None}):
+            months[0][1] = self.stored(self.SEPT, self.BUSY_SEPT, state='2026-07-01T00:00:00Z', **change)
+            t, e = self.trackers(months, self.WINDOWS, start_epoch=1791158400)
+            self.assertEqual((t['status'], t['contested']), ('insufficient', 0), change)
+
+    def test_an_event_crossing_a_state_change_uses_the_days_of_the_current_state_only(self):
+        before = self.stored([('2026-10-30', 1440, 1440, 1440)], {'2026-10-30': [[1.6, 1.9, 30]]}, virtualProcessors=6, from_utc='2026-10-01T00:00:00Z')
+        after = self.stored([('2026-10-31', 1440, 1440, 1440)], {'2026-10-31': [[0.8, 0.9, 2]]}, state='2026-10-31T00:00:00Z', from_utc='2026-10-31T00:00:00Z')
+        t, e = self.trackers([['2026-10', self.joined(before, after)]], [['2026-10-30', '2026-11-01']], start_epoch=1793404800)
+        self.assertEqual((t['status'], t['contested'], t['frontier']), ('contested', 2, [[0.8, 0.9]]))
+        self.assertEqual(e['reasons'], {'not the current configuration state': 1})
+        # A configuration changed and changed back: what lies before the change is another state.
+        months = [['2026-09', self.stored(self.SEPT, self.BUSY_SEPT)],
+                  ['2026-10', self.joined(self.stored([('2026-10-30', 1440, 1440, 1440)], virtualProcessors=6, state='2026-10-10T00:00:00Z',
+                                                      from_utc='2026-10-10T00:00:00Z'),
+                                          self.stored([('2026-10-31', 1440, 1440, 1440)], state='2026-10-31T00:00:00Z', from_utc='2026-10-31T00:00:00Z'))]]
+        t, e = self.trackers(months, self.WINDOWS, start_epoch=1793404800)
+        self.assertEqual((t['status'], t['contested']), ('insufficient', 0))
+        self.assertEqual(e['reasons'], {'not the current configuration state': 3})
+
+    def test_fine_and_coarse_occurrences_are_not_pooled_into_one_percentile(self):
+        coarse = [('2026-10-30', 1440, 96, 96), ('2026-10-31', 1440, 96, 96)]
+        months = [['2026-09', self.stored(self.SEPT, self.BUSY_SEPT)], ['2026-10', self.stored(coarse, self.BUSY_OCT, cadence=15)]]
+        t, e = self.trackers(months, self.WINDOWS)
+        self.assertEqual((e['mixedCadence'], e['cadenceMinutes'], e['levelSupported']), (True, [1, 15], False))
+        self.assertEqual((t['status'], t['contested'], t['cadence']), ('contested', 20, 15))   # read at its coarsest interval
+        self.assertIsNone(t['floor'])                                                  # no automatic level across intervals
+        self.assertEqual(t['bound'], 1.26)                                             # the maximum needs no weighting
+        # Quiet at both intervals: the absence is whole, and the evidence is still coarse, so the
+        # fine-data exemption is not open to it (the gate reads the tracker's interval).
+        months = [['2026-09', self.stored(self.SEPT)], ['2026-10', self.stored(coarse, cadence=15)]]
+        t, e = self.trackers(months, self.WINDOWS)
+        self.assertEqual((t['status'], t['cadence'], e['mixedCadence']), ('noCompetition', 15, True))
+        # One interval throughout, coarse: a level is possible, and it is labelled with that interval.
+        coarse_sept = [('2026-09-29', 1440, 96, 96), ('2026-09-30', 1440, 96, 96)]
+        months = [['2026-09', self.stored(coarse_sept, self.BUSY_SEPT, cadence=15)], ['2026-10', self.stored(coarse, self.BUSY_OCT, cadence=15)]]
+        t, e = self.trackers(months, self.WINDOWS)
+        self.assertEqual((e['mixedCadence'], t['cadence']), (False, 15))
+        self.assertIsNotNone(t['floor'])
+
+    def test_a_missing_event_day_prevents_the_no_competition_verdict(self):
+        whole = [['2026-09', self.stored(self.SEPT)], ['2026-10', self.stored(self.OCT)]]
+        self.assertEqual(self.trackers(whole, self.WINDOWS)[0]['status'], 'noCompetition')
+        for october in (self.OCT[:1],                                                  # a day not in history
+                        [self.OCT[0], ('2026-10-31', 1440, 0, 0)],                     # a day without PhysB
+                        [self.OCT[0], ('2026-10-31', 1440, 1440, 1200)]):              # a day with too little classified
+            t, e = self.trackers([whole[0], ['2026-10', self.stored(october)]], self.WINDOWS)
+            self.assertEqual(t['status'], 'insufficient', october)
+        # No usable day at all: no tracker, and the LPAR is sized as before.
+        t, e = self.trackers([['2026-09', self.stored(self.SEPT, virtualProcessors=6, state='2026-07-01T00:00:00Z')]], self.WINDOWS[:1])
+        self.assertEqual((t, e['status']), (None, 'unavailable'))
 
 
 if __name__ == '__main__':
