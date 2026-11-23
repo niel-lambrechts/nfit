@@ -272,6 +272,82 @@ class ContestedReaderTests(unittest.TestCase):
         r, _ = self.read([['2026-09', m]], start='2026-09-01', end='2026-09-02')
         self.assertEqual((r['readings'], r['status'], r['days']['window']), ([[0.5, 0.8, 2]], 'complete', 1))
 
+    # -- event-window evidence (nfit-profile) ---------------------------------------------------
+    def event(self, months, windows, vm='lpar', population='none'):
+        with open(os.path.join(REPO, 'nfit-profile'), encoding='utf-8') as fh:
+            source = fh.read()
+        names = PERL_SUBS + ('_contested_event_evidence',)
+        subs = ''.join(re.search(r'^(sub %s\s*\{.*?^\})' % name, source, re.S | re.M).group(1) + '\n' for name in names)
+        consts = ''.join(re.search(r'^(my \$%s\s*=.*?;)' % name, source, re.M).group(1) + '\n'
+                         for name in ('CONTESTED_BUSY_PROJECTION', 'CONTESTED_BUSY_READER', 'MEMBER_EXPOSURE_PROJECTION',
+                                      'PEAK_UPLIFT_GATE_MIN_CLASSIFIED', 'PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED',
+                                      'CONTESTED_LEVEL_MIN_MINUTES', 'CONTESTED_LEVEL_MIN_DAYS'))
+        script = ('use strict; use warnings; use JSON; use Time::Piece; use List::Util qw(max min);\n' + consts + subs +
+                  'local $/; my $in = decode_json(<STDIN>); '
+                  'print JSON->new->canonical->encode(_contested_event_evidence(@{$in}{qw(months vm population windows)}));')
+        out = subprocess.run(['perl', '-e', script], capture_output=True, text=True, timeout=60,
+                             input=json.dumps({'months': months, 'vm': vm, 'population': population, 'windows': windows}))
+        self.assertEqual(out.returncode, 0, out.stderr[-1200:])
+        return json.loads(out.stdout)
+
+    @staticmethod
+    def two_months(sep=None, oct_=None):
+        """September and October, each with its last two days stored in full unless given."""
+        full = lambda *dates: [(d, 1440, 1440, 1440) for d in dates]
+        sep = sep or {'days': full('2026-09-29', '2026-09-30')}
+        oct_ = oct_ or {'days': full('2026-10-30', '2026-10-31')}
+        return [['2026-09', month(sep.pop('days'), **sep)], ['2026-10', month(oct_.pop('days'), **oct_)]]
+
+    WINDOWS = [['2026-09-29', '2026-10-01'], ['2026-10-30', '2026-11-01']]
+
+    def test_event_windows_merge_their_contested_readings(self):
+        months = self.two_months({'days': [('2026-09-29', 1440, 1440, 1440), ('2026-09-30', 1440, 1440, 1440)],
+                                  'readings': {'2026-09-29': [[0.5, 0.8, 9]], '2026-09-30': [[0.6, 0.9, 4]]}},
+                                 {'days': [('2026-10-30', 1440, 1440, 1440), ('2026-10-31', 1440, 1440, 1440)],
+                                  'readings': {'2026-10-31': [[0.5, 0.8, 3], [1.2, 1.5, 1]]}})
+        e = self.event(months, self.WINDOWS)
+        self.assertEqual((e['status'], e['windowsRequested'], e['windowsWithEvidence']), ('contested', 2, 2))
+        self.assertEqual(e['readings'], [[0.5, 0.8, 12], [0.6, 0.9, 4], [1.2, 1.5, 1]])
+        self.assertEqual((e['observations']['contested'], e['contestedDays'], e['levelSupported']), (17, 3, True))
+        self.assertEqual([w['contestedObservations'] for w in e['windows']], [13, 4])
+        self.assertEqual((e['coverage'], e['worstDayShare'], e['daysWithoutHistory']), (1.0, 1.0, 0))
+        # Readings of an ordinary week between the events are not read.
+        months[1][1]['ContestedBusy']['lpar'][0]['populations']['none']['readings']['2026-10-15'] = [[3.0, 3.0, 50]]
+        self.assertEqual(self.event(months, self.WINDOWS)['readings'], e['readings'])
+        # Overlapping and adjoining windows are joined, not counted twice.
+        again = self.event(months, self.WINDOWS + [['2026-09-30', '2026-10-01'], ['2026-11-01', '2026-11-02']])
+        self.assertEqual((again['observations']['contested'], again['windowsRequested']), (17, 2))
+
+    def test_no_competition_needs_every_day_of_every_window(self):
+        self.assertEqual(self.event(self.two_months(), self.WINDOWS)['status'], 'noCompetition')
+        # A day of a window missing from history: the absence is not supported.
+        e = self.event(self.two_months(oct_={'days': [('2026-10-30', 1440, 1440, 1440)]}), self.WINDOWS)
+        self.assertEqual((e['status'], e['daysWithoutHistory'], e['worstDayShare']), ('insufficient', 1, 0))
+        # A day without PhysB, and a day with too little classified time.
+        e = self.event(self.two_months(oct_={'days': [('2026-10-30', 1440, 1440, 1440), ('2026-10-31', 1440, 0, 0)]}), self.WINDOWS)
+        self.assertEqual((e['status'], e['coverage'], e['worstDayShare']), ('insufficient', 0.75, 0))
+        e = self.event(self.two_months(oct_={'days': [('2026-10-30', 1440, 1440, 1440), ('2026-10-31', 1440, 1440, 1200)]}), self.WINDOWS)
+        self.assertEqual((e['status'], e['worstDayShare']), ('insufficient', round(1200 / 1440, 4)))
+        # A whole window without usable evidence.
+        e = self.event(self.two_months(oct_={'days': [('2026-10-30', 1440, 1440, 1440), ('2026-10-31', 1440, 1440, 1440)],
+                                             'marker': {'dataRevision': 'd2'}}), self.WINDOWS)
+        self.assertEqual((e['status'], e['windowsWithEvidence'], e['windows'][1]['status']), ('insufficient', 1, 'unavailable'))
+        # Fully sampled coarse data supports the absence as one-minute data does.
+        coarse = lambda *dates: [(d, 1440, 96, 96) for d in dates]
+        e = self.event(self.two_months({'days': coarse('2026-09-29', '2026-09-30'), 'cadence': 15},
+                                       {'days': coarse('2026-10-30', '2026-10-31'), 'cadence': 15}), self.WINDOWS)
+        self.assertEqual((e['status'], e['coverage'], e['cadenceMinutes']), ('noCompetition', 1.0, [15]))
+
+    def test_what_was_seen_stands_and_nothing_stored_is_unavailable(self):
+        # A contested reading counts whatever the coverage: it can only raise protection.
+        months = self.two_months(oct_={'days': [('2026-10-30', 1440, 1440, 700), ('2026-10-31', 1440, 0, 0)],
+                                       'readings': {'2026-10-30': [[0.9, 1.1, 2]]}})
+        e = self.event(months, self.WINDOWS)
+        self.assertEqual((e['status'], e['readings'], e['levelSupported']), ('contested', [[0.9, 1.1, 2]], False))
+        e = self.event(self.two_months(), [['2026-07-30', '2026-08-01']])
+        self.assertEqual((e['status'], e['windowsWithEvidence'], e['coverage']), ('unavailable', 0, None))
+        self.assertEqual(self.event(self.two_months(), [])['status'], 'unavailable')
+
     def test_the_count_weighted_percentile_is_the_percentile_of_the_expanded_observations(self):
         rng = random.Random(20261123)
         for _ in range(12):

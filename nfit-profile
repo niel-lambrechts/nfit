@@ -25322,7 +25322,7 @@ sub _contested_history_read
     my (%dates, %reasons, %cells, %cadences, %contested_dates);
     my %records = (evaluated => 0, full => 0, partial => 0, unavailable => 0, contested => 0);
     my %obs = (expectedOnEvaluatedDays => 0, paired => 0, classified => 0, contested => 0);
-    my ($contested_minutes, $eligible_minutes, $classified_minutes) = (0, 0, 0);
+    my ($contested_minutes, $eligible_minutes, $classified_minutes, $worst_day) = (0, 0, 0, undef);
     foreach my $pair (sort { $a->[0] cmp $b->[0] } @{ $months_aref // [] })
     {
         my $data = $pair->[1];
@@ -25357,7 +25357,13 @@ sub _contested_history_read
                 {
                     $records{unavailable}++;
                     $reasons{$why}++;
+                    $worst_day = 0 if (($day->{expectedMinutes} // 0) > 0);
                     next;
+                }
+                if (($day->{expectedMinutes} // 0) > 0)
+                {
+                    my $day_share = $day->{classifiedMinutes} * $cadence / $day->{expectedMinutes};
+                    $worst_day = $day_share if (!defined $worst_day || $day_share < $worst_day);
                 }
                 $supported{$date} = 1;
                 my $expected = ($day->{expectedMinutes} // 0) / $cadence;       # elapsed time into observations
@@ -25399,6 +25405,9 @@ sub _contested_history_read
     $result{observations} = { %obs, expectedOnEvaluatedDays => 0 + sprintf('%.2f', $obs{expectedOnEvaluatedDays}) };
     $result{eligibleMinutes}   = $eligible_minutes;
     $result{classifiedMinutes} = $classified_minutes;
+    # The least-classified stored day (0 for a day that could not be evaluated): a missing busy day
+    # must not be read as open capacity.
+    $result{worstDayShare} = defined $worst_day ? 0 + sprintf('%.4f', $worst_day) : undef;
     $result{coverage}     = $eligible_minutes > 0 ? 0 + sprintf('%.4f', $classified_minutes / $eligible_minutes) : undef;
     $result{cadenceMinutes}   = [ map { $_ + 0 } sort { $a <=> $b } keys %cadences ];      # hash keys are strings: written as numbers
     $result{contestedMinutes} = $contested_minutes;
@@ -25413,6 +25422,80 @@ sub _contested_history_read
     $result{status} = ($records{unavailable} || $records{partial} || $result{days}{withoutHistory} || %reasons) ? 'partial' : 'complete';
     $result{contestedObserved} = $obs{contested} ? JSON::true : JSON::false;
     return \%result;
+}
+
+# Event-window evidence (rule event-window-evidence-1): what history holds of one LPAR's work
+# during pool competition in the hours of one population, over a set of past event windows
+# ([ [from, toExclusive], ... ], whole UTC days; overlapping or adjoining windows are joined).
+# Ordinary weeks are not read: spare capacity in a normal month does not stand in for month-end.
+#
+# The verdict uses the rules of the standard models, over everything that was asked for:
+#   contested      a contested observation was stored in some window. The readings give the bound
+#                  and the level; what was seen stands whatever the coverage, because it can only
+#                  raise protection.
+#   noCompetition  nothing contested, and the absence is supported: every window has evidence, no
+#                  day of any window is missing from history, the classified share of the eligible
+#                  time is at least the gate's whole-window share and every day's at least its
+#                  daily share (the no-competition gate of the pool-borrowing rule).
+#   insufficient   nothing contested, and the absence is not supported (a missing day, a day or a
+#                  window without evidence, or too little classified time).
+#   unavailable    no window has evidence.
+# levelSupported: the contested observations meet the contested level's minimum (observations and
+# days); whether a percentile can be resolved is for the caller, who knows the percentile.
+sub _contested_event_evidence
+{
+    my ($months_aref, $vm, $population, $windows_aref) = @_;
+    my @windows;
+    foreach my $w (sort { $a->[0] cmp $b->[0] } grep { ref($_) eq 'ARRAY' && defined $_->[0] && defined $_->[1] && $_->[0] lt $_->[1] } @{ $windows_aref // [] })
+    {
+        if (@windows && $w->[0] le $windows[-1][1]) { $windows[-1][1] = $w->[1] if ($w->[1] gt $windows[-1][1]); }
+        else { push @windows, [ @$w ]; }
+    }
+    my %out = (rule => 'event-window-evidence-1', vm => $vm, population => $population, windows => [],
+               windowsRequested => scalar(@windows), windowsWithEvidence => 0);
+    my (%cells, %cadences, %reasons);
+    my %sum = (contested => 0, contestedDays => 0, contestedMinutes => 0, eligibleMinutes => 0, classifiedMinutes => 0, daysWithoutHistory => 0);
+    my $worst;
+    foreach my $w (@windows)
+    {
+        my $r = _contested_history_read($months_aref, $vm, $population, @$w);
+        push @{ $out{windows} }, { from => $w->[0], toExclusive => $w->[1], status => $r->{status}, reason => $r->{reason},
+                                   coverage => $r->{coverage}, worstDayShare => $r->{worstDayShare},
+                                   daysWithoutHistory => $r->{days}{withoutHistory},
+                                   contestedObservations => $r->{observations}{contested}, contestedDays => $r->{days}{contested} };
+        $reasons{$_} += $r->{reasons}{$_} for keys %{ $r->{reasons} };
+        $sum{eligibleMinutes}    += $r->{eligibleMinutes};
+        $sum{classifiedMinutes}  += $r->{classifiedMinutes};
+        $sum{daysWithoutHistory} += $r->{days}{withoutHistory};
+        # A window without evidence, or with a day missing from history, has a day with nothing classified.
+        my $w_worst = ($r->{status} eq 'unavailable' || $r->{days}{withoutHistory}) ? 0 : $r->{worstDayShare};
+        $worst = $w_worst if (defined $w_worst && (!defined $worst || $w_worst < $worst));
+        next if ($r->{status} eq 'unavailable');
+        $out{windowsWithEvidence}++;
+        $sum{contested}        += $r->{observations}{contested};
+        $sum{contestedDays}    += $r->{days}{contested};
+        $sum{contestedMinutes} += $r->{contestedMinutes};
+        $cadences{$_} = 1 for @{ $r->{cadenceMinutes} };
+        $cells{ sprintf('%.0f,%.0f', $_->[0] * 100, $_->[1] * 100) } += $_->[2] for @{ $r->{readings} };
+    }
+    $out{readings} = [ map { my ($b, $c) = split /,/, $_; [ $b / 100, $c / 100, $cells{$_} ] }
+                       sort { my @x = split /,/, $a; my @y = split /,/, $b; $x[0] <=> $y[0] || $x[1] <=> $y[1] } keys %cells ];
+    $out{observations}       = { contested => $sum{contested} };
+    $out{contestedDays}      = $sum{contestedDays};
+    $out{contestedMinutes}   = $sum{contestedMinutes};
+    $out{eligibleMinutes}    = $sum{eligibleMinutes};
+    $out{classifiedMinutes}  = $sum{classifiedMinutes};
+    $out{daysWithoutHistory} = $sum{daysWithoutHistory};
+    $out{coverage}           = $sum{eligibleMinutes} > 0 ? 0 + sprintf('%.4f', $sum{classifiedMinutes} / $sum{eligibleMinutes}) : undef;
+    $out{worstDayShare}      = $worst;
+    $out{cadenceMinutes}     = [ map { $_ + 0 } sort { $a <=> $b } keys %cadences ];
+    $out{reasons}            = \%reasons;
+    my $absence_supported = (@windows && $out{windowsWithEvidence} == @windows && !$sum{daysWithoutHistory}
+        && $sum{eligibleMinutes} > 0 && $sum{classifiedMinutes} / $sum{eligibleMinutes} >= $PEAK_UPLIFT_GATE_MIN_CLASSIFIED - 1e-9
+        && defined $worst && $worst >= $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED - 1e-9) ? 1 : 0;
+    $out{levelSupported} = ($sum{contested} >= $CONTESTED_LEVEL_MIN_MINUTES && $sum{contestedDays} >= $CONTESTED_LEVEL_MIN_DAYS) ? JSON::true : JSON::false;
+    $out{status} = !$out{windowsWithEvidence} ? 'unavailable' : $sum{contested} ? 'contested' : $absence_supported ? 'noCompetition' : 'insufficient';
+    return \%out;
 }
 
 # The highest protected level of stored readings for a tier share (busy plus the share of the

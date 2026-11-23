@@ -34,7 +34,9 @@ def load(name):
 
 mx = load('member_exposure_test')
 sf = load('structural_feasibility_test')
-TIMESTAMP_KEYS = {'availableAt', 'updated', 'LastUpdated'}
+# Not compared: timestamps, and the pool revision, a digest of the fixture's gzipped pool file, whose
+# header carries the second it was written (two roots built across a second boundary differ in it).
+TIMESTAMP_KEYS = {'availableAt', 'updated', 'LastUpdated', 'poolRevision'}
 NEW_BLOCKS = ('PoolHistory', 'MemberExposure')
 NEW_MARKERS = ('PoolEvidence', 'MemberExposureEvidence', 'PhysB', 'DailyPhysBUnavailable')
 
