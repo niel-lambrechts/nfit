@@ -87,16 +87,18 @@ def population_of(members, vm, profile):
 
 
 def evidence_class(members, vm, profile):
-    """What the evidence pass found for one LPAR and profile, from the stored proposal of the run:
-    contested, supportedNoCompetition, insufficientEvidence, missingEvidence (assessed, nothing usable
-    in history) or otherExclusion (not assessed: not an uncapped shared-pool LPAR, or no record)."""
-    member = members.get(vm) or {}
-    record = ((member.get('profiles') or {}).get(profile) or {}).get('cutProtection') or {}
-    verdict = (record.get('eventWindows') or {}).get('verdict')
-    if verdict:
-        return {'contested': 'contested', 'noCompetition': 'supportedNoCompetition'}.get(verdict, 'insufficientEvidence')
-    assessed = member.get('eventEvidence') or {}
-    return 'missingEvidence' if assessed else 'otherExclusion'
+    """What the evidence pass found for one LPAR in the hours of one profile, from the stored proposal of
+    the run: contested, supportedNoCompetition, insufficientEvidence, missingEvidence (assessed; nothing
+    usable in history for those hours, or the profile is in no assessed population) or otherExclusion
+    (not assessed: not an uncapped shared-pool LPAR in its current state)."""
+    assessed = (members.get(vm) or {}).get('eventEvidence') or {}
+    if not assessed:
+        return 'otherExclusion'
+    for population in assessed.values():
+        if profile in (population.get('profiles') or []):
+            return {'contested': 'contested', 'noCompetition': 'supportedNoCompetition',
+                    'insufficient': 'insufficientEvidence'}.get(population.get('verdict'), 'missingEvidence')
+    return 'missingEvidence'
 
 
 def role_words(text):
@@ -153,14 +155,16 @@ def main():
     ap.add_argument('--work', default=str(REPO / '.private' / 'history-check'), help='the work tree kept by dev/history-integration-check --keep')
     ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'seasonal'))
     ap.add_argument('--seasonality', default=str(REPO / 'etc' / 'nfit.seasonality.cfg'), help='the seasonality file to use')
+    ap.add_argument('--names', action='store_true', help='also list the LPARs whose planning figure moved, as pseudonyms '
+                                                         '(through dev/nfit-redact); printed only, never written to the result file')
     ap.add_argument('--profile-args', default='', help='extra nfit-profile options for both runs')
     a = ap.parse_args()
-    work = Path(a.work)
+    work = Path(a.work).resolve()                          # the runs change directory: a relative path would not survive it
     app, case = work / 'app', work / 'case'
     stage = next(iter(sorted((case / 'stage').glob('*'))), None) if (case / 'stage').is_dir() else None
     if stage is None or not (case / 'history' / stage.name).is_dir():
         sys.exit('seasonal-protection-compare: no kept work tree with history (run dev/history-integration-check --keep first)')
-    seasonality = Path(a.seasonality)
+    seasonality = Path(a.seasonality).resolve()
     if not seasonality.is_file():
         sys.exit('seasonal-protection-compare: seasonality file not found (see --seasonality)')
     known = events(seasonality)
@@ -197,7 +201,12 @@ def main():
                  'see its private log in the work tree)')
 
     common = sorted(set(before) & set(after))
-    profiles = [c for c in next(iter(after.values())) if re.match(r'^[POGB]\d?-', c) and '_rVCPU' not in c]
+    # The profile value columns: exactly the profile names of the stored proposal (the CSV also carries
+    # derived columns per profile, which are not entitlement figures).
+    known_profiles = {p for m in members.values() for p in (m.get('profiles') or {})}
+    known_profiles |= {p for m in members.values() for e in (m.get('eventEvidence') or {}).values() for p in (e.get('profiles') or [])}
+    profiles = [c for c in next(iter(after.values())) if c in known_profiles] or \
+               [c for c in next(iter(after.values())) if re.match(r'^[POGB]\d?-[0-9.]+W\d+$', c)]
     planning, cells, vps = [], [], []
     for vm in common:
         b, n = number(before[vm].get('NFIT - ENT')), number(after[vm].get('NFIT - ENT'))
@@ -212,11 +221,11 @@ def main():
                 cells.append((b, n))
     # The planning figure by what the evidence pass found for the LPAR's planning profile (from the
     # stored proposal of the run with the protection), and every moved figure with its explanation.
-    by_verdict, moved, cells_lowered, cells_raised, relied = {}, [], {}, {}, []
+    by_verdict, moved, cells_lowered, cells_raised, relied, unsupported = {}, [], {}, {}, [], {}
     for vm in common:
         member = members.get(vm) or {}
-        plan_profile = (member.get('eventWindow') or {}).get('planningProfile')
-        cls = evidence_class(members, vm, plan_profile) if plan_profile else ('missingEvidence' if member.get('eventEvidence') else 'otherExclusion')
+        plan_profile = member.get('planningProfile') or (member.get('eventWindow') or {}).get('planningProfile')
+        cls = evidence_class(members, vm, plan_profile)
         own = [(number(before[vm].get(p)), number(after[vm].get(p))) for p in profiles]
         own_moved = any(b is not None and n is not None and abs(n - b) > EPS for b, n in own)
         b, n = number(before[vm].get('NFIT - ENT')), number(after[vm].get('NFIT - ENT'))
@@ -224,7 +233,8 @@ def main():
             by_verdict.setdefault(cls, []).append((b, n))
             if abs(n - b) > EPS:
                 floor = ((member.get('profiles') or {}).get(plan_profile) or {}).get('tierFloor') or {} if plan_profile else {}
-                moved.append({'direction': 'raised' if n > b else 'lowered', 'evidence': cls,
+                moved.append({'vm': vm, 'before': b, 'after': n, 'planningProfile': plan_profile, 'pool': member.get('poolId'),
+                              'direction': 'raised' if n > b else 'lowered', 'evidence': cls,
                               'ownProfileValuesMoved': own_moved,
                               'allowanceWithheld': bool(floor.get('withheld')),
                               'contestedLevelApplied': bool((((member.get('profiles') or {}).get(plan_profile) or {}).get('contestedFloor') or {}).get('applied')) if plan_profile else False,
@@ -238,6 +248,8 @@ def main():
             target = cells_lowered if n < b else cells_raised
             key = evidence_class(members, vm, p)
             target[key] = target.get(key, 0) + 1
+            if n < b and key != 'supportedNoCompetition':
+                unsupported[p] = unsupported.get(p, 0) + 1
     explained = {}
     for m in moved:
         key = '%s | evidence %s | own profile values %s | allowance withheld %s | contested level %s | role words %s' % (
@@ -260,7 +272,8 @@ def main():
         'profileValuesRaisedByEvidence': dict(sorted(cells_raised.items())),
         'exemptionCheck': {'profileValuesLowered': sum(cells_lowered.values()),
                            'withSupportedNoCompetition': cells_lowered.get('supportedNoCompetition', 0),
-                           'withoutIt': sum(v for k, v in cells_lowered.items() if k != 'supportedNoCompetition')},
+                           'withoutIt': sum(v for k, v in cells_lowered.items() if k != 'supportedNoCompetition'),
+                           'withoutItByProfile': dict(sorted(unsupported.items()))},
         'eventWindowPlan': {'lparsWithAllowanceWithheld': len(relied), 'borrowingReliedOnCores': round(sum(relied), 2),
                             'pools': len(pool_lines),
                             'poolsWithinMaximum': sum(1 for _, r in pool_lines if r.startswith('guarantees and')),
@@ -287,7 +300,7 @@ def main():
                     'actionTextChanged': sum(1 for vm in common if (before[vm].get('NFIT - Action') or '') != (after[vm].get('NFIT - Action') or ''))},
         'seconds': {'without': seconds_before, 'with': seconds_after},
     }
-    out = Path(a.out)
+    out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     target = out / f'seasonal-protection-{re.sub(r"[^A-Za-z0-9_.-]", "_", a.event)}.json'
     target.write_text(json.dumps(result, indent=1) + '\n')
@@ -317,6 +330,16 @@ def main():
     print(f"  Against installed: {result['planningAgainstInstalled']}")
     print(f"  Actions          : {result['actions']}")
     print(f"  Seconds          : {result['seconds']}")
+    if a.names:
+        rows = ['%-24s pool %-4s %-10s %6.2f -> %6.2f  %-8s %-24s own values %s; allowance withheld %s; contested level %s; role words %s' % (
+            m['vm'], m['pool'] if m['pool'] is not None else '-', m['planningProfile'] or '-', m['before'], m['after'], m['direction'], m['evidence'],
+            'moved' if m['ownProfileValuesMoved'] else 'unchanged', 'yes' if m['allowanceWithheld'] else 'no',
+            'yes' if m['contestedLevelApplied'] else 'no', m['roleWordsInAction'])
+                for m in sorted(moved, key=lambda m: (m['direction'], m['evidence'], m['vm']))]
+        redacted = subprocess.run([str(REPO / 'dev' / 'nfit-redact')], input='\n'.join(rows) + '\n', capture_output=True, text=True)
+        print('  Moved LPARs (pseudonyms):')
+        print('\n'.join('    ' + line for line in redacted.stdout.splitlines()) if redacted.returncode == 0 and redacted.stdout.strip()
+              else '    (dev/nfit-redact gave no output; nothing is shown)')
     audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
     print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
     print(f'Written: {target}')
