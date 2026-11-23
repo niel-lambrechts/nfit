@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/thread-density-explore
+# PURPOSE  : Research (no sizing figure changes). On a staged system, tests
+#            three hypotheses set out in the research note "Thread Density,
+#            Busy Share and Run-Queue Load on Entitlement":
+#              H1  busy share (PhysB / PhysC) follows the SMT yield curve of the
+#                  processor generation for the threads per consumed core
+#                  (run queue / PhysC);
+#              H2  LPARs clearly below that curve exist as a group (unused width);
+#              H3  the run queue against the guaranteed threads (entitlement x
+#                  SMT), on the hours of the planning profile and against the
+#                  tier's density, separates over-guaranteed LPARs.
+#            Method, filters and thresholds are constants below, fixed before
+#            any result was read, and are written into the result.
+# INPUT    : a work tree kept by dev/history-integration-check --keep (its staged
+#            system, and the stored standard proposal for each LPAR's planning
+#            profile, hours and tier).
+# USAGE    : dev/thread-density-explore [--work DIR]
+# OUTPUT   : <out>/thread-density-<label>.json and tables (aggregates; no LPAR,
+#            pool or system is named)
+# ==============================================================================
+import argparse
+import calendar
+import json
+import re
+import subprocess
+import sys
+import time
+from array import array
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+# --- fixed in advance (research note, section 4) ---------------------------------------------
+ACTIVITY_FLOOR = 0.25            # cores of PhysC below which the busy share is not formed
+BUSY_TOLERANCE = 1.02            # PhysB may exceed PhysC by this factor (accounting tolerance)
+VP_CEILING_SHARE = 0.90          # the guaranteed set stays below this share of the VP count
+BINS = (0.5, 1.0, 1.5, 2.5, 3.5, 5.0, 7.0, 9.0, 12.0)       # upper edges of the bins of k; a last bin lies above
+BIN_MIN_SAMPLES = 30
+LPAR_MIN_SAMPLES = 500
+RESIDUAL_BAND = 0.10
+LOAD_MIN_SAMPLES = 1000
+TIER_DENSITY = {'P': 0.25, '1': 0.45, '2': 0.70, '3': 1.00, '4': 1.50}      # nFit's run-queue targets: threads per core / 8
+PROPOSED_FACTOR = 1.25           # Niël's tolerance factor on entitlement x SMT, reported beside the tiers
+FAR_BELOW, WITHIN = 0.50, 1.00   # P95 of the load as a share of the tier density
+CURVES = {                       # SMT yield by threads per core: v10 plan section 6.2, and nFit's default
+    'POWER8': {1: 1.00, 2: 1.45, 4: 1.89, 8: 2.02},
+    'Power9': {1: 1.00, 2: 1.70, 4: 2.35, 8: 2.96},
+    'Power10': {1: 1.00, 2: 1.95, 4: 2.66, 8: 3.40},
+    'Power11': {1: 1.00, 2: 2.00, 4: 2.80, 8: 3.54},
+    'default': {1: 1.00, 2: 1.45, 4: 1.90, 8: 2.35},
+}
+POPULATION_OF_LETTER = {'G': 'none', 'P': 'none', 'O': 'online+no-weekends', 'B': 'batch'}
+
+
+def generation_of(metadata):
+    text = '%s %s' % (metadata.get('proc_type') or '', metadata.get('proc_version') or '')
+    hit = re.search(r'POWER\s*_?(\d+)', text, re.I)
+    if not hit:
+        return 'unknown'
+    return {8: 'POWER8', 9: 'Power9', 10: 'Power10', 11: 'Power11'}.get(int(hit.group(1)), 'unknown')
+
+
+def yield_at(curve, k):
+    """Y(k): linear between the curve's points; k x Y(1) below one thread; flat above the last point."""
+    points = sorted(curve.items())
+    if k <= points[0][0]:
+        return k * points[0][1] / points[0][0]
+    for (k0, y0), (k1, y1) in zip(points, points[1:]):
+        if k <= k1:
+            return y0 + (y1 - y0) * (k - k0) / (k1 - k0)
+    return points[-1][1]
+
+
+def predicted_share(curve, k, smt):
+    top = yield_at(curve, smt)
+    return min(1.0, yield_at(curve, min(k, smt)) / top) if top > 0 else None
+
+
+def admits(population, weekday, minute):
+    """nFit's profile hours (UTC): weekday 0 is Sunday."""
+    window, _, rule = population.partition('+')
+    if rule == 'no-weekends' and weekday in (0, 6):
+        return False
+    if window == 'online':
+        return 480 <= minute < 1020
+    if window == 'batch':
+        return minute >= 1080 or minute < 360
+    return window == 'none'
+
+
+def quantile(values, q):
+    """Of a sorted sequence, with linear interpolation."""
+    if not values:
+        return None
+    rank = (len(values) - 1) * q
+    lower = int(rank)
+    upper = min(lower + 1, len(values) - 1)
+    return values[lower] + (values[upper] - values[lower]) * (rank - lower)
+
+
+def summary(values):
+    ordered = sorted(values)
+    return {'n': len(ordered), 'p25': round(quantile(ordered, 0.25), 3), 'median': round(quantile(ordered, 0.5), 3),
+            'p75': round(quantile(ordered, 0.75), 3)} if ordered else {'n': 0}
+
+
+def bin_of(k):
+    for i, edge in enumerate(BINS):
+        if k < edge:
+            return i
+    return len(BINS)
+
+
+def bin_label(i):
+    lower = 0 if i == 0 else BINS[i - 1]
+    return ('%g to %g' % (lower, BINS[i])) if i < len(BINS) else ('above %g' % BINS[-1])
+
+
+def planning_facts(stage):
+    """({LPAR: (planning profile, population, tier)}, where the hours came from, model) from the latest
+    stored standard proposal."""
+    store = stage / '.nfit.store' / 'proposals' / 'v1'
+    best = None
+    for path in (store.glob('*/*.json') if store.is_dir() else []):
+        doc = json.loads(path.read_text())
+        members = doc.get('members') or {}
+        argv = ((doc.get('settings') or {}).get('argv')) or []
+        if '--apply-seasonality' in argv or any('eventEvidence' in m or 'eventWindow' in m for m in members.values()):
+            continue                                       # a seasonal snapshot
+        if best is None or path.stat().st_mtime > best[0]:
+            best = (path.stat().st_mtime, doc)
+    facts, source = {}, {'proposal': 0, 'profileLetter': 0}
+    for vm, m in ((best[1].get('members') or {}).items() if best else []):
+        profile = m.get('planningProfile')
+        if not profile:
+            continue
+        record = ((m.get('profiles') or {}).get(profile) or {}).get('cutProtection') or {}
+        population = record.get('population')
+        source['proposal' if population else 'profileLetter'] += 1
+        population = population or POPULATION_OF_LETTER.get(profile[:1], 'none')
+        numbered = re.match(r'^[OGB]([1-4])-', profile)
+        facts[vm] = (profile, population, 'P' if profile.startswith('P') else (numbered.group(1) if numbered else '3'))
+    return facts, source, (best[1].get('model') if best else None)
+
+
+def read_samples(stage, states, planning):
+    """One pass over the staged samples: the guaranteed set and all valid samples per LPAR and
+    (generation, SMT mode), and the run-queue load on the planning hours of the current state."""
+    guaranteed, everything, load, pointer, days = {}, {}, {}, {}, {}
+    counts = {'rows': 0, 'withoutState': 0, 'withoutBusy': 0, 'invalidBusy': 0, 'belowFloor': 0, 'guaranteed': 0, 'valid': 0}
+    with (stage / '.nfit.cache.data').open(encoding='utf-8', errors='replace') as fh:
+        header = fh.readline().rstrip('\n').split(',')
+        try:
+            col = {name: header.index(name) for name in ('Timestamp', 'VMName', 'PhysC', 'RunQ', 'PhysB')}
+        except ValueError:
+            sys.exit('thread-density-explore: the staged data has no PhysB or run-queue column')
+        width = max(col.values()) + 1
+        for line in fh:
+            parts = line.rstrip('\n').split(',')
+            if len(parts) < width:
+                continue
+            counts['rows'] += 1
+            stamp, vm = parts[col['Timestamp']], parts[col['VMName']]
+            day = days.get(stamp[:10])
+            if day is None:
+                try:
+                    midnight = calendar.timegm((int(stamp[0:4]), int(stamp[5:7]), int(stamp[8:10]), 0, 0, 0))
+                except ValueError:
+                    continue
+                day = days[stamp[:10]] = (midnight, (midnight // 86400 + 4) % 7)        # 1970-01-01 was a Thursday
+            try:
+                minute = int(stamp[11:13]) * 60 + int(stamp[14:16])
+                consumed = float(parts[col['PhysC']])
+            except ValueError:
+                continue
+            epoch = day[0] + minute * 60
+            vm_states = states.get(vm)
+            if not vm_states:
+                counts['withoutState'] += 1
+                continue
+            i = pointer.get(vm, 0)
+            while i + 1 < len(vm_states) and vm_states[i + 1]['start_epoch'] <= epoch:
+                i += 1
+            pointer[vm] = i
+            md = vm_states[i].get('metadata') or {}
+            try:
+                ent, vps, smt = float(md.get('entitlement')), float(md.get('virtual_cpus')), int(md.get('smt') or 8)
+            except (TypeError, ValueError):
+                counts['withoutState'] += 1
+                continue
+            try:
+                queue = float(parts[col['RunQ']])
+            except ValueError:
+                queue = None
+            try:
+                busy = float(parts[col['PhysB']])
+            except ValueError:
+                busy = None
+
+            fact = planning.get(vm)
+            if fact and queue is not None and queue >= 0 and ent > 0 and i == len(vm_states) - 1 and admits(fact[1], day[1], minute):
+                slot = load.setdefault(vm, (array('f'), array('f'), array('f'), ent, smt))
+                slot[0].append(queue / (ent * smt))
+                slot[1].append(consumed)
+                slot[2].append(busy if busy is not None else float('nan'))
+
+            if busy is None or queue is None or queue < 0:
+                counts['withoutBusy'] += 1
+                continue
+            if consumed < ACTIVITY_FLOOR:
+                counts['belowFloor'] += 1
+                continue
+            if busy < 0 or busy > consumed * BUSY_TOLERANCE:
+                counts['invalidBusy'] += 1
+                continue
+            counts['valid'] += 1
+            key = (generation_of(md), smt)
+            k, share = queue / consumed, min(1.0, busy / consumed)
+            slot = everything.setdefault(vm, {}).setdefault(key, (array('f'), array('f')))
+            slot[0].append(k)
+            slot[1].append(share)
+            if consumed <= ent + 1e-9 and consumed <= VP_CEILING_SHARE * vps:
+                counts['guaranteed'] += 1
+                slot = guaranteed.setdefault(vm, {}).setdefault(key, (array('f'), array('f')))
+                slot[0].append(k)
+                slot[1].append(share)
+    return guaranteed, everything, load, counts
+
+
+def curve_table(source):
+    """Per (generation, SMT) and bin of k: per-LPAR median busy share, summarised across LPARs."""
+    out = {}
+    for vm, by_key in source.items():
+        for key, (ks, shares) in by_key.items():
+            bins = {}
+            for k, s in zip(ks, shares):
+                b = bins.setdefault(bin_of(k), ([], []))
+                b[0].append(k)
+                b[1].append(s)
+            for b, (kk, ss) in bins.items():
+                if len(ss) < BIN_MIN_SAMPLES:
+                    continue
+                cell = out.setdefault('%s SMT%d' % key, {}).setdefault(b, {'k': [], 'share': [], 'samples': 0, 'key': key})
+                cell['k'].append(quantile(sorted(kk), 0.5))
+                cell['share'].append(quantile(sorted(ss), 0.5))
+                cell['samples'] += len(ss)
+    table = {}
+    for group, cells in sorted(out.items()):
+        rows = []
+        for b in sorted(cells):
+            cell = cells[b]
+            generation, smt = cell['key']
+            k_mid = quantile(sorted(cell['k']), 0.5)
+            rows.append({'threadsPerCore': bin_label(b), 'medianThreadsPerCore': round(k_mid, 2), 'lpars': len(cell['share']),
+                         'samples': cell['samples'], 'busyShare': summary(cell['share']),
+                         'predictedGeneration': (round(predicted_share(CURVES[generation], k_mid, smt), 3) if generation in CURVES else None),
+                         'predictedDefault': round(predicted_share(CURVES['default'], k_mid, smt), 3)})
+        table[group] = rows
+    return table
+
+
+def fit(source, group_of):
+    """Per LPAR (its main generation and SMT mode): the median residual against each curve.
+    Returns (table, {LPAR: verdict against its generation curve})."""
+    classes, residuals, per_lpar = {}, {}, {}
+    for vm, by_key in source.items():
+        key = group_of.get(vm)
+        if key not in by_key or len(by_key[key][0]) < LPAR_MIN_SAMPLES:
+            continue
+        ks, shares = by_key[key]
+        generation, smt = key
+        group = '%s SMT%d' % key
+        for name in (generation, 'default'):
+            if name not in CURVES:
+                continue
+            mid = quantile(sorted(s - predicted_share(CURVES[name], k, smt) for k, s in zip(ks, shares)), 0.5)
+            which = 'default' if name == 'default' else 'generation'
+            verdict = 'fits' if abs(mid) <= RESIDUAL_BAND else ('below' if mid < 0 else 'above')
+            classes.setdefault(group, {}).setdefault(which, {'fits': 0, 'below': 0, 'above': 0})[verdict] += 1
+            residuals.setdefault(group, {}).setdefault(which, []).append(mid)
+            if which == 'generation' or generation not in CURVES:
+                per_lpar[vm] = verdict
+    table = {group: {which: dict(classes[group][which], medianResidual=summary(residuals[group][which]),
+                                 medianAbsoluteResidual=round(quantile(sorted(abs(x) for x in residuals[group][which]), 0.5), 3))
+                     for which in classes[group]} for group in sorted(classes)}
+    return table, per_lpar
+
+
+def load_table(load, planning, verdict_of):
+    """H3: per tier and class, the LPARs with their entitlement and consumption on the same hours."""
+    by_tier, overlap, proposed = {}, {}, {'lpars': 0, 'farBelow': 0, 'within': 0, 'above': 0}
+    for vm, (loads, consumed, busy, ent, smt) in load.items():
+        if len(loads) < LOAD_MIN_SAMPLES:
+            continue
+        tier = planning[vm][2]
+        p95 = quantile(sorted(loads), 0.95)
+        share_of_tier = p95 / TIER_DENSITY[tier]
+        verdict = 'farBelow' if share_of_tier < FAR_BELOW else ('within' if share_of_tier <= WITHIN else 'above')
+        c95 = quantile(sorted(consumed), 0.95)
+        valid_busy = sorted(b for b in busy if b == b)
+        slot = by_tier.setdefault(tier, {}).setdefault(verdict, {'lpars': 0, 'entitlement': 0.0, 'p95PhysC': 0.0, 'p95PhysB': 0.0,
+                                                                 'consumingAtOrAboveEntitlement': 0, 'load': []})
+        slot['lpars'] += 1
+        slot['entitlement'] += ent
+        slot['p95PhysC'] += c95
+        slot['p95PhysB'] += (quantile(valid_busy, 0.95) if valid_busy else 0.0)
+        slot['consumingAtOrAboveEntitlement'] += 1 if c95 >= ent - 1e-9 else 0
+        slot['load'].append(p95)
+        curve = verdict_of.get(vm, 'notClassified')
+        overlap.setdefault(verdict, {})[curve] = overlap.setdefault(verdict, {}).get(curve, 0) + 1
+        proposed['lpars'] += 1
+        ratio = p95 / PROPOSED_FACTOR
+        proposed['farBelow' if ratio < FAR_BELOW else ('within' if ratio <= WITHIN else 'above')] += 1
+    for tier in by_tier.values():
+        for slot in tier.values():
+            slot['p95Load'] = summary(slot.pop('load'))
+            for key in ('entitlement', 'p95PhysC', 'p95PhysB'):
+                slot[key] = round(slot[key], 2)
+    return {t: by_tier[t] for t in sorted(by_tier)}, overlap, proposed
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='a work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'thread-density'))
+    ap.add_argument('--label', help='a label for the result file (default: the name of the work tree)')
+    a = ap.parse_args()
+    work = Path(a.work).resolve()
+    stage = next(iter(sorted((work / 'case' / 'stage').glob('*'))), None) if (work / 'case' / 'stage').is_dir() else None
+    if stage is None or not (stage / '.nfit.cache.data').exists():
+        sys.exit('thread-density-explore: no kept work tree with a staged system (run dev/history-integration-check --keep first)')
+    label = a.label or work.name
+    states = json.loads((stage / '.nfit.cache.states').read_text())
+    for vm in states:
+        states[vm] = sorted((s for s in states[vm] if s.get('start_epoch') is not None and s.get('end_epoch') is not None),
+                            key=lambda s: s['start_epoch'])
+    planning, planning_source, standard_model = planning_facts(stage)
+
+    t0 = time.time()
+    guaranteed, everything, load, counts = read_samples(stage, states, planning)
+    seconds = round(time.time() - t0, 1)
+    group_of = {vm: max(by_key, key=lambda key: len(by_key[key][0])) for vm, by_key in everything.items()}
+    estate_guaranteed, estate_all = curve_table(guaranteed), curve_table(everything)
+    fit_guaranteed, verdict_of = fit(guaranteed, group_of)
+    fit_all, _ = fit(everything, group_of)
+    by_tier, overlap, proposed = load_table(load, planning, verdict_of)
+
+    result = {
+        'label': label, 'method': {
+            'activityFloorCores': ACTIVITY_FLOOR, 'busyTolerance': BUSY_TOLERANCE, 'vpCeilingShare': VP_CEILING_SHARE,
+            'binsOfThreadsPerCore': [bin_label(i) for i in range(len(BINS) + 1)], 'binMinSamples': BIN_MIN_SAMPLES,
+            'lparMinSamples': LPAR_MIN_SAMPLES, 'residualBand': RESIDUAL_BAND, 'loadMinSamples': LOAD_MIN_SAMPLES,
+            'tierDensity': TIER_DENSITY, 'proposedFactor': PROPOSED_FACTOR, 'farBelowShare': FAR_BELOW, 'withinShare': WITHIN,
+            'curves': {k: {str(n): y for n, y in v.items()} for k, v in CURVES.items()},
+            'guaranteedSet': 'PhysC at or below the entitlement and at or below %.2f x VPs' % VP_CEILING_SHARE,
+            'runQueue': 'as staged: the mean depth while the queue was occupied in the interval',
+            'planningFrom': dict(planning_source, standardModel=standard_model)},
+        'samples': counts,
+        'lpars': {'withValidSamples': len(everything), 'inGuaranteedSet': len(guaranteed), 'withPlanningFacts': len(planning)},
+        'H1_estateCurve': {'guaranteedSet': estate_guaranteed, 'allValidSamples': estate_all},
+        'H1_H2_fitPerLpar': {'guaranteedSet': fit_guaranteed, 'allValidSamples': fit_all},
+        'H3_loadOnEntitlement': {'byTier': by_tier, 'withProposedFactor': proposed, 'againstCurveVerdict': overlap},
+        'seconds': seconds,
+    }
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / ('thread-density-%s.json' % re.sub(r'[^A-Za-z0-9_.-]', '_', label))
+    target.write_text(json.dumps(result, indent=1) + '\n')
+
+    print(f"Thread density, busy share and run-queue load: {label} ({counts['rows']:,} samples read in {seconds} s)")
+    print(f"  Valid samples {counts['valid']:,} (below the activity floor {counts['belowFloor']:,}; without PhysB or run queue "
+          f"{counts['withoutBusy']:,}; busy outside tolerance {counts['invalidBusy']:,}); in the guaranteed set {counts['guaranteed']:,}")
+    print(f"  LPARs: {len(everything)} with valid samples, {len(guaranteed)} in the guaranteed set, {len(planning)} with planning facts "
+          f"(hours from the proposal {planning_source['proposal']}, from the profile letter {planning_source['profileLetter']})")
+    for title, table in (('H1  Busy share by threads per consumed core, guaranteed set', estate_guaranteed),
+                         ('    The same, all valid samples (for contrast)', estate_all)):
+        print()
+        print(title + ' (per-LPAR medians, summarised across LPARs)')
+        for group, rows in table.items():
+            print(f'  {group}')
+            print('    %-12s %6s %6s %12s   %-22s %10s %8s' % ('threads/core', 'median', 'LPARs', 'samples', 'busy share p25/med/p75', 'generation', 'default'))
+            for r in rows:
+                s = r['busyShare']
+                print('    %-12s %6.2f %6d %12s   %5.2f / %5.2f / %5.2f   %10s %8.2f' % (
+                    r['threadsPerCore'], r['medianThreadsPerCore'], r['lpars'], format(r['samples'], ','), s['p25'], s['median'], s['p75'],
+                    ('%.2f' % r['predictedGeneration']) if r['predictedGeneration'] is not None else '-', r['predictedDefault']))
+    for title, table in (('H1/H2  Fit per LPAR, guaranteed set', fit_guaranteed), ('       The same, all valid samples', fit_all)):
+        print()
+        print(title + ' (median residual = busy share minus prediction; band +/-%.2f)' % RESIDUAL_BAND)
+        for group, curves in table.items():
+            for which, c in curves.items():
+                m = c['medianResidual']
+                print(f"  {group:<14} {which + ' curve':<17} fits {c['fits']:>3}  below {c['below']:>3}  above {c['above']:>3}   "
+                      f"residual p25/med/p75 {m['p25']:+.2f} / {m['median']:+.2f} / {m['p75']:+.2f}   median |residual| {c['medianAbsoluteResidual']:.2f}")
+    print()
+    print('H3  Run-queue load on entitlement: P95 of run queue / (entitlement x SMT), planning hours, current state, against the tier density')
+    print('    %-5s %-9s %5s %12s %10s %10s %13s   %s' % ('tier', 'class', 'LPARs', 'entitlement', 'P95 PhysC', 'P95 PhysB', 'at/above ENT', 'P95 load p25/med/p75'))
+    for tier, classes in by_tier.items():
+        for verdict in ('farBelow', 'within', 'above'):
+            c = classes.get(verdict)
+            if not c:
+                continue
+            m = c['p95Load']
+            print('    %-5s %-9s %5d %12.2f %10.2f %10.2f %13d   %.2f / %.2f / %.2f' % (
+                tier, verdict, c['lpars'], c['entitlement'], c['p95PhysC'], c['p95PhysB'], c['consumingAtOrAboveEntitlement'],
+                m['p25'], m['median'], m['p75']))
+    print(f"    With one factor of {PROPOSED_FACTOR} on entitlement x SMT for every LPAR: {proposed}")
+    print(f'    Load class against the curve verdict of the same LPAR: {overlap}')
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
