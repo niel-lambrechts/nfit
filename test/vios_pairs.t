@@ -124,7 +124,7 @@ is_deeply([ @$pol{qw(Margin Conflict)} ], [0.10, 1], 'policy: margins differ - t
 $pol = UUT::_vios_group_policy([qw(vb vd)], $settings_of, { vios_sizing => 'match_larger', vios_takeover_margin => 0.10 }, 'vios_peer');
 is_deeply([ @$pol{qw(Mode Margin)} ], ['match_larger', 0.10], 'policy: [GLOBAL] defaults');
 $pol = UUT::_vios_group_policy([qw(vb vd ve)], $settings_of, {}, 'system');
-is($pol->{Mode}, 'match_larger', 'policy: three unnamed VIOS are never combined');
+is($pol->{Mode}, 'independent', 'policy: three unnamed VIOS are not one takeover group');
 like($pol->{Note}, qr/name the pairs with vios_peer/, 'policy: and the planner is told why');
 is(UUT::_vios_group_policy([qw(vb vd)], $settings_of, {}, 'system')->{Mode}, 'combined', 'policy: the two VIOS of a frame are combined');
 

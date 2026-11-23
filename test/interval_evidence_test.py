@@ -88,6 +88,7 @@ class IntervalEvidenceTest(unittest.TestCase):
         cls.no_pool = CoarseRun(no_pool=True, extra=STRICT)       # coarse LPAR samples, no pool observations
         cls.fine_no_pool = CoarseRun(no_pool=True, member_step=1)
         cls.normal = CoarseRun()                    # the default: normal planning
+        cls.five = CoarseRun(pool_step=5, member_step=5)   # coarse is any interval above one minute, not only 15
 
     @classmethod
     def tearDownClass(cls):
@@ -97,6 +98,7 @@ class IntervalEvidenceTest(unittest.TestCase):
         cls.no_pool.close()
         cls.fine_no_pool.close()
         cls.normal.close()
+        cls.five.close()
 
     def test_an_observation_is_one_sample_and_coverage_follows_the_cadence(self):
         support = [v['cutProtection']['support'] for v in self.coarse.members['vmA']['profiles'].values() if 'cutProtection' in v]
@@ -168,6 +170,13 @@ class IntervalEvidenceTest(unittest.TestCase):
             self.assertAlmostEqual(saved['cycleByPolicy']['strict']['entitlement'], 1.5)
             self.assertAlmostEqual(saved['cycleByPolicy']['normal']['entitlement'], float(normal['NFIT - ENT']))
         self.assertNotIn('cycleByPolicy', self.fine_no_pool.members.get('vmS', {}).get('profiles', {}).get(profile, {}))
+
+    def test_five_minute_data_is_coarse_and_named_as_five_minutes(self):
+        row = self.five.rows['vmS']
+        self.assertLess(float(row['NFIT - ENT']), 1.5)
+        self.assertIn('Review cut: 5-minute data may hide brief competition; member guarantees total 75% of the pool maximum.', row['NFIT - Action'])
+        self.assertNotIn('15-minute', row['NFIT - Action'])
+        self.assertTrue(all('resolution' in g for g in self.five.gates('vmA') if g.startswith('applied (legacy')) or not self.five.gates('vmA'))
 
     def test_the_hold_does_not_depend_on_pool_observations_being_present(self):
         # Coarse LPAR samples with no pool observations at all: the uncapped shared-pool LPAR's cut is held as well.

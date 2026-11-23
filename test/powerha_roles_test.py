@@ -39,6 +39,9 @@ def level(vm, t):
     return 1.2 if active else 0.08
 
 
+INSTALLED = {}   # LPAR -> installed entitlement, where a case needs another than 1.5
+
+
 def build(root, with_peer, extra=''):
     os.makedirs(os.path.join(root, 'etc'))
     os.makedirs(os.path.join(root, 'output'))
@@ -68,7 +71,7 @@ def build(root, with_peer, extra=''):
         states = {vm: [{'start_epoch': FIRST, 'end_epoch': FIRST + DAYS * 86400 - 60, 'duration_days': DAYS,
                         'metadata': {'proc_clock': '3800MHz', 'serial_number': serial, 'proc_type': 'PowerPC_POWER10',
                                      'proc_version': '2.0', 'max_cpu': 4, 'pool_id': 0, 'smt': 8, 'pool_cpu': 32,
-                                     'entitlement': 1.5, 'capped': 0, 'virtual_cpus': 4}}] for vm in vms}
+                                     'entitlement': INSTALLED.get(vm, 1.5), 'capped': 0, 'virtual_cpus': 4}}] for vm in vms}
         with open(os.path.join(cache, '.nfit.cache.states'), 'w') as fh:
             json.dump(states, fh)
         with open(os.path.join(cache, '.nfit_stage_id'), 'w') as fh:
@@ -177,10 +180,15 @@ class PowerHASizingTests(unittest.TestCase):
         cls.fallback = run(True, share)                              # the primary's system has not run
         cls.ordered = run(True, share, systems=('SYSHA2', 'SYSHA1'))  # it has: its proposal is used
         cls.took_over = run(True, '', systems=('SYSHA2',))           # independent; the node that took over
+        INSTALLED['hanodeB'] = 0.30                                  # the same node, installed below what it needs
+        try:
+            cls.took_over_low = run(True, '', systems=('SYSHA2',))
+        finally:
+            INSTALLED.clear()
 
     @classmethod
     def tearDownClass(cls):
-        for r in (cls.fallback, cls.ordered, cls.took_over):
+        for r in (cls.fallback, cls.ordered, cls.took_over, cls.took_over_low):
             shutil.rmtree(r['root'], ignore_errors=True)
 
     def test_standby_floor_with_the_primary_installed_as_fallback(self):
@@ -209,6 +217,17 @@ class PowerHASizingTests(unittest.TestCase):
         self.assertEqual((r['NFIT - ENT'], r['NFIT - VCPU']), ('1.50', '4'))
         self.assertTrue(r['NFIT - Action'].startswith('Reductions held: a possible workload handover to this node on 13 Sep 2026'),
                         r['NFIT - Action'])
+
+    def test_the_hold_blocks_decreases_and_keeps_a_needed_increase(self):
+        r = rows(self.took_over_low['csv'])['hanodeB']
+        own = float(r['G2-98W10'])
+        self.assertGreater(own, 0.30)                                # its own target is above what is installed
+        self.assertGreater(float(r['NFIT - ENT']), 0.30)             # the increase is not suppressed by the hold
+        self.assertEqual(r['NFIT - VCPU'], '4')                      # and no VP is taken away
+        self.assertTrue(r['NFIT - Action'].startswith('Reductions held: a possible workload handover to this node on 13 Sep 2026'),
+                        r['NFIT - Action'])
+        self.assertNotIn('No change.', r['NFIT - Action'])
+        self.assertIn('Raise entitlement 0.30 to', r['NFIT - Action'])
 
 
 if __name__ == '__main__':
