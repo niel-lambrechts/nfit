@@ -57,6 +57,35 @@ class CutProtectionTest(unittest.TestCase):
         self.assertEqual(len(snaps), 1)
         return Path(snaps[0])
 
+    def test_the_proposal_snapshot_is_filed_with_the_planner_outputs(self):
+        import hashlib
+        self.standard()
+        copy, = [p for p in self.outputs('.json') if '.proposal.' in p.name]
+        stored = self.snapshot()
+        self.assertEqual(copy.read_bytes(), stored.read_bytes())                     # the same bytes as the store
+        self.assertEqual(hashlib.sha256(copy.read_bytes()).hexdigest() + '.json', stored.name)   # so its digest identifies the run
+        doc = json.loads(copy.read_text())
+        self.assertTrue(doc['settings']['argv'] and doc['inputRevision'] and doc['window'])       # run identity and provenance
+        # An identical second run files the same snapshot again.
+        self.standard()
+        again, = [p for p in self.outputs('.json') if '.proposal.' in p.name]
+        self.assertEqual(again.read_bytes(), stored.read_bytes())
+
+    def test_contested_record_measurement_gives_aggregates_only(self):
+        self.standard('--research-contested-record')
+        report, = [p for p in self.outputs('.json') if p.name == 'nfit-profile.contested-record.json']
+        text = report.read_text()
+        for vm in mx.CONFIG:
+            self.assertNotIn(vm, text)
+        doc = json.loads(text)
+        self.assertGreater(doc['total']['records'], 0)
+        self.assertGreater(doc['total']['bytes'], doc['total']['columnBytes'])        # the column layout holds the same content in less
+        self.assertGreaterEqual(doc['total']['bytes'], doc['total']['gzipBytes'])
+        self.assertTrue(doc['worstDayRecord']['bytes'] > 0 and doc['worstDayRecord']['pairs'] <= doc['worstDayRecord']['observations'])
+        # Rounding both values up to 0.01 core never lowers a bound or a level, and moves it by one increment at most.
+        for name in ('cutProtectionBound', 'boundBeforeTheInstalledLimit', 'contestedLevelAll'):
+            self.assertTrue(doc['precision'][name] and all(0 <= float(k) <= 0.011 for k in doc['precision'][name]), name)
+
     def test_record_bound_and_protected_csv(self):
         log, csv_on = self.standard()
         self.assertIn('\nCut Protection\n', log)

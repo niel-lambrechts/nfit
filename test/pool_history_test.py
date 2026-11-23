@@ -212,6 +212,10 @@ class PoolHistoryTests(unittest.TestCase):
     def pool(self, pool_id, r=None):
         return self.month(r)['PoolHistory'][f'{SERIAL}:{pool_id}']
 
+    @staticmethod
+    def minute_of_day(index):
+        return index % 1440                      # `expected` is keyed by the minute index from DAY1
+
     def day(self, pool_id, segment, date):
         return next(d for d in self.pool(pool_id)['segments'][segment]['daily'] if d['date'] == date)
 
@@ -221,7 +225,7 @@ class PoolHistoryTests(unittest.TestCase):
         self.assertEqual(sorted(m['PoolHistory']), [f'{SERIAL}:0', f'{SERIAL}:12', f'{SERIAL}:7', f'{SERIAL}:9'])
         marker = m['Metadata']['PoolEvidence']
         self.assertEqual(marker['projection'], 'observed-pool-busy-1')
-        self.assertEqual(marker['capabilities'], {'concurrentBusy': 'observed', 'observedConfiguration': 'observed',
+        self.assertEqual(marker['capabilities'], {'concurrentBusy': 'observed', 'busyByProfileHours': 'dailySummaries', 'observedConfiguration': 'observed',
                                                   'scarcity': 'notEvaluated', 'memberExposure': 'notEvaluated',
                                                   'plans': 'notRecorded'})
         self.assertEqual((marker['windowStart'], marker['windowEndExclusive'], marker['status']),
@@ -247,6 +251,20 @@ class PoolHistoryTests(unittest.TestCase):
             self.assertAlmostEqual(d['busy'][name], quantile(values, p), places=4, msg=name)
         self.assertAlmostEqual(d['busy']['max'], max(values), places=4)
         self.assertLess(d['busy']['max'], 3.9)                                # 3.9 at +59 s was never selected
+
+    def test_a_pool_day_is_also_summarised_in_profile_hours(self):
+        # 1 September 2026 is a Tuesday. Online hours are 08:00-17:00 UTC, batch hours 18:00-06:00 UTC.
+        d = self.day(7, 0, '2026-09-01')
+        hours = d['busyByProfileHours']
+        online = [self.expected[m] for m in sorted(self.expected) if 480 <= self.minute_of_day(m) < 1020]
+        batch = [self.expected[m] for m in sorted(self.expected) if self.minute_of_day(m) >= 1080 or self.minute_of_day(m) < 360]
+        for name, values in (('online', online), ('online+no-weekends', online), ('batch', batch), ('batch+no-weekends', batch)):
+            self.assertEqual(hours[name]['observations'], len(values), name)
+            self.assertAlmostEqual(hours[name]['max'], max(values), places=4, msg=name)
+            self.assertAlmostEqual(hours[name]['p95'], quantile(values, 0.95), places=4, msg=name)
+        self.assertLess(hours['online']['observations'] + hours['batch']['observations'], d['supportedMinutes'])   # hours outside both exist
+        # Unsmoothed daily summaries of the readings; all hours stays in `busy`.
+        self.assertNotIn('none', hours)
 
     def test_exclusions_and_reporter_support_are_counted(self):
         d = self.day(7, 0, '2026-09-01')

@@ -600,6 +600,8 @@ my $PHYSB_HISTORY_FEATURE        = 'PhysB-v1';
 # --[no-]pool-history: observed pool busy and configuration in monthly history.
 my $pool_history_flag;
 my $POOL_HISTORY_PROJECTION = 'observed-pool-busy-1';   # what a reader may expect in the block
+# Profile-hours populations a pool day is also summarised in (busyByProfileHours); all hours is the day's `busy`.
+my @POOL_PROFILE_HOURS = qw(online online+no-weekends batch batch+no-weekends);
 my $POOL_HISTORY_FEATURE    = 'PoolBusy-observed-1';
 my $POOL_OBSERVATIONS_FILE  = '.nfit.cache.pool.observations.csv.gz';
 # Pool evidence store (v10 milestone 1.1d): see _pool_day_sources.
@@ -687,6 +689,8 @@ my $contested_floor_context;                  # the evidence of the floor in for
 # sides, a comparison only with minMinutes on both sides. Observational: it
 # corroborates pressure and is never a sizing input.
 my $research_busy_share;
+# Research: size and precision of the durable contested record (history schema draft, 0.01-core counted pairs).
+my $research_contested_record;
 my %BUSY_SHARE_RULES = (binWidth => 0.10, minCores => 0.10, minEntShare => 0.10, minBinMinutes => 5, minMinutes => 15);
 my ($candidate_test, $candidate_window, $candidate_snapshot);
 # --research-pool-ceiling-replay START/CUTOFF/END (research only; v10 stage 3.4,
@@ -908,6 +912,7 @@ GetOptions(
     'research-contested-level'   => \$research_contested_level,
     'contested-level!'           => \$contested_level_flag,
     'research-busy-share'        => \$research_busy_share,
+    'research-contested-record'  => \$research_contested_record,
     'research-pool-ceiling-replay=s' => \$research_pool_ceiling_replay,
     'research-pool-coarse-evidence=s' => \$research_pool_coarse_evidence,
     'uplift-exemption!'          => \$uplift_exemption_flag,
@@ -2557,7 +2562,17 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
     $SYSTEM_CPU_CADENCE = _cpu_cache_cadence($current_cache_path);
     if (_cut_protection_wanted($current_cache_path) && $effective_start_date_obj && $effective_end_date_obj)
     {
-        _protection_evidence_before_sizing($current_cache_path, $effective_start_date_obj, $effective_end_date_obj, \@vm_order);
+        my $cp_evidence = _protection_evidence_before_sizing($current_cache_path, $effective_start_date_obj, $effective_end_date_obj, \@vm_order);
+        if ($research_contested_record && ref($cp_evidence) eq 'HASH' && ref($cp_evidence->{Trackers}) eq 'ARRAY')
+        {
+            my $path = File::Spec->catfile($output_dir, 'nfit-profile.contested-record.json');
+            if (open my $out, '>', $path)
+            {
+                print {$out} JSON->new->utf8->canonical->pretty->encode(_contested_record_measure($cp_evidence->{Trackers}));
+                close $out;
+                print STDERR "  [INFO] Contested record measurement: $path\n";
+            }
+        }
     }
 
     _phase("Applying modifiers and generating rationale");
@@ -3162,8 +3177,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                 (ref($structural_summary->{Findings}) eq 'HASH' ? $structural_summary->{Findings}{Pools} : undef));
             my $action_count = _log_recommended_actions($open_log_files{$system_identifier}, $structural_summary, $exposure_summary, $pool_use_report, \%COARSE_REVIEW);
             printf STDERR "  [INFO] Recommended actions: %d (see rationale)\n", $action_count;
-            _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
-                $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals);
+            # The snapshot is also filed with the planner outputs: the store lives beside the staged
+            # data and goes when that is restaged; the recommendations of a run should not.
+            my $proposal_copy = _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
+                $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals,
+                File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.proposal.%s.json',
+                    (map { s/[^a-zA-Z0-9_.-]//gr } ($system_identifier || 'standard', $report_type_for_filename)), $unique_date_suffix)));
+            push @generated_files, $proposal_copy if defined $proposal_copy;
 
         }
     }
@@ -17088,7 +17108,7 @@ sub _load_candidate_snapshot
 
 sub _publish_tactical_proposals
 {
-    my ($cache, $model, $start, $end, $members) = @_;
+    my ($cache, $model, $start, $end, $members, $copy_path) = @_;
     require Digest::SHA;
     my $revision = _proposal_revision($cache);
     my %files = (engine => $nfit_script_path, profiler => abs_path($0),
@@ -17108,12 +17128,20 @@ sub _publish_tactical_proposals
     my $dir = File::Spec->catdir($cache, '.nfit.store', 'proposals', 'v1', $model);
     make_path($dir, {mode => 0700});
     my $path = File::Spec->catfile($dir, Digest::SHA::sha256_hex($payload) . '.json');
-    return if -f $path;
+    # The copy for the planner's files: the same bytes, so its digest identifies the snapshot.
+    my $copied;
+    if (defined $copy_path && open my $copy, '>:raw', $copy_path)
+    {
+        print {$copy} $payload;
+        $copied = $copy_path if close $copy;
+    }
+    return $copied if -f $path;
     my ($fh, $tmp) = tempfile('.pending-XXXXXXXX', DIR => $dir, UNLINK => 1);
     binmode $fh;
     print {$fh} $payload or die "Cannot write proposal snapshot: $!";
     close $fh or die "Cannot close proposal snapshot: $!";
     rename $tmp, $path or die "Cannot publish proposal snapshot: $!";
+    return $copied;
 }
 
 # ==============================================================================
@@ -23935,6 +23963,13 @@ sub _pool_build_month
                 {
                     push @{ $acc->{values} }, $record->{value};
                     push @{ $acc->{reporters} }, $record->{reporters};
+                    # The same reading in the hours of each profile population (all hours is `values`).
+                    my ($day_of_week, $minute_of_day) = ((int($minute / 86400) + 4) % 7, ($minute % 86400) / 60);
+                    foreach my $population (@POOL_PROFILE_HOURS)
+                    {
+                        push @{ $acc->{hours}{$population} }, $record->{value}
+                            if _exposure_population_admits($population, $day_of_week, $minute_of_day);
+                    }
                 }
                 $observed_size{$pool_key}{$index}{ $record->{size} } = 1 if defined $record->{size};
             }
@@ -24003,6 +24038,19 @@ sub _pool_build_month
                         p99            => _pool_round(_pool_quantile(\@values, 0.99)),
                         max            => _pool_round($values[-1]),
                     };
+                    # Daily distribution summaries in the hours of each profile population: unsmoothed, as the
+                    # pool rule is. They describe the day; they cannot be combined into exact percentiles
+                    # over longer periods. A population without a reading on the day is left out.
+                    my %by_hours;
+                    foreach my $population (@POOL_PROFILE_HOURS)
+                    {
+                        my @in = sort { $a <=> $b } @{ $acc->{hours}{$population} // [] };
+                        next unless @in;
+                        $by_hours{$population} = { observations => scalar(@in), p50 => _pool_round(_pool_quantile(\@in, 0.50)),
+                            p95 => _pool_round(_pool_quantile(\@in, 0.95)), p99 => _pool_round(_pool_quantile(\@in, 0.99)),
+                            max => _pool_round($in[-1]) };
+                    }
+                    $entry{busyByProfileHours} = \%by_hours if %by_hours;
                     $entry{reporters} = {
                         min                   => 0 + $reporters[0],
                         median                => _pool_round(_pool_median(@reporters)),
@@ -24173,6 +24221,7 @@ sub _build_pool_history
             schemaVersion      => 1,
             capabilities       => {
                 concurrentBusy        => 'observed',
+                busyByProfileHours    => 'dailySummaries',
                 observedConfiguration => 'observed',
                 scarcity              => 'notEvaluated',
                 memberExposure        => 'notEvaluated',
@@ -26144,7 +26193,7 @@ sub _protection_add_minute
     my $eps = 1e-9;
     $p->{contested}++;
     $p->{days}{ int($minute / 86400) } = 1;
-    push @{ $p->{all} }, [ $busy, $consumed ];      # every contested observation: the contested level is their percentile
+    push @{ $p->{all} }, [ $busy, $consumed, int($minute / 86400) ];      # every contested observation, with its UTC day: the contested level is their percentile
     unless (grep { $_->[0] >= $busy - $eps && $_->[1] >= $consumed - $eps } @{ $p->{frontier} })
     {
         @{ $p->{frontier} } = ((grep { !($_->[0] <= $busy + $eps && $_->[1] <= $consumed + $eps) } @{ $p->{frontier} }),
@@ -26277,6 +26326,139 @@ sub _contested_level
     $up++ if ($cents - $up > 1e-6);
     my $days = scalar(keys %{ $p->{days} // {} });
     return ($up / 100, $n, $days, ($n >= $CONTESTED_LEVEL_MIN_MINUTES && $days >= $CONTESTED_LEVEL_MIN_DAYS) ? 1 : 0);
+}
+
+# Research (--research-contested-record): what the durable contested record would cost and how
+# far it would move the figures, for the counted (busy, consumed) pairs on a 0.01-core grid with
+# both values rounded up. One record per LPAR state, profile-hours population and UTC day, as the
+# history schema draft has it. Aggregates only: no LPAR is named.
+#   classes  quiet (no contested day), intermittent, persistent (contested on at least half of its
+#            evaluated days): a description for the report, not a rule.
+#   size     bytes of the compact JSON day records, and of the same text gzipped.
+#   error    for each profile: the cut-protection bound and the contested level from the rounded
+#            pairs against those from the readings as observed.
+sub _contested_record_measure
+{
+    my ($trackers) = @_;
+    require IO::Compress::Gzip;
+    my $json = JSON->new->utf8->canonical;
+    my $up = sub { my ($v) = @_; my $c = $v * 100; my $i = int($c); $i++ if ($c - $i > 1e-6); return $i / 100; };
+    my %percentile_of = map { ($_->{name} => ((($_->{flags} // '') =~ /(?:-p|--percentile)\s+([0-9.]+)/) ? $1 + 0 : $DEFAULT_PERCENTILE + 0)) } @profiles;
+    my (%class, %text, @rows, @errors, $all_text, %worst);
+    $all_text = '';
+    my $index = 0;
+    foreach my $t (@{ $trackers // [] })
+    {
+        my $p = $t->{protection} or next;
+        $index++;
+        my (%by_day, %raw_n);
+        foreach my $r (@{ $p->{all} // [] })
+        {
+            my ($b, $c, $day) = ($up->($r->[0]), $up->($r->[1]), $r->[2]);
+            $by_day{$day}{ sprintf('%.2f,%.2f', $b, $c) }++;
+            $raw_n{$day}++;
+        }
+        my ($bytes, $days, $contested_days, $max_pairs, $max_obs, $pairs_total, $text) = (0, 0, 0, 0, 0, 0, '');
+        my %columns = (dates => [], expected => [], paired => [], classified => [], scarce => [], contested => [], readings => {});
+        foreach my $day (sort { $a <=> $b } keys %{ $t->{daily} // {} })
+        {
+            my $acc = $t->{daily}{$day};
+            my $cadence = (sort { $t->{observations}{$b} <=> $t->{observations}{$a} } keys %{ $t->{observations} // {} })[0] // 1;
+            my @pairs = map { my ($b, $c) = split /,/, $_; [ $b + 0, $c + 0, $by_day{$day}{$_} ] }
+                        sort { $a cmp $b } keys %{ $by_day{$day} // {} };
+            my %record = (date => gmtime($day * 86400)->ymd, status => 'evaluated', lparCadenceSeconds => 60 * $cadence,
+                poolCadenceSeconds => 60 * ($t->{poolCadenceLast} // $cadence), representedMinutes => ($acc->{classified} // 0) * $cadence,
+                expected => $acc->{expected} // 0, paired => $acc->{paired} // 0, classified => $acc->{classified} // 0,
+                scarce => $acc->{scarce} // 0, contested => $raw_n{$day} // 0,
+                (@pairs ? (resolution => 0.01, maxRoundingCores => 0.01, readings => \@pairs) : ()));
+            my $line = $json->encode(\%record);
+            # The same content laid out by column: one list per field over the days, readings only on contested days.
+            push @{ $columns{$_} }, $record{$_} for qw(expected paired classified scarce contested);
+            push @{ $columns{dates} }, $record{date};
+            $columns{readings}{ $record{date} } = \@pairs if @pairs;
+            @columns{qw(lparCadenceSeconds poolCadenceSeconds resolution)} = (@record{qw(lparCadenceSeconds poolCadenceSeconds)}, 0.01);
+            $bytes += length($line);
+            $text .= $line . "\n";
+            $days++;
+            $contested_days++ if @pairs;
+            $pairs_total += scalar(@pairs);
+            if (length($line) > ($worst{bytes} // 0)) { %worst = (bytes => length($line), pairs => scalar(@pairs), observations => $raw_n{$day} // 0); }
+            $max_pairs = scalar(@pairs) if (@pairs > $max_pairs);
+            $max_obs = $raw_n{$day} if (($raw_n{$day} // 0) > $max_obs);
+        }
+        my $kind = !$contested_days ? 'quiet' : ($contested_days * 2 >= $days ? 'persistent' : 'intermittent');
+        my $c = ($class{$kind} //= { records => 0, days => 0, contestedDays => 0, bytes => 0, pairs => 0, observations => 0 });
+        $c->{records}++;
+        $c->{days} += $days;
+        $c->{contestedDays} += $contested_days;
+        $c->{bytes} += $bytes;
+        my $column_text = $json->encode(\%columns) . "\n";
+        $c->{columnBytes} += length($column_text);
+        $text{"$kind:columns"} .= $column_text;
+        $text{'all:columns'} .= $column_text;
+        $c->{pairs} += $pairs_total;
+        $c->{observations} += scalar(@{ $p->{all} // [] });
+        $text{$kind} .= $text;
+        $all_text .= $text;
+        push @rows, { record => $index, class => $kind, population => $t->{population}, installedEntitlement => $t->{entitlement},
+            days => $days, contestedDays => $contested_days, observations => scalar(@{ $p->{all} // [] }), pairs => $pairs_total,
+            mostPairsInADay => $max_pairs, mostObservationsInADay => $max_obs, bytes => $bytes,
+            bytesPer30Days => ($days ? int(30 * $bytes / $days + 0.5) : 0) };
+        # Precision: the bound and the level from the rounded pairs against the observed readings.
+        next unless $contested_days;
+        my @rounded = map { my $day = $_; map { my ($b, $c) = split /,/, $_; ([ $b + 0, $c + 0, $day ]) x $by_day{$day}{$_} } keys %{ $by_day{$day} } } keys %by_day;
+        my %coarse = (frontier => [ map { [ $_->[0], $_->[1] ] } @rounded ], all => \@rounded, days => $p->{days});
+        foreach my $profile (@{ $t->{profiles} // [] })
+        {
+            my ($share, $tier) = _protection_share_of($profile);
+            next unless defined $share;
+            my ($bound, $bound_r) = (_protection_bound($p, $share, $t->{entitlement}), _protection_bound(\%coarse, $share, $t->{entitlement}));
+            my ($open, $open_r)   = (_protection_bound($p, $share, undef), _protection_bound(\%coarse, $share, undef));
+            my $perc = $percentile_of{$profile} // $DEFAULT_PERCENTILE + 0;
+            my ($level, $n, $ndays, $enough) = _contested_level($p, $share, $perc);
+            my ($level_r) = _contested_level(\%coarse, $share, $perc);
+            my $resolved = ($enough && $n * (1 - $perc / 100) >= 1 - 1e-9) ? 1 : 0;
+            push @errors, { record => $index, class => $kind, tier => "$tier", installedEntitlement => $t->{entitlement},
+                boundDifference => 0 + sprintf('%.2f', ($bound_r // 0) - ($bound // 0)),
+                unlimitedBoundDifference => 0 + sprintf('%.2f', ($open_r // 0) - ($open // 0)),
+                levelDifference => (defined $level ? 0 + sprintf('%.2f', $level_r - $level) : undef),
+                floorInForce => ($resolved ? JSON::true : JSON::false), level => $level };
+        }
+    }
+    my $gz = sub { my ($t) = @_; my $out = ''; IO::Compress::Gzip::gzip(\$t => \$out) or return undef; return length($out); };
+    my $spread = sub
+    {
+        my ($key, @set) = @_;
+        my %n;
+        $n{ sprintf('%.2f', $_->{$key}) }++ for grep { defined $_->{$key} } @set;
+        return \%n;
+    };
+    my @in_force = grep { $_->{floorInForce} } @errors;
+    my $days_all = max(1, map { $_->{days} } @rows);
+    return {
+        form => 'counted (busy, consumed) pairs on a 0.01-core grid, both rounded up; one record per LPAR state, population and UTC day',
+        layouts => 'bytes: one JSON object per day; columnBytes: the same content with one list per field over the days (no information removed)',
+        windowDays => $days_all,
+        classes => { map { my $k = $_; ($k => { %{ $class{$k} }, gzipBytes => $gz->($text{$k} // ''), columnGzipBytes => $gz->($text{"$k:columns"} // ''),
+            columnBytesPer30Days => int(30 * ($class{$k}{columnBytes} // 0) / $days_all + 0.5),
+            bytesPer30Days => int(30 * $class{$k}{bytes} / $days_all + 0.5) }) } keys %class },
+        total => { records => scalar(@rows), bytes => length($all_text), gzipBytes => $gz->($all_text),
+                   columnBytes => length($text{'all:columns'} // ''), columnGzipBytes => $gz->($text{'all:columns'} // ''),
+                   columnBytesPer30Days => int(30 * length($text{'all:columns'} // '') / $days_all + 0.5),
+                   bytesPer30Days => int(30 * length($all_text) / $days_all + 0.5), gzipBytesPer30Days => int(30 * ($gz->($all_text) // 0) / $days_all + 0.5) },
+        worstDayRecord => \%worst,
+        largestRecords => [ (sort { $b->{bytes} <=> $a->{bytes} } @rows)[0 .. (@rows > 12 ? 11 : $#rows)] ],
+        precision => {
+            profiles => scalar(@errors),
+            cutProtectionBound => $spread->('boundDifference', @errors),
+            boundBeforeTheInstalledLimit => $spread->('unlimitedBoundDifference', @errors),
+            contestedLevelAll => $spread->('levelDifference', @errors),
+            contestedLevelWhereTheFloorIsInForce => $spread->('levelDifference', @in_force),
+            byTierWhereInForce => { map { my $tier = $_; ($tier => $spread->('levelDifference', grep { $_->{tier} eq $tier } @in_force)) }
+                                    uniq(map { $_->{tier} } @in_force) },
+            largest => [ (sort { ($b->{levelDifference} // 0) <=> ($a->{levelDifference} // 0) } @in_force)[0 .. (@in_force > 8 ? 7 : $#in_force)] ],
+        },
+    };
 }
 
 sub _contested_level_on
