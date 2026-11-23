@@ -36,7 +36,8 @@ import member_exposure_test as M
 import contested_reader_test as C
 
 EVENT = ('[Global]\nmin_history_days = 1\nseasonal_lookback_days = 1\n'
-         '[ev]\nmodel = %s\npriority = 10\ndates = %s\nbaseline_period_days = %d\nmin_historical_years = 0\n')
+         '[ev]\nmodel = %s\npriority = 10\ndates = %s\nbaseline_period_days = %d\nmin_historical_years = 0\n'
+         'min_historical_peaks = %d\nmin_historical_periods = %d\n')
 COLUMNS = ('G3-95W15', 'O3-95W15', 'B3-95W15', 'NFIT - ENT', 'NFIT - VCPU')
 
 
@@ -50,6 +51,8 @@ class EventWindowTests(unittest.TestCase):
         cls.with_history = cls.seasonal('2026-09-01:2026-09-01', history=True)
         cls.switched_off = cls.seasonal('2026-09-01:2026-09-01', history=True, flags=['--no-cut-protection'])
         cls.no_history = cls.seasonal('2026-09-01:2026-09-01', history=False)
+        # The same event when the model asks for three past occurrences and history holds one.
+        cls.too_few = cls.seasonal('2026-09-01:2026-09-01', history=True, occurrences=3)
         # Recency decay assembles its figure outside the sizing chain.
         cls.recency = {name: cls.seasonal('2026-09-01:2026-09-01', model='recency_decay', **kw)
                        for name, kw in (('with', {'history': True}), ('off', {'history': True, 'flags': ['--no-cut-protection']}),
@@ -65,14 +68,14 @@ class EventWindowTests(unittest.TestCase):
         cls.fixture.tearDownClass()
 
     @classmethod
-    def seasonal(cls, dates, history, flags=(), model='predictive_peak', days=2, baseline=1, prior=False):
+    def seasonal(cls, dates, history, flags=(), model='predictive_peak', days=2, baseline=1, prior=False, occurrences=1):
         M.DAYS = days
         try:
             root = cls.fixture.make_root()
         finally:
             M.DAYS = 2
         with open(os.path.join(root, 'etc', 'nfit.seasonality.cfg'), 'w') as fh:
-            fh.write(EVENT % (model, dates, baseline))
+            fh.write(EVENT % (model, dates, baseline, occurrences, occurrences))
         if history:
             cls.fixture.run_profile(root, '--update-history', '--min-history-days', '1', '--pool-history', '--force')
         if prior:
@@ -94,8 +97,14 @@ class EventWindowTests(unittest.TestCase):
         with open(path) as fh:
             rows = {row['VM']: row for row in csv.DictReader(fh)}
         log, = glob.glob(os.path.join(root, 'output', '*.ev.*.log'))
+        snapshot = {}
+        copies = glob.glob(os.path.join(root, 'output', '*.ev.proposal.*.json'))
+        if copies:
+            with open(copies[0]) as fh:
+                snapshot = json.load(fh)
+        stored = glob.glob(os.path.join(root, 'stage', M.SERIAL, '.nfit.store', 'proposals', 'v1', 'ev', '*.json'))
         with open(log) as fh:
-            return {'rows': rows, 'log': fh.read(), 'stderr': run.stderr}
+            return {'rows': rows, 'log': fh.read(), 'stderr': run.stderr, 'snapshot': snapshot, 'stored': stored, 'copies': copies}
 
     def figures(self, run, vm):
         return {k: run['rows'][vm][k] for k in COLUMNS}
@@ -109,6 +118,69 @@ class EventWindowTests(unittest.TestCase):
                          r'pool 7 was contested, on 40 minutes over 1 day of past event windows\.' % (
                              re.escape(row['G3-95W15']), re.escape(before['G3-95W15'])))
         self.assertNotIn('past event windows', before['NFIT - Action'])
+
+    def test_a_seasonal_run_stores_its_proposal_with_the_evidence_and_the_event_window_plan(self):
+        for run in (self.with_history, self.recency['with'], self.multiplicative['with'], self.no_history, self.switched_off):
+            self.assertEqual((len(run['copies']), len(run['stored'])), (1, 1))             # one snapshot, filed twice
+            with open(run['stored'][0], 'rb') as a, open(run['copies'][0], 'rb') as b:
+                self.assertEqual(a.read(), b.read())
+        doc = self.with_history['snapshot']
+        self.assertEqual((doc['model'], doc['schemaVersion']), ('ev', 2))
+        member = doc['members']['vmB']
+        record = member['profiles']['G3-95W15']['cutProtection']
+        self.assertEqual((record['evidence'], record['status'], record['eventWindows']['verdict']), ('eventWindows', 'bound', 'contested'))
+        self.assertEqual((record['eventWindows']['usableWindows'], record['eventWindows']['minOccurrences']), (1, 1))
+        self.assertEqual(member['eventEvidence']['none']['verdict'], 'contested')
+        self.assertEqual(doc['members']['vmS']['eventEvidence']['none']['verdict'], 'noCompetition')
+        self.assertNotIn('eventEvidence', doc['members']['vmX'])                          # dedicated: not assessed
+        self.assertEqual((member['eventWindow']['pool'], member['eventWindow']['planningProfile']), (7, 'G3-95W15'))
+        self.assertEqual(member['eventWindow']['entitlement'], float(self.with_history['rows']['vmB']['NFIT - ENT']))
+        # Without evidence the snapshot carries the figures and no evidence record.
+        self.assertNotIn('cutProtection', self.no_history['snapshot']['members']['vmB']['profiles']['G3-95W15'])
+        log = self.with_history['log']
+        self.assertIn('Event-Window Plan (event ev)', log)
+        self.assertIn('Event requirements by pool (event ev)', log)
+        self.assertRegex(log, r'\n  7\s+2\s+4\.00\s+2\.97\s+0\s+0\.00  guarantees and relied-on borrowing fit under the pool maximum')
+        self.assertIn('Not assessed here: the default pool and the frame', log)
+        self.assertIn('whether the forecast level will meet competition that past occurrences did not', log)
+
+    def test_one_quiet_occurrence_is_not_enough_when_the_model_requires_three(self):
+        # vmS met no competition on the one past occurrence in history. With a minimum of one it is found without
+        # competition; with the model's minimum of three it has too little evidence, and its figures are those of
+        # a seasonal run as it was. What was seen still counts: vmB's cut is limited either way.
+        self.assertIn('LPARs          : 2 with work during pool competition, 0 without competition, 1 with too little evidence', self.too_few['log'])
+        self.assertRegex(self.too_few['log'], r'vmS\s+too little evidence: 1 usable occurrence of 1 \(minimum 3\)')
+        self.assertIn("accepted from 3 usable occurrences (the model's own minimum)", self.too_few['log'])
+        self.assertEqual(self.figures(self.too_few, 'vmS'), self.figures(self.switched_off, 'vmS'))
+        self.assertEqual(self.figures(self.too_few, 'vmB'), self.figures(self.with_history, 'vmB'))
+
+    def test_usable_occurrences_are_counted_for_the_lpar_not_for_the_system(self):
+        quiet = lambda *months: [[m, self.stored(days, from_utc=m + '-01T00:00:00Z')] for m, days in months]
+        aug = [('2026-08-30', 1440, 1440, 1440), ('2026-08-31', 1440, 1440, 1440)]
+        windows = [['2026-08-30', '2026-09-01']] + self.WINDOWS
+        three = quiet(('2026-08', aug), ('2026-09', self.SEPT), ('2026-10', self.OCT))
+        t, e = self.trackers(three, windows, min_occurrences=3)
+        self.assertEqual((t['status'], e['usableWindows'], e['minOccurrences'], e['occurrencesShort']), ('noCompetition', 3, 3, False))
+        # Three occurrences lie in the system's history; for this LPAR one is unusable.
+        cases = {
+            'an earlier configuration state': [['2026-08', self.stored(aug, virtualProcessors=6, state='2026-07-01T00:00:00Z',
+                                                                       from_utc='2026-08-01T00:00:00Z')]] + three[1:],
+            'a day missing from history': [['2026-08', self.stored(aug[:1], from_utc='2026-08-01T00:00:00Z')]] + three[1:],
+            'a day without PhysB': [['2026-08', self.stored([aug[0], ('2026-08-31', 1440, 0, 0)], from_utc='2026-08-01T00:00:00Z')]] + three[1:],
+            'a thinly classified day': [['2026-08', self.stored([aug[0], ('2026-08-31', 1440, 1440, 1000)], from_utc='2026-08-01T00:00:00Z')]] + three[1:],
+        }
+        for name, months in cases.items():
+            t, e = self.trackers(months, windows, min_occurrences=3)
+            self.assertEqual((t['status'], e['usableWindows'], e['occurrencesShort']), ('insufficient', 2, True), name)
+            self.assertEqual([w['usable'] for w in e['windows']], [False, True, True], name)
+        # Two usable occurrences asked of a model that needs three: too few, though each is whole.
+        t, e = self.trackers(three[1:], self.WINDOWS, min_occurrences=3)
+        self.assertEqual((t['status'], e['usableWindows'], e['occurrencesShort']), ('insufficient', 2, True))
+        self.assertEqual(self.trackers(three[1:], self.WINDOWS, min_occurrences=2)[0]['status'], 'noCompetition')
+        # Too few occurrences never hides what was seen.
+        busy = [['2026-09', self.stored(self.SEPT, self.BUSY_SEPT)]]
+        t, e = self.trackers(busy, self.WINDOWS[:1], min_occurrences=3)
+        self.assertEqual((t['status'], t['contested'], e['occurrencesShort']), ('contested', 12, True))
 
     def test_recency_decay_is_protected_after_its_requirement_is_assembled(self):
         row, before = self.recency['with']['rows']['vmB'], self.recency['off']['rows']['vmB']
@@ -184,7 +256,7 @@ class EventWindowTests(unittest.TestCase):
     FACTS = {'entitlement': 2.0, 'virtualProcessors': 4, 'capped': False, 'pool': 'SYS:7', 'poolCeiling': 4.0, 'smt': 8}
     START = '2026-08-01T00:00:00Z'                    # the start history recorded for the state
 
-    def trackers(self, months, windows, start_epoch=1785542400, metadata=None):
+    def trackers(self, months, windows, start_epoch=1785542400, metadata=None, min_occurrences=1):
         """nfit-profile's _event_protection_trackers for one LPAR in its current state (start_epoch is
         2026-08-01T00:00:00Z unless given): per population the tracker's figures, and the summary."""
         with open(os.path.join(REPO, 'nfit-profile'), encoding='utf-8') as fh:
@@ -202,7 +274,7 @@ class EventWindowTests(unittest.TestCase):
                   + consts + subs + r"""
             local $/; my $in = decode_json(<STDIN>);
             my ($trackers, $summary) = _event_protection_trackers($in->{months}, $in->{db}, { lpar => 1 }, $in->{asof}, $in->{windows},
-                                                                  { none => [ 'G3-95W15' ] });
+                                                                  { none => [ 'G3-95W15' ] }, $in->{min});
             my @out = map { my $t = $_; my $floor = _contested_floor_for($t, 'G3-95W15', '-p 95');
                             { cadence => _evidence_cadence_of($t), contested => $t->{protection}{contested},
                               days => scalar(keys %{ $t->{protection}{days} }), observations => scalar(@{ $t->{protection}{all} }),
@@ -215,7 +287,7 @@ class EventWindowTests(unittest.TestCase):
         md.update(metadata or {})
         db = {'lpar': [{'start_epoch': start_epoch, 'end_epoch': 1793491140, 'metadata': md}]}
         out = subprocess.run(['perl', '-e', script], capture_output=True, text=True, timeout=60,
-                             input=json.dumps({'months': months, 'db': db, 'asof': 1793491200, 'windows': windows}))
+                             input=json.dumps({'months': months, 'db': db, 'asof': 1793491200, 'windows': windows, 'min': min_occurrences}))
         self.assertEqual(out.returncode, 0, out.stderr[-1500:])
         result = json.loads(out.stdout)
         return (result['trackers'][0] if result['trackers'] else None), result['summary']

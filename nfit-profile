@@ -25470,7 +25470,9 @@ sub _contested_history_read
 #   noCompetition  nothing contested, and the absence is supported: every window has evidence, no
 #                  day of any window is missing from history, the classified share of the eligible
 #                  time is at least the gate's whole-window share and every day's at least its
-#                  daily share (the no-competition gate of the pool-borrowing rule).
+#                  daily share (the no-competition gate of the pool-borrowing rule), and the usable
+#                  occurrences number at least minOccurrences (what the seasonal model requires of
+#                  its own history; usable for this LPAR and these hours, not merely present).
 #   insufficient   nothing contested, and the absence is not supported (a missing day, a day or a
 #                  window without evidence, or too little classified time).
 #   unavailable    no window has evidence.
@@ -25486,8 +25488,9 @@ sub _contested_event_evidence
         if (@windows && $w->[0] le $windows[-1][1]) { $windows[-1][1] = $w->[1] if ($w->[1] gt $windows[-1][1]); }
         else { push @windows, [ @$w ]; }
     }
+    my $min_occurrences = (ref($opts) eq 'HASH' && $opts->{minOccurrences}) ? $opts->{minOccurrences} : 1;
     my %out = (rule => 'event-window-evidence-1', vm => $vm, population => $population, windows => [],
-               windowsRequested => scalar(@windows), windowsWithEvidence => 0);
+               windowsRequested => scalar(@windows), windowsWithEvidence => 0, usableWindows => 0, minOccurrences => $min_occurrences);
     my (%cells, %cadences, %reasons);
     my %sum = (contested => 0, contestedDays => 0, contestedMinutes => 0, eligibleMinutes => 0, classifiedMinutes => 0, daysWithoutHistory => 0);
     my $worst;
@@ -25505,6 +25508,12 @@ sub _contested_event_evidence
         $sum{daysWithoutHistory} += $r->{days}{withoutHistory};
         # A window without evidence, or with a day missing from history, has a day with nothing classified.
         my $w_worst = ($r->{status} eq 'unavailable' || $r->{days}{withoutHistory}) ? 0 : $r->{worstDayShare};
+        # A usable occurrence: evaluated on every day, with the gate's classified shares.
+        my $usable = ($r->{status} ne 'unavailable' && !$r->{days}{withoutHistory} && !$r->{dayRecords}{unavailable}
+            && defined $r->{coverage} && $r->{coverage} >= $PEAK_UPLIFT_GATE_MIN_CLASSIFIED - 1e-9
+            && defined $w_worst && $w_worst >= $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED - 1e-9) ? 1 : 0;
+        $out{windows}[-1]{usable} = ($usable ? JSON::true : JSON::false);
+        $out{usableWindows} += $usable;
         $worst = $w_worst if (defined $w_worst && (!defined $worst || $w_worst < $worst));
         next if ($r->{status} eq 'unavailable');
         $out{windowsWithEvidence}++;
@@ -25526,7 +25535,10 @@ sub _contested_event_evidence
     $out{worstDayShare}      = $worst;
     $out{cadenceMinutes}     = [ map { $_ + 0 } sort { $a <=> $b } keys %cadences ];
     $out{reasons}            = \%reasons;
-    my $absence_supported = (@windows && $out{windowsWithEvidence} == @windows && !$sum{daysWithoutHistory}
+    # Fewer usable occurrences than the model itself requires of its history: no verdict of quiet.
+    $out{occurrencesShort} = ($out{usableWindows} < $min_occurrences) ? JSON::true : JSON::false;
+    my $absence_supported = (@windows && $out{usableWindows} >= $min_occurrences
+        && $out{windowsWithEvidence} == @windows && !$sum{daysWithoutHistory}
         && $sum{eligibleMinutes} > 0 && $sum{classifiedMinutes} / $sum{eligibleMinutes} >= $PEAK_UPLIFT_GATE_MIN_CLASSIFIED - 1e-9
         && defined $worst && $worst >= $PEAK_UPLIFT_GATE_MIN_DAY_CLASSIFIED - 1e-9) ? 1 : 0;
     $out{dayRows} = \@day_rows if (ref($opts) eq 'HASH' && $opts->{days});
@@ -25607,7 +25619,7 @@ sub _event_past_windows
 # Returns (trackers, { LPAR => { population => evidence summary } }).
 sub _event_protection_trackers
 {
-    my ($months_aref, $db, $vms_href, $asof, $windows_aref, $populations) = @_;
+    my ($months_aref, $db, $vms_href, $asof, $windows_aref, $populations, $min_occurrences) = @_;
     my (@trackers, %summary);
     my $day_of = sub { return int(Time::Piece->strptime($_[0], '%Y-%m-%d')->epoch / 86400); };
     foreach my $vm (sort keys %{ $vms_href // {} })
@@ -25641,7 +25653,7 @@ sub _event_protection_trackers
         my $comparable = sub { return $is_current{ join('|', $_[0]->{stateStartUTC} // '', $_[0]->{fromUTC} // '') } ? 1 : 0; };
         foreach my $population (sort keys %{ $populations // {} })
         {
-            my $e = _contested_event_evidence($months_aref, $vm, $population, $windows_aref, { days => 1, state => $comparable });
+            my $e = _contested_event_evidence($months_aref, $vm, $population, $windows_aref, { days => 1, state => $comparable, minOccurrences => $min_occurrences });
             my $rows = delete $e->{dayRows};
             $summary{$vm}{$population} = $e;
             next if ($e->{status} eq 'unavailable');
@@ -25776,6 +25788,147 @@ sub _event_protect_assembled
     return ($result, \%dbg);
 }
 
+# The number of past occurrences a seasonal model requires before it trusts its own history,
+# from the event's configuration. Event-window evidence must show at least as many usable
+# occurrences, for the LPAR and the profile's hours, before an absence of competition is
+# accepted (the pool-borrowing allowance is withheld on nothing less).
+sub _event_min_occurrences
+{
+    my ($event_config) = @_;
+    my $model = (ref($event_config) eq 'HASH') ? ($event_config->{model} // '') : '';
+    my $configured = ($model eq 'multiplicative_seasonal')
+        ? ($event_config->{min_historical_periods} // $event_config->{min_historical_years} // 1)
+        : ($event_config->{min_historical_peaks} // 3);
+    return (looks_like_number($configured // '') && $configured >= 1) ? int($configured) : 1;
+}
+
+# After a seasonal model has written its CSV: the evidence record of every profile, the
+# event-window plan in the rationale, and the proposal snapshot (as a standard run stores one,
+# under the event's name).
+#
+# The event-window plan runs the pool and VP checks on the event's figures, then states, per
+# user-defined pool, what the event asks of the pool if its members' peaks coincide:
+#   guarantees         the members' planning entitlements for the event
+#   borrowing relied on  for a member whose pool-borrowing allowance was withheld (its past
+#                      occurrences showed no competition), the part of its event demand above
+#                      its entitlement that it is expected to draw from the pool
+# Past quiet occurrences allow the allowance to be withheld. They do not show that the pool
+# will have that capacity to lend at the forecast level: where guarantees plus relied-on
+# borrowing exceed the pool maximum, or the maximum is unknown, that is said as unresolved.
+# Nothing here is a statement that the plan is safe; frame capacity is not assessed.
+sub _seasonal_plan_and_snapshot
+{
+    my ($map_ref, $event_name, $system_id, $suffix, $proposals, $cache_dir, $start_obj, $end_obj) = @_;
+    my $log_fh = $open_log_files{$system_id};
+    _protection_results($EVENT_EVIDENCE_STATUS->{Trackers}, $map_ref, $proposals)
+        if (ref($EVENT_EVIDENCE_STATUS) eq 'HASH' && ref($EVENT_EVIDENCE_STATUS->{Trackers}) eq 'ARRAY');
+
+    my $plan = _event_window_plan($map_ref);
+    if (defined $log_fh && ref($log_fh))
+    {
+        print {$log_fh} "\n", ('=' x 70), "\nEvent-Window Plan (event $event_name)\n", ('=' x 70), "\n",
+            "  The checks below run on the figures of the event window, not on a standing target.\n";
+    }
+    my $structural = _log_structural_feasibility($log_fh, $map_ref, \@vm_order, \@profiles, \%vm_tier_overrides);
+    print {$log_fh} map { "$_\n" } _event_window_plan_lines($event_name, $plan) if (defined $log_fh && ref($log_fh));
+    foreach my $vm (keys %{ $plan->{Members} })
+    {
+        $proposals->{$vm}{eventWindow} = $plan->{Members}{$vm} if (ref($proposals->{$vm}) eq 'HASH');
+    }
+    # What the evidence pass found for each LPAR it assessed, per profile-hours population. An LPAR
+    # without this record was not assessed: not an uncapped shared-pool LPAR in its current state.
+    my $summary = (ref($EVENT_EVIDENCE_STATUS) eq 'HASH') ? $EVENT_EVIDENCE_STATUS->{Summary} : undef;
+    foreach my $vm (keys %{ $summary // {} })
+    {
+        next unless (ref($proposals->{$vm}) eq 'HASH');
+        $proposals->{$vm}{eventEvidence} = { map { my $e = $summary->{$vm}{$_};
+            ($_ => { verdict => $e->{status}, usableWindows => $e->{usableWindows}, windowsRequested => $e->{windowsRequested},
+                     minOccurrences => $e->{minOccurrences}, contestedObservations => $e->{observations}{contested},
+                     coverage => $e->{coverage}, daysWithoutHistory => $e->{daysWithoutHistory}, reasons => $e->{reasons} }) } keys %{ $summary->{$vm} } };
+    }
+    return undef unless (ref($proposals) eq 'HASH' && %$proposals && $start_obj && $end_obj);
+    my ($sys_name, $model_name) = map { s/[^a-zA-Z0-9_.-]//gr } ($system_id || 'standard', $event_name);
+    return _publish_tactical_proposals($cache_dir, $model_name, $start_obj->ymd, $end_obj->ymd, $proposals,
+        File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.proposal.%s.json', $sys_name, $model_name, $suffix)));
+}
+
+# The pool-level view of the event's figures: { Pools => [ per user-defined pool ], Members => { LPAR => {...} } }.
+sub _event_window_plan
+{
+    my ($map_ref) = @_;
+    my $findings = _collect_structural_findings($map_ref, \@vm_order, \@profiles, \%vm_tier_overrides);
+    my (@pools, %members);
+    foreach my $pool (@{ $findings->{Pools} // [] })
+    {
+        my ($guarantees, $relied, $withheld, $known) = (0, 0, 0, 1);
+        foreach my $row (@{ $pool->{Members} // [] })
+        {
+            my $ent = $row->{Proposed} // $row->{Current};
+            if (!defined $ent) { $known = 0; next; }
+            $guarantees += $ent;
+            my $dbg = _safe_dig($map_ref, $row->{Vm}, 'CoreResults', 'ProfileDebugInfo', $row->{PlanningProfile} // '');
+            my %member = (pool => $pool->{PoolId}, planningProfile => $row->{PlanningProfile}, entitlement => 0 + $ent,
+                          allowanceWithheld => JSON::false, borrowingReliedOn => 0);
+            if (ref($dbg) eq 'HASH' && $dbg->{'TierFloorWithheld'} && looks_like_number($dbg->{'TierFloorValue'} // ''))
+            {
+                my $above = _structural_shown_value($dbg->{'TierFloorValue'}) - $ent;
+                $above = 0 if ($above < 0);
+                @member{qw(allowanceWithheld borrowingReliedOn)} = (JSON::true, 0 + sprintf('%.2f', $above));
+                $relied += $above;
+                $withheld++;
+            }
+            $members{ $row->{Vm} } = \%member;
+        }
+        next if ($pool->{PoolId} == 0);                    # the default pool is assessed with the frame, not here
+        my $ceiling = $pool->{Ceiling};
+        my $requirement = $guarantees + $relied;
+        push @pools, { PoolId => $pool->{PoolId}, Ceiling => $ceiling, Members => scalar(@{ $pool->{Members} // [] }),
+                       Guarantees => $guarantees, Withheld => $withheld, Relied => $relied, Requirement => $requirement, Known => $known,
+                       Verdict => (!$known || !defined $ceiling) ? 'unknown'
+                                : ($guarantees > $ceiling + $STRUCTURAL_ENT_TOLERANCE) ? 'guaranteesExceedMaximum'
+                                : ($requirement > $ceiling + $STRUCTURAL_ENT_TOLERANCE) ? 'borrowingUnresolved' : 'withinMaximum' };
+    }
+    return { Pools => \@pools, Members => \%members };
+}
+
+sub _event_window_plan_lines
+{
+    my ($event_name, $plan) = @_;
+    my @lines = ('', "Event requirements by pool (event $event_name)",
+        '  Guarantees are the planning entitlements for the event. Borrowing relied on is the event demand',
+        '  above the entitlement of members whose pool-borrowing allowance was withheld because their past',
+        '  occurrences showed no competition. Past quiet occurrences permit that; they do not show that the',
+        '  pool can lend the same at the forecast level. The figures assume the members\' peaks coincide.');
+    my @pools = @{ $plan->{Pools} // [] };
+    if (!@pools)
+    {
+        push @lines, '  No user-defined pool with a recommendation in this run.', '';
+        return @lines;
+    }
+    push @lines, sprintf('  %-6s %8s %8s %11s %9s %12s  %s', 'Pool', 'Members', 'Maximum', 'Guarantees', 'Withheld', 'Relied on', 'Reading');
+    foreach my $p (@pools)
+    {
+        my $reading = {
+            withinMaximum            => 'guarantees and relied-on borrowing fit under the pool maximum',
+            borrowingUnresolved      => sprintf('unresolved: %.2f cores of relied-on borrowing do not fit under the maximum if peaks coincide',
+                                                $p->{Requirement} - ($p->{Ceiling} // 0)),
+            guaranteesExceedMaximum  => 'the guarantees alone exceed the pool maximum (see Pool and VP Checks)',
+            unknown                  => 'not assessed: the pool maximum or a member\'s entitlement is unknown',
+        }->{ $p->{Verdict} };
+        push @lines, sprintf('  %-6s %8d %8s %11.2f %9d %12.2f  %s', $p->{PoolId}, $p->{Members},
+            (defined $p->{Ceiling} ? sprintf('%.2f', $p->{Ceiling}) : 'unknown'), $p->{Guarantees}, $p->{Withheld}, $p->{Relied}, $reading);
+    }
+    my $unresolved = scalar(grep { $_->{Verdict} eq 'borrowingUnresolved' || $_->{Verdict} eq 'unknown' } @pools);
+    push @lines, '',
+        ($unresolved
+            ? sprintf('  %d pool%s with future borrowing capacity unresolved. Before the event: raise the pool maximum, restore the', $unresolved, ($unresolved == 1 ? '' : 's'))
+            : '  No pool is short at its maximum on these figures.'),
+        ($unresolved ? '  guarantee of the members concerned for the event window, or accept the reliance knowingly.' : ()),
+        '  Not assessed here: the default pool and the frame (shared processors against all pools together),',
+        '  and whether the forecast level will meet competition that past occurrences did not.', '';
+    return @lines;
+}
+
 # The evidence pass of a seasonal run: fills %CUT_PROTECTION_EVIDENCE from history for the
 # event's past windows. Returns a status hashref (Status, Reason, Windows, Counts).
 sub _protection_evidence_from_history
@@ -25791,7 +25944,8 @@ sub _protection_evidence_from_history
     _step('Event-window evidence');
     my $states = _exposure_load_states($cache_dir);
     my ($trackers, $summary) = _event_protection_trackers(\@months, $states,
-        { map { $_ => 1 } @{ $vms_aref // [ keys %{ $states // {} } ] } }, $asof_obj->epoch + 86400, $windows, _exposure_populations());
+        { map { $_ => 1 } @{ $vms_aref // [ keys %{ $states // {} } ] } }, $asof_obj->epoch + 86400, $windows, _exposure_populations(),
+        _event_min_occurrences($event_config));
     foreach my $t (@$trackers)
     {
         $CUT_PROTECTION_EVIDENCE{ $t->{vm} }{$_} = $t for @{ $t->{profiles} };
@@ -25809,7 +25963,7 @@ sub _protection_evidence_from_history
         scalar(@$windows), (@$windows == 1 ? '' : 's'), $event_name, $windows->[0][0], (Time::Piece->strptime($windows->[-1][1], '%Y-%m-%d') - ONE_DAY)->ymd,
         @counts{qw(contested noCompetition insufficient unavailable)}));
     return { Status => 'evaluated', Trackers => $trackers, Windows => $windows, Counts => \%counts, ExcludedStateDays => $excluded,
-             Summary => $summary };
+             Summary => $summary, MinOccurrences => _event_min_occurrences($event_config) };
 }
 
 # The "Event-Window Evidence" rationale section of a seasonal run: what history holds for the
@@ -25834,8 +25988,11 @@ sub _event_evidence_report_lines
         @{$counts}{qw(contested noCompetition insufficient unavailable)});
     push @lines, sprintf('  Earlier states : %d day record(s) from before an LPAR\'s current configuration; not used, and not counted as quiet.', $status->{ExcludedStateDays})
         if $status->{ExcludedStateDays};
-    push @lines, '  Too little evidence: the absence of competition is not shown (a day missing from history or',
-                 '  not evaluated); the tier\'s pool-borrowing allowance stays, and no cut is deepened on it.'
+    push @lines, sprintf('  Occurrences    : an absence of competition is accepted from %d usable occurrence%s (the model\'s own minimum),',
+                         $status->{MinOccurrences}, ($status->{MinOccurrences} == 1 ? '' : 's')),
+                 '                   each measured on every day, for the LPAR in its current configuration.';
+    push @lines, '  Too little evidence: the absence of competition is not shown (too few usable occurrences, a day',
+                 '  missing from history or not evaluated); the tier\'s pool-borrowing allowance stays.'
         if $counts->{insufficient};
     my $width = max(map { length } keys %$summary, 'LPAR');
     foreach my $vm (sort keys %$summary)
@@ -25849,7 +26006,8 @@ sub _event_evidence_report_lines
             ? sprintf('contested: %d observation%s over %d day%s in %d of %d window%s; %s%s', $e->{observations}{contested},
                       ($e->{observations}{contested} == 1 ? '' : 's'), $e->{contestedDays}, ($e->{contestedDays} == 1 ? '' : 's'),
                       scalar(grep { $_->{contestedObservations} } @{ $e->{windows} }), $e->{windowsRequested}, ($e->{windowsRequested} == 1 ? '' : 's'), $cover, $gaps)
-            : sprintf('too little evidence: %s%s', $cover, $gaps))
+            : sprintf('too little evidence: %d usable occurrence%s of %d (minimum %d); %s%s', $e->{usableWindows},
+                      ($e->{usableWindows} == 1 ? '' : 's'), $e->{windowsRequested}, $e->{minOccurrences}, $cover, $gaps))
             . ($e->{mixedCadence} ? sprintf('; sampled at %s minutes: no contested level, and read as %d-minute data',
                                             join(' and ', @{ $e->{cadenceMinutes} }), $e->{cadenceMinutes}[-1]) : '');
     }
@@ -27685,6 +27843,8 @@ sub _protection_results
                 (ref($t->{eventEvidence}) eq 'HASH' ? (evidence => 'eventWindows', eventWindows => {
                     rule => $t->{eventEvidence}{rule}, windows => $t->{eventEvidence}{windows},
                     windowsWithEvidence => $t->{eventEvidence}{windowsWithEvidence}, coverage => $t->{eventEvidence}{coverage},
+                    usableWindows => $t->{eventEvidence}{usableWindows}, minOccurrences => $t->{eventEvidence}{minOccurrences},
+                    verdict => $t->{eventEvidence}{status},
                     worstDayShare => $t->{eventEvidence}{worstDayShare}, daysWithoutHistory => $t->{eventEvidence}{daysWithoutHistory},
                     reasons => $t->{eventEvidence}{reasons} }) : ()),
                 tier => $tier, share => $share, population => $t->{population}, pool => $t->{pool},
@@ -33100,6 +33260,7 @@ sub _execute_multiplicative_seasonal {
             }
         }
 
+        my %seasonal_proposals;
         _write_standard_csv_report(
             $assimilation_map,
             $event_name,
@@ -33110,8 +33271,11 @@ sub _execute_multiplicative_seasonal {
             0,
             $exec_ctx->{adaptive_saturation_thresh},
             $exec_ctx->{adaptive_thresholds_href},
-            $anchor_bucket  # Pass anchor_bucket for potential column inclusion
+            $anchor_bucket,  # Pass anchor_bucket for potential column inclusion
+            \%seasonal_proposals
         );
+        push @generated_files, grep { defined } _seasonal_plan_and_snapshot($assimilation_map, $event_name, $exec_ctx->{system_identifier},
+            $unique_suffix, \%seasonal_proposals, $current_cache_path, $exec_ctx->{effective_start_date}, $exec_ctx->{effective_end_date});
 
         # Verbose Output Files
         if ($exec_ctx->{verbose}) {
@@ -33568,6 +33732,7 @@ sub _execute_recency_decay {
         }
     }
 
+    my %seasonal_proposals;
     _write_standard_csv_report(
         $assimilation_map,
         $event_name,
@@ -33578,8 +33743,11 @@ sub _execute_recency_decay {
         0,
         $args_href->{adaptive_saturation_thresh},
         $args_href->{adaptive_thresholds_href},
-        $anchor_bucket  # Pass anchor_bucket for potential column inclusion
+        $anchor_bucket,  # Pass anchor_bucket for potential column inclusion
+        \%seasonal_proposals
     );
+    push @generated_files, grep { defined } _seasonal_plan_and_snapshot($assimilation_map, $event_name, $args_href->{system_identifier},
+        $unique_suffix, \%seasonal_proposals, $current_cache_path, $args_href->{effective_start_date}, $args_href->{effective_end_date});
 
     # 3. Horizon Metadata Calculation
     # We use the event_end_obj (e.g., May 31) derived earlier from the Event Config.
@@ -33927,6 +34095,7 @@ sub _execute_predictive_peak {
         log_predictive_peak_rationale($open_log_files{$args_href->{system_identifier}}, $effective_config, $ctx);
     }
 
+    my %seasonal_proposals;
     _write_standard_csv_report(
         $assimilation_map,
         $event_name,
@@ -33937,8 +34106,11 @@ sub _execute_predictive_peak {
         1, # is_predictive_peak
         $args_href->{adaptive_saturation_thresh},
         $args_href->{adaptive_thresholds_href},
-        $anchor_bucket  # Pass anchor_bucket for potential column inclusion
+        $anchor_bucket,  # Pass anchor_bucket for potential column inclusion
+        \%seasonal_proposals
     );
+    push @generated_files, grep { defined } _seasonal_plan_and_snapshot($assimilation_map, $event_name, $args_href->{system_identifier},
+        $unique_suffix, \%seasonal_proposals, $current_cache_path, $args_href->{effective_start_date}, $args_href->{effective_end_date});
 
     # Determine Forecast Horizon for Metadata (anchored to effective end date)
     my ($next_start, $next_end) = determine_event_period($effective_config, $args_href->{effective_end_date}, 'forecast');

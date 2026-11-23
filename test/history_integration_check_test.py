@@ -68,7 +68,7 @@ class HistoryIntegrationCheckTests(unittest.TestCase):
         cfg = os.path.join(scratch, 'seasonality.cfg')
         with open(cfg, 'w') as fh:
             fh.write('[Global]\nmin_history_days = 1\nseasonal_lookback_days = 1\n'
-                     '[ev]\nmodel = predictive_peak\npriority = 10\ndates = 2026-09-01:2026-09-01\nbaseline_period_days = 1\n')
+                     '[ev]\nmodel = predictive_peak\npriority = 10\ndates = 2026-09-01:2026-09-01\nbaseline_period_days = 1\nmin_historical_peaks = 1\n')
         tool = [sys.executable, os.path.join(REPO, 'dev', 'seasonal-protection-compare'), '--work', work, '--out', out, '--seasonality', cfg]
         listing = subprocess.run(tool, capture_output=True, text=True, timeout=60)
         self.assertEqual(listing.returncode, 2)
@@ -83,6 +83,12 @@ class HistoryIntegrationCheckTests(unittest.TestCase):
         self.assertEqual(result['lpars']['both'], 4)
         self.assertGreaterEqual(result['planningEntitlement']['raised'], 1)             # a cut limited by the event's evidence
         self.assertGreaterEqual(result['actions']['cutLimitedByPastEventWindows'], 1)
+        # Every moved figure is explained from the stored proposal of the run, and no profile value came
+        # down without supported no-competition evidence.
+        self.assertTrue(any(k.startswith('raised | evidence contested | own profile values moved') for k in result['movedPlanningFigures']),
+                        result['movedPlanningFigures'])
+        self.assertEqual(result['exemptionCheck']['withoutIt'], 0)
+        self.assertEqual((result['eventWindowPlan']['pools'], result['eventWindowPlan']['poolsWithinMaximum']), (2, 2))
         for name in ('vmA', 'vmB', 'vmS', 'vmX', M.SERIAL):
             self.assertNotIn(name, text)
         with open(history, 'rb') as fh:
