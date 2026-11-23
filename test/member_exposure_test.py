@@ -521,6 +521,21 @@ class MemberExposureTests(unittest.TestCase):
         self.assertEqual((pop['cadenceMinutes'], pop['cadenceByDate']), (1, {'1970-01-04': 15}))               # a day at another interval says so
         self.assertEqual((counts['observations'], counts['pairs'], counts['unavailableDayRecords']), (3, 2, 2))
 
+    def test_the_month_file_is_compact_json_with_the_content_and_numbers_of_the_indented_form(self):
+        text = self.bytes_first.decode('utf-8')
+        self.assertNotIn('\n', text)
+        self.assertNotRegex(text[:5000], r'"\s*:\s+|,\s+"')                              # no indentation or padding
+        # The same encoder with indentation, the form used before: identical content, identical number text.
+        script = ('use strict; use warnings; use JSON; local $/; my $d = JSON->new->decode(<STDIN>); '
+                  'print JSON->new->pretty->canonical->encode($d), "\n==SPLIT==\n", JSON->new->canonical->encode($d);')
+        out = subprocess.run(['perl', '-e', script], input=text, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr[-500:])
+        indented, compact = out.stdout.split('\n==SPLIT==\n')
+        self.assertEqual(json.loads(indented), json.loads(text))
+        self.assertEqual(compact, text)                                                    # canonical key order, stable numbers
+        self.assertEqual(re.sub(r'\s+', '', indented), re.sub(r'\s+', '', text))            # nothing but whitespace differs
+        self.assertGreater(len(indented), 2 * len(text))
+
     # -- re-runs and the CSV ------------------------------------------------------------
     def test_an_identical_second_run_leaves_the_partition_unchanged(self):
         self.assertEqual(self.bytes_first, self.bytes_second)

@@ -36,6 +36,8 @@ class HistoryIntegrationCheckTests(unittest.TestCase):
             text = fh.read()
         result = json.loads(text)
         self.assertEqual((result['verdict'], result['failures']), ('pass', []))
+        self.assertEqual((result['format']['writtenCompact'], result['format']['parsedContentIdentical']), (True, True))
+        self.assertLess(result['format']['writtenBytes'], result['format']['indentedBytes'])
         self.assertEqual(result['secondRun'], {'monthFiles': 1, 'unchanged': 1, 'changed': 0, 'added': 0})
         raw = result['rawAgainstHistory']
         self.assertGreater(raw['comparisons'], 0)
