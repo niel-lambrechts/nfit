@@ -6,7 +6,7 @@
 #            The model's baseline is the mean of the daily profile values of a
 #            window of history. The baseline stored with an occurrence is
 #            another quantity: one percentile over all days of its baseline
-#            period, which lies above the daily mean when the days differ.
+#            period. The two need not agree (here the stored one is set higher).
 #            1. An event that reaches only that stored baseline (no uplift over
 #               it) is forecast at the event's level: baseline x (event value /
 #               history baseline as of the occurrence). Dividing by the stored
@@ -49,7 +49,9 @@ class MultiplierBasisTests(unittest.TestCase):
     def test_an_occurrence_is_divided_by_the_baseline_it_is_multiplied_with(self):
         case = self.level
         meta = case.records[MODEL]['_meta']
-        self.assertEqual(meta['multiplierBasis'], {'denominator': BASIS})
+        self.assertEqual(meta['multiplierBasis']['denominator'], BASIS)
+        self.assertGreater(meta['multiplierBasis']['occurrencePairs'], 0)
+        self.assertNotIn('occurrencePairsWithoutIt', meta['multiplierBasis'])
         for vm in LPARS:
             for profile in (PROFILE, OTHER):
                 # 1.3 B over a daily mean of B: the forecast is the event's level on the current baseline ...
@@ -62,7 +64,8 @@ class MultiplierBasisTests(unittest.TestCase):
         meta = case.records[MODEL]['_meta']
         self.assertEqual(meta['multiplierBasis']['denominator'], BASIS)
         self.assertGreater(meta['multiplierBasis']['occurrencePairsWithoutIt'], 0)
-        self.assertRegex(case.stderr[MODEL], r'\[NOTE\] \d+ LPAR-profile occurrence\(s\) left out of the seasonal multiplier: history holds no daily values')
+        self.assertLess(meta['multiplierBasis']['occurrencePairsWithoutIt'], meta['multiplierBasis']['occurrencePairs'])
+        self.assertRegex(case.stderr[MODEL], r'\[NOTE\] \d+ of \d+ LPAR-profile occurrence\(s\) left out of the seasonal multiplier: history holds no daily values')
         # The later occurrence has its month before it: the forecast stands on it alone.
         self.assertAlmostEqual(case.demand(MODEL, 'vmS') / case.baseline(MODEL, 'vmS'), 1.3, delta=0.005)
         self.assertEqual(case.capacity(MODEL, 'vmS')['observations'], {'legacy': 1})
