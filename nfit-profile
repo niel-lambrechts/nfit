@@ -3086,6 +3086,11 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                             $recency_decay_results_for_history{$vm} = { %$core_res };
                         }
                     }
+                    # The model's demand, where this path has it for every LPAR; otherwise the record
+                    # stays unmarked, as before (sized figures, never read as demand).
+                    my %recency_demand_for_history = map { ($_ => { %{ $assimilation_map_ref->{$_}{CoreResults}{ModelDemand} } }) }
+                        grep { ref($assimilation_map_ref->{$_}{CoreResults}{ModelDemand}) eq 'HASH' } keys %recency_decay_results_for_history;
+                    %recency_demand_for_history = () unless (scalar(keys %recency_demand_for_history) == scalar(keys %recency_decay_results_for_history));
 
                     # 2. [REFACTORED] Horizon Metadata Calculation
                     # Use the deterministic event period relative to the analysis end date.
@@ -3117,10 +3122,12 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                         $current_cache_path,
                         $apply_seasonality_event,
                         'recency_decay',
-                        \%recency_decay_results_for_history,
+                        (%recency_demand_for_history ? \%recency_demand_for_history : \%recency_decay_results_for_history),
                         $event_config,
                         $horizon_meta,
-                        $analysis_context
+                        $analysis_context,
+                        undef, undef, undef,
+                        (%recency_demand_for_history ? \%recency_decay_results_for_history : undef)
                     );
                 }
             } else {
@@ -19258,8 +19265,29 @@ sub _assemble_seasonal_snapshot {
 #     VM02: { ... }
 #   }
 # ==============================================================================
+# The marker of a ModelForecasts record whose 'forecast' is the model's demand and whose
+# 'sized' is the figure after the sizing chain. nfit-forecast reads the same marker.
+# (A sub, not a variable: the main program runs before this point of the file is reached.)
+sub _model_forecast_semantics { return { version => 1, forecast => 'model-demand', sized => 'sized-result' }; }
+# The sized figures of the seasonal model that ran last: LPAR => profile => value.
+our %SEASONAL_SIZED;
+
+sub _seasonal_sized_from_map
+{
+    my ($map) = @_;
+    %SEASONAL_SIZED = map { ($_ => { %{ $map->{$_}{CoreResults}{ProfileValues} } }) }
+                      grep { ref($map->{$_}) eq 'HASH' && ref($map->{$_}{CoreResults}) eq 'HASH'
+                             && ref($map->{$_}{CoreResults}{ProfileValues}) eq 'HASH' } keys %$map;
+    return { map { ($_ => { %{ $SEASONAL_SIZED{$_} } }) } keys %SEASONAL_SIZED };
+}
+
 sub _store_model_forecast_to_history {
-    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config, $horizon_meta, $analysis_context, $explicit_anchor_bucket, $fingerprints_href, $baseline_meta_href) = @_;
+    my ($system_cache_dir, $event_name, $model_type, $forecast_results_href, $event_config, $horizon_meta, $analysis_context, $explicit_anchor_bucket, $fingerprints_href, $baseline_meta_href, $sized_results_href) = @_;
+    # Demand and sizing are kept apart (v10): with $sized_results_href the caller states that
+    # $forecast_results_href is the model's demand before any allocation rule (run-queue terms,
+    # borrowing rule, cut protection, contested level, roles), and gives the sized figures
+    # separately. The record is then marked. A record without the marker is a legacy one whose
+    # 'forecast' holds sized figures; it is never read as demand.
 
     return unless ($system_cache_dir && $event_name && $model_type && $forecast_results_href);
     return unless (scalar keys %$forecast_results_href > 0);
@@ -19451,6 +19479,7 @@ sub _store_model_forecast_to_history {
                                                    $baseline_meta_href->{coverage_by_vm});
     }
 
+    $meta_block->{semantics} = _model_forecast_semantics() if (ref($sized_results_href) eq 'HASH');
     $model_data{'_meta'} = $meta_block;
 
     # Build per-VM forecast and baseline data
@@ -19519,6 +19548,12 @@ sub _store_model_forecast_to_history {
             $model_data{$vm_name} = {
                 forecast => \%forecast_by_profile,
             };
+            if (ref($sized_results_href) eq 'HASH' && ref($sized_results_href->{$vm_name}) eq 'HASH')
+            {
+                my %sized = map { ($_ => sprintf("%.4f", $sized_results_href->{$vm_name}{$_}) + 0) }
+                            grep { looks_like_number($sized_results_href->{$vm_name}{$_} // '') } keys %{ $sized_results_href->{$vm_name} };
+                $model_data{$vm_name}{sized} = \%sized if %sized;
+            }
             $model_data{$vm_name}{baseline} = \%baseline_by_profile if %baseline_by_profile;
             $model_data{$vm_name}{components} = \%components_by_profile if %components_by_profile;
             $vm_count++;
@@ -32699,7 +32734,8 @@ sub _execute_multiplicative_seasonal {
 
         # Merge forecasted profile values (overwrites ProfileValues hash)
         if (exists $forecast_results->{$vm_name}) {
-            $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
+            # A copy: the sizing chain writes into ProfileValues, and the forecast must stay the model's demand.
+            $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = { %{ $forecast_results->{$vm_name} } };
         }
 
         # Restore PeakValue (immutable historical fact - not a forecast)
@@ -33438,8 +33474,13 @@ sub _execute_multiplicative_seasonal {
             $analysis_context,
             $exec_ctx->{anchor_bucket},
             $exec_ctx->{_fingerprints}, # Phase 4: Idempotency fingerprints
-            $exec_ctx->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
+            $exec_ctx->{_baseline_meta}, # Phase 6: Baseline metadata for staleness
+            _seasonal_sized_from_map($assimilation_map)
         );
+    }
+    else
+    {
+        _seasonal_sized_from_map($assimilation_map);        # for the caller that aggregates occurrences
     }
     # For aggregated mode, return the raw forecast hashref to caller
     return $forecast_results;
@@ -33622,6 +33663,7 @@ sub _execute_recency_decay {
 
     # 6. Enrichment, Logging, and Result Extraction
     my %recency_results_for_history;
+    my %recency_demand;              # LPAR => profile => the model's demand: decayed base plus growth
 
     foreach my $vm_name (@vm_order) {
         my $vm_map_ref = $assimilation_map->{$vm_name};
@@ -33722,6 +33764,7 @@ sub _execute_recency_decay {
             if (defined $base_val && looks_like_number($base_val)) {
                 # Final = Base + StandardGrowth + RunQ_Potential
                 my $final_val = $base_val + $standard_growth_adj + $runq_potential;
+                $recency_demand{$vm_name}{$p_name} = sprintf("%.4f", $base_val + $standard_growth_adj) + 0;
                 # Event-window protection (stage 3.6): on the assembled requirement, before the VP
                 # targets, the current-cycle pair and the pool checks are derived from it.
                 my ($protected_val, $event_dbg) = _event_protect_assembled($vm_name, $profile, $final_val);
@@ -33759,6 +33802,10 @@ sub _execute_recency_decay {
         # Extract for History
         if (exists $vm_map_ref->{CoreResults}{ProfileValues}) {
              $recency_results_for_history{$vm_name} = { %{$vm_map_ref->{CoreResults}{ProfileValues}} };
+             # Profiles the model does not assemble (the peak profile) carry their measured value as demand.
+             $recency_demand{$vm_name}{$_} //= $vm_map_ref->{CoreResults}{ProfileValues}{$_}
+                 for keys %{ $vm_map_ref->{CoreResults}{ProfileValues} };
+             $vm_map_ref->{CoreResults}{ModelDemand} = { %{ $recency_demand{$vm_name} } };
         }
 
         # Populate ClippingInfo into %seasonal_debug_info so Phase 3.3 in
@@ -33876,14 +33923,16 @@ sub _execute_recency_decay {
         $current_cache_path,
         $event_name,
         'recency_decay',
-        \%recency_results_for_history,
+        \%recency_demand,
         $event_config,
         $horizon_meta,
         $analysis_context,
         $args_href->{anchor_bucket},
         $args_href->{_fingerprints},  # Phase 4: Idempotency fingerprints
-        $args_href->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
+        $args_href->{_baseline_meta}, # Phase 6: Baseline metadata for staleness
+        { map { ($_ => { %{ $recency_results_for_history{$_} } }) } keys %recency_results_for_history }
     );
+    %SEASONAL_SIZED = map { ($_ => { %{ $recency_results_for_history{$_} } }) } keys %recency_results_for_history;
 
     # Phase 3.2: allow orchestration to aggregate results
     return \%recency_results_for_history;
@@ -34061,7 +34110,8 @@ sub _execute_predictive_peak {
     # Merge Forecast
     foreach my $vm_name (@vm_order) {
         if (exists $forecast_results->{$vm_name}) {
-             $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = $forecast_results->{$vm_name};
+             # A copy: the sizing chain writes into ProfileValues, and the forecast must stay the model's demand.
+             $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = { %{ $forecast_results->{$vm_name} } };
         }
     }
 
@@ -34240,7 +34290,8 @@ sub _execute_predictive_peak {
         $analysis_context,
         $args_href->{anchor_bucket},
         $args_href->{_fingerprints},  # Phase 4: Idempotency fingerprints
-        $args_href->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
+        $args_href->{_baseline_meta}, # Phase 6: Baseline metadata for staleness
+        _seasonal_sized_from_map($assimilation_map)
     );
 }
 
@@ -34871,7 +34922,9 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
         $analysis_context,
         $bucket_exec_ctx->{anchor_bucket},
         $bucket_exec_ctx->{_fingerprints},  # Phase 4: Idempotency fingerprints
-        $bucket_exec_ctx->{_baseline_meta}  # Phase 6: Baseline metadata for staleness
+        $bucket_exec_ctx->{_baseline_meta}, # Phase 6: Baseline metadata for staleness
+        # The sized figures are those of the final occurrence, which is the one the CSV publishes.
+        { map { ($_ => { %{ $SEASONAL_SIZED{$_} } }) } grep { ref($SEASONAL_SIZED{$_}) eq 'HASH' } keys %aggregated_forecast }
     );
 
     # Phase 3.2: CSV output for aggregated bucket
