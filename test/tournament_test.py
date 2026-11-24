@@ -78,7 +78,7 @@ AHEAD = 'next occurrence after the last occurrence trained on'
 NAMED = {'data_end': '2026-09-12', 'target_start': '2026-10-01', 'target_date': '2026-10-02', 'target_basis': 'next occurrence after the data ends'}
 
 
-def perl(origin, semantics=V2, names=None, basis=None, profiles='p1', exclusions='NONE', **lpars):
+def perl(origin, semantics=V2, names=None, basis=None, profiles='flags-1:p1', exclusions='NONE', **lpars):
     """A stored nfit-profile record: where its data ends, the occurrence it names, how that target was
     established, and the definitions it was made on."""
     meta = {'AnalysisContext': {'analysis_end': origin + 'T00:00:00'}}
@@ -231,7 +231,9 @@ class ParticipationTests(unittest.TestCase):
             'multiplicative_seasonal': same,
             # The same model as the source event stores: told apart by the event it is stored under.
             'predictive_peak': perl('2026-09-12', names='2026-10-02', basis=AHEAD, vmA={P1: 7.0}),
-            'other_profiles': perl('2026-09-12', names='2026-10-02', basis=AHEAD, profiles='p2', vmA={P1: 2.0}),
+            'other_profiles': perl('2026-09-12', names='2026-10-02', basis=AHEAD, profiles='flags-1:p2', vmA={P1: 2.0}),
+            # Written before the fingerprint covered the flags: a hash of the names alone is no statement.
+            'names_only': perl('2026-09-12', names='2026-10-02', basis=AHEAD, profiles='p1', vmA={P1: 2.0}),
             'other_exclusions': perl('2026-09-12', names='2026-10-02', basis=AHEAD, exclusions='x9', vmA={P1: 2.0}),
             'unstated': perl('2026-09-12', names='2026-10-02', basis=AHEAD, profiles=None, vmA={P1: 2.0}),
             'other_occurrence': perl('2026-09-12', names='2026-10-09', basis=AHEAD, vmA={P1: 2.0})}}
@@ -248,6 +250,9 @@ class ParticipationTests(unittest.TestCase):
         self.assertEqual(rows['other_profiles']['reason'], "profile definitions differ from those of the source event 'ev'")
         self.assertEqual(rows['other_exclusions']['reason'], "exclusions differ from those of the source event 'ev'")
         self.assertEqual(rows['unstated']['reason'], "profile definitions not stated by the record or by the source event's record")
+        self.assertEqual(rows['names_only']['reason'], "profile definitions not stated by the record or by the source event's record")
+        self.assertIsNone(T['zone2_record_contract'](perl('2026-09-12', profiles='0123abcd'))['profileDefinitions'])
+        self.assertEqual(T['zone2_record_contract'](perl('2026-09-12'))['profileDefinitions'], 'flags-1:p1')
         self.assertRegex(rows['other_occurrence']['reason'], r'^its target \(occurrence ending 2026-10-09; .*\) is not the occurrence in question')
         self.assertIn('Records of: ev, strategic (observed occurrences: ev)', T['format_tournament_participation']([t]))
         # Without a usable record of the source event there is nothing to match the definitions against.

@@ -86,6 +86,8 @@ class ModelDemandTests(unittest.TestCase):
             self.assertIsNotNone(record, (model, name))
             semantics = record['_meta']['semantics']
             self.assertEqual({k: semantics[k] for k in MARKER}, MARKER, (model, name))
+            # The definitions the record was made on are stated in the current scheme (D-019).
+            self.assertRegex(record['_meta']['profile_definitions'], r'^flags-1:[0-9a-f]{32}$', (model, name))
             for vm in LPARS:
                 self.assertIn(PROFILE, record[vm]['forecast'], (model, name, vm))
                 # The sized figure is the one the CSV publishes for the profile.
