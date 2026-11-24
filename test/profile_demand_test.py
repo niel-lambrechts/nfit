@@ -47,6 +47,7 @@ PROFILE, OTHER = 'G3-95W15', 'G2-98W10'              # the same hours; their own
 LPARS = ('vmA', 'vmB', 'vmS')
 EARLIER = ('2026-07', '2026-08')
 DATES = '2026-07-01:2026-07-01, 2026-08-01:2026-08-01, 2026-09-01:2026-09-01, 2026-09-12:2026-09-12'
+NEXT_DATES = '2026-10-01:2026-10-01'
 MODELS = ('multiplicative_seasonal', 'predictive_peak')
 
 
@@ -176,7 +177,8 @@ class Case:
 
     def configure(self, model):
         with open(os.path.join(self.root, 'etc', 'nfit.seasonality.cfg'), 'w') as fh:
-            fh.write(E.EVENT % (model, DATES, 8, 2 if model == 'predictive_peak' else 1, 1))
+            # The occurrence after the last one in the data is configured as well: a forecast names it as its target.
+            fh.write(E.EVENT % (model, DATES + ', ' + NEXT_DATES, 8, 2 if model == 'predictive_peak' else 1, 1))
 
     def demand(self, model, vm, profile=PROFILE):
         return self.records[model][vm]['forecast'][profile]

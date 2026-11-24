@@ -55,6 +55,25 @@ class ObservedHistoryTests(unittest.TestCase):
     def tearDownClass(cls):
         M.MemberExposureTests.tearDownClass()
 
+    def test_a_record_states_the_occurrence_its_projection_is_for(self):
+        """The target follows from the model's construction and from what it was fitted to, not from the day
+        the analysis ends. Here September's occurrence is not in history when the models run."""
+        records = self.as_of[None].records
+        # The trend is fitted to July and August and projected one occurrence on: that is September's own
+        # occurrence, which the data of this run covers. The record says so; nothing downstream has to guess.
+        meta = records['predictive_peak']['_meta']
+        self.assertEqual((meta['last_trained_occurrence_end'], meta['forecast_target_start'], meta['forecast_target_date']),
+                         ('2026-08-01', '2026-09-01', '2026-09-01'))
+        self.assertEqual(meta['forecast_target_basis'], 'next occurrence after the last occurrence trained on')
+        # The multiplier is applied to the baseline as of the end of the data: the occurrence after it.
+        meta = records['multiplicative_seasonal']['_meta']
+        self.assertEqual((meta['forecast_target_start'], meta['forecast_target_date'], meta['forecast_target_basis']),
+                         ('2026-10-01', '2026-10-01', 'next occurrence after the data ends'))
+        self.assertNotIn('last_trained_occurrence_end', meta)
+        # Recency decay summarises the data it has: it states no basis for a later target.
+        if 'recency_decay' in records:
+            self.assertNotIn('forecast_target_basis', records['recency_decay']['_meta'])
+
     def test_repeated_generation_leaves_observed_history_alone_and_does_not_inflate(self):
         for case in (self.occurrence, self.recency, self.unverified, self.unstamped, self.replaced):
             self.assertTrue(case.before)

@@ -72,10 +72,16 @@ V2 = {'version': 2, 'forecast': 'profile-demand'}
 P1, P2 = 'G3-95W15', 'G2-98W10'
 
 
-def perl(origin, semantics=V2, names=None, **lpars):
+AHEAD = 'next occurrence after the last occurrence trained on'
+
+
+def perl(origin, semantics=V2, names=None, basis=None, **lpars):
+    """A stored nfit-profile record: where its data ends, the occurrence it names, and how that target was established."""
     meta = {'AnalysisContext': {'analysis_end': origin + 'T00:00:00'}}
     if names:
         meta['forecast_target_date'] = names
+    if basis:
+        meta['forecast_target_basis'] = basis
     if semantics:
         meta['semantics'] = dict(semantics)
     return dict({'_meta': meta}, **{vm: {'forecast': dict(f)} for vm, f in lpars.items()})
@@ -157,15 +163,20 @@ class ParticipationTests(unittest.TestCase):
             m2026_09={'ev': {'eventName': 'ev', 'periodEndDate': '2026-09-12', 'generatedOn': '2026-09-13T00:00:00',
                              'results': {'HistoricPeak': values},
                              'ModelForecasts': {
-                                 # Its record names the occurrence that ended on its last day of data; its value
-                                 # is the projection one occurrence on, so the label does not withhold it.
-                                 'predictive_peak': perl('2026-09-12', names='2026-09-12', vmA={P1: 1.9, P2: 2.8}, vmB={P1: 1.1}),
+                                 # States which occurrence its projection is for, and how that follows from the model.
+                                 'predictive_peak': perl('2026-09-12', names='2026-10-02', basis=AHEAD, vmA={P1: 1.9, P2: 2.8}, vmB={P1: 1.1}),
                                  'multiplicative_seasonal': perl('2026-09-12', {'version': 1, 'forecast': 'model-demand'}, vmA={P1: 9.0}),
-                                 'recency_decay': perl('2026-10-01', vmA={P1: 2.0}),          # its window runs into the target occurrence
-                                 # A record that names an occurrence its own data already covers.
-                                 'recency_now': perl('2026-09-12', names='2026-09-05', vmA={P1: 2.0}),
-                                 # The same estimate frozen and named for the occurrence ahead: a persistence forecast.
-                                 'recency_ahead': perl('2026-09-12', names='2026-10-02', vmA={P1: 2.0}),
+                                 # Its data runs into the occurrence it is for.
+                                 'late_run': perl('2026-10-01', names='2026-10-02', basis=AHEAD, vmA={P1: 2.0}),
+                                 # Names an occurrence its own data already covers (recency decay over a completed
+                                 # period; any record written when the label was the period the analysis ended on).
+                                 'recency_decay': perl('2026-09-12', names='2026-09-12', vmA={P1: 2.0}),
+                                 # Names a later occurrence without saying how the projection comes to be for it.
+                                 'unexplained': perl('2026-09-12', names='2026-10-02', vmA={P1: 2.0}),
+                                 # Names nothing.
+                                 'unnamed': perl('2026-09-12', vmA={P1: 2.0}),
+                                 # Is for an occurrence other than the one stored next.
+                                 'another': perl('2026-09-12', names='2026-11-02', basis=AHEAD, vmA={P1: 2.0}),
                              }},
                       'ad': zone3},
             m2026_10={'ev': occurrence('2026-10-01', '2026-10-02', values, clipped={'vmA': {P2: 0.4}})})
@@ -183,17 +194,14 @@ class ParticipationTests(unittest.TestCase):
         self.assertEqual(status['holt'], ('withheld', 'output is another quantity (weekly-raw-peak: 1)'))
         self.assertEqual(status['huber'], ('withheld', 'output quantity not stated (written before outputs were stated)'))
         self.assertRegex(status['multiplicative_seasonal'][1], r'^semantics version 1 \(model-demand\)')
-        # A current-state estimate whose data runs into the occurrence is no forecast of it.
-        self.assertEqual(status['recency_decay'], ('withheld', 'not frozen before its target (data ends 2026-10-01, target occurrence starts 2026-10-01)'))
-        self.assertEqual(status['recency_now'], ('withheld', 'current-state estimate: the occurrence it names (ends 2026-09-05) is not after its data (ends 2026-09-12)'))
-        self.assertEqual(status['recency_ahead'][0], 'participates')
-        # Recency decay itself: a completed occurrence includes one ending on its last day; frozen ahead, it is persistence.
-        records = self.raw['2026-09']['SeasonalEventSnapshots']['ev']['ModelForecasts']
-        records['recency_decay'] = perl('2026-09-12', names='2026-09-12', vmA={P1: 2.0})
-        self.assertRegex(self.table()['models']['recency_decay']['reason'], r'^current-state estimate')
-        records['recency_decay'] = perl('2026-09-12', names='2026-10-02', vmA={P1: 2.0})
-        self.assertRegex(self.table()['models']['recency_decay']['reason'], r'carried forward \(persistence\), frozen before the target occurrence$')
-        self.assertEqual(sorted(t['admitted']), ['arima', 'event_multiplier', 'predictive_peak', 'recency_ahead'])
+        self.assertEqual(status['late_run'], ('withheld', 'not frozen before its target (data ends 2026-10-01, target occurrence starts 2026-10-01)'))
+        self.assertEqual(status['recency_decay'], ('withheld', 'names an occurrence its own data already covers (ends 2026-09-12; data ends 2026-09-12): not a forecast of a later occurrence'))
+        # No target is assigned on a record's behalf.
+        for name in ('unexplained', 'unnamed'):
+            self.assertEqual(status[name], ('withheld', 'target not established: the record does not state which occurrence its projection is for'))
+        self.assertEqual(status['another'], ('withheld', 'its target (occurrence ending 2026-11-02; %s) is not the occurrence being scored (ends 2026-10-02)' % AHEAD))
+        self.assertEqual(status['predictive_peak'][1], 'states profile-demand; frozen 2026-09-12, before the target occurrence it names (%s)' % AHEAD)
+        self.assertEqual(sorted(t['admitted']), ['arima', 'event_multiplier', 'predictive_peak'])
         self.assertEqual(t['admitted']['predictive_peak'], {'vmA': {P1: 1.9, P2: 2.8}, 'vmB': {P1: 1.1}})
         self.assertEqual(t['models']['predictive_peak']['pairs'], 3)
         self.assertEqual(t['targets'][('vmA', P2)]['target'], 3.4)
@@ -315,7 +323,10 @@ class EndToEndTests(unittest.TestCase):
         M.MemberExposureTests.roots = []
         # History: level months, occurrences in July, August and September at 1.2 B (raw peaks at 1.5 B), a
         # current record of two nfit-profile models in September, and the October occurrence at 1.3 B as the target.
-        cls.case = P.Case('occurrence', peak={P.PROFILE: 1.2}, models=('predictive_peak', 'multiplicative_seasonal'), later_peak=1.3)
+        # The September occurrence is in history before the models run (as after a history update), so the trend is
+        # fitted through it and its projection is for October. Without it the projection would be for September itself.
+        cls.case = P.Case('occurrence', peak={P.PROFILE: 1.2}, models=('predictive_peak', 'multiplicative_seasonal'), later_peak=1.3,
+                          target_event={'eventName': 'ev', 'periodEndDate': '2026-09-12', 'generatedOn': '2026-09-13T00:00:00'})
         with open(os.path.join(cls.case.root, 'etc', 'nfit.seasonality.cfg'), 'a') as fh:
             fh.write('\n[ad]\nmodel = adaptive_peak\nsource_event = ev\npriority = 10\ndates = %s, 2026-10-01:2026-10-01\n'
                      'baseline_period_days = 8\nmin_historical_years = 0\nmin_historical_peaks = 1\nmin_historical_periods = 1\n' % P.DATES)
@@ -361,6 +372,11 @@ class EndToEndTests(unittest.TestCase):
         self.assertRegex(query.stdout, r'predictive_peak\s+Zone 2 \(nfit-profile\)\s+participates\s+\d+  states profile-demand; frozen 2026-09-12')
         for name in P.LPARS + (M.SERIAL,):
             self.assertNotIn(name, query.stdout)
+
+        # The records say which occurrence they are for: the trend was fitted through September's occurrence.
+        meta = case.records['predictive_peak']['_meta']
+        self.assertEqual((meta['last_trained_occurrence_end'], meta['forecast_target_date']), ('2026-09-12', '2026-10-01'))
+        self.assertEqual(case.records['multiplicative_seasonal']['_meta']['forecast_target_date'], '2026-10-01')
 
         # -- backfill, scoring and selection
         run = self.run_forecast('--seasonal-event', 'ad', '--tournament')

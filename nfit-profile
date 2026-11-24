@@ -710,6 +710,7 @@ my %SEASONAL_UNVERIFIED_SNAPSHOTS;
 # What the multiplicative model divided each past occurrence by, for the stored record:
 # (denominator => text, occurrencePairs => LPAR-profile occurrences looked at, occurrencePairsWithoutIt => those left out).
 my %SEASONAL_MULTIPLIER_BASIS;
+my %SEASONAL_LAST_TRAINED_END;   # event name -> end date (YYYY-MM-DD) of the last occurrence the predictive series is fitted to
 # Research: size and precision of the durable contested record (history schema draft, 0.01-core counted pairs).
 my $research_contested_record;
 my %BUSY_SHARE_RULES = (binWidth => 0.10, minCores => 0.10, minEntShare => 0.10, minBinMinutes => 5, minMinutes => 15);
@@ -18512,6 +18513,32 @@ sub _get_true_baseline_results {
 }
 
 # ==============================================================================
+# SUBROUTINE: _seasonal_forecast_target
+# PURPOSE:    The occurrence a seasonal forecast is for: the first occurrence of the
+#             event that begins after a given day (the last occurrence trained on,
+#             or the end of the data, as the model's construction has it).
+# ARGS:
+#   1. $event_config (hash ref)
+#   2. $after_obj (Time::Piece): the day after which the target occurrence lies.
+#   3. $data_end_obj (Time::Piece): the end of the analysis window (for the horizon in days).
+#   4. $basis (string): how the target follows from the model, stored with it.
+# RETURNS:    { target_date, target_start, days, basis } or undef when it cannot be established.
+# ==============================================================================
+sub _seasonal_forecast_target {
+    my ($event_config, $after_obj, $data_end_obj, $basis) = @_;
+    return undef unless (defined $after_obj && ref($after_obj) eq 'Time::Piece');
+    my $after_day = Time::Piece->strptime($after_obj->ymd, '%Y-%m-%d');
+    my ($start, $end) = determine_event_period($event_config, $after_day + ONE_DAY, 'forecast');
+    # An occurrence already under way on that day is not the target: take the one that follows it.
+    ($start, $end) = determine_event_period($event_config, $end + ONE_DAY, 'forecast') if ($start && $end && $start <= $after_day);
+    return undef unless ($start && $end && $start > $after_day);
+    my $ref_day = (defined $data_end_obj && ref($data_end_obj) eq 'Time::Piece') ? Time::Piece->strptime($data_end_obj->ymd, '%Y-%m-%d') : $after_day;
+    my $days = int(($end->epoch - $ref_day->epoch) / 86400);
+    $days = 0 if ($days < 0);
+    return { target_date => $end->ymd, target_start => $start->ymd, days => $days, basis => $basis };
+}
+
+# ==============================================================================
 # SUBROUTINE: _get_historical_peak_data
 # PURPOSE:    Reads the snapshot cache for a given event and returns time series
 #             data for historical peaks and residuals. This version is enhanced
@@ -18532,6 +18559,7 @@ sub _get_historical_peak_data {
     my $cutoff_obj = (defined $asof_end_obj && ref($asof_end_obj) eq 'Time::Piece') ? $asof_end_obj->truncate(to => 'day') : undef;
 
     print STDERR "  ⧉ Predictive Peak: assembling saturation-aware historical peak and residual data for event $event_name\n";
+    delete $SEASONAL_LAST_TRAINED_END{$event_name};
 
     my $unified_history = read_unified_history($system_cache_dir);
     my @event_history;
@@ -18573,6 +18601,11 @@ sub _get_historical_peak_data {
         }
         my $hist_results = $event->{results};
         my $residual_results = $event->{results}{'PeakResidual'} || {};
+        # The last occurrence the series are fitted to. The projection is one occurrence beyond it, so
+        # this date, and not the end of the analysis window, says which occurrence the forecast is for.
+        $SEASONAL_LAST_TRAINED_END{$event_name} = $event->{periodEndDate}
+            if ($event->{periodEndDate} && $event->{periodEndDate} =~ /^\d{4}-\d{2}-\d{2}$/
+                && (!defined $SEASONAL_LAST_TRAINED_END{$event_name} || $event->{periodEndDate} gt $SEASONAL_LAST_TRAINED_END{$event_name}));
 
         # Build the union of (vm, profile) pairs from OccurrencePeaks[] and
         # legacy PeakValue so that rich occurrence-level entries are never
@@ -19743,6 +19776,10 @@ sub _store_model_forecast_to_history {
     if ($horizon_meta) {
         $meta_block->{forecast_target_date}  = $horizon_meta->{target_date};
         $meta_block->{forecast_horizon_days} = $horizon_meta->{days};
+        # How the target was established (absent where the record only names the period it summarises).
+        $meta_block->{forecast_target_start} = $horizon_meta->{target_start} if (defined $horizon_meta->{target_start});
+        $meta_block->{forecast_target_basis} = $horizon_meta->{basis}        if (defined $horizon_meta->{basis});
+        $meta_block->{last_trained_occurrence_end} = $horizon_meta->{trained_to} if (defined $horizon_meta->{trained_to});
     }
 
     # Phase 4: Inject fingerprints for idempotency (if provided)
@@ -33748,22 +33785,9 @@ sub _execute_multiplicative_seasonal {
 
     # Determine Forecast Horizon for Metadata (anchored to effective end date)
     my $asof_end = $exec_ctx->{effective_end_date} // $exec_ctx->{cache_end_date};
-    my ($next_start, $next_end) = determine_event_period($effective_config, $asof_end, 'forecast');
-    my $horizon_meta = undef;
-
-    if ($next_end) {
-        my $ref_time = (defined $asof_end && ref($asof_end) eq 'Time::Piece')
-            ? $asof_end
-            : Time::Piece->new();
-
-        my $days_diff = int(($next_end->epoch - $ref_time->epoch) / 86400);
-        $days_diff = 0 if $days_diff < 0;
-
-        $horizon_meta = {
-            target_date => $next_end->ymd,
-            days        => $days_diff
-        };
-    }
+    # The multiplier is applied to the baseline as of the end of the data, so the forecast is for the
+    # first occurrence after that day (not for an occurrence that ends on it, which the data covers).
+    my $horizon_meta = _seasonal_forecast_target($effective_config, $asof_end, $asof_end, 'next occurrence after the data ends');
 
     # Build the context object from existing args
     my $analysis_context = {
@@ -34577,20 +34601,13 @@ sub _execute_predictive_peak {
         $unique_suffix, \%seasonal_proposals, $current_cache_path, $args_href->{effective_start_date}, $args_href->{effective_end_date});
 
     # Determine Forecast Horizon for Metadata (anchored to effective end date)
-    my ($next_start, $next_end) = determine_event_period($effective_config, $args_href->{effective_end_date}, 'forecast');
-    my $horizon_meta = undef;
-
-    if ($next_end) {
-        my $ref_time = (defined $args_href->{effective_end_date} && ref($args_href->{effective_end_date}) eq 'Time::Piece') ? $args_href->{effective_end_date} : Time::Piece->new();
-
-        my $days_diff = int(($next_end->epoch - $ref_time->epoch) / 86400);
-        $days_diff = 0 if $days_diff < 0;
-
-        $horizon_meta = {
-            target_date => $next_end->ymd,
-            days        => $days_diff
-        };
-    }
+    # The trend is projected one occurrence beyond the occurrences it was fitted to, so the forecast is
+    # for the first occurrence after the last of those. Without a fitted occurrence no target is stated.
+    my $trained_to = $SEASONAL_LAST_TRAINED_END{$effective_event_name};
+    my $trained_to_obj = $trained_to ? eval { Time::Piece->strptime($trained_to, '%Y-%m-%d') } : undef;
+    my $horizon_meta = _seasonal_forecast_target($effective_config, $trained_to_obj, $args_href->{effective_end_date},
+        'next occurrence after the last occurrence trained on');
+    $horizon_meta->{trained_to} = $trained_to if ($horizon_meta);
 
     # Build the context object from existing args
     my $analysis_context = {
@@ -35263,8 +35280,10 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
                           sized => 'final occurrence' . (($occ_n && $bucket_occ_aref->[-1]{end}) ? ' ending ' . $bucket_occ_aref->[-1]{end}->ymd : '') },
     };
 
-    # Horizon meta is optional for multiplicative; keep undef unless you already compute it
-    my $horizon_meta = undef;
+    # The aggregate is applied to the baseline as of the end of the bucket's data, so the forecast is
+    # for the first occurrence after that day (as in the single-occurrence path).
+    my $horizon_meta = _seasonal_forecast_target($event_cfg, $bucket_exec_ctx->{effective_end_date}, $bucket_exec_ctx->{effective_end_date},
+        'next occurrence after the data ends');
 
     _store_model_forecast_to_history(
         $current_cache_path,
