@@ -11,19 +11,30 @@
 #                (--base <revision before it>, no flags);
 #              - why a variant moved between revisions
 #                (--base REV --flag=--research-engine-seasonal-input).
-#            Before each run the history, the stage's proposal store and the
-#            engine's result cache are restored from pristine copies, and every
-#            input is fingerprinted;
-#            the tool says whether the two runs read identical inputs.
+#            Both runs read one fixed history (the tree's history.pristine; the
+#            history found at invocation when there is none yet). Before each
+#            run that history, the stage's proposal store and the engine's
+#            result cache are put back, and every input is fingerprinted: the
+#            comparison FAILS when the two runs did not read identical inputs.
+#            What the kept tree held at invocation (its history, executables,
+#            seasonality file, proposal store and engine files) is kept apart
+#            from the fixed history and put back afterwards, also when a run
+#            fails. Nothing is rebuilt: these are seasonal runs on existing
+#            history.
 #            For each LPAR on its planning profile the stored terms of the two
 #            runs are compared in the order of the sizing chain: engine
 #            measurements, the model figure the chain reads, the starting
 #            requirement, the pressure tests, the additive, floors and caps, the
 #            profile target, the VP terms, the published figure. An LPAR is
-#            filed under the first group in which its terms differ; the rule
-#            that governs the published figure in each run is read from the
-#            stored proposal (role, cut protection, current-cycle status and
-#            binding).
+#            filed under the first group in which its terms differ: that says
+#            where the two runs first part, not what caused the published
+#            difference. The published difference itself is reconciled in
+#            cores: starting requirement, additive, the other terms of the
+#            chain up to the profile target, and the rules after the target
+#            (protection, role, current cycle), with the verdicts that flipped
+#            and the governing rule of each run from the stored proposal.
+#            LPARs and LPAR-profile pairs that cannot be compared are counted
+#            and named by reason, never dropped silently.
 #            Aggregates, and the largest movers under pseudonyms
 #            (dev/nfit-redact). The kept tree is left as it was found.
 # INPUT    : the work tree kept by dev/history-integration-check --keep
@@ -63,6 +74,8 @@ GROUPS = (
     ('profile target', ('FinalAdjustedPhysC',)),
     ('VP terms', ('rVCPU_Raw', 'rVCPU_YieldFloorCores', 'rVCPU_P99W1Floor', 'rVCPU_ReductionSafetyState', 'rVCPU_Final')),
 )
+VERDICTS = ('CPUCapLimited', 'CPUFlatlining', 'CPUFlatliningPartial', 'CPUFlatliningPartialSevere', 'IsRunQPressure', 'IsWorkloadPressure',
+            'DBWDampeningApplied', 'AdditiveSafetyCapApplied', 'BudgetFloorApplied')
 SHOWN = ('PreGrowthBasePhysC', 'BasePhysC', 'BasePlanningDemand', 'IsWorkloadPressure', 'IsRunQPressure', 'FinalAdditive', 'FinalAdjustedPhysC')
 
 
@@ -159,27 +172,63 @@ def pseudonyms(names):
             for i, name in enumerate(names)}
 
 
+def verdict(value):
+    """A stored verdict as yes/no: the first word decides ('True (75% dampening ...)' is yes)."""
+    word = str(value if value is not None else '').strip().split(' ')[0].lower()
+    return 'yes' if word in ('true', 'yes', '1') else 'no'
+
+
 def compare(base, head):
-    """Per LPAR on its planning profile: which groups of terms differ, and the published figures of both runs."""
-    lpars = []
-    for vm, th in head['trace'].items():
-        tb, mh, mb = base['trace'].get(vm), head['members'].get(vm), base['members'].get(vm)
-        profile = th.get('planningProfile')
-        if not tb or not mh or not mb or profile is None or tb.get('planningProfile') != profile:
+    """Per LPAR on its planning profile: which groups of terms differ, the published figures of both runs and
+    the terms that reconcile their difference. Also what could not be compared, by reason."""
+    lpars, left_out = [], {}
+    pairs = {'compared': 0, 'onlyInBase': 0, 'onlyInCurrent': 0}
+
+    def leave_out(reason, vm):
+        left_out.setdefault(reason, []).append(vm)
+
+    for vm in sorted(set(base['trace']) | set(head['trace'])):
+        th, tb = head['trace'].get(vm), base['trace'].get(vm)
+        if th is None or tb is None:
+            leave_out('sized only by the base revision' if th is None else 'sized only by the current files', vm)
             continue
-        dh, db = (th.get('profiles') or {}).get(profile) or {}, (tb.get('profiles') or {}).get(profile) or {}
+        ph_, pb_ = th.get('profiles') or {}, tb.get('profiles') or {}
+        pairs['compared'] += len(set(ph_) & set(pb_))
+        pairs['onlyInBase'] += len(set(pb_) - set(ph_))
+        pairs['onlyInCurrent'] += len(set(ph_) - set(pb_))
+        profile = th.get('planningProfile')
+        mh, mb = head['members'].get(vm), base['members'].get(vm)
+        if profile is None or tb.get('planningProfile') != profile:
+            leave_out('planning profile differs between the runs', vm)
+            continue
+        if profile not in ph_ or profile not in pb_:
+            leave_out('planning profile not sized in both runs', vm)
+            continue
+        if not mh or not mb:
+            leave_out('no stored proposal member in both runs', vm)
+            continue
+        dh, db = ph_[profile], pb_[profile]
         differing = {name: [k for k in keys if not same(db.get(k), dh.get(k))] for name, keys in GROUPS}
         (pb, vb, rb), (ph, vh, rh) = published(mb), published(mh)
+        if pb is None or ph is None:
+            leave_out('no published entitlement in both runs', vm)
+            continue
         groups = [name for name, _keys in GROUPS if differing[name]]
-        if (pb is not None and ph is not None and abs(ph - pb) >= EPS) or vb != vh:
+        if abs(ph - pb) >= EPS or vb != vh:
             groups.append('published')
+        delta = lambda key: (num(dh.get(key)) or 0.0) - (num(db.get(key)) or 0.0)
+        d_start, d_add, d_target = delta('BasePlanningDemand'), delta('FinalAdditive'), delta('FinalAdjustedPhysC')
         lpars.append((vm, {'planningProfile': profile, 'groups': groups, 'first': groups[0] if groups else 'nothing differs',
                            'terms': sorted(k for keys in differing.values() for k in keys),
                            'base': {k: db.get(k) for k in SHOWN}, 'head': {k: dh.get(k) for k in SHOWN},
+                           'verdictsFlipped': {k: '%s>%s' % (verdict(db.get(k)), verdict(dh.get(k))) for k in VERDICTS
+                                               if verdict(db.get(k)) != verdict(dh.get(k))},
                            'publishedBase': pb, 'publishedHead': ph, 'vpsBase': vb, 'vpsHead': vh, 'ruleBase': rb, 'ruleHead': rh,
-                           'publishedChange': (ph - pb) if pb is not None and ph is not None else None,
-                           'targetChange': ((num(dh.get('FinalAdjustedPhysC')) or 0) - (num(db.get('FinalAdjustedPhysC')) or 0))}))
-    return lpars
+                           'publishedChange': ph - pb, 'targetChange': d_target,
+                           # The published difference in cores, term by term: the four add up to it.
+                           'reconciliation': {'startingRequirement': d_start, 'additive': d_add, 'otherChainTerms': d_target - d_start - d_add,
+                                              'afterTheTarget': (ph - pb) - d_target}}))
+    return lpars, left_out, pairs
 
 
 def main():
@@ -213,59 +262,92 @@ def main():
         blobs[name] = blob.stdout
     base_id = subprocess.run(['git', '-C', str(REPO), 'rev-parse', '--short', a.base], capture_output=True, text=True).stdout.strip() or a.base
 
-    shutil.copy(seasonality, app / 'etc' / 'nfit.seasonality.cfg')
     history = case / 'history' / stage.name
     pristine = case / 'history.pristine' / stage.name
-    if not pristine.is_dir():
-        pristine.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(history, pristine)
-    proposals, kept_proposals = stage / PROPOSALS, work / 'proposals.pristine'
-    if kept_proposals.exists():
-        shutil.rmtree(kept_proposals)
+    proposals = stage / PROPOSALS
+    live_settings = app / 'etc' / 'nfit.seasonality.cfg'
+    # What the kept tree holds now, apart from the fixed history both runs read.
+    held = work / 'invocation.keep'
+    if held.exists():
+        shutil.rmtree(held)
+    held.mkdir(parents=True)
+    shutil.copytree(history, held / 'history')
     if proposals.exists():
-        shutil.copytree(proposals, kept_proposals)
-    kept_engine = work / 'engine-files.pristine'
-    keep_engine_files(stage, kept_engine)
-    env = pr.perl_env()
-    args = ['--nmondir', str(stage), '--apply-seasonality', a.event] + list(a.flag)
-    if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
-        args += ['--config', str(app / 'config.csv')]
+        shutil.copytree(proposals, held / 'proposals')
+    keep_engine_files(stage, held / 'engine-files')
+    (held / 'app').mkdir()
+    for name in pr.EXECUTABLES:
+        if (app / name).is_file():
+            shutil.copy2(app / name, held / 'app' / name)
+    if live_settings.is_file():
+        shutil.copy2(live_settings, held / 'app' / live_settings.name)
 
-    runs, inputs = {}, {}
-    for label in ('base', 'head'):
+    def put_back():
+        restore(held / 'history', history)
+        restore(held / 'proposals', proposals)
+        restore_engine_files(stage, held / 'engine-files')
         for name in pr.EXECUTABLES:
-            if label == 'base':
-                (app / name).write_bytes(blobs[name])
-            else:
-                shutil.copy(REPO / name, app / name)
-            (app / name).chmod(0o700)
-        restore(kept_proposals, proposals)
-        restore_engine_files(stage, kept_engine)
-        inputs[label] = {'stagedData': fingerprint(stage, skip=(PROPOSALS,) + ENGINE_FILES), 'proposalStore': fingerprint(proposals),
-                         'engineCaches': ''.join(fingerprint(stage / name) for name in ENGINE_FILES),
-                         'history': fingerprint(pristine), 'configuration': fingerprint(app / 'config.csv'),
-                         'settings': fingerprint(app / 'etc')}
-        trace = work / f'seasonal-revision-{label}.private.json'
-        trace.unlink(missing_ok=True)
-        print(f"{a.event} ({model}): sizing with {'revision ' + base_id if label == 'base' else 'the current files'}"
-              + (' and ' + ' '.join(a.flag) if a.flag else ''), flush=True)
-        rows, _log, seconds, members = spc.one_run(app, case, stage, history, pristine, 'seasonal-revision-' + label,
-                                                   args + ['--research-runq-trace', str(trace)], env)
-        if not rows or not trace.is_file():
-            restore(pristine, history)
-            restore(kept_proposals, proposals)
-            restore_engine_files(stage, kept_engine)
-            sys.exit(f'seasonal-revision-compare: the {label} run produced no CSV or no trace (does that revision know every switch given? '
-                     'see its private log in the work tree)')
-        runs[label] = {'members': members, 'trace': json.loads(trace.read_text())['members'], 'seconds': seconds}
-    restore(pristine, history)                             # the kept tree as it was found
-    restore(kept_proposals, proposals)
-    restore_engine_files(stage, kept_engine)
-    identical = {k: inputs['base'][k] == inputs['head'][k] for k in inputs['base']}
+            (app / name).unlink(missing_ok=True)
+            if (held / 'app' / name).is_file():
+                shutil.copy2(held / 'app' / name, app / name)
+        live_settings.unlink(missing_ok=True)
+        if (held / 'app' / live_settings.name).is_file():
+            shutil.copy2(held / 'app' / live_settings.name, live_settings)
 
-    lpars = compare(runs['base'], runs['head'])
+    made_pristine = not pristine.is_dir()
+    runs, inputs = {}, {}
+    try:
+        if made_pristine:                                  # no fixed history yet: the history found now is it, for this call only
+            pristine.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(history, pristine)
+        shutil.copy(seasonality, live_settings)
+        env = pr.perl_env()
+        args = ['--nmondir', str(stage), '--apply-seasonality', a.event] + list(a.flag)
+        if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
+            args += ['--config', str(app / 'config.csv')]
+        for label in ('base', 'head'):
+            for name in pr.EXECUTABLES:
+                if label == 'base':
+                    (app / name).write_bytes(blobs[name])
+                else:
+                    shutil.copy(REPO / name, app / name)
+                (app / name).chmod(0o700)
+            restore(held / 'proposals', proposals)
+            restore_engine_files(stage, held / 'engine-files')
+            inputs[label] = {'stagedData': fingerprint(stage, skip=(PROPOSALS,) + ENGINE_FILES), 'proposalStore': fingerprint(proposals),
+                             'engineCaches': ''.join(fingerprint(stage / name) for name in ENGINE_FILES),
+                             'history': fingerprint(pristine), 'configuration': fingerprint(app / 'config.csv'),
+                             'settings': fingerprint(app / 'etc')}
+            trace = work / f'seasonal-revision-{label}.private.json'
+            trace.unlink(missing_ok=True)
+            print(f"{a.event} ({model}): sizing with {'revision ' + base_id if label == 'base' else 'the current files'}"
+                  + (' and ' + ' '.join(a.flag) if a.flag else ''), flush=True)
+            try:
+                rows, _log, seconds, members = spc.one_run(app, case, stage, history, pristine, 'seasonal-revision-' + label,
+                                                           args + ['--research-runq-trace', str(trace)], env)
+            except RuntimeError as failure:
+                sys.exit(f'seasonal-revision-compare: the {label} run failed ({failure}). Does that revision know every switch given? '
+                         'The kept tree was put back as it was found.')
+            if not rows or not trace.is_file():
+                sys.exit(f'seasonal-revision-compare: the {label} run produced no CSV or no trace (does that revision know every switch given? '
+                         'see its private log in the work tree). The kept tree was put back as it was found.')
+            runs[label] = {'members': members, 'trace': json.loads(trace.read_text())['members'], 'seconds': seconds}
+    finally:
+        put_back()                                         # the kept tree as it was found, also when a run failed
+        if made_pristine and pristine.is_dir():
+            shutil.rmtree(pristine)
+            if not any(pristine.parent.iterdir()):
+                pristine.parent.rmdir()
+    identical = {k: inputs['base'][k] == inputs['head'][k] for k in inputs['base']}
+    if not all(identical.values()):
+        sys.exit('seasonal-revision-compare: the two runs did not read identical inputs (%s); no comparison is reported'
+                 % ', '.join(k for k, v in identical.items() if not v))
+
+    lpars, left_out, pairs = compare(runs['base'], runs['head'])
+    all_names = pseudonyms(sorted({vm for vms in left_out.values() for vm in vms}))
     total = lambda key: round(sum((r.get(key) or 0.0) for _vm, r in lpars), 2)
-    by_first, by_term, by_rule = {}, {}, {}
+    by_first, by_term, by_rule, flips = {}, {}, {}, {}
+    reconciliation = {'startingRequirement': 0.0, 'additive': 0.0, 'otherChainTerms': 0.0, 'afterTheTarget': 0.0}
     for _vm, r in lpars:
         slot = by_first.setdefault(r['first'], {'lpars': 0, 'targetChange': 0.0, 'publishedChange': 0.0, 'publishedMoved': 0})
         slot['lpars'] += 1
@@ -275,6 +357,10 @@ def main():
         for term in r['terms']:
             by_term[term] = by_term.get(term, 0) + 1
         if abs(r['publishedChange'] or 0.0) >= EPS:
+            for key, value in r['reconciliation'].items():
+                reconciliation[key] = round(reconciliation[key] + value, 4)
+            for key, flip in r['verdictsFlipped'].items():
+                flips['%s %s' % (key, flip)] = flips.get('%s %s' % (key, flip), 0) + 1
             pair = by_rule.setdefault('%s -> %s' % (r['ruleBase'], r['ruleHead']), {'lpars': 0, 'publishedChange': 0.0})
             pair['lpars'] += 1
             pair['publishedChange'] = round(pair['publishedChange'] + r['publishedChange'], 2)
@@ -285,10 +371,19 @@ def main():
     result = {'event': a.event, 'model': model, 'base': base_id, 'head': pr.git_identity(), 'flags': a.flag,
               'inputsIdentical': identical, 'allInputsIdentical': all(identical.values()),
               'method': {'groups': {name: list(keys) for name, keys in GROUPS}, 'tolerance': EPS,
-                         'first': 'the first group, in the order of the sizing chain, in which a term of the planning profile differs',
+                         'first': 'the first group, in the order of the sizing chain, in which a term of the planning profile differs: '
+                                  'where the runs first part, not the cause of a published difference',
+                         'reconciliation': 'over the LPARs whose published figure moved, in cores: change of the starting requirement, of the additive, '
+                                           'of the other chain terms up to the profile target (target - start - additive), and of what the rules '
+                                           'after the target add (published - target); the four add up to the published change',
                          'rule': 'role, else cut protection where it bound, else the current-cycle status and binding of the stored proposal',
-                         'restored': 'history, the proposal store of the stage and the engine result cache are restored from pristine copies before each run'},
+                         'restored': 'both runs read one fixed history; it, the proposal store and the engine files are put back before each run; the state found at invocation is kept apart and put back afterwards, also on failure'},
               'lpars': len(lpars),
+              'notCompared': {reason: {'lpars': len(vms), 'pseudonyms': [all_names[vm] for vm in vms]} for reason, vms in sorted(left_out.items())},
+              'profilePairs': pairs,
+              'reconciliationOfPublishedMoves': dict({k: round(v, 2) for k, v in reconciliation.items()},
+                                                     total=round(sum(reconciliation.values()), 2)),
+              'verdictsFlippedOnPublishedMoves': dict(sorted(flips.items(), key=lambda kv: -kv[1])),
               'totals': {'publishedBase': total('publishedBase'), 'publishedHead': total('publishedHead'), 'publishedChange': total('publishedChange'),
                          'targetChange': total('targetChange'),
                          'publishedMoved': sum(1 for _v, r in lpars if abs(r['publishedChange'] or 0.0) >= EPS),
@@ -311,7 +406,16 @@ def main():
     print('  Inputs identical for both runs: ' + ', '.join('%s %s' % (k, 'yes' if v else 'NO') for k, v in identical.items()))
     print(f"  Published: {t['publishedBase']:.2f} -> {t['publishedHead']:.2f} cores ({t['publishedChange']:+.2f}); moved on {t['publishedMoved']} LPARs; "
           f"VPs changed on {t['vpsChanged']}; profile targets {t['targetChange']:+.2f}")
-    print('  LPARs by the first group of terms that differs (order of the sizing chain):')
+    print(f"  LPAR-profile pairs sized by both runs: {pairs['compared']}; only by the base revision {pairs['onlyInBase']}; only by the current files {pairs['onlyInCurrent']}")
+    if left_out:
+        print('  NOT compared: ' + '; '.join('%s: %d (%s)' % (reason, len(vms), ', '.join(all_names[vm] for vm in vms)) for reason, vms in sorted(left_out.items())))
+    else:
+        print('  Every LPAR sized by either run is compared.')
+    rc = result['reconciliationOfPublishedMoves']
+    print(f"  Published moves reconciled (cores, {t['publishedMoved']} LPARs): starting requirement {rc['startingRequirement']:+.2f}; additive {rc['additive']:+.2f}; "
+          f"other chain terms {rc['otherChainTerms']:+.2f}; rules after the target {rc['afterTheTarget']:+.2f}; sum {rc['total']:+.2f}")
+    print('  Verdicts that flipped on those LPARs (base>current): ' + ('; '.join('%s %d' % kv for kv in result['verdictsFlippedOnPublishedMoves'].items()) or 'none'))
+    print('  LPARs by the first group of terms that differs (where the runs first part; not a cause):')
     for name, c in result['byFirstDifferingGroup'].items():
         print('    %-32s %4d LPARs  target %+8.2f  published %+8.2f  (published moved on %d)' % (name, c['lpars'], c['targetChange'], c['publishedChange'], c['publishedMoved']))
     print('  Terms that differ (LPARs): ' + ('; '.join('%s %d' % kv for kv in list(result['termsDiffering'].items())[:14]) or 'none'))
@@ -325,9 +429,10 @@ def main():
         for vm, r in ranked:
             flags = '%s>%s / %s>%s' % (r['base'].get('IsWorkloadPressure'), r['head'].get('IsWorkloadPressure'), r['base'].get('IsRunQPressure'), r['head'].get('IsRunQPressure'))
             rule = r['ruleHead'] if r['ruleBase'] == r['ruleHead'] else '%s > %s' % (r['ruleBase'], r['ruleHead'])
-            print('    %-12s %-10s %13s %13s %13s %11s %13s %13s  %s; %s' % (
+            flipped = ', '.join('%s %s' % kv for kv in r['verdictsFlipped'].items() if not kv[0].startswith('Is'))
+            print('    %-12s %-10s %13s %13s %13s %11s %13s %13s  %s; %s%s' % (
                 names[vm], r['planningProfile'], pair(r, 'PreGrowthBasePhysC'), pair(r, 'BasePhysC'), pair(r, 'BasePlanningDemand'), pair(r, 'FinalAdditive'),
-                pair(r, 'FinalAdjustedPhysC'), '%.2f>%.2f' % (r['publishedBase'], r['publishedHead']), flags, rule))
+                pair(r, 'FinalAdjustedPhysC'), '%.2f>%.2f' % (r['publishedBase'], r['publishedHead']), flags, rule, ('; ' + flipped) if flipped else ''))
     audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
     print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
     print(f'Written: {target}')
