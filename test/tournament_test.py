@@ -62,6 +62,7 @@ def load():
     ns = {'os': os, 'json': json, 'sys': sys, 'datetime': datetime}
     exec(compile(SOURCE[start:end], FORECAST, 'exec'), ns)
     ledger = re.search(r'^SCORING_LOGIC_VERSION = .*?$', SOURCE, re.M).group(0) + '\n' + \
+        re.search(r'^MODEL_COMPLEXITY_ORDER = \{.*?^\}', SOURCE, re.S | re.M).group(0) + '\n' + \
         re.search(r'^def calculate_pinball_loss\(.*?(?=^class NFitForecast)', SOURCE, re.S | re.M).group(0)
     exec(compile(ledger, FORECAST, 'exec'), ns)
     return ns
@@ -342,6 +343,50 @@ class LedgerTests(unittest.TestCase):
             data['meta'].pop(key, None)
         return data
 
+    def test_a_selection_reports_the_chosen_candidates_own_figures_or_nothing(self):
+        resolve = T['resolve_selection']
+        median = {'selection_mode': 'bootstrap', 'chosen_model': 'ensemble_median', 'rationale': 'r'}
+        # No candidate in the pool: nothing is reported, whatever the selection says. (The forecast of the
+        # synthesised weekly ensemble used to stay in the row under the name ensemble_median.)
+        for pool in ({}, None, {'holt': None}):
+            got = resolve(median, pool, {})
+            self.assertEqual((got['model'], got['mode'], got['forecast'], got['pi_lower'], got['pi_upper']), ('', 'no eligible forecast', None, None, None))
+            self.assertRegex(got['rationale'], r'^No eligible forecast')
+        # The median of the pool: no interval, even where candidates have their own.
+        got = resolve(median, {'a': 1.0, 'b': 3.0, 'c': 10.0}, {'a': (0.5, 1.5)})
+        self.assertEqual((got['model'], got['mode'], got['forecast'], got['pi_lower'], got['pi_upper']), ('ensemble_median', 'bootstrap', 3.0, None, None))
+        self.assertEqual(resolve(median, {'a': 1.0, 'b': 3.0}, {})['forecast'], 2.0)
+        # A chosen model: its own forecast and its own interval, or no interval.
+        for mode in ('tournament', 'unopposed'):
+            chosen = {'selection_mode': mode, 'chosen_model': 'a', 'rationale': 'r'}
+            got = resolve(chosen, {'a': 1.0, 'b': 3.0}, {'a': (0.5, 1.5), 'b': (2.0, 4.0)})
+            self.assertEqual((got['model'], got['mode'], got['forecast'], got['pi_lower'], got['pi_upper']), ('a', mode, 1.0, 0.5, 1.5))
+            got = resolve(chosen, {'a': 1.0, 'b': 3.0}, {'b': (2.0, 4.0)})
+            self.assertEqual((got['forecast'], got['pi_lower'], got['pi_upper']), (1.0, None, None))
+            self.assertEqual(resolve(chosen, {'b': 3.0}, {})['mode'], 'no eligible forecast')
+
+    def test_a_single_qualified_model_is_chosen_and_said_to_be_unopposed(self):
+        ledger = T['ScoreLedger'](self.folder)
+        for index in range(5):
+            month = '2026-%02d' % (index + 1)
+            ledger.record_observation('vmA', P1, 'ev', 'event_multiplier', 2.0, 1.9, 0.95, month)
+            if index < 2:
+                ledger.record_observation('vmA', P1, 'ev', 'predictive_peak', 2.0, 2.0, 0.95, month)
+        got = ledger.select_best_model('vmA', P1, 'ev', ['event_multiplier', 'predictive_peak'])
+        self.assertEqual((got['selection_mode'], got['chosen_model'], got['observations']), ('unopposed', 'event_multiplier', 5))
+        self.assertRegex(got['rationale'], r'^Single qualified model: event_multiplier \(avg pinball loss \d+\.\d{4} over 5 observations\)\. '
+                                           r'Comparative superiority not established\.$')
+        # Nothing was measured against it: no credit for a margin or for a field.
+        self.assertEqual((got['confidence_components']['margin_score'], got['confidence_components']['field_score']), (0.0, 0.0))
+        # With a second qualified model it is a tournament.
+        for index in range(2, 5):
+            ledger.record_observation('vmA', P1, 'ev', 'predictive_peak', 2.0, 2.0, 0.95, '2026-%02d' % (index + 1))
+        got = ledger.select_best_model('vmA', P1, 'ev', ['event_multiplier', 'predictive_peak'])
+        self.assertEqual((got['selection_mode'], got['chosen_model']), ('tournament', 'predictive_peak'))
+        self.assertEqual(got['confidence_components']['field_score'], 10.0)
+        # None qualified: the median of the pool.
+        self.assertEqual(ledger.select_best_model('vmA', P1, 'ev', ['holt'])['selection_mode'], 'bootstrap')
+
     def test_the_new_ledger_is_its_own_file_and_the_earlier_one_is_left_alone(self):
         with open(self.old, 'rb') as fh:
             before = fh.read()
@@ -491,6 +536,17 @@ class EndToEndTests(unittest.TestCase):
         # A direct model fitted to the weekly series states that series' quantity and is not relabelled.
         direct = candidates['holt']['vmS'][P.PROFILE]
         self.assertIn(direct['output_quantity'], ('weekly-profile-maximum', 'weekly-raw-peak'))
+        self.assertNotIn('ahead', direct)
+        # Beside it, under its own name, the event-profile candidate derived from it: the model's forecast of the
+        # week before October's occurrence (three weeks on from the last week of data) times the ratio of past
+        # event values to the same series in the week before each of them. Here that ratio is 1.2.
+        derived = candidates['holt_event']['vmS'][P.PROFILE]
+        self.assertEqual((derived['derived_from'], derived['output_quantity'], derived['steps_ahead'], derived['background_week_end']),
+                         ('holt', 'profile-demand', 3, '2026-09-27'))
+        self.assertEqual((derived['data_end'], derived['target_start'], derived['target_date']), ('2026-09-12', '2026-10-01', '2026-10-01'))
+        self.assertAlmostEqual(derived['forecast'], derived['background_forecast'] * derived['multiplier'], places=6)
+        self.assertAlmostEqual(derived['multiplier'], 1.2, delta=0.02)
+        self.assertGreaterEqual(derived['multiplier_n'], 1)
         # The pool for selection is that of the latest month, for the occurrence its candidates name; the weekly outputs stay out.
         # Here that is October, whose candidates are for November's occurrence, which no history holds yet.
         self.assertIn('ad, candidates for selection: those stored in 2026-10; quantity: profile-demand (profile-requirement-1)', text)
@@ -505,13 +561,15 @@ class EndToEndTests(unittest.TestCase):
         scoring = snaps['2026-09']['ad']['AdaptiveForecast']['scoring']
         self.assertEqual((scoring['_meta']['scoring_semantics'], scoring['_meta']['scored_against_month']), ('profile-requirement-1', '2026-10'))
         part = scoring['participation']
+        self.assertEqual(part['holt_event']['status'], 'participates')
         self.assertEqual({m: part[m]['status'] for m in ('predictive_peak', 'multiplicative_seasonal', 'event_multiplier', 'holt')},
                          {'predictive_peak': 'participates', 'multiplicative_seasonal': 'participates',
                           'event_multiplier': 'participates', 'holt': 'withheld'})
         # The ledger: the target is the October value on the profile basis, 1.3 B, for the admitted models only.
         first = self.ledger_content()
         models = first['scores']['vmS'][P.PROFILE]['ad']['models']
-        self.assertEqual(sorted(models), ['event_multiplier', 'multiplicative_seasonal', 'predictive_peak'])
+        self.assertEqual(sorted(m for m in models if not m.endswith('_event')), ['event_multiplier', 'multiplicative_seasonal', 'predictive_peak'])
+        self.assertIn('holt_event', models)
         entry = models['predictive_peak']['monthly_scores']['2026-09']
         self.assertAlmostEqual(entry['target'], 1.3 * case.values['vmS'][P.PROFILE], places=3)
         self.assertEqual(entry['target_class'], 'observed')
@@ -530,7 +588,7 @@ class EndToEndTests(unittest.TestCase):
         self.run_forecast('--seasonal-event', 'ad', '--tournament', '--force-rescore')
         after = self.ledger_content()
         models = after['scores']['vmS'][P.PROFILE]['ad']['models']
-        self.assertEqual(sorted(models), ['event_multiplier', 'multiplicative_seasonal'])
+        self.assertEqual(sorted(m for m in models if not m.endswith('_event')), ['event_multiplier', 'multiplicative_seasonal'])
         self.assertEqual(models['multiplicative_seasonal'], first['scores']['vmS'][P.PROFILE]['ad']['models']['multiplicative_seasonal'])
 
 

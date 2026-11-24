@@ -90,6 +90,9 @@ class PartsTests(unittest.TestCase):
             ['v2', 'ensemble_median', 'bootstrap', '4.2', '', '', '4.2', '', ''],              # the median with this run's multiplier
             ['v2', 'ensemble_median', 'bootstrap', '4.0', '3.0', '5.0', '', '', ''],           # a borrowed interval
             ['v2', 'ensemble_median', 'bootstrap', '9.0', '', '', '', '', ''],                 # not the median
+            ['v1', 'event_multiplier', 'unopposed', '2.4', '2.0', '2.8', '', '', ''],          # a single qualified model: its own figures
+            ['v3', '', 'no eligible forecast', '', '', '', '', '', ''],                        # no candidate: nothing reported
+            ['v3', '', 'no eligible forecast', '7.0', '6.0', '8.0', '', '', ''],               # ... and never another forecast in its place
         ]
         path = os.path.join(folder, 'selection.csv')
         with open(path, 'w', newline='') as fh:
@@ -106,9 +109,36 @@ class PartsTests(unittest.TestCase):
             'tournament: the chosen model is not in the pool': 1,
             'bootstrap: the median of the pool, no interval reported': 2,
             'bootstrap: an interval is reported although a median has none of its own': 1,
-            'bootstrap: forecast is not the median of the pool': 1})
-        self.assertEqual(modes, {'tournament': 7, 'bootstrap': 4})
+            'bootstrap: forecast is not the median of the pool': 1,
+            'unopposed: own forecast and own interval': 1,
+            'no eligible forecast: nothing reported': 1,
+            'no eligible forecast: a forecast or an interval is reported all the same': 1})
+        self.assertEqual(modes, {'tournament': 7, 'bootstrap': 4, 'unopposed': 1, 'no eligible forecast': 2})
         self.assertEqual(chosen[('ensemble_median', 'bootstrap')], 4)
+
+
+class MatchedTests(unittest.TestCase):
+
+    def test_models_are_compared_on_the_cases_both_were_scored_on(self):
+        def scores(losses, label='observed'):
+            return {'monthly_scores': {month: {'pinball_loss': loss, 'target_class': label} for month, loss in losses.items()}}
+        months = ['2026-0%d' % n for n in range(1, 8)]
+        ledger = {'scores': {'v1': {'P': {'ad': {'models': {
+            'event_multiplier': scores({m: 0.20 for m in months}),
+            'holt_event': scores({m: 0.10 for m in months}),
+            'predictive_peak': scores({'2026-06': 0.30, '2026-07': 0.50})}}, 'other': {'models': {'x': scores({'2026-01': 9.0})}}}},
+            'v2': {'P': {'ad': {'models': {'event_multiplier': scores({'2026-07': 0.40}, 'estimated (hidden demand added)')}}}}}}
+        cases = A.ledger_cases(ledger, 'ad')
+        self.assertEqual(sorted(cases), ['event_multiplier', 'holt_event', 'predictive_peak'])        # the other event's scores are not read
+        text = '\n'.join(A.matched_report(cases, 5))
+        # Outcomes are counted once, however many candidates were scored against them.
+        self.assertIn('outcomes scored against: 8 (LPAR, profile, occurrence) - 1 estimated (hidden demand added), 7 observed; 17 candidate evaluations of them', text)
+        self.assertRegex(text, r'holt_event\s+all\s+7\s+7\s+0\.1000\s+0\.2000\s+-0\.1000\s+100%')
+        self.assertRegex(text, r'predictive_peak\s+all\s+2\s+2\s+0\.4000\s+0\.2000\s+\+0\.2000\s+0%')
+        # At the sixth and seventh origins five earlier scores are known: holt_event has the lowest and is chosen.
+        self.assertIn('2 cases: mean loss of the model chosen 0.1000; of event_multiplier on the same cases 0.2000; difference -0.1000', text)
+        self.assertIn('chosen: 2 x holt_event', text)
+        self.assertEqual(A.matched_report({}, 5), [])
 
 
 @unittest.skipUnless(TT.T and M.perl_ready() and TT.RUNTIME, "nfit-forecast, perl with JSON or nfit-forecast's Python modules unavailable")
@@ -151,6 +181,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertRegex(text, r'predictive_peak\s+\d+\s+\d+\s+\d+\.\d{4}')
         self.assertIn('none: every selection falls back to the median of the pool (bootstrap)', text)     # one scored occurrence is not five
         self.assertIn('Ledger rebuilt from nothing: identical', text)
+        self.assertIn('4. Matched comparison (the same LPAR, profile and occurrence)', text)
+        self.assertRegex(text, r'holt_event\s+all\s+1\s+\d+\s+\d\.\d{4}')                   # the derived candidates are scored and compared
         self.assertIn('ad, candidates for selection: those stored in 2026-10', text)
         self.assertRegex(text, r'\d+ x bootstrap: the median of the pool, no interval reported')
         for wrong in ('differs', 'although', 'is not the median', 'not in the pool\n', 'DIFFERENT', 'HISTORY CHANGED'):

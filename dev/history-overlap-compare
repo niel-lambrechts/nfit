@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/history-overlap-compare
+# PURPOSE  : Two histories of the same system hold some of the same months (an
+#            earlier history and the current one). Before values of both are
+#            used together, this compares the months they share and says, in
+#            aggregates only, whether the stored quantities agree:
+#              - what each side records of how the month was calculated;
+#              - coverage: LPARs, profiles and days on each side;
+#              - daily profile values and daily peaks, value by value;
+#              - event results (event value, baseline, residual, clipping and
+#                its increment, occurrence peaks), pair by pair;
+#              - within each side, how the event value relates to the highest
+#                daily profile value of the occurrence and to the raw peak, and
+#                the stored baseline to the mean of its days: a difference in
+#                those relations is a difference of definition;
+#              - whether a model record from before the correction sits beside
+#                observed results.
+#            A ratio is new / old. No LPAR, system or serial number is printed.
+#            It reads; it writes nothing.
+# USAGE    : dev/history-overlap-compare --old DIR [--new DIR] [--months 2026-08,2026-09]
+#            DIR holds nfit.hist.YYYY-MM.json files. --new defaults to the fixed
+#            history of .private/history-check-prod.
+# ==============================================================================
+import argparse
+import json
+import statistics
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+RESULT_KEYS = ('HistoricPeak', 'PeakValue', 'HistoricBaseline', 'PeakResidual')
+SHOWN = ('version', 'schema', 'basis', 'interval', 'processed', 'generated', 'days', 'smoothing')
+
+
+def months_of(folder):
+    out = {}
+    for path in sorted(Path(folder).glob('nfit.hist.*.json')):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        for month, content in data.items():
+            if isinstance(content, dict):
+                out[month] = content
+    return out
+
+
+def number(value):
+    """A stored figure: a number, or the first numeric field of a small record."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    if isinstance(value, dict):
+        for key in ('value', 'raw_peak', 'peak', 'max'):
+            if number(value.get(key)) is not None:
+                return number(value[key])
+    return None
+
+
+def ratios_line(label, pairs):
+    """One line on matched figures: how many, how the ratio new / old is spread, how many agree."""
+    usable = [(a, b) for a, b in pairs if a is not None and b is not None]
+    if not usable:
+        return f'    {label:<34} no matched value'
+    same = sum(1 for a, b in usable if abs(a - b) <= 1e-4 + 1e-4 * max(abs(a), abs(b)))
+    ratios = sorted(b / a for a, b in usable if a > 1e-6)
+    if not ratios:
+        return f'    {label:<34} {len(usable):>7} matched; identical {100.0 * same / len(usable):.0f}% (old values are zero)'
+    pick = lambda q: ratios[min(len(ratios) - 1, int(q * len(ratios)))]
+    within = lambda tolerance: 100.0 * sum(1 for r in ratios if abs(r - 1.0) <= tolerance) / len(ratios)
+    return (f'    {label:<34} {len(usable):>7} matched; identical {100.0 * same / len(usable):>3.0f}%; within 2% {within(0.02):>3.0f}%; within 5% {within(0.05):>3.0f}%; '
+            f'ratio median {statistics.median(ratios):.3f} (10th {pick(0.10):.3f}, 90th {pick(0.90):.3f})')
+
+
+def daily(month_data, series):
+    """{(LPAR, profile, day): value} of one daily series of a month."""
+    out = {}
+    for vm, block in (month_data.get('MonthlyWorkloadAnalysis') or {}).items():
+        by_profile = block.get(series) if isinstance(block, dict) else None
+        if not isinstance(by_profile, dict):
+            continue
+        for profile, by_day in by_profile.items():
+            if isinstance(by_day, dict):
+                for day, value in by_day.items():
+                    if number(value) is not None:
+                        out[(vm, profile, day)] = number(value)
+    return out
+
+
+def by_pair(block):
+    """{(LPAR, profile): value} of a results block keyed LPAR -> profile."""
+    out = {}
+    for vm, by_profile in (block or {}).items() if isinstance(block, dict) else []:
+        if isinstance(by_profile, dict):
+            for profile, value in by_profile.items():
+                if number(value) is not None:
+                    out[(vm, profile)] = number(value)
+    return out
+
+
+def window_of(snapshot):
+    """(occurrence start, occurrence end, baseline start, baseline end) as stored; each may be None."""
+    results = snapshot.get('results') if isinstance(snapshot.get('results'), dict) else {}
+    starts = [o.get('occurrence_start') for o in results.get('OccurrencePeaks') or [] if isinstance(o, dict) and o.get('occurrence_start')]
+    baseline = snapshot.get('baselinePeriod') if isinstance(snapshot.get('baselinePeriod'), dict) else {}
+    return (min(starts) if starts else None, snapshot.get('periodEndDate'), baseline.get('startDate'), baseline.get('endDate'))
+
+
+def relations(month_data, snapshot):
+    """Within one history: event value / highest daily profile value of the occurrence, raw peak / event value,
+    stored baseline / mean daily profile value of the baseline days. Medians over LPAR-profile pairs."""
+    results = snapshot.get('results') if isinstance(snapshot.get('results'), dict) else {}
+    start, end, base_start, base_end = window_of(snapshot)
+    profile_days = daily(month_data, 'DailyProfileSeries')
+    event_values = by_pair(results.get('HistoricPeak')) or by_pair(results.get('PeakValue'))
+    baselines = by_pair(results.get('HistoricBaseline'))
+    in_window, in_baseline = {}, {}
+    for (vm, profile, day), value in profile_days.items():
+        if start and end and start <= day <= end:
+            in_window.setdefault((vm, profile), []).append(value)
+        if base_start and base_end and base_start <= day <= base_end:
+            in_baseline.setdefault((vm, profile), []).append(value)
+    raw = {}
+    for occ in results.get('OccurrencePeaks') or []:
+        if isinstance(occ, dict) and number(occ.get('raw_peak_value')) is not None:
+            key = (occ.get('vm'), occ.get('profile'))
+            raw[key] = max(raw.get(key, 0.0), number(occ['raw_peak_value']))
+    def median_of(pairs):
+        values = [a / b for a, b in pairs if b and b > 1e-6]
+        return (statistics.median(values), len(values)) if values else (None, 0)
+    return {
+        'event value / highest daily profile value of the occurrence': median_of([(v, max(in_window[k])) for k, v in event_values.items() if k in in_window]),
+        'raw occurrence peak / event value': median_of([(raw[k], v) for k, v in event_values.items() if k in raw]),
+        'stored baseline / mean daily profile value of its days': median_of([(v, statistics.fmean(in_baseline[k])) for k, v in baselines.items() if k in in_baseline]),
+    }
+
+
+def earlier_records(snapshot):
+    """Model records from before the correction that sit beside observed results (names of the models)."""
+    records = snapshot.get('ModelForecasts') if isinstance(snapshot.get('ModelForecasts'), dict) else {}
+    found = []
+    for name, record in records.items():
+        meta = record.get('_meta') if isinstance(record, dict) else None
+        semantics = meta.get('semantics') if isinstance(meta, dict) else None
+        if not name.startswith('_') and not (isinstance(semantics, dict) and (semantics.get('version') or 0) >= 2):
+            found.append(name)
+    return sorted(found)
+
+
+def compare_month(month, old, new):
+    lines = [f'{month}']
+    # -- what each side records of the calculation
+    lines.append('  How the month was calculated, as recorded')
+    meta_old, meta_new = (old.get('Metadata') or {}), (new.get('Metadata') or {})
+    for key in sorted(set(meta_old) | set(meta_new)):
+        a, b = meta_old.get(key), meta_new.get(key)
+        scalar = all(not isinstance(v, (dict, list)) for v in (a, b))
+        shown = scalar and any(word in key.lower() for word in SHOWN)
+        state = 'same' if a == b else 'only in the old history' if key not in meta_new else 'only in the new history' if key not in meta_old else 'DIFFERENT'
+        lines.append(f'    {key:<34} {state}' + (f' (old {a}, new {b})' if shown and a != b else f' ({a})' if shown else ''))
+    if not meta_old and not meta_new:
+        lines.append('    (neither side records anything)')
+    shape = lambda data: sorted({key for block in (data.get('MonthlyWorkloadAnalysis') or {}).values() if isinstance(block, dict) for key in block})
+    only_old, only_new = sorted(set(shape(old)) - set(shape(new))), sorted(set(shape(new)) - set(shape(old)))
+    lines.append('    fields stored per LPAR           ' + ('same on both sides' if not only_old and not only_new else
+                                                            f"only old: {', '.join(only_old) or '-'}; only new: {', '.join(only_new) or '-'}"))
+    # -- coverage and daily values
+    for series, words in (('DailyProfileSeries', 'Daily profile values'), ('DailyPeakSeries', 'Daily peaks')):
+        a, b = daily(old, series), daily(new, series)
+        lines.append(f'  {words} ({series})')
+        if not a or not b:
+            lines.append('    ' + ('stored on neither side' if not a and not b else 'stored only in the ' + ('new' if b else 'old') + ' history'))
+            continue
+        for what, index in (('LPARs', 0), ('profiles', 1), ('days', 2)):
+            sa, sb = {k[index] for k in a}, {k[index] for k in b}
+            lines.append(f'    {what:<34} both {len(sa & sb)}, only old {len(sa - sb)}, only new {len(sb - sa)}')
+        shared = sorted(set(a) & set(b))
+        lines.append(ratios_line('all profiles', [(a[k], b[k]) for k in shared]))
+        for profile in sorted({k[1] for k in shared}):
+            lines.append(ratios_line(profile, [(a[k], b[k]) for k in shared if k[1] == profile]))
+    # -- event results
+    snaps_old, snaps_new = (old.get('SeasonalEventSnapshots') or {}), (new.get('SeasonalEventSnapshots') or {})
+    for event in sorted(set(snaps_old) | set(snaps_new)):
+        so, sn = snaps_old.get(event), snaps_new.get(event)
+        lines.append(f"  Event '{event}'")
+        if not isinstance(so, dict) or not isinstance(sn, dict):
+            lines.append('    stored only in the ' + ('new' if isinstance(sn, dict) else 'old') + ' history')
+            continue
+        ro = so.get('results') if isinstance(so.get('results'), dict) else {}
+        rn = sn.get('results') if isinstance(sn.get('results'), dict) else {}
+        wo, wn = window_of(so), window_of(sn)
+        lines.append('    occurrence and baseline dates    ' + ('same' if wo == wn else f'DIFFERENT (old {wo[0]} to {wo[1]}, baseline {wo[2]} to {wo[3]}; '
+                                                                                        f'new {wn[0]} to {wn[1]}, baseline {wn[2]} to {wn[3]})'))
+        lines.append(f"    results stamped by the generator old {'yes' if so.get('generatedOn') else 'NO'}, new {'yes' if sn.get('generatedOn') else 'NO'}")
+        for side, snap, results in (('old', so, ro), ('new', sn, rn)):
+            before = earlier_records(snap)
+            if before and results:
+                lines.append(f"    {side}: model record(s) from before the correction beside the results: {', '.join(before)}")
+        for key in RESULT_KEYS:
+            a, b = by_pair(ro.get(key)), by_pair(rn.get(key))
+            if a or b:
+                lines.append(ratios_line(key, [(a[k], b[k]) for k in sorted(set(a) & set(b))])
+                             + f'; pairs only old {len(set(a) - set(b))}, only new {len(set(b) - set(a))}')
+        def clipped(results):
+            out = {}
+            for vm, by_profile in (results.get('ClippingInfo') or {}).items() if isinstance(results.get('ClippingInfo'), dict) else []:
+                for profile, info in (by_profile or {}).items() if isinstance(by_profile, dict) else []:
+                    if isinstance(info, dict):
+                        flag = info.get('isClipped')
+                        on = flag.strip().lower() in ('1', 'true', 'yes') if isinstance(flag, str) else bool(flag)
+                        out[(vm, profile)] = number(info.get('unmetDemandEstimate')) if on else None
+            return out
+        co, cn = clipped(ro), clipped(rn)
+        if co or cn:
+            both = [k for k in set(co) & set(cn) if co[k] is not None and cn[k] is not None]
+            lines.append(f"    clipped pairs                     both {len(both)}, only old {sum(1 for k, v in co.items() if v is not None and cn.get(k) is None)}, "
+                         f"only new {sum(1 for k, v in cn.items() if v is not None and co.get(k) is None)}")
+            lines.append(ratios_line('hidden-demand increment', [(co[k], cn[k]) for k in both]))
+        def occurrences(results):
+            return {(o.get('vm'), o.get('profile'), o.get('occurrence_start')): number(o.get('raw_peak_value'))
+                    for o in results.get('OccurrencePeaks') or [] if isinstance(o, dict)}
+        oo, on_ = occurrences(ro), occurrences(rn)
+        if oo or on_:
+            lines.append(ratios_line('occurrence raw peaks', [(oo[k], on_[k]) for k in sorted(set(oo) & set(on_))])
+                         + f'; stored old {len(oo)}, new {len(on_)}')
+        lines.append('    relations within each history (median over pairs; a different relation is a different definition)')
+        rel_old, rel_new = relations(old, so), relations(new, sn)
+        for name in rel_old:
+            (a, na), (b, nb) = rel_old[name], rel_new[name]
+            show = lambda value, n: f'{value:.3f} ({n} pairs)' if value is not None else 'not derivable'
+            lines.append(f'      {name:<58} old {show(a, na)}, new {show(b, nb)}')
+    return lines
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--old', help='the folder of the earlier history (nfit.hist.*.json)')
+    ap.add_argument('--new', help='the folder of the current history (default: the fixed history of .private/history-check-prod)')
+    ap.add_argument('--months', help='months to compare (comma-separated; default: every month both hold)')
+    a = ap.parse_args()
+    if not a.old:
+        ap.print_usage()
+        return 2
+    new_folder = Path(a.new) if a.new else None
+    if new_folder is None:
+        case = REPO / '.private' / 'history-check-prod' / 'case'
+        base = case / ('history.pristine' if (case / 'history.pristine').is_dir() else 'history')
+        new_folder = next(iter(sorted(p for p in base.glob('*') if p.is_dir())), None) if base.is_dir() else None
+    if new_folder is None or not Path(a.old).is_dir() or not new_folder.is_dir():
+        sys.exit('history-overlap-compare: a history folder was not found')
+    old, new = months_of(a.old), months_of(new_folder)
+    shared = sorted(set(old) & set(new))
+    wanted = [m.strip() for m in a.months.split(',')] if a.months else shared
+    print(f"Old history: {len(old)} months ({min(old) if old else '-'} to {max(old) if old else '-'}); "
+          f"new history: {len(new)} months ({min(new) if new else '-'} to {max(new) if new else '-'}); months in both: {', '.join(shared) or 'none'}")
+    print('A ratio is new / old.\n')
+    done = 0
+    for month in wanted:
+        if month not in old or month not in new:
+            print(f'{month}\n  not in both histories\n')
+            continue
+        print('\n'.join(compare_month(month, old[month], new[month])) + '\n')
+        done += 1
+    return 0 if done else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
