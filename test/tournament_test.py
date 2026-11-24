@@ -73,11 +73,18 @@ P1, P2 = 'G3-95W15', 'G2-98W10'
 
 
 AHEAD = 'next occurrence after the last occurrence trained on'
+# What an nfit-forecast candidate states of the occurrence it is for.
+NAMED = {'data_end': '2026-09-12', 'target_start': '2026-10-01', 'target_date': '2026-10-02', 'target_basis': 'next occurrence after the data ends'}
 
 
-def perl(origin, semantics=V2, names=None, basis=None, **lpars):
-    """A stored nfit-profile record: where its data ends, the occurrence it names, and how that target was established."""
+def perl(origin, semantics=V2, names=None, basis=None, profiles='p1', exclusions='NONE', **lpars):
+    """A stored nfit-profile record: where its data ends, the occurrence it names, how that target was
+    established, and the definitions it was made on."""
     meta = {'AnalysisContext': {'analysis_end': origin + 'T00:00:00'}}
+    if profiles:
+        meta['profile_definitions'] = profiles
+    if exclusions:
+        meta['exclusion_definitions'] = exclusions
     if names:
         meta['forecast_target_date'] = names
     if basis:
@@ -151,11 +158,14 @@ class ParticipationTests(unittest.TestCase):
             'analysis_windows': {'vmA': {P1: {'start': '2026-06-01', 'end': '2026-09-12'}}},
             'candidates': {
                 # Trained on dense weekly data, output stated as the profile requirement: takes part.
-                'event_multiplier': {'vmA': {P1: {'forecast': 2.2, 'output_quantity': 'profile-demand', 'training_source': 'daily baseline x ratio'}}},
+                'event_multiplier': {'vmA': {P1: dict(NAMED, forecast=2.2, pi_lower=1.9, pi_upper=2.5, output_quantity='profile-demand',
+                                                      training_source='daily baseline x ratio')}},
                 # The next value of a weekly series: another quantity.
                 'holt': {'vmA': {P1: {'forecast': 5.0, 'output_quantity': 'weekly-raw-peak', 'training_source': 'DailyPeakSeries_weekly_max'}}},
                 # Fitted to the event values themselves.
-                'arima': {'vmA': {P1: {'forecast': 2.1, 'output_quantity': 'profile-demand', 'training_source': 'MonthlyPeakValue'}}},
+                'arima': {'vmA': {P1: dict(NAMED, forecast=2.1, output_quantity='profile-demand', training_source='MonthlyPeakValue')}},
+                # States the profile requirement, but not which occurrence its projection is for.
+                'svr': {'vmA': {P1: {'forecast': 2.0, 'output_quantity': 'profile-demand', 'training_source': 'MonthlyPeakValue'}}},
                 # Written before outputs were stated.
                 'huber': {'vmA': {P1: {'forecast': 2.4}}},
             }}}
@@ -192,6 +202,7 @@ class ParticipationTests(unittest.TestCase):
         self.assertEqual(status['event_multiplier'][0], 'participates')           # dense training, profile-demand output
         self.assertEqual(status['arima'][0], 'participates')
         self.assertEqual(status['holt'], ('withheld', 'output is another quantity (weekly-raw-peak: 1)'))
+        self.assertEqual(status['svr'], ('withheld', 'target not established: the candidates do not state which occurrence their projection is for'))
         self.assertEqual(status['huber'], ('withheld', 'output quantity not stated (written before outputs were stated)'))
         self.assertRegex(status['multiplicative_seasonal'][1], r'^semantics version 1 \(model-demand\)')
         self.assertEqual(status['late_run'], ('withheld', 'not frozen before its target (data ends 2026-10-01, target occurrence starts 2026-10-01)'))
@@ -199,7 +210,7 @@ class ParticipationTests(unittest.TestCase):
         # No target is assigned on a record's behalf.
         for name in ('unexplained', 'unnamed'):
             self.assertEqual(status[name], ('withheld', 'target not established: the record does not state which occurrence its projection is for'))
-        self.assertEqual(status['another'], ('withheld', 'its target (occurrence ending 2026-11-02; %s) is not the occurrence being scored (ends 2026-10-02)' % AHEAD))
+        self.assertEqual(status['another'], ('withheld', 'its target (occurrence ending 2026-11-02; %s) is not the occurrence in question (ends 2026-10-02)' % AHEAD))
         self.assertEqual(status['predictive_peak'][1], 'states profile-demand; frozen 2026-09-12, before the target occurrence it names (%s)' % AHEAD)
         self.assertEqual(sorted(t['admitted']), ['arima', 'event_multiplier', 'predictive_peak'])
         self.assertEqual(t['admitted']['predictive_peak'], {'vmA': {P1: 1.9, P2: 2.8}, 'vmB': {P1: 1.1}})
@@ -208,9 +219,79 @@ class ParticipationTests(unittest.TestCase):
         self.assertEqual(t['models']['holt']['trainingSources'], {'DailyPeakSeries_weekly_max': 1})
         text = T['format_tournament_participation']([t])
         self.assertIn('Target occurrence: 2026-10-01 to 2026-10-02, stored in 2026-10; observations verified', text)
-        self.assertRegex(text, r'holt\s+Zone 3 \(nfit-forecast\) withheld\s+0  output is another quantity')
+        self.assertRegex(text, r'holt\s+Zone 3 \(nfit-forecast\)\s+ad\s+withheld\s+0  output is another quantity')
         for name in ('vmA', 'vmB'):
             self.assertNotIn(name, text)                                           # counts only: no LPAR is named
+
+    def test_records_of_a_second_event_compete_only_on_the_same_definitions(self):
+        snaps = self.raw['2026-09']['SeasonalEventSnapshots']
+        same = perl('2026-09-12', names='2026-10-02', basis='next occurrence after the data ends', vmA={P1: 2.3})
+        snaps['strategic'] = {'eventName': 'strategic', 'ModelForecasts': {
+            'multiplicative_seasonal': same,
+            # The same model as the source event stores: told apart by the event it is stored under.
+            'predictive_peak': perl('2026-09-12', names='2026-10-02', basis=AHEAD, vmA={P1: 7.0}),
+            'other_profiles': perl('2026-09-12', names='2026-10-02', basis=AHEAD, profiles='p2', vmA={P1: 2.0}),
+            'other_exclusions': perl('2026-09-12', names='2026-10-02', basis=AHEAD, exclusions='x9', vmA={P1: 2.0}),
+            'unstated': perl('2026-09-12', names='2026-10-02', basis=AHEAD, profiles=None, vmA={P1: 2.0}),
+            'other_occurrence': perl('2026-09-12', names='2026-10-09', basis=AHEAD, vmA={P1: 2.0})}}
+        # By default the source event alone supplies records.
+        self.assertNotIn('other_profiles', self.table()['models'])
+        t = T['tournament_candidates'](self.raw, '2026-09', 'ad', 'ev', ['ev', 'strategic'])
+        rows = t['models']
+        # The source event's own version-1 record and the second event's current one are two candidates.
+        self.assertEqual((rows['multiplicative_seasonal']['sourceEvent'], rows['multiplicative_seasonal']['status']), ('ev', 'withheld'))
+        self.assertEqual((rows['multiplicative_seasonal@strategic']['sourceEvent'], rows['multiplicative_seasonal@strategic']['status']),
+                         ('strategic', 'participates'))
+        self.assertEqual(t['admitted']['multiplicative_seasonal@strategic'], {'vmA': {P1: 2.3}})
+        self.assertEqual(rows['predictive_peak@strategic']['status'], 'participates')
+        self.assertEqual(rows['other_profiles']['reason'], "profile definitions differ from those of the source event 'ev'")
+        self.assertEqual(rows['other_exclusions']['reason'], "exclusions differ from those of the source event 'ev'")
+        self.assertEqual(rows['unstated']['reason'], "profile definitions not stated by the record or by the source event's record")
+        self.assertRegex(rows['other_occurrence']['reason'], r'^its target \(occurrence ending 2026-10-09; .*\) is not the occurrence in question')
+        self.assertIn('Records of: ev, strategic (observed occurrences: ev)', T['format_tournament_participation']([t]))
+        # Without a usable record of the source event there is nothing to match the definitions against.
+        snaps['ev']['ModelForecasts'] = {}
+        t = T['tournament_candidates'](self.raw, '2026-09', 'ad', 'ev', ['ev', 'strategic'])
+        self.assertEqual(t['models']['multiplicative_seasonal']['reason'], "no usable record of the source event 'ev' to match its definitions against")
+        self.assertEqual(T['candidate_source_events']({'source_event': 'ev', 'candidate_sources': 'strategic, ev ,x'}, 'ad'), ('ev', ['ev', 'strategic', 'x']))
+        self.assertEqual(T['candidate_source_events']({'source_event': 'ev'}, 'ad'), ('ev', ['ev']))
+        self.assertEqual(T['candidate_source_events']({}, 'ev'), ('ev', ['ev']))
+
+    def test_the_pool_for_selection_is_one_month_and_one_occurrence(self):
+        # An earlier month holds a model the latest month does not: it is not carried forward.
+        self.raw['2026-08'] = {'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'ModelForecasts': {
+            'old_model': perl('2026-08-12', names='2026-09-02', basis=AHEAD, vmA={P1: 9.9})}}}}
+        pool = T['tournament_live_pool'](self.raw, 'ad', 'ev')
+        self.assertEqual(pool['forecastMonth'], '2026-09')
+        self.assertNotIn('old_model', pool['models'])
+        # The occurrence ahead is the one the source event's record names; here history already holds it.
+        self.assertEqual(pool['target'], {'occurrenceStart': '2026-10-01', 'occurrenceEnd': '2026-10-02', 'observed': True})
+        chosen_from = pool['pool']['vmA'][P1]
+        self.assertEqual(sorted(chosen_from), ['arima', 'event_multiplier', 'predictive_peak'])
+        self.assertEqual(chosen_from['predictive_peak'], 1.9)
+        # An nfit-forecast candidate is handed over whole: its own interval and what it states travel with it.
+        self.assertEqual((chosen_from['event_multiplier']['pi_lower'], chosen_from['event_multiplier']['pi_upper'],
+                          chosen_from['event_multiplier']['target_date']), (1.9, 2.5, '2026-10-02'))
+        self.assertEqual(pool['models']['holt']['status'], 'withheld')
+        self.assertEqual(pool['models']['recency_decay']['status'], 'withheld')
+        del self.raw['2026-10']
+        self.assertFalse(T['tournament_live_pool'](self.raw, 'ad', 'ev')['target']['observed'])
+        self.assertIn('Occurrence ahead: 2026-10-01 to 2026-10-02\n', T['format_tournament_live_pool'](T['tournament_live_pool'](self.raw, 'ad', 'ev')))
+        self.assertEqual(T['tournament_live_pool']({}, 'ad', 'ev')['pool'], {})
+
+    def test_the_next_occurrence_follows_from_the_event_definition(self):
+        nxt = T['next_occurrence_after']
+        monthly = {'period': 'monthly', 'day_of_period': '-1', 'duration_days': '7'}
+        self.assertEqual(nxt(monthly, '2026-10-31'), ('2026-11-24', '2026-11-30'))
+        self.assertEqual(nxt(monthly, '2026-10-24'), ('2026-10-25', '2026-10-31'))        # begins after the day
+        self.assertEqual(nxt(monthly, '2026-10-25'), ('2026-11-24', '2026-11-30'))        # one under way is not ahead
+        self.assertEqual(nxt(monthly, '2026-12-31'), ('2027-01-25', '2027-01-31'))
+        self.assertEqual(nxt({'period': 'monthly', 'day_of_period': '31', 'duration_days': '3'}, '2027-01-31'), ('2027-02-26', '2027-02-28'))
+        dates = {'dates': '2025-11-21:2025-11-28, 2026-11-20:2026-11-27'}
+        self.assertEqual(nxt(dates, '2025-11-28'), ('2026-11-20', '2026-11-27'))
+        self.assertEqual(nxt(dates, '2026-11-20'), (None, None))
+        self.assertEqual(nxt({}, '2026-01-01'), (None, None))
+        self.assertEqual(nxt(monthly, None), (None, None))
 
     def test_nothing_is_admitted_without_a_verified_target(self):
         del self.raw['2026-10']['SeasonalEventSnapshots']['ev']['generatedOn']
@@ -327,6 +408,14 @@ class EndToEndTests(unittest.TestCase):
         # fitted through it and its projection is for October. Without it the projection would be for September itself.
         cls.case = P.Case('occurrence', peak={P.PROFILE: 1.2}, models=('predictive_peak', 'multiplicative_seasonal'), later_peak=1.3,
                           target_event={'eventName': 'ev', 'periodEndDate': '2026-09-12', 'generatedOn': '2026-09-13T00:00:00'})
+        # For nfit-forecast the event has one more occurrence, in November: the one ahead of all stored data.
+        path = os.path.join(cls.case.root, 'etc', 'nfit.seasonality.cfg')
+        with open(path) as fh:
+            text = fh.read()
+        assert text.count(P.NEXT_DATES) == 1
+        with open(path, 'w') as fh:
+            # (and September one occurrence, the one stored: a backfill takes the first occurrence of a month)
+            fh.write(text.replace(P.NEXT_DATES, P.NEXT_DATES + ', 2026-11-01:2026-11-01').replace('2026-09-01:2026-09-01, ', ''))
         with open(os.path.join(cls.case.root, 'etc', 'nfit.seasonality.cfg'), 'a') as fh:
             fh.write('\n[ad]\nmodel = adaptive_peak\nsource_event = ev\npriority = 10\ndates = %s, 2026-10-01:2026-10-01\n'
                      'baseline_period_days = 8\nmin_historical_years = 0\nmin_historical_peaks = 1\nmin_historical_periods = 1\n' % P.DATES)
@@ -369,7 +458,7 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(self.files(), before)
         self.assertIn('candidates stored in 2026-09 (data ends 2026-09-12); quantity scored: profile-demand (profile-requirement-1)', query.stdout)
         self.assertIn('Target occurrence: 2026-10-01 to 2026-10-01, stored in 2026-10; observations verified', query.stdout)
-        self.assertRegex(query.stdout, r'predictive_peak\s+Zone 2 \(nfit-profile\)\s+participates\s+\d+  states profile-demand; frozen 2026-09-12')
+        self.assertRegex(query.stdout, r'predictive_peak\s+Zone 2 \(nfit-profile\)\s+ev\s+participates\s+\d+  states profile-demand; frozen 2026-09-12')
         for name in P.LPARS + (M.SERIAL,):
             self.assertNotIn(name, query.stdout)
 
@@ -402,7 +491,16 @@ class EndToEndTests(unittest.TestCase):
         # A direct model fitted to the weekly series states that series' quantity and is not relabelled.
         direct = candidates['holt']['vmS'][P.PROFILE]
         self.assertIn(direct['output_quantity'], ('weekly-profile-maximum', 'weekly-raw-peak'))
-        self.assertRegex(text, r'candidates kept out of the pool \(profile-requirement-1: the pool holds profile-demand only\)')
+        # The pool for selection is that of the latest month, for the occurrence its candidates name; the weekly outputs stay out.
+        # Here that is October, whose candidates are for November's occurrence, which no history holds yet.
+        self.assertIn('ad, candidates for selection: those stored in 2026-10; quantity: profile-demand (profile-requirement-1)', text)
+        self.assertIn('Occurrence ahead: 2026-11-01 to 2026-11-01\n', text)
+        self.assertRegex(text, r'event_multiplier\s+Zone 3 \(nfit-forecast\)\s+ad\s+participates')
+        self.assertRegex(text, r'holt\s+Zone 3 \(nfit-forecast\)\s+ad\s+withheld')
+        october = snaps['2026-10']['ad']['AdaptiveForecast']['candidates']['event_multiplier']['vmS'][P.PROFILE]
+        self.assertEqual((october['data_end'], october['target_start'], october['target_date']), ('2026-10-01', '2026-11-01', '2026-11-01'))
+        self.assertEqual((em['data_end'], em['target_start'], em['target_date']), ('2026-09-12', '2026-10-01', '2026-10-01'))
+        self.assertEqual(em['horizon_days'], 19)                                   # the baseline is projected to that occurrence
         # The stored scoring block says who took part against which occurrence.
         scoring = snaps['2026-09']['ad']['AdaptiveForecast']['scoring']
         self.assertEqual((scoring['_meta']['scoring_semantics'], scoring['_meta']['scored_against_month']), ('profile-requirement-1', '2026-10'))

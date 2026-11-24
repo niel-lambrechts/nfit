@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/tournament-acceptance
+# PURPOSE  : Bounded acceptance of the sizing tournament (profile-requirement-1)
+#            for one system and one tournament event, on a disposable copy of a
+#            kept work tree. The kept tree itself is not written to.
+#
+#            On the copy it
+#              1. stores the seasonal records of the candidate source events
+#                 with the current nfit-profile (unless --no-seasonal-run);
+#              2. runs nfit-forecast --tournament (backfill, scoring, selection);
+#              3. rebuilds the ledger from nothing and compares the two;
+#            and reports, in counts only:
+#              - what history holds (records and candidates per month);
+#              - participation, month by month, in four groups: eligible now,
+#                awaiting regeneration, another quantity, target or provenance
+#                missing or ambiguous - with the reasons;
+#              - eligible forecasts, scored candidates and tournament-qualified
+#                models, each on its own;
+#              - whether the rebuilt ledger is identical;
+#              - whether each selection carries the chosen candidate's own
+#                forecast and interval, and where that candidate came from.
+#            No LPAR, system or serial number is printed.
+# USAGE    : dev/tournament-acceptance --event NAME [--work DIR]
+#                [--candidate-sources A,B] [--scope all|latest]
+#                [--no-seasonal-run] [--keep]
+# ==============================================================================
+import argparse
+import configparser
+import csv
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import platform
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+FORECAST = Path(os.environ.get('NFIT_FORECAST') or (REPO.parent / 'nfit-forecast' / 'nfit-forecast'))
+GROUPS = ('eligible now', 'awaiting regeneration', 'another quantity or no later target', 'target or provenance missing or ambiguous')
+
+
+def _module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+pr = _module('protection_replay', REPO / 'dev' / 'protection-replay')
+
+
+def block(source):
+    """The decoder and tournament block of nfit-forecast, run in isolation (the tests load it the same way)."""
+    start = source.rindex('# ====', 0, source.index('# Zone 2 record decoder (zone2-record-decoder-1)'))
+    end = source.index('# --- End of Zone 2 record decoder ---')
+    ns = {'os': os, 'json': json, 'sys': sys, 'datetime': datetime}
+    exec(compile(source[start:end], str(FORECAST), 'exec'), ns)
+    return ns
+
+
+def fingerprint(root):
+    """One hash of the names and bytes below a folder ('' when it does not exist)."""
+    root = Path(root)
+    if not root.exists():
+        return ''
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob('*') if p.is_file()):
+        digest.update(str(path.relative_to(root)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def clone(src, dst):
+    """A copy of a folder: a copy-on-write clone where the file system offers one, else a plain copy."""
+    attempts = [['cp', '-cR', str(src), str(dst)]] if platform.system() == 'Darwin' else [['cp', '-R', '--reflink=auto', str(src), str(dst)]]
+    for cmd in attempts:
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            return 'copy-on-write clone' if platform.system() == 'Darwin' else 'copy'
+        shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, symlinks=True)
+    return 'copy'
+
+
+def months_of(history):
+    """{month: month data} of a history folder."""
+    out = {}
+    for path in sorted(Path(history).glob('nfit.hist.*.json')):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        for month, content in data.items():
+            if isinstance(content, dict):
+                out[month] = content
+    return out
+
+
+def ledger_of(history, name):
+    """The ledger without its timestamps, or None."""
+    path = Path(history) / name
+    if not path.is_file():
+        return None
+    data = json.loads(path.read_text())
+    for key in ('created_on', 'last_updated'):
+        (data.get('meta') or {}).pop(key, None)
+    return data
+
+
+def group_of(row):
+    """Which of the four groups a participation row belongs to."""
+    if row['status'] == 'participates':
+        return GROUPS[0]
+    reason = row.get('reason') or ''
+    if (reason.startswith(('no semantics marker', 'semantics version', 'output quantity not stated', 'target not established'))
+            or 'not stated by the record' in reason or 'no forecasts' in reason):
+        return GROUPS[1]
+    if reason.startswith(('output is another quantity', 'names an occurrence its own data already covers')):
+        return GROUPS[2]
+    return GROUPS[3]
+
+
+def set_candidate_sources(path, event, sources):
+    """Writes candidate_sources into the event's section of a seasonality file (the copy's)."""
+    lines, out, inside, done = path.read_text().splitlines(), [], False, False
+    for line in lines:
+        header = re.match(r'\s*\[(.+?)\]\s*$', line)
+        if header:
+            inside = header.group(1) == event
+            out.append(line)
+            if inside:
+                out.append('candidate_sources = ' + ', '.join(sources))
+                done = True
+            continue
+        if inside and re.match(r'\s*candidate_sources\s*=', line):
+            continue
+        out.append(line)
+    if not done:
+        sys.exit(f"tournament-acceptance: the seasonality file has no event '{event}'")
+    path.write_text('\n'.join(out) + '\n')
+
+
+def number(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def close(a, b):
+    return a is not None and b is not None and abs(a - b) <= 1e-6 + 1e-4 * max(abs(a), abs(b))
+
+
+def check_selection(csv_path, pool):
+    """Does each selection carry the chosen candidate's own forecast and interval? Counts by outcome,
+    and where the chosen candidates came from."""
+    tally, chosen, modes = {}, {}, {}
+
+    def count(what):
+        tally[what] = tally.get(what, 0) + 1
+    with open(csv_path, newline='') as fh:
+        rows = list(csv.DictReader(fh))
+    if not rows:
+        return tally, chosen, modes
+    key = next((k for k in ('VM', 'VMName', 'vm') if k in rows[0]), None)
+    profiles = sorted(c[:-len('_Model')] for c in rows[0] if c.endswith('_Model'))
+    for row in rows:
+        candidates_of_vm = pool['pool'].get(row.get(key), {}) if key else {}
+        for profile in profiles:
+            model, mode = row.get(profile + '_Model'), row.get(profile + '_Mode')
+            if not model:
+                continue
+            modes[mode] = modes.get(mode, 0) + 1
+            chosen[(model, mode)] = chosen.get((model, mode), 0) + 1
+            forecast, low, high = (number(row.get(profile + s)) for s in ('_Forecast', '_PI_Lower', '_PI_Upper'))
+            stored = candidates_of_vm.get(profile, {})
+            if mode != 'tournament':
+                # A median of the candidates: no interval of its own, so none may be reported.
+                values = sorted(number(v.get('forecast')) if isinstance(v, dict) else number(v) for v in stored.values())
+                live = number(row.get(profile + '_MultiplierForecast'))
+                with_live = sorted(values + [live]) if live is not None and 'event_multiplier' not in stored else None
+                medians = [statistics.median(v) for v in (values, with_live) if v]
+                if low is not None or high is not None:
+                    count('bootstrap: an interval is reported although a median has none of its own')
+                elif any(close(forecast, m) for m in medians):
+                    count('bootstrap: the median of the pool, no interval reported')
+                else:
+                    count('bootstrap: forecast is not the median of the pool')
+                continue
+            mine = stored.get(model)
+            if mine is None and model == 'event_multiplier':
+                # This run's own multiplier forecast, which is reported in the same row.
+                mine = {'forecast': number(row.get(profile + '_MultiplierForecast')), 'pi_lower': number(row.get(profile + '_Multiplier_PI_Lower')),
+                        'pi_upper': number(row.get(profile + '_Multiplier_PI_Upper'))}
+            if mine is None:
+                count('tournament: the chosen model is not in the pool')
+                continue
+            own = mine if isinstance(mine, dict) else {'forecast': mine}
+            own_low, own_high = number(own.get('pi_lower')), number(own.get('pi_upper'))
+            if not close(forecast, number(own.get('forecast'))):
+                count("tournament: forecast differs from the chosen candidate's own")
+            elif own_low is None or own_high is None:
+                count('tournament: own forecast; the candidate has no interval and none is reported' if low is None and high is None
+                      else 'tournament: an interval is reported although the chosen candidate has none')
+            elif close(low, own_low) and close(high, own_high):
+                count('tournament: own forecast and own interval')
+            else:
+                count("tournament: interval differs from the chosen candidate's own")
+    return tally, chosen, modes
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--event', help='the tournament event (an adaptive_peak event)')
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='the work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--seasonality', default=str(REPO / 'etc' / 'nfit.seasonality.cfg'), help='the seasonality file to use')
+    ap.add_argument('--candidate-sources', help="events whose nfit-profile records may compete (comma-separated; default: the event's "
+                                                'candidate_sources in the seasonality file, else its source event alone)')
+    ap.add_argument('--scope', default='all', choices=('all', 'latest'), help='which history months the seasonal runs fill (default: all)')
+    ap.add_argument('--no-seasonal-run', action='store_true', help='use the records history already holds')
+    ap.add_argument('--keep', action='store_true', help='keep the working copy')
+    a = ap.parse_args()
+
+    work = Path(a.work).resolve()
+    stage = next(iter(sorted((work / 'case' / 'stage').glob('*'))), None) if (work / 'case' / 'stage').is_dir() else None
+    if stage is None or not (work / 'case' / 'history' / stage.name).is_dir():
+        sys.exit('tournament-acceptance: no kept work tree with history (run dev/history-integration-check --keep first)')
+    if not FORECAST.is_file():
+        sys.exit('tournament-acceptance: nfit-forecast not found beside this repository (set NFIT_FORECAST)')
+    seasonality = Path(a.seasonality).resolve()
+    settings = configparser.ConfigParser(interpolation=None, strict=False)
+    settings.read(seasonality, encoding='utf-8')
+    if not a.event or not settings.has_section(a.event) or settings.get(a.event, 'model', fallback='') != 'adaptive_peak':
+        print('Give --event, an adaptive_peak event of the seasonality file:')
+        for name in settings.sections():
+            print(f"  {name:<28} {settings.get(name, 'model', fallback='')}")
+        return 2
+    source = settings.get(a.event, 'source_event', fallback=a.event)
+    listed = a.candidate_sources or settings.get(a.event, 'candidate_sources', fallback='')
+    sources = [source] + [s.strip() for s in listed.split(',') if s.strip() and s.strip() != source]
+    missing = [s for s in sources if not settings.has_section(s)]
+    if missing:
+        sys.exit('tournament-acceptance: not in the seasonality file: ' + ', '.join(missing))
+
+    source_text = FORECAST.read_text(encoding='utf-8')
+    if 'def tournament_live_pool(' not in source_text:
+        sys.exit('tournament-acceptance: this nfit-forecast has no profile-requirement tournament')
+    T = block(source_text)
+
+    kept = {name: fingerprint(work / 'case' / name) for name in ('history', 'history.pristine')}
+    copy = work.parent / (work.name + '.tournament-acceptance')
+    if copy.exists():
+        sys.exit(f'tournament-acceptance: a working copy is already there ({copy.name} beside the work tree); remove it first')
+    copy.mkdir()
+    status = 1
+    try:
+        how = {clone(work / name, copy / name) for name in ('app', 'case')}
+        app, case = copy / 'app', copy / 'case'
+        stage = case / 'stage' / stage.name
+        history = case / 'history' / stage.name
+        pristine = case / 'history.pristine' / stage.name
+        if pristine.is_dir():                                  # the fixed history the comparisons read is the starting point
+            shutil.rmtree(history)
+            shutil.copytree(pristine, history)
+        for name in pr.EXECUTABLES:
+            shutil.copy(REPO / name, app / name)
+            (app / name).chmod(0o700)
+        shutil.copy(FORECAST, app / 'nfit-forecast')
+        (app / 'etc').mkdir(exist_ok=True)
+        shutil.copy(seasonality, app / 'etc' / 'nfit.seasonality.cfg')
+        set_candidate_sources(app / 'etc' / 'nfit.seasonality.cfg', a.event, sources[1:]) if len(sources) > 1 else None
+        (app / 'output').mkdir(exist_ok=True)
+        print(f"Working copy: a {' / '.join(sorted(how))} of the kept tree; the kept tree is not written to.")
+        print(f"Event {a.event}: observed occurrences of '{source}'; nfit-profile records of {', '.join(sources)}.\n")
+
+        # 1. the seasonal records
+        env = pr.perl_env()
+        if not a.no_seasonal_run:
+            for name in sources:
+                args = ['--nmondir', str(stage), '--apply-seasonality', name, '--seasonal-scope', a.scope]
+                if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
+                    args += ['--config', str(app / 'config.csv')]
+                print(f"Storing the records of '{name}' ({settings.get(name, 'model', fallback='?')}, scope {a.scope}) ...", flush=True)
+                try:
+                    pr.invoke(app, case, 'tournament-acceptance-' + name, args, env)
+                except RuntimeError as failure:
+                    a.keep = True
+                    sys.exit(f'tournament-acceptance: {failure}. The working copy is kept for its log.')
+
+        # 2. the tournament, and 3. the rebuild from nothing
+        def forecast(label, *extra):
+            with (case / f'tournament-acceptance-{label}.private.log').open('w') as log:
+                proc = subprocess.run([sys.executable, '-W', 'ignore', str(app / 'nfit-forecast'), '--nmondir', str(stage),
+                                       '--seasonal-event', a.event, '--tournament'] + list(extra), cwd=str(app),
+                                      env=dict(os.environ, PYTHONWARNINGS='ignore'), stdout=log, stderr=subprocess.STDOUT)
+            if proc.returncode:
+                a.keep = True
+                sys.exit(f'tournament-acceptance: the nfit-forecast run ({label}) exited {proc.returncode}. The working copy is kept for its log.')
+
+        ledger_name = T['TOURNAMENT_LEDGER_FILE']
+        print('Running the tournament (backfill, scoring, selection) ...', flush=True)
+        forecast('first')
+        first = ledger_of(history, ledger_name)
+        made = sorted((app / 'output').glob(f'nfit-forecast.*.{a.event}.*.csv'), key=lambda p: p.stat().st_mtime)
+        selection_csv = made[-1] if made else None
+        print('Rebuilding the ledger from nothing ...\n', flush=True)
+        (history / ledger_name).unlink(missing_ok=True)
+        forecast('rebuild', '--force-rescore')
+        rebuilt = ledger_of(history, ledger_name)
+
+        # ---- the report -----------------------------------------------------------------
+        months = months_of(history)
+        print('What history holds')
+        print(f"  {'month':<9} {'occurrence results':<19} " + ' '.join(f'{s[:24]:<24}' for s in sources) + ' nfit-forecast candidates')
+        for month in sorted(months):
+            snaps = months[month].get('SeasonalEventSnapshots') or {}
+            cells = []
+            for name in sources:
+                records = (snaps.get(name) or {}).get('ModelForecasts') or {}
+                cells.append(', '.join(sorted(k for k in records if not k.startswith('_'))) or '-')
+            observed = 'yes' if isinstance((snaps.get(source) or {}).get('results'), dict) and snaps[source]['results'] else '-'
+            candidates = ((snaps.get(a.event) or {}).get('AdaptiveForecast') or {}).get('candidates') or {}
+            print(f"  {month:<9} {observed:<19} " + ' '.join(f'{c[:24]:<24}' for c in cells) + f' {len(candidates)} models')
+
+        tables = T['tournament_participation_tables'](sorted(months.items()), a.event, source, sources)
+        print('\nParticipation in scoring, month by month')
+        totals = {}
+        for t in tables:
+            target = t.get('target')
+            where = (f"occurrence {target['occurrenceStart'] or '?'} to {target['occurrenceEnd']}"
+                     + ('' if target['observationsUsable'] else ' (results not verified)')) if target else 'no later occurrence stored'
+            print(f"  {t['forecastMonth']} (data ends {(t.get('origin') or {}).get('dataEnds') or 'not stated'}), scored against {where}")
+            grouped = {}
+            for name, row in sorted(t['models'].items()):
+                grouped.setdefault(group_of(row), []).append((name, row))
+                key = (name, row.get('sourceEvent') or '')
+                tally = totals.setdefault(key, {'months': 0, 'pairs': 0, 'groups': {}})
+                tally['groups'][group_of(row)] = tally['groups'].get(group_of(row), 0) + 1
+                if row['status'] == 'participates':
+                    tally['months'] += 1
+                    tally['pairs'] += row['pairs']
+            for group in GROUPS:
+                for name, row in grouped.get(group, []):
+                    print(f"    {group:<42} {name:<28} {(row.get('sourceEvent') or ''):<24} {row['pairs']:>5} pairs  {row['reason'] or ''}")
+        if not tables:
+            print('  (no month stores a candidate)')
+
+        print('\n1. Eligible forecasts (admitted to scoring)')
+        print(f"  {'model':<28} {'stored under':<24} {'months':>6} {'forecasts':>10}   months in each group")
+        for (name, stored_under), tally in sorted(totals.items()):
+            spread = '; '.join(f'{n} x {g}' for g, n in sorted(tally['groups'].items(), key=lambda kv: GROUPS.index(kv[0])))
+            print(f"  {name:<28} {stored_under:<24} {tally['months']:>6} {tally['pairs']:>10}   {spread}")
+
+        print('\n2. Scored candidates (the ledger of this run)')
+        scored, qualified, pairs_seen, classes = {}, {}, set(), {}
+        minimum = T['ScoreLedger'].DEFAULT_MIN_OBSERVATIONS if 'ScoreLedger' in T else 5
+        for vm, by_profile in ((first or {}).get('scores') or {}).items():
+            for profile, by_event in by_profile.items():
+                models = ((by_event.get(a.event) or {}).get('models') or {}) if isinstance(by_event, dict) else {}
+                for model, entry in models.items():
+                    pairs_seen.add((vm, profile))
+                    row = scored.setdefault(model, {'pairs': 0, 'observations': 0, 'loss': 0.0})
+                    row['pairs'] += 1
+                    row['observations'] += int(entry.get('observations') or 0)
+                    row['loss'] += float(entry.get('pinball_loss_sum') or 0.0)
+                    if int(entry.get('observations') or 0) >= minimum:
+                        qualified[model] = qualified.get(model, 0) + 1
+                    for month_entry in (entry.get('monthly_scores') or {}).values():
+                        label = month_entry.get('target_class') or 'not recorded'
+                        classes[label] = classes.get(label, 0) + 1
+        if first is None:
+            print('  (no ledger was written)')
+        else:
+            meta = first.get('meta') or {}
+            print(f"  ledger {ledger_name}: {meta.get('semantics')}, quantity {meta.get('quantity')}; {len(pairs_seen)} LPAR-profile pairs")
+            print(f"  {'model':<28} {'pairs':>6} {'observations':>13} {'mean pinball loss':>18}")
+            for model, row in sorted(scored.items()):
+                mean = row['loss'] / row['observations'] if row['observations'] else float('nan')
+                print(f"  {model:<28} {row['pairs']:>6} {row['observations']:>13} {mean:>18.4f}")
+            if classes:
+                print('  targets scored against: ' + ', '.join(f'{n} {c}' for c, n in sorted(classes.items())))
+
+        print(f'\n3. Tournament-qualified models (at least {minimum} scored occurrences for a pair)')
+        if qualified:
+            for model, n in sorted(qualified.items()):
+                print(f"  {model:<28} qualified for {n} of {scored[model]['pairs']} pairs")
+        else:
+            print('  none: every selection falls back to the median of the pool (bootstrap)')
+
+        print('\nLedger rebuilt from nothing: ' + ('identical' if first is not None and first == rebuilt else
+                                                    'no ledger to compare' if first is None and rebuilt is None else 'DIFFERENT'))
+
+        pool = T['tournament_live_pool'](months, a.event, source, sources)
+        print('\nSelection for the occurrence ahead')
+        print('  ' + T['format_tournament_live_pool'](pool).replace('\n', '\n  ').rstrip())
+        if selection_csv is None:
+            print('  (the run wrote no selection file)')
+        else:
+            tally, chosen, modes = check_selection(selection_csv, pool)
+            print('  selections: ' + (', '.join(f'{n} {m or "no mode"}' for m, n in sorted(modes.items(), key=lambda kv: str(kv[0]))) or 'none'))
+            for (model, mode), n in sorted(chosen.items(), key=lambda kv: (str(kv[0][1]), kv[0][0])):
+                row = pool['models'].get(model)
+                came = (f"stored under {row['sourceEvent']} in {pool['forecastMonth']}, data ends {row['origin']}" if row and row['status'] == 'participates'
+                        else "this run's own multiplier forecast" if model == 'event_multiplier' else 'the median of the pool' if model == 'ensemble_median'
+                        else 'not in the pool')
+                print(f"    {n:>5} x {model:<26} ({mode}): {came}")
+            print("  does each selection carry the chosen candidate's own forecast and interval?")
+            for what, n in sorted(tally.items()):
+                print(f"    {n:>5} x {what}")
+
+        after = {name: fingerprint(work / 'case' / name) for name in kept}
+        print('\nKept tree: ' + ('history as it was found' if after == kept else 'HISTORY CHANGED (it should not have)'))
+        status = 0 if after == kept and (first == rebuilt) else 1
+    finally:
+        if a.keep:
+            print(f'Working copy kept: {copy.name} (beside the work tree).')
+        else:
+            shutil.rmtree(copy, ignore_errors=True)
+    return status
+
+
+if __name__ == '__main__':
+    sys.exit(main())

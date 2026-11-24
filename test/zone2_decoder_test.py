@@ -189,16 +189,15 @@ class Zone2DecoderTests(unittest.TestCase):
     # -- 3. one decoder for every consumer --------------------------------------------------
     def test_every_zone2_consumer_reads_through_the_decoder(self):
         body = SOURCE[:SOURCE.index('# Zone 2 record decoder (zone2-record-decoder-1)')]
-        self.assertGreaterEqual(body.count('zone2_eligible_forecasts('), 2)       # bootstrap median, live candidates
+        self.assertGreaterEqual(body.count('zone2_eligible_forecasts('), 1)       # bootstrap median
         self.assertEqual(body.count('tournament_candidates('), 1)                  # scoring: admission through the same decoder
+        self.assertEqual(body.count(' = tournament_live_pool('), 1)                   # selection: the same admission, for the occurrence ahead
         self.assertEqual(body.count('zone2_forecast_value('), 1)                   # strategic extraction
         self.assertEqual(body.count('zone2_block_stale_reason('), 1)               # the Zone 2 staleness gate
         # The earlier readings of a Zone 2 record are gone ...
         for gone in ("profile_data.get('forecast', profile_data.get('value'))", "val_block.get('forecast', val_block.get('value'))",
                      "val.get('forecast', val.get('value'))", 'Path A (scalar)', "vm_block['forecast'].get(profile_name)"):
             self.assertNotIn(gone, SOURCE, gone)
-        # ... and the candidates nfit-forecast writes itself are still read as they are stored.
-        self.assertIn("candidates_block = adaptive_block.get('candidates', {})", SOURCE)
         compile(SOURCE, FORECAST, 'exec')
 
 
@@ -241,7 +240,9 @@ class LiveCandidateTests(unittest.TestCase):
         import profile_demand_test as P
         M.MemberExposureTests.roots = []
         self.addCleanup(M.MemberExposureTests.tearDownClass)
-        case = P.Case('legacy', peak={P.PROFILE: 1.2}, models=('predictive_peak',))          # September holds a current record
+        # September holds a current record, made with September's occurrence in history: it is for October's.
+        case = P.Case('legacy', peak={P.PROFILE: 1.2}, models=('predictive_peak',),
+                      target_event={'eventName': 'ev', 'periodEndDate': '2026-09-12', 'generatedOn': '2026-09-13T00:00:00'})
         earlier = {'recency_decay': {'_meta': {'generated_on': '2026-08-02T00:00:00', 'model_version': 1}, 'vmA': {P.PROFILE: 9.0}}}
         path = os.path.join(case.folder, 'nfit.hist.2026-08.json')
         with open(path) as fh:
@@ -259,7 +260,10 @@ class LiveCandidateTests(unittest.TestCase):
                              capture_output=True, text=True, timeout=150, env=dict(os.environ, PYTHONWARNINGS='ignore'))
         text = run.stdout + run.stderr
         self.assertEqual(run.returncode, 0, text[-1500:])
-        self.assertRegex(text, r'Zone 2 records not read as candidates \(zone2-record-decoder-1\): 1 x no semantics marker .*\. Read: 1\.')
+        # The pool is that of the latest month alone: September's record is in it, August's earlier one is not looked at.
+        self.assertRegex(text, r'candidates for selection: those stored in 2026-09')
+        self.assertRegex(text, r'predictive_peak\s+Zone 2 \(nfit-profile\)\s+ev\s+participates')
+        self.assertNotRegex(text, r'recency_decay\s+Zone 2 \(nfit-profile\)\s+ev\s+participates')
         self.assertRegex(text, r'2026-08 / ev\s+: \[Z-Gate\] Zone 2 record is no candidate \(recency_decay: no semantics marker')
         # August's results sit beside that earlier record: they are not trained on, and the run says so.
         self.assertRegex(text, r'Stored results not read as observations \(zone1-observation-gate-1\): '
