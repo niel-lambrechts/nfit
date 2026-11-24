@@ -68,7 +68,7 @@ class EventWindowTests(unittest.TestCase):
         cls.fixture.tearDownClass()
 
     @classmethod
-    def seasonal(cls, dates, history, flags=(), model='predictive_peak', days=2, baseline=1, prior=False, occurrences=1):
+    def seasonal(cls, dates, history, flags=(), model='predictive_peak', days=2, baseline=1, prior=False, occurrences=1, peak=1.05):
         M.DAYS = days
         try:
             root = cls.fixture.make_root()
@@ -79,7 +79,8 @@ class EventWindowTests(unittest.TestCase):
         if history:
             cls.fixture.run_profile(root, '--update-history', '--min-history-days', '1', '--pool-history', '--force')
         if prior:
-            # A synthetic earlier occurrence: the event's peak 20% above its baseline, for every profile.
+            # A synthetic earlier occurrence: the event's peak above its baseline by the given factor, for every profile.
+            # At 1.05 the model's demand stays below the level the past window protects, so the protection binds.
             folder = os.path.join(root, 'history', M.SERIAL)
             with open(os.path.join(folder, 'nfit.hist.2026-09.json')) as fh:
                 analysis = json.load(fh)['2026-09']['MonthlyWorkloadAnalysis']
@@ -88,7 +89,7 @@ class EventWindowTests(unittest.TestCase):
                 'Metadata': {'ProcessedStartDate': '2026-08-01', 'ProcessedEndDate': '2026-08-31', 'ProcessedDays': 31},
                 'MonthlyWorkloadAnalysis': analysis,
                 'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'periodEndDate': '2026-08-01', 'results': {
-                    'HistoricPeak': {vm: {k: round(v * 1.2, 4) for k, v in pv.items()} for vm, pv in values.items()},
+                    'HistoricPeak': {vm: {k: round(v * peak, 4) for k, v in pv.items()} for vm, pv in values.items()},
                     'HistoricBaseline': values}}}}}
             with open(os.path.join(folder, 'nfit.hist.2026-08.json'), 'w') as fh:
                 json.dump(august, fh)
@@ -140,7 +141,8 @@ class EventWindowTests(unittest.TestCase):
         log = self.with_history['log']
         self.assertIn('Event-Window Plan (event ev)', log)
         self.assertIn('Event requirements by pool and for the frame (event ev)', log)
-        self.assertRegex(log, r'\n  Frame\s+3\s+unknown\s+3\.49\s+0\s+0\.00  not assessed')      # no default pool in this system
+        self.assertRegex(log, r'\n  Frame\s+3\s+unknown\s+3\.47\s+0\s+0\.00  not assessed')      # no default pool in this system
+        # (3.47: 2.00 + 0.97 + 0.50. The third is the model's forecast; the engine's own profile value, 0.52, was sized before.)
         self.assertRegex(log, r'\n  7\s+2\s+4\.00\s+2\.97\s+0\s+0\.00  guarantees and relied-on borrowing fit under the pool maximum')
         self.assertIn('whether the forecast level will meet competition that past occurrences did not', log)
 

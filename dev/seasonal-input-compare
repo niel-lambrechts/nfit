@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/seasonal-input-compare
+# PURPOSE  : Before and after of one correction, on a kept work tree: a seasonal
+#            run now sizes from the seasonal model's demand; before, it sized
+#            from the engine's own profile base and growth. The same event is
+#            sized twice with the current nfit-profile on the same history, once
+#            with --research-engine-seasonal-input (before) and once without
+#            (after), and each LPAR-profile whose figure moved is attributed:
+#              corrected input : the figure follows the changed starting
+#                                requirement;
+#              downstream rule : a rule further down the chain (a floor, a
+#                                protection, a role) set it, in part or in whole;
+#              unchanged       : the input changed and a downstream rule set the
+#                                same figure both times, or nothing changed.
+#            Planning profiles with their sums; other sized profiles as counts of
+#            LPAR-profile pairs only. Aggregates only: nothing is named.
+# INPUT    : the work tree kept by dev/history-integration-check --keep
+# USAGE    : dev/seasonal-input-compare --event NAME [--work DIR] [--seasonality FILE]
+#            (without --event: lists the events of the seasonality file)
+# OUTPUT   : <out>/seasonal-input-<event>.json and a table
+# ==============================================================================
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+EPS = 0.005
+
+
+def _module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+sys.dont_write_bytecode = True
+spc = _module('seasonal_protection_compare', REPO / 'dev' / 'seasonal-protection-compare')
+pr = spc.pr
+
+
+def num(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None
+
+
+def published(member):
+    profile = (member.get('profiles') or {}).get(member.get('planningProfile')) or {}
+    role = member.get('role') if isinstance(member.get('role'), dict) else None
+    source = role if role else (profile.get('currentCycle') or {})
+    return num(source.get('entitlement')), num(source.get('VPs')), (role or {}).get('type')
+
+
+def attribute(before, after):
+    """One sized profile, from its stored terms before and after: (class, input change, figure change)."""
+    b_in, a_in = num(before.get('BasePlanningDemand')), num(after.get('BasePlanningDemand'))
+    b_out, a_out = num(before.get('FinalAdjustedPhysC')), num(after.get('FinalAdjustedPhysC'))
+    if None in (b_in, a_in, b_out, a_out):
+        return 'not evaluated', 0.0, 0.0
+    d_in, d_out = a_in - b_in, a_out - b_out
+    if abs(d_out) < EPS:
+        return ('unchanged: a downstream rule set the same figure' if abs(d_in) >= EPS else 'unchanged'), d_in, d_out
+    if abs(d_out - d_in) < EPS:
+        return 'corrected input', d_in, d_out
+    return ('downstream rule: moved by more or less than the input' if abs(d_in) >= EPS else 'downstream rule: the input did not change'), d_in, d_out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--event', help='the seasonal event to size')
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='the work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'seasonal'))
+    ap.add_argument('--seasonality', default=str(REPO / 'etc' / 'nfit.seasonality.cfg'), help='the seasonality file to use')
+    a = ap.parse_args()
+    work = Path(a.work).resolve()
+    app, case = work / 'app', work / 'case'
+    stage = next(iter(sorted((case / 'stage').glob('*'))), None) if (case / 'stage').is_dir() else None
+    if stage is None or not (case / 'history' / stage.name).is_dir():
+        sys.exit('seasonal-input-compare: no kept work tree with history (run dev/history-integration-check --keep first)')
+    seasonality = Path(a.seasonality).resolve()
+    if not seasonality.is_file():
+        sys.exit('seasonal-input-compare: seasonality file not found (see --seasonality)')
+    known = spc.events(seasonality)
+    if not a.event or a.event not in [name for name, _ in known]:
+        print('Events of the seasonality file (give one with --event):')
+        for name, model in known:
+            print(f'  {name:<28} {model}')
+        return 2
+    model = dict(known)[a.event]
+
+    for name in pr.EXECUTABLES:
+        shutil.copy(REPO / name, app / name)
+        (app / name).chmod(0o700)
+    shutil.copy(seasonality, app / 'etc' / 'nfit.seasonality.cfg')
+    history = case / 'history' / stage.name
+    pristine = case / 'history.pristine' / stage.name
+    if not pristine.is_dir():
+        pristine.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(history, pristine)
+    env = pr.perl_env()
+    base = ['--nmondir', str(stage), '--apply-seasonality', a.event]
+    if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
+        base += ['--config', str(app / 'config.csv')]
+
+    runs = {}
+    for label, extra in (('before', ['--research-engine-seasonal-input']), ('after', [])):
+        trace = work / f'seasonal-input-{label}.private.json'
+        trace.unlink(missing_ok=True)
+        print(f'{a.event} ({model}): sizing {label} the correction', flush=True)
+        rows, _log, seconds, members = spc.one_run(app, case, stage, history, pristine, 'seasonal-input-' + label,
+                                                   base + extra + ['--research-runq-trace', str(trace)], env)
+        if not rows or not trace.is_file():
+            sys.exit('seasonal-input-compare: a run produced no CSV or no trace (is the event active at the end of the staged data? '
+                     'see its private log in the work tree)')
+        runs[label] = {'rows': rows, 'members': members, 'trace': json.loads(trace.read_text())['members'], 'seconds': seconds}
+    shutil.rmtree(history)
+    shutil.copytree(pristine, history)                     # the kept tree as it was found
+
+    before, after = runs['before'], runs['after']
+    planning = {'lpars': 0, 'classes': {}, 'targetBefore': 0.0, 'targetAfter': 0.0, 'publishedBefore': 0.0, 'publishedAfter': 0.0,
+                'publishedRaised': 0, 'publishedLowered': 0, 'publishedVPsChanged': 0, 'modelDemand': 0.0, 'engineValue': 0.0}
+    others = {'pairs': 0, 'classes': {}}
+    by_role = {}
+    ratios = []
+    for vm, t in after['trace'].items():
+        tb = before['trace'].get(vm)
+        ma, mb = after['members'].get(vm), before['members'].get(vm)
+        if not tb or not ma or not mb:
+            continue
+        for name, d in (t.get('profiles') or {}).items():
+            db = (tb.get('profiles') or {}).get(name)
+            if db is None:
+                continue
+            cls, d_in, d_out = attribute(db, d)
+            if name != t.get('planningProfile'):
+                others['pairs'] += 1
+                slot = others['classes'].setdefault(cls, {'pairs': 0, 'raised': 0, 'lowered': 0})
+                slot['pairs'] += 1
+                slot['raised'] += d_out >= EPS
+                slot['lowered'] += d_out <= -EPS
+                continue
+            planning['lpars'] += 1
+            slot = planning['classes'].setdefault(cls, {'lpars': 0, 'inputCores': 0.0, 'targetCores': 0.0, 'raised': 0, 'lowered': 0})
+            slot['lpars'] += 1
+            slot['inputCores'] = round(slot['inputCores'] + d_in, 2)
+            slot['targetCores'] = round(slot['targetCores'] + d_out, 2)
+            slot['raised'] += d_out >= EPS
+            slot['lowered'] += d_out <= -EPS
+            planning['targetBefore'] = round(planning['targetBefore'] + (num(db.get('FinalAdjustedPhysC')) or 0), 2)
+            planning['targetAfter'] = round(planning['targetAfter'] + (num(d.get('FinalAdjustedPhysC')) or 0), 2)
+            demand, engine = num(d.get('SizingInputModelDemand')), num(d.get('SizingInputEngineValue'))
+            if demand is not None and engine is not None:
+                planning['modelDemand'] = round(planning['modelDemand'] + demand, 2)
+                planning['engineValue'] = round(planning['engineValue'] + engine, 2)
+                if engine > 0:
+                    ratios.append(demand / engine)
+            (pb, vb, _), (pa, va, role) = published(mb), published(ma)
+            if pb is not None and pa is not None:
+                planning['publishedBefore'] = round(planning['publishedBefore'] + pb, 2)
+                planning['publishedAfter'] = round(planning['publishedAfter'] + pa, 2)
+                planning['publishedRaised'] += pa - pb >= EPS
+                planning['publishedLowered'] += pa - pb <= -EPS
+                r = by_role.setdefault(role or 'none', {'lpars': 0, 'publishedBefore': 0.0, 'publishedAfter': 0.0})
+                r['lpars'] += 1
+                r['publishedBefore'] = round(r['publishedBefore'] + pb, 2)
+                r['publishedAfter'] = round(r['publishedAfter'] + pa, 2)
+            planning['publishedVPsChanged'] += (va is not None and vb is not None and va != vb)
+    ratios.sort()
+    quantile = lambda q: round(ratios[min(len(ratios) - 1, int(q * (len(ratios) - 1) + 0.5))], 3) if ratios else None
+    result = {'event': a.event, 'model': model, 'commit': pr.git_identity(),
+              'method': {'before': '--research-engine-seasonal-input: the chain starts from the engine profile base and growth',
+                         'after': 'the chain starts from the seasonal model demand', 'tolerance': EPS,
+                         'figure': 'FinalAdjustedPhysC of the sized profile; published = the planning recommendation (a role sizes it last)'},
+              'planningProfiles': planning, 'otherSizedProfiles': others, 'byRole': by_role,
+              'modelDemandOverEngineValue': {'n': len(ratios), 'p10': quantile(0.10), 'median': quantile(0.5), 'p90': quantile(0.90)},
+              'seconds': {k: v['seconds'] for k, v in runs.items()}}
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / ('seasonal-input-%s.json' % re.sub(r'[^A-Za-z0-9_.-]', '_', a.event))
+    target.write_text(json.dumps(result, indent=1) + '\n')
+
+    p = planning
+    print()
+    print(f"{a.event} ({model}): the sizing input before and after, {p['lpars']} LPARs on their planning profile")
+    print(f"  Model demand {p['modelDemand']:.2f} cores against the engine's value {p['engineValue']:.2f} (demand / engine value: "
+          f"p10 {result['modelDemandOverEngineValue']['p10']}, median {result['modelDemandOverEngineValue']['median']}, p90 {result['modelDemandOverEngineValue']['p90']})")
+    print(f"  Profile target  : {p['targetBefore']:.2f} -> {p['targetAfter']:.2f} cores ({p['targetAfter'] - p['targetBefore']:+.2f})")
+    print(f"  Published       : {p['publishedBefore']:.2f} -> {p['publishedAfter']:.2f} cores ({p['publishedAfter'] - p['publishedBefore']:+.2f}); "
+          f"raised on {p['publishedRaised']} LPARs, lowered on {p['publishedLowered']}; published VPs changed on {p['publishedVPsChanged']}")
+    print('  Planning profiles by what set the change:')
+    for cls, c in sorted(p['classes'].items(), key=lambda kv: -kv[1]['lpars']):
+        print('    %-58s %4d LPARs  input %+8.2f  target %+8.2f  (raised %d, lowered %d)' % (cls, c['lpars'], c['inputCores'], c['targetCores'], c['raised'], c['lowered']))
+    print(f"  Other sized profiles ({others['pairs']} LPAR-profile pairs; counts only):")
+    for cls, c in sorted(others['classes'].items(), key=lambda kv: -kv[1]['pairs']):
+        print('    %-58s %5d pairs  (raised %d, lowered %d)' % (cls, c['pairs'], c['raised'], c['lowered']))
+    print('  Published planning figure by role:')
+    for role, c in sorted(by_role.items()):
+        print('    %-10s %4d LPARs  %.2f -> %.2f cores' % (role, c['lpars'], c['publishedBefore'], c['publishedAfter']))
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

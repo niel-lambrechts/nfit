@@ -699,6 +699,10 @@ my $research_busy_share;
 # the run-queue additive (Section D), so that its effect on the published
 # figures can be read as a difference of two runs. Never for planning.
 my ($research_runq_trace, $research_no_runq_additive);
+# --research-engine-seasonal-input (research only): a seasonal run sizes from the engine's own
+# profile base and growth, as it did before the seasonal model's demand became the sizing input.
+# For the before-and-after comparison of that correction (dev/seasonal-input-compare). Never for planning.
+my $research_engine_seasonal_input;
 my %RUNQ_TRACE;
 # Research: size and precision of the durable contested record (history schema draft, 0.01-core counted pairs).
 my $research_contested_record;
@@ -935,6 +939,7 @@ GetOptions(
     'research-busy-share'        => \$research_busy_share,
     'research-runq-trace=s'      => \$research_runq_trace,
     'research-no-runq-additive'  => \$research_no_runq_additive,
+    'research-engine-seasonal-input' => \$research_engine_seasonal_input,
     'research-contested-record'  => \$research_contested_record,
     'research-pool-ceiling-replay=s' => \$research_pool_ceiling_replay,
     'research-pool-coarse-evidence=s' => \$research_pool_coarse_evidence,
@@ -7654,6 +7659,17 @@ sub _profile_widened
     return (($dbg->{'rVCPU_RunQEnvelopeOverride'} // 'No') eq 'Yes') ? 1 : 0;
 }
 
+# The requirement the sizing chain starts from, and the growth it still has to add:
+# (start, growth to apply, source). With a seasonal model's demand: that demand, and no further
+# growth (the model's own growth is in it). Otherwise the engine's pre-growth base and its growth.
+sub _sizing_start_requirement
+{
+    my ($model_demand, $engine_base, $engine_growth) = @_;
+    return ($model_demand + 0, 0, 'seasonal model demand')
+        if (defined $model_demand && looks_like_number($model_demand) && $model_demand >= 0);
+    return ($engine_base, ((defined $engine_growth && looks_like_number($engine_growth)) ? $engine_growth + 0 : 0), 'engine profile value');
+}
+
 sub calculate_runq_modified_physc
 {
     my ($vm_name, $vm_map_ref, $profile_ref, $pressure_flags_href, $adaptive_thresholds_href) = @_;
@@ -8338,6 +8354,20 @@ sub calculate_runq_modified_physc
     # keep their "0.0000" initialisation from the defaults block above; the
     # additive path below sets them where it has something to say.
     my $base_adjusted_physc = $eff_p_base_numeric;
+    # The starting requirement. A seasonal model gives its demand for the profile explicitly
+    # (CoreResults.SizingDemandInput): that is then the requirement, and the engine's growth is not
+    # applied to it again. The engine's base and growth stay what they are, historical measurements
+    # that the rules further down read. An ordinary run has no such input and is sized as before.
+    my ($sizing_start, $sizing_growth, $sizing_source) = _sizing_start_requirement(
+        ($research_engine_seasonal_input ? undef : _safe_dig($vm_map_ref, 'CoreResults', 'SizingDemandInput', $profile_name)),
+        $eff_p_base_numeric, $growth_adj_numeric);
+    $base_adjusted_physc = $sizing_start;
+    $debug_info{'SizingInputSource'} = $sizing_source;
+    if ($sizing_source eq 'seasonal model demand')
+    {
+        $debug_info{'SizingInputModelDemand'} = sprintf("%.4f", $sizing_start);
+        $debug_info{'SizingInputEngineValue'} = defined($eff_p_base_numeric) ? sprintf("%.4f", $eff_p_base_numeric + ($growth_adj_numeric // 0)) : $na_str;
+    }
 
     # Apply GrowthAdj. Ordering is preserved from the previous implementation:
     # growth was applied after downsizing so it could not disqualify the
@@ -8345,8 +8375,8 @@ sub calculate_runq_modified_physc
     # $downsized_pre_growth / DownsizedPhysC_PreGrowth remain the pre-growth
     # reference the additive path and rationale expect.
     my $downsized_pre_growth = $base_adjusted_physc;
-    if (defined $growth_adj_numeric && looks_like_number($growth_adj_numeric)) {
-        $base_adjusted_physc = $downsized_pre_growth + $growth_adj_numeric;
+    if (defined $downsized_pre_growth && defined $sizing_growth && looks_like_number($sizing_growth)) {
+        $base_adjusted_physc = $downsized_pre_growth + $sizing_growth;
     }
     $debug_info{'DownsizedPhysC_PreGrowth'} = sprintf("%.4f", $downsized_pre_growth);
     $debug_info{'DownsizedPhysC'} = sprintf("%.4f", $base_adjusted_physc);
@@ -19479,7 +19509,15 @@ sub _store_model_forecast_to_history {
                                                    $baseline_meta_href->{coverage_by_vm});
     }
 
-    $meta_block->{semantics} = _model_forecast_semantics() if (ref($sized_results_href) eq 'HASH');
+    if (ref($sized_results_href) eq 'HASH')
+    {
+        $meta_block->{semantics} = _model_forecast_semantics();
+        # 'forecast' and 'sized' of one LPAR and profile are a before-and-after pair only when both come
+        # from the same sizing. The aggregated multiplicative record says what each of them is instead.
+        my $scope = (ref($analysis_context) eq 'HASH') ? $analysis_context->{record_scope} : undef;
+        $meta_block->{semantics}{pair} = (ref($scope) eq 'HASH') ? 'not-corresponding' : 'corresponding';
+        @{ $meta_block->{semantics} }{qw(forecastScope sizedScope)} = @{$scope}{qw(forecast sized)} if (ref($scope) eq 'HASH');
+    }
     $model_data{'_meta'} = $meta_block;
 
     # Build per-VM forecast and baseline data
@@ -32736,6 +32774,8 @@ sub _execute_multiplicative_seasonal {
         if (exists $forecast_results->{$vm_name}) {
             # A copy: the sizing chain writes into ProfileValues, and the forecast must stay the model's demand.
             $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = { %{ $forecast_results->{$vm_name} } };
+            # The model's demand is the sizing chain's starting requirement for each profile (not the engine's base).
+            $assimilation_map->{$vm_name}{CoreResults}{SizingDemandInput} = { %{ $forecast_results->{$vm_name} } };
         }
 
         # Restore PeakValue (immutable historical fact - not a forecast)
@@ -34112,6 +34152,8 @@ sub _execute_predictive_peak {
         if (exists $forecast_results->{$vm_name}) {
              # A copy: the sizing chain writes into ProfileValues, and the forecast must stay the model's demand.
              $assimilation_map->{$vm_name}{CoreResults}{ProfileValues} = { %{ $forecast_results->{$vm_name} } };
+             # The model's demand is the sizing chain's starting requirement for each profile (not the engine's base).
+             $assimilation_map->{$vm_name}{CoreResults}{SizingDemandInput} = { %{ $forecast_results->{$vm_name} } };
         }
     }
 
@@ -34907,6 +34949,10 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
         bucket_occurrence_end_dates => [ map { $_->{end} ? $_->{end}->ymd : () } @$bucket_occ_aref ],
         # Phase 3.3: VM scope metadata (undef if no filtering applied)
         vm_scope => $vm_scope_meta,
+        # The demand is aggregated over the occurrences; the sized figures are those of the final
+        # occurrence alone (the one the CSV publishes). They are not a before-and-after pair.
+        record_scope => { forecast => sprintf('%s of %d occurrence%s', $method, $occ_n, ($occ_n == 1 ? '' : 's')),
+                          sized => 'final occurrence' . (($occ_n && $bucket_occ_aref->[-1]{end}) ? ' ending ' . $bucket_occ_aref->[-1]{end}->ymd : '') },
     };
 
     # Horizon meta is optional for multiplicative; keep undef unless you already compute it
