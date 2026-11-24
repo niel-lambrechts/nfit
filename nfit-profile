@@ -707,6 +707,9 @@ my %RUNQ_TRACE;
 # Stored event snapshots a seasonal model left out because their results cannot be read as
 # observations: "event month" => reason. Reported with the stored forecast.
 my %SEASONAL_UNVERIFIED_SNAPSHOTS;
+# What the multiplicative model divided each past occurrence by, for the stored record:
+# (denominator => text, occurrencePairsWithoutIt => count of LPAR-profile occurrences left out).
+my %SEASONAL_MULTIPLIER_BASIS;
 # Research: size and precision of the durable contested record (history schema draft, 0.01-core counted pairs).
 my $research_contested_record;
 my %BUSY_SHARE_RULES = (binWidth => 0.10, minCores => 0.10, minEntShare => 0.10, minBinMinutes => 5, minMinutes => 15);
@@ -11099,7 +11102,7 @@ sub _format_layer_a_source_summary {
 #   - A hash reference containing historical data for verbose reporting.
 # ==============================================================================
 sub calculate_multiplicative_forecast {
-    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href, $exclusions_href, $asof_start_obj, $asof_end_obj, $precomputed_baselines_href) = @_;
+    my ($system_cache_dir, $system_identifier, $event_name, $event_config, $full_seasonality_config, $initial_results_table_href, $exclusions_href, $asof_start_obj, $asof_end_obj, $precomputed_baselines_href, $baseline_at_cref) = @_;
 
     # This subroutine implements a robust, multi-stage forecast for multiplicative seasonal events.
     # It intelligently determines the most appropriate recent baseline and applies a recency-weighted
@@ -11183,6 +11186,8 @@ sub calculate_multiplicative_forecast {
     # --- Step 2: Two-Tiered Baseline Strategy ---
     my %current_baseline_results;
     my $baseline_source_log = "N/A";
+    my $like_for_like_cref;
+    %SEASONAL_MULTIPLIER_BASIS = ();
     my @event_history_final = @event_history_initial; # Start with all available history.
 
     # Phase 6: Use pre-computed history-based baseline if provided by orchestrator.
@@ -11190,6 +11195,10 @@ sub calculate_multiplicative_forecast {
     if ($precomputed_baselines_href && ref($precomputed_baselines_href) eq 'HASH' && %$precomputed_baselines_href) {
         %current_baseline_results = %$precomputed_baselines_href;
         $baseline_source_log = "History-based (canonical window)";
+        # This baseline is the mean of the daily profile values of the window. A past occurrence's stored
+        # baseline is another quantity (one percentile over all days of its baseline period), so each
+        # occurrence is divided by this same baseline as of that occurrence.
+        $like_for_like_cref = $baseline_at_cref if (ref($baseline_at_cref) eq 'CODE');
         print STDERR "  Φ Multiplicative Seasonal Forecast [Baseline]: history-based (pre-computed)\n";
     } else {
 
@@ -11518,6 +11527,25 @@ sub calculate_multiplicative_forecast {
                         }
                         my $hist_base     = _safe_dig($hist_results, 'HistoricBaseline', $vm_name, $p_name);
                         my $hist_residual = _safe_dig($hist_results, 'PeakResidual', $vm_name, $p_name);
+                        if ($like_for_like_cref)
+                        {
+                            # The denominator on the basis of the baseline it will be multiplied with.
+                            my $as_of    = eval { Time::Piece->strptime($hist_event->{periodEndDate} // '', '%Y-%m-%d') };
+                            my $earlier  = $as_of ? $like_for_like_cref->($as_of) : undef;
+                            my $same     = (ref($earlier) eq 'HASH' && ref($earlier->{$vm_name}) eq 'HASH') ? $earlier->{$vm_name}{$p_name} : undef;
+                            $SEASONAL_MULTIPLIER_BASIS{denominator} = 'history baseline as of each occurrence (mean of the daily profile values of its window)';
+                            unless (defined $same && looks_like_number($same) && $same > 0.001)
+                            {
+                                # No like-for-like denominator: the occurrence is left out, not divided by another quantity.
+                                $SEASONAL_MULTIPLIER_BASIS{occurrencePairsWithoutIt}++;
+                                next;
+                            }
+                            $hist_base = $same;
+                        }
+                        else
+                        {
+                            $SEASONAL_MULTIPLIER_BASIS{denominator} = 'stored baseline of each occurrence';
+                        }
 
                         # The profile requirement: the event's value on the profile's own basis.
                         my $resolved_peak = _resolve_layer_a_peak_from_snapshot(
@@ -19859,6 +19887,10 @@ sub _store_model_forecast_to_history {
                 if ((!looks_like_number($version) || $version < 2) && ref($event_snapshot->{results}) eq 'HASH');
         }
         $model_data{'_meta'}{observationsNotUsed} = { %SEASONAL_UNVERIFIED_SNAPSHOTS } if %SEASONAL_UNVERIFIED_SNAPSHOTS;
+        $model_data{'_meta'}{multiplierBasis} = { %SEASONAL_MULTIPLIER_BASIS } if ($model_type eq 'multiplicative_seasonal' && %SEASONAL_MULTIPLIER_BASIS);
+        printf STDERR "  [NOTE] %d LPAR-profile occurrence(s) left out of the seasonal multiplier: history holds no daily values for a like-for-like baseline as of the occurrence\n",
+            $SEASONAL_MULTIPLIER_BASIS{occurrencePairsWithoutIt}
+            if ($model_type eq 'multiplicative_seasonal' && $SEASONAL_MULTIPLIER_BASIS{occurrencePairsWithoutIt});
         printf STDERR "  [NOTE] %d stored occurrence record(s) not read as observations (provenance not verified): %s\n",
             scalar(keys %SEASONAL_UNVERIFIED_SNAPSHOTS), join('; ', map { "$_ ($SEASONAL_UNVERIFIED_SNAPSHOTS{$_})" } sort keys %SEASONAL_UNVERIFIED_SNAPSHOTS)
             if %SEASONAL_UNVERIFIED_SNAPSHOTS;
@@ -31955,6 +31987,30 @@ sub _execute_automatic_seasonal_discovery {
 
                     $exec_ctx->{_baseline_result} = $baseline_result;
                     $exec_ctx->{_baseline_meta}   = $baseline_result->{meta};
+                    # The same baseline as of an earlier date, on the same rules (window, coverage, scope and
+                    # exclusions): what a past occurrence is divided by must be the quantity its ratio is then
+                    # multiplied with. { vm => { profile => value } }, or undef when history gives none.
+                    my %baseline_as_of;
+                    $exec_ctx->{_baseline_at} = sub {
+                        my ($end_obj) = @_;
+                        return undef unless ($end_obj);
+                        my $key = $end_obj->ymd;
+                        return $baseline_as_of{$key} if (exists $baseline_as_of{$key});
+                        my @periods = find_all_historical_periods($seasonality_config, $end_obj - (($bl_canonical_days + 31) * ONE_DAY), $end_obj);
+                        my $earlier = eval {
+                            _get_baseline_from_history({
+                                system_cache_dir   => $current_cache_path,
+                                end_date_obj       => $end_obj,
+                                canonical_days     => $bl_canonical_days,
+                                coverage_threshold => $event_cfg->{baseline_coverage_threshold} // 0.7,
+                                vm_scope_filter    => $bl_vm_scope,
+                                date_exclusions    => $bl_exclusions,
+                                peak_periods       => \@periods,
+                                profiles           => [map { $_->{name} } @$profiles_aref],
+                            });
+                        };
+                        return $baseline_as_of{$key} = ((ref($earlier) eq 'HASH' && ref($earlier->{baselines}) eq 'HASH') ? $earlier->{baselines} : undef);
+                    };
 
                     if (($verbose // 0) >= 1) {
                         my $bl_status = ($baseline_result->{meta}{coverage_by_vm})
@@ -31992,6 +32048,7 @@ sub _execute_automatic_seasonal_discovery {
             #  - Snapshot auditability is preserved
             if ($model_type eq 'predictive_peak' && !$use_l1_baseline) {
                 delete $exec_ctx->{_baseline_result};
+                delete $exec_ctx->{_baseline_at};
                 $exec_ctx->{_baseline_meta} = {
                     baseline_source => 'l1_cache',
                     fingerprint     => $baseline_fp_href->{fingerprint},
@@ -32939,7 +32996,8 @@ sub _execute_multiplicative_seasonal {
         $exclusions,
         $exec_ctx->{effective_start_date},
         $exec_ctx->{effective_end_date},
-        $precomputed_baselines     # Phase 6: history-based baseline (undef → L1 fallback)
+        $precomputed_baselines,    # Phase 6: history-based baseline (undef → L1 fallback)
+        ($precomputed_baselines ? $exec_ctx->{_baseline_at} : undef)   # the same baseline as of a past occurrence
     );
 
     # Merge Forecast Results (preserving event-period measurement values)

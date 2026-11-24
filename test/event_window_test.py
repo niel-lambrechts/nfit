@@ -38,6 +38,16 @@ import contested_reader_test as C
 EVENT = ('[Global]\nmin_history_days = 1\nseasonal_lookback_days = 1\n'
          '[ev]\nmodel = %s\npriority = 10\ndates = %s\nbaseline_period_days = %d\nmin_historical_years = 0\n'
          'min_historical_peaks = %d\nmin_historical_periods = %d\n')
+def month_of(analysis, values, month, days=28):
+    """A month's workload analysis for a synthetic earlier month: the given analysis with its daily profile series
+    re-dated into that month, each day at the profile's value (a level month)."""
+    out = json.loads(json.dumps(analysis))
+    for vm, block in out.items():
+        if isinstance(block, dict) and vm in values:
+            block['DailyProfileSeries'] = {profile: {'%s-%02d' % (month, d): v for d in range(1, days + 1)} for profile, v in values[vm].items()}
+    return out
+
+
 COLUMNS = ('G3-95W15', 'O3-95W15', 'B3-95W15', 'NFIT - ENT', 'NFIT - VCPU')
 
 
@@ -87,12 +97,17 @@ class EventWindowTests(unittest.TestCase):
             values = {vm: {k: float(v) for k, v in (block.get('ProfileValues') or {}).items()} for vm, block in analysis.items()}
             august = {'2026-08': {
                 'Metadata': {'ProcessedStartDate': '2026-08-01', 'ProcessedEndDate': '2026-08-31', 'ProcessedDays': 31},
-                'MonthlyWorkloadAnalysis': analysis,
+                'MonthlyWorkloadAnalysis': month_of(analysis, values, '2026-08', 31),
                 'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'periodEndDate': '2026-08-01', 'generatedOn': '2026-08-02T00:00:00', 'results': {
                     'HistoricPeak': {vm: {k: round(v * peak, 4) for k, v in pv.items()} for vm, pv in values.items()},
                     'HistoricBaseline': values}}}}}
             with open(os.path.join(folder, 'nfit.hist.2026-08.json'), 'w') as fh:
                 json.dump(august, fh)
+            # The month before it, level: the daily values the August occurrence's baseline is read from.
+            july = {'2026-07': {'Metadata': {'ProcessedStartDate': '2026-07-01', 'ProcessedEndDate': '2026-07-31', 'ProcessedDays': 31},
+                                'MonthlyWorkloadAnalysis': month_of(analysis, values, '2026-07', 31)}}
+            with open(os.path.join(folder, 'nfit.hist.2026-07.json'), 'w') as fh:
+                json.dump(july, fh)
         run = cls.fixture.run_profile(root, '--apply-seasonality', 'ev', *flags)
         path, = glob.glob(os.path.join(root, 'output', '*.ev.*.csv'))
         with open(path) as fh:

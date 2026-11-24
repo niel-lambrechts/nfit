@@ -74,7 +74,7 @@ class Case:
     template = None
 
     def __init__(self, form='legacy', raw=1.5, residual=0.25, peak=None, hidden=0.0, latent_extra=0.0, generated=True,
-                 earlier_record=None, latest_peak=None, target_event=None, models=MODELS, repeats=1, trace=False):
+                 earlier_record=None, latest_peak=None, target_event=None, models=MODELS, repeats=1, trace=False, stored_baseline=1.0, month_before=True):
         fixture = M.MemberExposureTests
         if Case.template is None:
             # The fixture's months and their history, generated once and copied for every case.
@@ -95,13 +95,21 @@ class Case:
         self.values = {vm: {k: float(v) for k, v in (block.get('ProfileValues') or {}).items()} for vm, block in analysis.items()}
         peak = peak or {}
         # The event's value on each profile's own basis: B, unless a factor is given for the profile.
-        results = {'HistoricBaseline': self.values,
+        # The stored baseline of an occurrence: one percentile over all days of its baseline period. It need not equal
+        # the mean of the daily values of those days (stored_baseline is its factor on B).
+        results = {'HistoricBaseline': {vm: {k: round(v * stored_baseline, 4) for k, v in pv.items()} for vm, pv in self.values.items()},
                    'HistoricPeak': {vm: {k: round(v * peak.get(k, 1.0), 4) for k, v in pv.items()} for vm, pv in self.values.items()},
                    'PeakResidual': {vm: {k: round(v * residual, 4) for k, v in pv.items()} for vm, pv in self.values.items()}}
         if hidden:
             results['ClippingInfo'] = {vm: {k: {'isClipped': True, 'clippingConfidence': 0.9, 'unmetDemandEstimate': round(v * hidden, 4),
                                                 'unclippedPeakEstimate': round(v * (peak.get(k, 1.0) + hidden), 4)}
                                             for k, v in pv.items()} for vm, pv in self.values.items()}
+        # The month before the first occurrence, level: the daily values its baseline is read from.
+        june = {'2026-06': {'Metadata': {'ProcessedStartDate': '2026-06-01', 'ProcessedEndDate': '2026-06-28', 'ProcessedDays': 28},
+                            'MonthlyWorkloadAnalysis': E.month_of(analysis, self.values, '2026-06')}}
+        if month_before:
+            with open(os.path.join(self.folder, 'nfit.hist.2026-06.json'), 'w') as fh:
+                json.dump(june, fh)
         for index, month in enumerate(EARLIER):
             day = month + '-01'
             stored_form = form if isinstance(form, str) else form[index]      # one form, or one per earlier month
@@ -127,7 +135,7 @@ class Case:
             if earlier_record and month == EARLIER[-1]:
                 event['ModelForecasts'] = earlier_record
             stored = {month: {'Metadata': {'ProcessedStartDate': day, 'ProcessedEndDate': month + '-28', 'ProcessedDays': 28},
-                              'MonthlyWorkloadAnalysis': analysis, 'SeasonalEventSnapshots': {'ev': event}}}
+                              'MonthlyWorkloadAnalysis': E.month_of(analysis, self.values, month), 'SeasonalEventSnapshots': {'ev': event}}}
             with open(os.path.join(self.folder, 'nfit.hist.%s.json' % month), 'w') as fh:
                 json.dump(stored, fh)
         if target_event:
