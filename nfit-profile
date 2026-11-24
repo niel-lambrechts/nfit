@@ -704,6 +704,9 @@ my ($research_runq_trace, $research_no_runq_additive);
 # For the before-and-after comparison of that correction (dev/seasonal-input-compare). Never for planning.
 my $research_engine_seasonal_input;
 my %RUNQ_TRACE;
+# Stored event snapshots a seasonal model left out because their results cannot be read as
+# observations: "event month" => reason. Reported with the stored forecast.
+my %SEASONAL_UNVERIFIED_SNAPSHOTS;
 # Research: size and precision of the durable contested record (history schema draft, 0.01-core counted pairs).
 my $research_contested_record;
 my %BUSY_SHARE_RULES = (binWidth => 0.10, minCores => 0.10, minEntShare => 0.10, minBinMinutes => 5, minMinutes => 15);
@@ -10848,8 +10851,57 @@ sub _resolve_layer_a_occurrence_value {
 #             is_fallback, notes.  Returns undef if no usable peak value can
 #             be resolved from any source.
 # ==============================================================================
+# Whether the results of a stored event snapshot may be read as observations. They may when the
+# history generator stamped the snapshot and no model store from before the demand-quantity
+# correction can have written into them: those stores wrote a model's figure into HistoricPeak
+# (multiplicative seasonal) or PeakValue (recency decay) when no observation was at hand.
+# Returns (usable, reason).
+sub _snapshot_observations_usable
+{
+    my ($snapshot) = @_;
+    return (0, 'no results') unless (ref($snapshot) eq 'HASH' && ref($snapshot->{results}) eq 'HASH');
+    return (0, 'not written by the history generator') unless (defined $snapshot->{generatedOn});
+    return (0, 'marked: a model store from before the correction may have written into them') if ($snapshot->{observationsUnverified});
+    foreach my $model (qw(multiplicative_seasonal recency_decay))
+    {
+        my $record = (ref($snapshot->{ModelForecasts}) eq 'HASH') ? $snapshot->{ModelForecasts}{$model} : undef;
+        next unless (ref($record) eq 'HASH');
+        my $version = _safe_dig($record, '_meta', 'semantics', 'version') // 0;
+        return (0, "holds a $model record from before the correction") if (!looks_like_number($version) || $version < 2);
+    }
+    return (1, '');
+}
+
+# The peak of one past occurrence, for one of two purposes that never stand in for each other:
+#   'profile'  the profile requirement: the event's value on the profile's own percentile, smoothing
+#              window and hours (HistoricPeak, else PeakValue), plus the estimated hidden demand
+#              where clipping was detected (ClippingInfo.unmetDemandEstimate), applied once. Occurrence
+#              peaks are not read: equivalent observations give the same value in either record form.
+#   'peak'     the peak-capacity estimate (the default, as before): latent occurrence peak, raw
+#              occurrence peak (a maximum: no percentile, no smoothing), then the legacy values.
 sub _resolve_layer_a_peak_from_snapshot {
-    my ($hist_results_href, $vm_name, $profile_name, $prefer_latent, $event_name, $month_key) = @_;
+    my ($hist_results_href, $vm_name, $profile_name, $prefer_latent, $event_name, $month_key, $purpose) = @_;
+    if (defined $purpose && $purpose eq 'profile')
+    {
+        return undef unless (ref($hist_results_href) eq 'HASH');
+        my ($value, $key) = (_safe_dig($hist_results_href, 'HistoricPeak', $vm_name, $profile_name), 'HistoricPeak');
+        ($value, $key) = (_safe_dig($hist_results_href, 'PeakValue', $vm_name, $profile_name), 'PeakValue')
+            unless (defined $value && looks_like_number($value));
+        return undef unless (defined $value && looks_like_number($value));
+        my $clip = _safe_dig($hist_results_href, 'ClippingInfo', $vm_name, $profile_name);
+        my $hidden = (ref($clip) eq 'HASH' && $clip->{isClipped} && looks_like_number($clip->{unmetDemandEstimate} // '')
+                      && $clip->{unmetDemandEstimate} > 0) ? $clip->{unmetDemandEstimate} + 0 : 0;
+        return {
+            value          => $value + $hidden,
+            layer_a_source => ($hidden ? 'profile_event_value_with_hidden_demand' : 'profile_event_value'),
+            is_latent      => ($hidden ? 1 : 0),
+            is_raw         => 0,
+            is_fallback    => 0,
+            profile_value  => 0 + $value,
+            hidden_demand  => $hidden,
+            notes          => "Resolved from $key on the profile's own basis" . ($hidden ? ' plus the estimated hidden demand' : ''),
+        };
+    }
 
     $prefer_latent = defined $prefer_latent ? $prefer_latent : 1;
     $event_name    = defined $event_name    ? $event_name    : 'unknown_event';
@@ -11377,6 +11429,7 @@ sub calculate_multiplicative_forecast {
         my $vm_forecasts = {};
         my %vm_historic_multipliers;
         my %vm_historic_residuals;
+        my %vm_historic_capacity;
 
         # Gather historical data for all active events for this VM.
         foreach my $active_event_cfg (@active_events) {
@@ -11398,21 +11451,43 @@ sub calculate_multiplicative_forecast {
                     my $p_name = $profile->{name};
 
                     my @multipliers;
+                    my @capacity_multipliers;
                     my @residuals;
                     foreach my $hist_event (@history_for_this_event) {
                         my $hist_results  = $hist_event->{results};
                         my $hist_month    = $hist_event->{_month_key} // 'unknown_month';
+                        # Only observations enter: a snapshot a model store may have written into is left out.
+                        my ($usable, $why_not) = _snapshot_observations_usable($hist_event);
+                        unless ($usable)
+                        {
+                            $SEASONAL_UNVERIFIED_SNAPSHOTS{"$active_event_name $hist_month"} = $why_not;
+                            next;
+                        }
                         my $hist_base     = _safe_dig($hist_results, 'HistoricBaseline', $vm_name, $p_name);
                         my $hist_residual = _safe_dig($hist_results, 'PeakResidual', $vm_name, $p_name);
 
+                        # The profile requirement: the event's value on the profile's own basis.
                         my $resolved_peak = _resolve_layer_a_peak_from_snapshot(
                             $hist_results,
                             $vm_name,
                             $p_name,
-                            1,                  # Phase 1 rule: multiplicative path prefers latent truth
+                            1,
                             $active_event_name,
                             $hist_month,
+                            'profile',
                         );
+                        # The peak-capacity estimate: the latent or raw occurrence peak. Kept apart.
+                        my $capacity_peak = _resolve_layer_a_peak_from_snapshot(
+                            $hist_results, $vm_name, $p_name, 1, $active_event_name, $hist_month, 'peak');
+                        if ($capacity_peak && looks_like_number($capacity_peak->{value} // '')
+                            && defined $hist_base && looks_like_number($hist_base) && $hist_base > 0.001)
+                        {
+                            push @capacity_multipliers, {
+                                value          => $capacity_peak->{value} / $hist_base,
+                                date           => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d'),
+                                layer_a_source => $capacity_peak->{layer_a_source},
+                            };
+                        }
 
                         if ($resolved_peak
                             && defined $resolved_peak->{value}
@@ -11440,6 +11515,9 @@ sub calculate_multiplicative_forecast {
                     my $event_multiplier = calculate_recency_weighted_average(\@multipliers, $today_for_recency, 365);
                     $vm_historic_multipliers{$p_name}{$active_event_name} = { 'multiplier' => $event_multiplier, 'history' => \@multipliers };
                     $vm_historic_residuals{$p_name}{$active_event_name} = \@residuals;
+                    $vm_historic_capacity{$p_name}{$active_event_name} = {
+                        'multiplier' => calculate_recency_weighted_average(\@capacity_multipliers, $today_for_recency, 365),
+                        'source'     => $capacity_multipliers[-1]{layer_a_source} } if @capacity_multipliers;
 
                 }
             }
@@ -11508,9 +11586,36 @@ sub calculate_multiplicative_forecast {
 
             my $trend_adjusted_baseline = $current_baseline_val * $trend_adjustment_factor;
             my $primary_forecast = $trend_adjusted_baseline * $final_multiplier * $volatility_buffer;
-            my $combined_forecast = $primary_forecast + $forecasted_residual;
+            # The profile requirement. The residual is not added: it is the gap to the residual profile,
+            # and adding it would move the result onto that profile's basis.
+            my $combined_forecast = $primary_forecast;
             my $amplification = $event_config->{peak_amplification_factor} // 1.0;
             my $final_recommendation = $combined_forecast * $amplification;
+            # The peak-capacity estimate, kept under its own name: the same baseline, trend and buffers on
+            # the occurrence peaks. The residual belongs to it only where the peak it was built from is
+            # itself a profile value (no occurrence peak stored); a raw or latent peak already contains it.
+            my ($peak_capacity, $peak_capacity_source);
+            if (!$is_bootstrap_run && exists $vm_historic_capacity{$p_name})
+            {
+                my $capacity_multiplier = 1.0;
+                my %sources;
+                foreach my $event_data (values %{ $vm_historic_capacity{$p_name} })
+                {
+                    next unless (defined $event_data->{'multiplier'});
+                    $capacity_multiplier *= $event_data->{'multiplier'};
+                    $sources{ $event_data->{'source'} // 'unknown' } = 1;
+                }
+                if ($is_interaction_run && @dampening_factors)
+                {
+                    my $dampening_to_apply = (sort { $a <=> $b } @dampening_factors)[0];
+                    $capacity_multiplier = 1 + (($capacity_multiplier - 1) * $dampening_to_apply);
+                }
+                $peak_capacity_source = join('+', sort keys %sources);
+                my $on_profile_basis = ($peak_capacity_source =~ /^legacy_(?:historicpeak|peakvalue)_fallback$/) ? 1 : 0;
+                $peak_capacity = ($trend_adjusted_baseline * $capacity_multiplier * $volatility_buffer
+                                  + ($on_profile_basis ? $forecasted_residual : 0)) * $amplification;
+                $peak_capacity_source .= ' + residual' if ($on_profile_basis && $forecasted_residual > 0);
+            }
 
             $vm_forecasts->{$p_name} = $final_recommendation;
 
@@ -11534,10 +11639,12 @@ sub calculate_multiplicative_forecast {
                 trend_factor           => $trend_adjustment_factor,
                 multiplier             => $final_multiplier,
                 volatility             => $volatility_buffer,
-                forecasted_residual    => $forecasted_residual,
+                forecasted_residual    => $forecasted_residual,      # reported; not part of the profile requirement
                 amplification_factor   => $amplification,
                 forecast               => $final_recommendation,
-                observed_peak          => $observed_peak_val,  # Store for history
+                peak_capacity          => $peak_capacity,
+                peak_capacity_source   => $peak_capacity_source,
+                observed_peak          => $observed_peak_val,  # the engine's profile value of the occurrence window
                 OutlierWarning         => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings),
                 active_events          => $active_events_str,
                 is_bootstrap_run       => $is_bootstrap_run,
@@ -18085,7 +18192,9 @@ sub calculate_predictive_peak_forecast {
             # Combine the signal and volatility forecasts. Undefined values are treated as zero.
             my $combined_prediction;
             if (defined $predicted_peak_val) {
-                $combined_prediction = ($predicted_peak_val // 0) + ($predicted_residual_val // 0);
+                # The profile requirement: the projected profile value. The projected residual is not
+                # added; it is the gap to the residual profile, and is reported with the components.
+                $combined_prediction = ($predicted_peak_val // 0);
             }
 
             # The final recommendation is the higher of the baseline or the combined prediction.
@@ -18116,6 +18225,9 @@ sub calculate_predictive_peak_forecast {
             # Store all components in the debug hash for comprehensive logging.
             $seasonal_debug_info{$vm_name}{$p_name} = {
                 TrueBaseline       => $baseline_val,
+                PeakCapacity       => (defined $predicted_components_href->{$vm_name}{$p_name}{capacity}
+                                       ? $predicted_components_href->{$vm_name}{$p_name}{capacity} * ($event_config->{peak_amplification_factor} // 1.0) : undef),
+                PeakCapacitySource => $predicted_components_href->{$vm_name}{$p_name}{capacity_source},
                 PredictedPeak      => $predicted_peak_val,
                 PredictedResidual  => $predicted_residual_val,
                 CombinedPrediction => $combined_prediction,
@@ -18333,10 +18445,18 @@ sub _get_historical_peak_data {
     }
 
     my %peaks_by_profile;
+    my %capacity_by_profile;
     my %residuals_by_profile;
 
     foreach my $event (@event_history) {
         my $date = $event->{_month_key} . "-01"; # Use the first of the month as the date for the time series.
+        # Only observations enter: a snapshot a model store may have written into is left out.
+        my ($usable, $why_not) = _snapshot_observations_usable($event);
+        unless ($usable)
+        {
+            $SEASONAL_UNVERIFIED_SNAPSHOTS{"$event_name $event->{_month_key}"} = $why_not if (ref($event->{results}) eq 'HASH');
+            next;
+        }
         my $hist_results = $event->{results};
         my $residual_results = $event->{results}{'PeakResidual'} || {};
 
@@ -18358,10 +18478,13 @@ sub _get_historical_peak_data {
 
         # Fallback population: legacy PeakValue pairs for older history that
         # predates OccurrencePeaks[].
-        my $peak_values = $hist_results->{'PeakValue'} || {};
-        for my $vm (keys %$peak_values) {
-            for my $profile (keys %{$peak_values->{$vm}}) {
-                $vm_profile_union{$vm}{$profile} = 1;
+        foreach my $peak_values ($hist_results->{'PeakValue'} || {}, $hist_results->{'HistoricPeak'} || {}) {
+            next unless (ref($peak_values) eq 'HASH');
+            for my $vm (keys %$peak_values) {
+                next unless (ref($peak_values->{$vm}) eq 'HASH');
+                for my $profile (keys %{$peak_values->{$vm}}) {
+                    $vm_profile_union{$vm}{$profile} = 1;
+                }
             }
         }
 
@@ -18369,13 +18492,21 @@ sub _get_historical_peak_data {
         # Phase 1 rule: predictive_peak prefers latent truth.
         for my $vm (sort keys %vm_profile_union) {
             for my $profile (sort keys %{$vm_profile_union{$vm}}) {
+                # The peak-capacity series: latent or raw occurrence peaks. Kept apart from the demand.
+                my $capacity_peak = _resolve_layer_a_peak_from_snapshot(
+                    $hist_results, $vm, $profile, 1, $event_name, $event->{_month_key}, 'peak');
+                push @{$capacity_by_profile{$profile}{$vm}}, {
+                    value => $capacity_peak->{value}, date => $date, layer_a_source => $capacity_peak->{layer_a_source},
+                } if ($capacity_peak && looks_like_number($capacity_peak->{value} // ''));
+                # The profile requirement: the event's value on the profile's own basis.
                 my $resolved_peak = _resolve_layer_a_peak_from_snapshot(
                     $hist_results,
                     $vm,
                     $profile,
-                    1,          # Phase 1 rule: predictive_peak prefers latent truth
+                    1,
                     $event_name,
                     $event->{_month_key},
+                    'profile',
                 );
 
                 next unless ($resolved_peak
@@ -18404,6 +18535,7 @@ sub _get_historical_peak_data {
     # Return a hash containing both data series.
     return {
         peaks => \%peaks_by_profile,
+        capacity => \%capacity_by_profile,
         residuals => \%residuals_by_profile
     };
 }
@@ -18485,9 +18617,23 @@ sub _calculate_peak_prediction {
             my $residual_series_aref = $residual_series_per_profile->{$profile_name}{$vm_name} || [];
             my ($predicted_residual, $residual_debug) = $_predict_next_value->($residual_series_aref);
 
+            # The peak-capacity estimate: the same projection on the occurrence peaks. The residual
+            # belongs to it only where those peaks are themselves profile values.
+            my $capacity_series_aref = ($historical_data_href->{capacity} || {})->{$profile_name}{$vm_name} || [];
+            my ($predicted_capacity) = (scalar(@$capacity_series_aref) >= $min_peaks) ? $_predict_next_value->($capacity_series_aref) : (undef);
+            my $capacity_source = @$capacity_series_aref ? ($capacity_series_aref->[-1]{layer_a_source} // 'unknown') : undef;
+            if (defined $predicted_capacity && defined $capacity_source && $capacity_source =~ /^legacy_(?:historicpeak|peakvalue)_fallback$/
+                && defined $predicted_residual && $predicted_residual > 0)
+            {
+                $predicted_capacity += $predicted_residual;
+                $capacity_source .= ' + residual';
+            }
+
             $predictions{$vm_name}{$profile_name} = {
                 peak     => $predicted_peak,
                 residual => $predicted_residual,
+                capacity => $predicted_capacity,
+                capacity_source => $capacity_source,
             };
 
             $debug_info{$vm_name}{$profile_name} = {
@@ -19298,7 +19444,11 @@ sub _assemble_seasonal_snapshot {
 # The marker of a ModelForecasts record whose 'forecast' is the model's demand and whose
 # 'sized' is the figure after the sizing chain. nfit-forecast reads the same marker.
 # (A sub, not a variable: the main program runs before this point of the file is reached.)
-sub _model_forecast_semantics { return { version => 1, forecast => 'model-demand', sized => 'sized-result' }; }
+# Version 2 (demand-quantity correction): 'forecast' is the profile requirement, the demand on the
+# profile's own percentile, smoothing window and hours; the peak-capacity estimate is kept beside it
+# as 'peakCapacity' and is never a sizing input by itself. Version 1 records ('model-demand') held a
+# figure built on raw occurrence maxima with the residual added: they are not mixed with these.
+sub _model_forecast_semantics { return { version => 2, forecast => 'profile-demand', sized => 'sized-result', peakCapacity => 'peak-capacity-estimate' }; }
 # The sized figures of the seasonal model that ran last: LPAR => profile => value.
 our %SEASONAL_SIZED;
 
@@ -19594,75 +19744,49 @@ sub _store_model_forecast_to_history {
             }
             $model_data{$vm_name}{baseline} = \%baseline_by_profile if %baseline_by_profile;
             $model_data{$vm_name}{components} = \%components_by_profile if %components_by_profile;
+            # What the run observed and the peak-capacity estimate stay inside the model's record,
+            # each under its own name. Neither is written into the snapshot's results.
+            my (%observed, %capacity);
+            foreach my $profile_key (keys %forecast_by_profile)
+            {
+                my $debug = $seasonal_debug_info{$vm_name}{$profile_key};
+                next unless (ref($debug) eq 'HASH');
+                $observed{$profile_key} = sprintf("%.4f", $debug->{observed_peak}) + 0
+                    if (defined $debug->{observed_peak} && looks_like_number($debug->{observed_peak}));
+                my $cap = $debug->{peak_capacity} // $debug->{PeakCapacity};
+                $capacity{$profile_key} = { value => sprintf("%.4f", $cap) + 0, source => ($debug->{peak_capacity_source} // $debug->{PeakCapacitySource} // 'unknown') }
+                    if (defined $cap && looks_like_number($cap));
+            }
+            $model_data{$vm_name}{observed} = \%observed if %observed;
+            $model_data{$vm_name}{peakCapacity} = \%capacity if %capacity;
             $vm_count++;
         }
     }
 
     # Only write if we have actual data
     if ($vm_count > 0) {
+        # A record of the two models that used to write into results, from before the correction:
+        # the snapshot's results can no longer be told from model output. The mark stays when the
+        # record is replaced; the history generator's snapshot does not carry it.
+        foreach my $writer (qw(multiplicative_seasonal recency_decay))
+        {
+            my $earlier = (ref($event_snapshot->{ModelForecasts}) eq 'HASH') ? $event_snapshot->{ModelForecasts}{$writer} : undef;
+            next unless (ref($earlier) eq 'HASH');
+            my $version = _safe_dig($earlier, '_meta', 'semantics', 'version') // 0;
+            $event_snapshot->{observationsUnverified} = "a $writer record from before the demand-quantity correction was stored here"
+                if ((!looks_like_number($version) || $version < 2) && ref($event_snapshot->{results}) eq 'HASH');
+        }
+        $model_data{'_meta'}{observationsNotUsed} = { %SEASONAL_UNVERIFIED_SNAPSHOTS } if %SEASONAL_UNVERIFIED_SNAPSHOTS;
+        printf STDERR "  [NOTE] %d stored occurrence record(s) not read as observations (provenance not verified): %s\n",
+            scalar(keys %SEASONAL_UNVERIFIED_SNAPSHOTS), join('; ', map { "$_ ($SEASONAL_UNVERIFIED_SNAPSHOTS{$_})" } sort keys %SEASONAL_UNVERIFIED_SNAPSHOTS)
+            if %SEASONAL_UNVERIFIED_SNAPSHOTS;
         $event_snapshot->{ModelForecasts}{$model_type} = \%model_data;
 
-        # Phase 3.2: Also populate results block (Zone 1) for models that generate observable facts
-        # This enables multiplier calculation for subsequent occurrences within the same run
-        if ($model_type eq 'multiplicative_seasonal') {
-            $event_snapshot->{results} //= {};
-            $event_snapshot->{results}{HistoricPeak} //= {};
-            $event_snapshot->{results}{HistoricBaseline} //= {};
-
-            foreach my $vm_name (keys %model_data) {
-                foreach my $profile_key (keys %{ $model_data{$vm_name}{forecast} // {} }) {
-                    # HistoricPeak: use observed_peak from debug_info, fallback to forecast
-                    my $peak_val = undef;
-                    if (exists $seasonal_debug_info{$vm_name}{$profile_key}{observed_peak}) {
-                        $peak_val = $seasonal_debug_info{$vm_name}{$profile_key}{observed_peak};
-                    }
-                    $peak_val //= $model_data{$vm_name}{forecast}{$profile_key};
-
-                    if (defined $peak_val && looks_like_number($peak_val)) {
-                        $event_snapshot->{results}{HistoricPeak}{$vm_name}{$profile_key} = $peak_val + 0;
-                    }
-
-                    # HistoricBaseline: from model_data baseline
-                    my $base_val = $model_data{$vm_name}{baseline}{$profile_key};
-                    if (defined $base_val && looks_like_number($base_val)) {
-                        $event_snapshot->{results}{HistoricBaseline}{$vm_name}{$profile_key} = $base_val + 0;
-                    }
-                }
-            }
-        }
-
-
-        # Phase 3.3: Capture Zone 1 results for recency_decay
-        # Although recency_decay doesn't consume historical snapshots, recording what it
-        # observed enables historical audit, accuracy analysis, and cross-month comparison.
-        # For recency_decay, the "forecast" IS the observed peak (measurement of last peak period).
-        if ($model_type eq 'recency_decay') {
-            $event_snapshot->{results} //= {};
-            $event_snapshot->{results}{PeakValue} //= {};
-
-            foreach my $vm_name (keys %model_data) {
-                foreach my $profile_key (keys %{ $model_data{$vm_name}{forecast} // {} }) {
-                    # PeakValue: For recency_decay, the forecast IS the observed peak
-                    my $peak_val = $model_data{$vm_name}{forecast}{$profile_key};
-                    if (defined $peak_val && looks_like_number($peak_val)) {
-                        $event_snapshot->{results}{PeakValue}{$vm_name}{$profile_key} = $peak_val + 0;
-                    }
-                }
-            }
-
-            # Capture ClippingInfo from %seasonal_debug_info if available
-            if (%seasonal_debug_info) {
-                $event_snapshot->{results}{ClippingInfo} //= {};
-                foreach my $vm_name (keys %seasonal_debug_info) {
-                    foreach my $profile_key (keys %{$seasonal_debug_info{$vm_name}}) {
-                        my $clip_info = $seasonal_debug_info{$vm_name}{$profile_key}{ClippingInfo};
-                        if (ref($clip_info) eq 'HASH' && scalar keys %$clip_info > 0) {
-                            $event_snapshot->{results}{ClippingInfo}{$vm_name}{$profile_key} = $clip_info;
-                        }
-                    }
-                }
-            }
-        }
+        # Observed history is not written from here. Earlier versions put a model's figure into
+        # results.HistoricPeak (multiplicative seasonal, when no observed value was at hand) and into
+        # results.PeakValue (recency decay), where later runs read it as an observation. What a run
+        # observed is now kept in its own record (observed), and results belong to the history generator.
+        %SEASONAL_UNVERIFIED_SNAPSHOTS = ();
 
         # Update metadata timestamp
         $history_data->{$target_month_key}{Metadata} //= {};
@@ -34715,6 +34839,7 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
     # Collect per-occurrence forecast values and multipliers
     # Phase 3.2: collect all component fields for complete history storage
     my %forecast_samples;       # vm -> profile -> [forecast, ...]
+    my (%capacity_samples, %capacity_source);   # the peak-capacity estimate of each occurrence, and its source
     my %multiplier_samples;     # vm -> profile -> [multiplier, ...]
     my %baseline_samples;       # vm -> profile -> [baseline, ...]
     my %trend_samples;          # vm -> profile -> [trend_factor, ...]
@@ -34809,6 +34934,9 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
                 my $a = $d->{amplification_factor};
                 push @{ $amplification_samples{$vm}{$profile} }, ($a + 0)
                     if (defined $a && looks_like_number($a));
+                push @{ $capacity_samples{$vm}{$profile} }, ($d->{peak_capacity} + 0)
+                    if (defined $d->{peak_capacity} && looks_like_number($d->{peak_capacity}));
+                $capacity_source{$vm}{$profile} = $d->{peak_capacity_source} if (defined $d->{peak_capacity_source});
             }
         }
     }
@@ -34930,6 +35058,8 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
                 volatility           => (defined $agg_v ? ($agg_v + 0) : undef),
                 forecasted_residual  => (defined $agg_r ? ($agg_r + 0) : undef),
                 amplification_factor => (defined $agg_a ? ($agg_a + 0) : undef),
+                peak_capacity        => _aggregate_numeric($capacity_samples{$vm}{$profile} // [], $method),
+                peak_capacity_source => $capacity_source{$vm}{$profile},
                 synthesis            => $syn,
             };
         }

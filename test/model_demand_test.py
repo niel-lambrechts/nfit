@@ -31,7 +31,7 @@ if HERE not in sys.path:
 import member_exposure_test as M
 import event_window_test as E
 
-MARKER = {'version': 1, 'forecast': 'model-demand', 'sized': 'sized-result'}
+MARKER = {'version': 2, 'forecast': 'profile-demand', 'sized': 'sized-result', 'peakCapacity': 'peak-capacity-estimate'}
 PROFILE = 'G3-95W15'
 LPARS = ('vmA', 'vmB', 'vmS')
 DATES = '2026-08-01:2026-08-01, 2026-09-01:2026-09-01, 2026-09-12:2026-09-12'

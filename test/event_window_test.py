@@ -88,7 +88,7 @@ class EventWindowTests(unittest.TestCase):
             august = {'2026-08': {
                 'Metadata': {'ProcessedStartDate': '2026-08-01', 'ProcessedEndDate': '2026-08-31', 'ProcessedDays': 31},
                 'MonthlyWorkloadAnalysis': analysis,
-                'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'periodEndDate': '2026-08-01', 'results': {
+                'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'periodEndDate': '2026-08-01', 'generatedOn': '2026-08-02T00:00:00', 'results': {
                     'HistoricPeak': {vm: {k: round(v * peak, 4) for k, v in pv.items()} for vm, pv in values.items()},
                     'HistoricBaseline': values}}}}}
             with open(os.path.join(folder, 'nfit.hist.2026-08.json'), 'w') as fh:
