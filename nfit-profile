@@ -10872,6 +10872,33 @@ sub _snapshot_observations_usable
     return (1, '');
 }
 
+# One observation of a peak-capacity series, on a stated basis: an occurrence peak as stored
+# ('latent' or 'raw'), or, where the snapshot holds no occurrence peak, the profile value plus that
+# occurrence's own peak residual ('legacy'). Returns (value, basis), or nothing.
+sub _capacity_observation
+{
+    my ($peak, $residual) = @_;
+    return () unless (ref($peak) eq 'HASH' && looks_like_number($peak->{value} // ''));
+    my $source = $peak->{layer_a_source} // '';
+    return ($peak->{value} + 0, 'latent') if ($source eq 'occurrence_latent_peak');
+    return ($peak->{value} + 0, 'raw')    if ($source eq 'occurrence_raw_peak');
+    return ($peak->{value} + ((defined $residual && looks_like_number($residual) && $residual > 0) ? $residual : 0), 'legacy');
+}
+
+# The basis of a peak-capacity series, over every observation in it: (source, counts by basis,
+# reason it is unavailable). Occurrence peaks and legacy values are different quantities: a series
+# holding both gives no estimate.
+sub _capacity_series_basis
+{
+    my ($series_aref) = @_;
+    my %n;
+    $n{ $_->{basis} // 'legacy' }++ foreach (@{ $series_aref // [] });
+    return (undef, \%n, 'no stored occurrence') unless %n;
+    my $occurrence = ($n{latent} // 0) + ($n{raw} // 0);
+    return (undef, \%n, 'mixed occurrence and legacy observations') if ($occurrence && $n{legacy});
+    return (($occurrence ? 'occurrence_peaks' : 'legacy_profile_values_with_residual'), \%n, undef);
+}
+
 # The peak of one past occurrence, for one of two purposes that never stand in for each other:
 #   'profile'  the profile requirement: the event's value on the profile's own percentile, smoothing
 #              window and hours (HistoricPeak, else PeakValue), plus the estimated hidden demand
@@ -11479,13 +11506,13 @@ sub calculate_multiplicative_forecast {
                         # The peak-capacity estimate: the latent or raw occurrence peak. Kept apart.
                         my $capacity_peak = _resolve_layer_a_peak_from_snapshot(
                             $hist_results, $vm_name, $p_name, 1, $active_event_name, $hist_month, 'peak');
-                        if ($capacity_peak && looks_like_number($capacity_peak->{value} // '')
-                            && defined $hist_base && looks_like_number($hist_base) && $hist_base > 0.001)
+                        my ($capacity_value, $capacity_basis) = _capacity_observation($capacity_peak, $hist_residual);
+                        if (defined $capacity_value && defined $hist_base && looks_like_number($hist_base) && $hist_base > 0.001)
                         {
                             push @capacity_multipliers, {
-                                value          => $capacity_peak->{value} / $hist_base,
-                                date           => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d'),
-                                layer_a_source => $capacity_peak->{layer_a_source},
+                                value => $capacity_value / $hist_base,
+                                date  => Time::Piece->strptime($hist_event->{periodEndDate}, '%Y-%m-%d'),
+                                basis => $capacity_basis,
                             };
                         }
 
@@ -11515,9 +11542,12 @@ sub calculate_multiplicative_forecast {
                     my $event_multiplier = calculate_recency_weighted_average(\@multipliers, $today_for_recency, 365);
                     $vm_historic_multipliers{$p_name}{$active_event_name} = { 'multiplier' => $event_multiplier, 'history' => \@multipliers };
                     $vm_historic_residuals{$p_name}{$active_event_name} = \@residuals;
+                    my ($capacity_source, $capacity_counts, $capacity_unavailable) = _capacity_series_basis(\@capacity_multipliers);
                     $vm_historic_capacity{$p_name}{$active_event_name} = {
-                        'multiplier' => calculate_recency_weighted_average(\@capacity_multipliers, $today_for_recency, 365),
-                        'source'     => $capacity_multipliers[-1]{layer_a_source} } if @capacity_multipliers;
+                        'multiplier'   => (defined $capacity_source ? calculate_recency_weighted_average(\@capacity_multipliers, $today_for_recency, 365) : undef),
+                        'source'       => $capacity_source,
+                        'observations' => $capacity_counts,
+                        'unavailable'  => $capacity_unavailable };
 
                 }
             }
@@ -11594,27 +11624,37 @@ sub calculate_multiplicative_forecast {
             # The peak-capacity estimate, kept under its own name: the same baseline, trend and buffers on
             # the occurrence peaks. The residual belongs to it only where the peak it was built from is
             # itself a profile value (no occurrence peak stored); a raw or latent peak already contains it.
-            my ($peak_capacity, $peak_capacity_source);
+            my ($peak_capacity, $peak_capacity_source, $peak_capacity_unavailable, %peak_capacity_observations);
             if (!$is_bootstrap_run && exists $vm_historic_capacity{$p_name})
             {
                 my $capacity_multiplier = 1.0;
                 my %sources;
                 foreach my $event_data (values %{ $vm_historic_capacity{$p_name} })
                 {
-                    next unless (defined $event_data->{'multiplier'});
-                    $capacity_multiplier *= $event_data->{'multiplier'};
-                    $sources{ $event_data->{'source'} // 'unknown' } = 1;
+                    $peak_capacity_observations{$_} += $event_data->{'observations'}{$_} foreach (keys %{ $event_data->{'observations'} // {} });
+                    if (defined $event_data->{'multiplier'} && defined $event_data->{'source'})
+                    {
+                        $capacity_multiplier *= $event_data->{'multiplier'};
+                        $sources{ $event_data->{'source'} } = 1;
+                    }
+                    else
+                    {
+                        $peak_capacity_unavailable //= ($event_data->{'unavailable'} // 'no stored occurrence');
+                    }
                 }
-                if ($is_interaction_run && @dampening_factors)
+                $peak_capacity_unavailable //= 'mixed occurrence and legacy observations' if (scalar(keys %sources) > 1);
+                $peak_capacity_unavailable //= 'no stored occurrence' unless %sources;
+                unless (defined $peak_capacity_unavailable)
                 {
-                    my $dampening_to_apply = (sort { $a <=> $b } @dampening_factors)[0];
-                    $capacity_multiplier = 1 + (($capacity_multiplier - 1) * $dampening_to_apply);
+                    if ($is_interaction_run && @dampening_factors)
+                    {
+                        my $dampening_to_apply = (sort { $a <=> $b } @dampening_factors)[0];
+                        $capacity_multiplier = 1 + (($capacity_multiplier - 1) * $dampening_to_apply);
+                    }
+                    ($peak_capacity_source) = keys %sources;
+                    # A legacy observation carries its own residual already: nothing is added here.
+                    $peak_capacity = $trend_adjusted_baseline * $capacity_multiplier * $volatility_buffer * $amplification;
                 }
-                $peak_capacity_source = join('+', sort keys %sources);
-                my $on_profile_basis = ($peak_capacity_source =~ /^legacy_(?:historicpeak|peakvalue)_fallback$/) ? 1 : 0;
-                $peak_capacity = ($trend_adjusted_baseline * $capacity_multiplier * $volatility_buffer
-                                  + ($on_profile_basis ? $forecasted_residual : 0)) * $amplification;
-                $peak_capacity_source .= ' + residual' if ($on_profile_basis && $forecasted_residual > 0);
             }
 
             $vm_forecasts->{$p_name} = $final_recommendation;
@@ -11644,6 +11684,8 @@ sub calculate_multiplicative_forecast {
                 forecast               => $final_recommendation,
                 peak_capacity          => $peak_capacity,
                 peak_capacity_source   => $peak_capacity_source,
+                peak_capacity_observations => { %peak_capacity_observations },
+                peak_capacity_unavailable  => $peak_capacity_unavailable,
                 observed_peak          => $observed_peak_val,  # the engine's profile value of the occurrence window
                 OutlierWarning         => _get_warning_for_vm_forecast($vm_name, \%outlier_warnings),
                 active_events          => $active_events_str,
@@ -18228,6 +18270,8 @@ sub calculate_predictive_peak_forecast {
                 PeakCapacity       => (defined $predicted_components_href->{$vm_name}{$p_name}{capacity}
                                        ? $predicted_components_href->{$vm_name}{$p_name}{capacity} * ($event_config->{peak_amplification_factor} // 1.0) : undef),
                 PeakCapacitySource => $predicted_components_href->{$vm_name}{$p_name}{capacity_source},
+                PeakCapacityObservations => $predicted_components_href->{$vm_name}{$p_name}{capacity_observations},
+                PeakCapacityUnavailable  => $predicted_components_href->{$vm_name}{$p_name}{capacity_unavailable},
                 PredictedPeak      => $predicted_peak_val,
                 PredictedResidual  => $predicted_residual_val,
                 CombinedPrediction => $combined_prediction,
@@ -18495,9 +18539,9 @@ sub _get_historical_peak_data {
                 # The peak-capacity series: latent or raw occurrence peaks. Kept apart from the demand.
                 my $capacity_peak = _resolve_layer_a_peak_from_snapshot(
                     $hist_results, $vm, $profile, 1, $event_name, $event->{_month_key}, 'peak');
-                push @{$capacity_by_profile{$profile}{$vm}}, {
-                    value => $capacity_peak->{value}, date => $date, layer_a_source => $capacity_peak->{layer_a_source},
-                } if ($capacity_peak && looks_like_number($capacity_peak->{value} // ''));
+                my ($capacity_value, $capacity_basis) = _capacity_observation($capacity_peak, _safe_dig($hist_results, 'PeakResidual', $vm, $profile));
+                push @{$capacity_by_profile{$profile}{$vm}}, { value => $capacity_value, date => $date, basis => $capacity_basis }
+                    if (defined $capacity_value);
                 # The profile requirement: the event's value on the profile's own basis.
                 my $resolved_peak = _resolve_layer_a_peak_from_snapshot(
                     $hist_results,
@@ -18617,23 +18661,21 @@ sub _calculate_peak_prediction {
             my $residual_series_aref = $residual_series_per_profile->{$profile_name}{$vm_name} || [];
             my ($predicted_residual, $residual_debug) = $_predict_next_value->($residual_series_aref);
 
-            # The peak-capacity estimate: the same projection on the occurrence peaks. The residual
-            # belongs to it only where those peaks are themselves profile values.
+            # The peak-capacity estimate: the same projection on the capacity series, when every
+            # observation in it is on one basis.
             my $capacity_series_aref = ($historical_data_href->{capacity} || {})->{$profile_name}{$vm_name} || [];
-            my ($predicted_capacity) = (scalar(@$capacity_series_aref) >= $min_peaks) ? $_predict_next_value->($capacity_series_aref) : (undef);
-            my $capacity_source = @$capacity_series_aref ? ($capacity_series_aref->[-1]{layer_a_source} // 'unknown') : undef;
-            if (defined $predicted_capacity && defined $capacity_source && $capacity_source =~ /^legacy_(?:historicpeak|peakvalue)_fallback$/
-                && defined $predicted_residual && $predicted_residual > 0)
-            {
-                $predicted_capacity += $predicted_residual;
-                $capacity_source .= ' + residual';
-            }
+            my ($capacity_source, $capacity_counts, $capacity_unavailable) = _capacity_series_basis($capacity_series_aref);
+            $capacity_unavailable //= 'insufficient history' if (scalar(@$capacity_series_aref) < $min_peaks);
+            my ($predicted_capacity) = defined($capacity_unavailable) ? (undef) : $_predict_next_value->($capacity_series_aref);
+            $capacity_unavailable //= 'no projection' unless (defined $predicted_capacity);
 
             $predictions{$vm_name}{$profile_name} = {
                 peak     => $predicted_peak,
                 residual => $predicted_residual,
                 capacity => $predicted_capacity,
                 capacity_source => $capacity_source,
+                capacity_observations => $capacity_counts,
+                capacity_unavailable => $capacity_unavailable,
             };
 
             $debug_info{$vm_name}{$profile_name} = {
@@ -19753,9 +19795,20 @@ sub _store_model_forecast_to_history {
                 next unless (ref($debug) eq 'HASH');
                 $observed{$profile_key} = sprintf("%.4f", $debug->{observed_peak}) + 0
                     if (defined $debug->{observed_peak} && looks_like_number($debug->{observed_peak}));
-                my $cap = $debug->{peak_capacity} // $debug->{PeakCapacity};
-                $capacity{$profile_key} = { value => sprintf("%.4f", $cap) + 0, source => ($debug->{peak_capacity_source} // $debug->{PeakCapacitySource} // 'unknown') }
-                    if (defined $cap && looks_like_number($cap));
+                my $cap     = $debug->{peak_capacity} // $debug->{PeakCapacity};
+                my $counts  = $debug->{peak_capacity_observations} // $debug->{PeakCapacityObservations};
+                my $missing = $debug->{peak_capacity_unavailable} // $debug->{PeakCapacityUnavailable};
+                my %counts  = (ref($counts) eq 'HASH') ? %$counts : ();
+                if (defined $cap && looks_like_number($cap) && !defined $missing)
+                {
+                    $capacity{$profile_key} = { value => sprintf("%.4f", $cap) + 0, source => ($debug->{peak_capacity_source} // $debug->{PeakCapacitySource} // 'unknown'),
+                                                observations => \%counts };
+                }
+                elsif (defined $missing)
+                {
+                    # No estimate, and the reason: a figure on a mixed basis is not stored.
+                    $capacity{$profile_key} = { unavailable => $missing, observations => \%counts };
+                }
             }
             $model_data{$vm_name}{observed} = \%observed if %observed;
             $model_data{$vm_name}{peakCapacity} = \%capacity if %capacity;
@@ -34839,7 +34892,7 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
     # Collect per-occurrence forecast values and multipliers
     # Phase 3.2: collect all component fields for complete history storage
     my %forecast_samples;       # vm -> profile -> [forecast, ...]
-    my (%capacity_samples, %capacity_source);   # the peak-capacity estimate of each occurrence, and its source
+    my (%capacity_samples, %capacity_source, %capacity_unavailable, %capacity_observations);   # the peak-capacity estimate of each occurrence
     my %multiplier_samples;     # vm -> profile -> [multiplier, ...]
     my %baseline_samples;       # vm -> profile -> [baseline, ...]
     my %trend_samples;          # vm -> profile -> [trend_factor, ...]
@@ -34934,9 +34987,16 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
                 my $a = $d->{amplification_factor};
                 push @{ $amplification_samples{$vm}{$profile} }, ($a + 0)
                     if (defined $a && looks_like_number($a));
-                push @{ $capacity_samples{$vm}{$profile} }, ($d->{peak_capacity} + 0)
-                    if (defined $d->{peak_capacity} && looks_like_number($d->{peak_capacity}));
-                $capacity_source{$vm}{$profile} = $d->{peak_capacity_source} if (defined $d->{peak_capacity_source});
+                if (defined $d->{peak_capacity} && looks_like_number($d->{peak_capacity}) && !defined $d->{peak_capacity_unavailable})
+                {
+                    push @{ $capacity_samples{$vm}{$profile} }, ($d->{peak_capacity} + 0);
+                    $capacity_source{$vm}{$profile}{ $d->{peak_capacity_source} // 'unknown' } = 1;
+                }
+                elsif (defined $d->{peak_capacity_unavailable})
+                {
+                    $capacity_unavailable{$vm}{$profile} //= $d->{peak_capacity_unavailable};
+                }
+                $capacity_observations{$vm}{$profile} = $d->{peak_capacity_observations} if (ref($d->{peak_capacity_observations}) eq 'HASH');
             }
         }
     }
@@ -35051,6 +35111,7 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
             my $agg_r = _aggregate_numeric($residual_samples{$vm}{$profile} // [], 'median');
             my $agg_a = _aggregate_numeric($amplification_samples{$vm}{$profile} // [], 'median');
 
+            my @capacity_source_names = sort keys %{ $capacity_source{$vm}{$profile} // {} };
              $seasonal_debug_info{$vm}{$profile} = {
                 multiplier           => (defined $agg_m ? ($agg_m + 0) : undef),
                 baseline             => (defined $agg_b ? ($agg_b + 0) : undef),
@@ -35058,8 +35119,13 @@ sub _execute_multiplicative_seasonal_bucket_aggregated {
                 volatility           => (defined $agg_v ? ($agg_v + 0) : undef),
                 forecasted_residual  => (defined $agg_r ? ($agg_r + 0) : undef),
                 amplification_factor => (defined $agg_a ? ($agg_a + 0) : undef),
-                peak_capacity        => _aggregate_numeric($capacity_samples{$vm}{$profile} // [], $method),
-                peak_capacity_source => $capacity_source{$vm}{$profile},
+                # One estimate only when every occurrence gave one on the same basis.
+                peak_capacity        => ((!defined $capacity_unavailable{$vm}{$profile} && scalar(keys %{ $capacity_source{$vm}{$profile} // {} }) == 1)
+                                         ? _aggregate_numeric($capacity_samples{$vm}{$profile} // [], $method) : undef),
+                peak_capacity_source => $capacity_source_names[0],
+                peak_capacity_observations => $capacity_observations{$vm}{$profile},
+                peak_capacity_unavailable  => ($capacity_unavailable{$vm}{$profile}
+                                               // (scalar(keys %{ $capacity_source{$vm}{$profile} // {} }) > 1 ? 'mixed occurrence and legacy observations' : undef)),
                 synthesis            => $syn,
             };
         }

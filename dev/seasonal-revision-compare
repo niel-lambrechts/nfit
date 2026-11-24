@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/seasonal-revision-compare
+# PURPOSE  : Research (no figure changes). One seasonal event sized twice on a
+#            kept work tree, on identical inputs: once with nfit and
+#            nfit-profile as they were at an earlier revision (--base REV, read
+#            with git show) and once with the current files. The same extra
+#            switches (--flag, repeatable) go to both runs, so the tool answers
+#            two questions:
+#              - the historical comparison: what a correction changed
+#                (--base <revision before it>, no flags);
+#              - why a variant moved between revisions
+#                (--base REV --flag=--research-engine-seasonal-input).
+#            Before each run the history, the stage's proposal store and the
+#            engine's result cache are restored from pristine copies, and every
+#            input is fingerprinted;
+#            the tool says whether the two runs read identical inputs.
+#            For each LPAR on its planning profile the stored terms of the two
+#            runs are compared in the order of the sizing chain: engine
+#            measurements, the model figure the chain reads, the starting
+#            requirement, the pressure tests, the additive, floors and caps, the
+#            profile target, the VP terms, the published figure. An LPAR is
+#            filed under the first group in which its terms differ; the rule
+#            that governs the published figure in each run is read from the
+#            stored proposal (role, cut protection, current-cycle status and
+#            binding).
+#            Aggregates, and the largest movers under pseudonyms
+#            (dev/nfit-redact). The kept tree is left as it was found.
+# INPUT    : the work tree kept by dev/history-integration-check --keep
+# USAGE    : dev/seasonal-revision-compare --event NAME --base REV [--flag=SWITCH ...]
+#                                          [--work DIR] [--seasonality FILE] [--top N]
+# OUTPUT   : <out>/seasonal-revision-<event>[-<flags>].json and a table
+# ==============================================================================
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+EPS = 0.005
+PROPOSALS = Path('.nfit.store') / 'proposals'
+# What a run writes into the stage beside the proposal store: the engine's result cache and its
+# record of the last call. Restored before each run, so that no run reads what the other left.
+ENGINE_FILES = ('.nfit.cache.results', '.nfit.engine.last_args', '.nfit.engine.last_manifest')
+
+# The stored terms of a sized profile, in the order of the sizing chain.
+GROUPS = (
+    ('engine measurements', ('PreGrowthBasePhysC', 'GrowthAdjUsed', 'AbsRunQValueUsedForCalc', 'NormRunQ_P50_Val', 'NormRunQ_P90_Val',
+                             'RunQPressure_P90_Val', 'rVCPU_P99W1RawPeak', 'rVCPU_RunQHiThreads', 'EntitlementForForecast', 'LPARMaxCPUConfig',
+                             'rVCPU_CurrentVPs')),
+    ('model figure read by the chain', ('BasePhysC', 'PostGrowthBasePhysC', 'SizingInputModelDemand')),
+    ('starting requirement', ('SizingInputSource', 'BasePlanningDemand', 'DownsizedPhysC_PreGrowth', 'DownsizedPhysC')),
+    ('pressure tests', ('CPUFlatlining', 'CPUFlatliningPartial', 'CPUFlatliningPartialSevere', 'IsRunQPressure', 'IsWorkloadPressure', 'EffectiveLCPUsAtBase', 'EffectiveLCPUsForPressure', 'ExcessThreads')),
+    ('additive', ('RawAdditive', 'MaxAdditiveCap', 'CappedRawAdditive', 'VoltFactor', 'PoolFactor', 'DBWDampeningApplied',
+                  'AdditiveSafetyCapApplied', 'FinalAdditive')),
+    ('floors and caps', ('BudgetFloorApplied', 'BudgetFloorCores', 'PreMaxCpuCapRec', 'CPUCapLimited')),
+    ('profile target', ('FinalAdjustedPhysC',)),
+    ('VP terms', ('rVCPU_Raw', 'rVCPU_YieldFloorCores', 'rVCPU_P99W1Floor', 'rVCPU_ReductionSafetyState', 'rVCPU_Final')),
+)
+SHOWN = ('PreGrowthBasePhysC', 'BasePhysC', 'BasePlanningDemand', 'IsWorkloadPressure', 'IsRunQPressure', 'FinalAdditive', 'FinalAdjustedPhysC')
+
+
+def _module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+sys.dont_write_bytecode = True
+spc = _module('seasonal_protection_compare', REPO / 'dev' / 'seasonal-protection-compare')
+pr = spc.pr
+
+
+def num(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None
+
+
+def same(a, b):
+    x, y = num(a), num(b)
+    if x is not None and y is not None:
+        return abs(x - y) < EPS
+    return (a if a is not None else '') == (b if b is not None else '')
+
+
+def fingerprint(root, skip=()):
+    """sha256 over the relative names and contents below a folder (or of one file); '' when absent."""
+    root = Path(root)
+    if not root.exists():
+        return ''
+    digest = hashlib.sha256()
+    files = [root] if root.is_file() else sorted(p for p in root.rglob('*') if p.is_file())
+    for path in files:
+        rel = path.relative_to(root) if root.is_dir() else Path(path.name)
+        if any(str(rel).startswith(str(s)) for s in skip):
+            continue
+        digest.update(str(rel).encode() + b'\0')
+        with path.open('rb') as fh:
+            for block in iter(lambda: fh.read(1 << 20), b''):
+                digest.update(block)
+    return digest.hexdigest()
+
+
+def restore(pristine, live):
+    if live.exists():
+        shutil.rmtree(live)
+    if pristine.exists():
+        shutil.copytree(pristine, live)
+
+
+def keep_engine_files(stage, kept):
+    if kept.exists():
+        shutil.rmtree(kept)
+    kept.mkdir(parents=True)
+    for name in ENGINE_FILES:
+        if (stage / name).is_file():
+            shutil.copy2(stage / name, kept / name)
+
+
+def restore_engine_files(stage, kept):
+    for name in ENGINE_FILES:
+        (stage / name).unlink(missing_ok=True)
+        if (kept / name).is_file():
+            shutil.copy2(kept / name, stage / name)
+
+
+def published(member):
+    """(entitlement, VPs, governing rule) of the planning recommendation in a stored proposal member."""
+    profile = (member.get('profiles') or {}).get(member.get('planningProfile')) or {}
+    role = member.get('role') if isinstance(member.get('role'), dict) else None
+    cycle = profile.get('currentCycle') or {}
+    source = role if role else cycle
+    protection = profile.get('cutProtection') or {}
+    if role:
+        rule = 'role: %s' % (role.get('type') or 'unnamed')
+    elif protection.get('status') == 'bound':
+        rule = 'cut protection (%s)' % (protection.get('evidence') or 'evidence')
+    else:
+        binding = cycle.get('binding') or []
+        rule = 'current cycle %s%s' % (cycle.get('status') or '?', (': ' + ', '.join(str(b) for b in binding)) if binding else '')
+    return num(source.get('entitlement')), num(source.get('VPs')), rule
+
+
+def pseudonyms(names):
+    done = subprocess.run([str(REPO / 'dev' / 'nfit-redact')], input='\n'.join(names) + '\n', capture_output=True, text=True)
+    lines = done.stdout.splitlines() if done.returncode == 0 else []
+    return {name: (lines[i].strip() if i < len(lines) and lines[i].strip() and lines[i].strip() != name else 'lpar-%02d' % (i + 1))
+            for i, name in enumerate(names)}
+
+
+def compare(base, head):
+    """Per LPAR on its planning profile: which groups of terms differ, and the published figures of both runs."""
+    lpars = []
+    for vm, th in head['trace'].items():
+        tb, mh, mb = base['trace'].get(vm), head['members'].get(vm), base['members'].get(vm)
+        profile = th.get('planningProfile')
+        if not tb or not mh or not mb or profile is None or tb.get('planningProfile') != profile:
+            continue
+        dh, db = (th.get('profiles') or {}).get(profile) or {}, (tb.get('profiles') or {}).get(profile) or {}
+        differing = {name: [k for k in keys if not same(db.get(k), dh.get(k))] for name, keys in GROUPS}
+        (pb, vb, rb), (ph, vh, rh) = published(mb), published(mh)
+        groups = [name for name, _keys in GROUPS if differing[name]]
+        if (pb is not None and ph is not None and abs(ph - pb) >= EPS) or vb != vh:
+            groups.append('published')
+        lpars.append((vm, {'planningProfile': profile, 'groups': groups, 'first': groups[0] if groups else 'nothing differs',
+                           'terms': sorted(k for keys in differing.values() for k in keys),
+                           'base': {k: db.get(k) for k in SHOWN}, 'head': {k: dh.get(k) for k in SHOWN},
+                           'publishedBase': pb, 'publishedHead': ph, 'vpsBase': vb, 'vpsHead': vh, 'ruleBase': rb, 'ruleHead': rh,
+                           'publishedChange': (ph - pb) if pb is not None and ph is not None else None,
+                           'targetChange': ((num(dh.get('FinalAdjustedPhysC')) or 0) - (num(db.get('FinalAdjustedPhysC')) or 0))}))
+    return lpars
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--event', help='the seasonal event to size')
+    ap.add_argument('--base', help='the earlier revision of nfit and nfit-profile (a commit)')
+    ap.add_argument('--flag', action='append', default=[], help='an extra nfit-profile switch for both runs (repeatable), e.g. --flag=--research-engine-seasonal-input')
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='the work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'seasonal'))
+    ap.add_argument('--seasonality', default=str(REPO / 'etc' / 'nfit.seasonality.cfg'), help='the seasonality file to use')
+    ap.add_argument('--top', type=int, default=10, help='how many of the largest movers to list (pseudonyms)')
+    a = ap.parse_args()
+    work = Path(a.work).resolve()
+    app, case = work / 'app', work / 'case'
+    stage = next(iter(sorted((case / 'stage').glob('*'))), None) if (case / 'stage').is_dir() else None
+    if stage is None or not (case / 'history' / stage.name).is_dir():
+        sys.exit('seasonal-revision-compare: no kept work tree with history (run dev/history-integration-check --keep first)')
+    seasonality = Path(a.seasonality).resolve()
+    known = spc.events(seasonality) if seasonality.is_file() else []
+    if not a.event or a.event not in [name for name, _ in known] or not a.base:
+        print('Give --event and --base. Events of the seasonality file:')
+        for name, model in known:
+            print(f'  {name:<28} {model}')
+        return 2
+    model = dict(known)[a.event]
+    blobs = {}
+    for name in pr.EXECUTABLES:
+        blob = subprocess.run(['git', '-C', str(REPO), 'show', f'{a.base}:{name}'], capture_output=True)
+        if blob.returncode:
+            sys.exit(f'seasonal-revision-compare: cannot read {name} at {a.base}')
+        blobs[name] = blob.stdout
+    base_id = subprocess.run(['git', '-C', str(REPO), 'rev-parse', '--short', a.base], capture_output=True, text=True).stdout.strip() or a.base
+
+    shutil.copy(seasonality, app / 'etc' / 'nfit.seasonality.cfg')
+    history = case / 'history' / stage.name
+    pristine = case / 'history.pristine' / stage.name
+    if not pristine.is_dir():
+        pristine.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(history, pristine)
+    proposals, kept_proposals = stage / PROPOSALS, work / 'proposals.pristine'
+    if kept_proposals.exists():
+        shutil.rmtree(kept_proposals)
+    if proposals.exists():
+        shutil.copytree(proposals, kept_proposals)
+    kept_engine = work / 'engine-files.pristine'
+    keep_engine_files(stage, kept_engine)
+    env = pr.perl_env()
+    args = ['--nmondir', str(stage), '--apply-seasonality', a.event] + list(a.flag)
+    if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
+        args += ['--config', str(app / 'config.csv')]
+
+    runs, inputs = {}, {}
+    for label in ('base', 'head'):
+        for name in pr.EXECUTABLES:
+            if label == 'base':
+                (app / name).write_bytes(blobs[name])
+            else:
+                shutil.copy(REPO / name, app / name)
+            (app / name).chmod(0o700)
+        restore(kept_proposals, proposals)
+        restore_engine_files(stage, kept_engine)
+        inputs[label] = {'stagedData': fingerprint(stage, skip=(PROPOSALS,) + ENGINE_FILES), 'proposalStore': fingerprint(proposals),
+                         'engineCaches': ''.join(fingerprint(stage / name) for name in ENGINE_FILES),
+                         'history': fingerprint(pristine), 'configuration': fingerprint(app / 'config.csv'),
+                         'settings': fingerprint(app / 'etc')}
+        trace = work / f'seasonal-revision-{label}.private.json'
+        trace.unlink(missing_ok=True)
+        print(f"{a.event} ({model}): sizing with {'revision ' + base_id if label == 'base' else 'the current files'}"
+              + (' and ' + ' '.join(a.flag) if a.flag else ''), flush=True)
+        rows, _log, seconds, members = spc.one_run(app, case, stage, history, pristine, 'seasonal-revision-' + label,
+                                                   args + ['--research-runq-trace', str(trace)], env)
+        if not rows or not trace.is_file():
+            restore(pristine, history)
+            restore(kept_proposals, proposals)
+            restore_engine_files(stage, kept_engine)
+            sys.exit(f'seasonal-revision-compare: the {label} run produced no CSV or no trace (does that revision know every switch given? '
+                     'see its private log in the work tree)')
+        runs[label] = {'members': members, 'trace': json.loads(trace.read_text())['members'], 'seconds': seconds}
+    restore(pristine, history)                             # the kept tree as it was found
+    restore(kept_proposals, proposals)
+    restore_engine_files(stage, kept_engine)
+    identical = {k: inputs['base'][k] == inputs['head'][k] for k in inputs['base']}
+
+    lpars = compare(runs['base'], runs['head'])
+    total = lambda key: round(sum((r.get(key) or 0.0) for _vm, r in lpars), 2)
+    by_first, by_term, by_rule = {}, {}, {}
+    for _vm, r in lpars:
+        slot = by_first.setdefault(r['first'], {'lpars': 0, 'targetChange': 0.0, 'publishedChange': 0.0, 'publishedMoved': 0})
+        slot['lpars'] += 1
+        slot['targetChange'] = round(slot['targetChange'] + (r['targetChange'] or 0.0), 2)
+        slot['publishedChange'] = round(slot['publishedChange'] + (r['publishedChange'] or 0.0), 2)
+        slot['publishedMoved'] += abs(r['publishedChange'] or 0.0) >= EPS
+        for term in r['terms']:
+            by_term[term] = by_term.get(term, 0) + 1
+        if abs(r['publishedChange'] or 0.0) >= EPS:
+            pair = by_rule.setdefault('%s -> %s' % (r['ruleBase'], r['ruleHead']), {'lpars': 0, 'publishedChange': 0.0})
+            pair['lpars'] += 1
+            pair['publishedChange'] = round(pair['publishedChange'] + r['publishedChange'], 2)
+    order = [name for name, _ in GROUPS] + ['published', 'nothing differs']
+    ranked = sorted(lpars, key=lambda x: -abs(x[1]['publishedChange'] or 0.0))[:max(0, a.top)]
+    ranked = [x for x in ranked if abs(x[1]['publishedChange'] or 0.0) >= EPS]
+    names = pseudonyms([vm for vm, _r in ranked])
+    result = {'event': a.event, 'model': model, 'base': base_id, 'head': pr.git_identity(), 'flags': a.flag,
+              'inputsIdentical': identical, 'allInputsIdentical': all(identical.values()),
+              'method': {'groups': {name: list(keys) for name, keys in GROUPS}, 'tolerance': EPS,
+                         'first': 'the first group, in the order of the sizing chain, in which a term of the planning profile differs',
+                         'rule': 'role, else cut protection where it bound, else the current-cycle status and binding of the stored proposal',
+                         'restored': 'history, the proposal store of the stage and the engine result cache are restored from pristine copies before each run'},
+              'lpars': len(lpars),
+              'totals': {'publishedBase': total('publishedBase'), 'publishedHead': total('publishedHead'), 'publishedChange': total('publishedChange'),
+                         'targetChange': total('targetChange'),
+                         'publishedMoved': sum(1 for _v, r in lpars if abs(r['publishedChange'] or 0.0) >= EPS),
+                         'vpsChanged': sum(1 for _v, r in lpars if r['vpsBase'] != r['vpsHead'])},
+              'byFirstDifferingGroup': {k: by_first[k] for k in order if k in by_first},
+              'termsDiffering': dict(sorted(by_term.items(), key=lambda kv: -kv[1])),
+              'publishedMovesByGoverningRule': dict(sorted(by_rule.items(), key=lambda kv: -abs(kv[1]['publishedChange']))),
+              'largestMovers': [dict(r, lpar=names[vm]) for vm, r in ranked],
+              'seconds': {k: v['seconds'] for k, v in runs.items()}}
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    suffix = ''.join('-' + re.sub(r'[^A-Za-z0-9]+', '_', f).strip('_') for f in a.flag)
+    target = out / ('seasonal-revision-%s%s.json' % (re.sub(r'[^A-Za-z0-9_.-]', '_', a.event), suffix))
+    target.write_text(json.dumps(result, indent=1) + '\n')
+
+    t = result['totals']
+    print()
+    print(f"{a.event} ({model}): revision {base_id} -> {result['head']}" + (f" with {' '.join(a.flag)}" if a.flag else '')
+          + f", {len(lpars)} LPARs on their planning profile")
+    print('  Inputs identical for both runs: ' + ', '.join('%s %s' % (k, 'yes' if v else 'NO') for k, v in identical.items()))
+    print(f"  Published: {t['publishedBase']:.2f} -> {t['publishedHead']:.2f} cores ({t['publishedChange']:+.2f}); moved on {t['publishedMoved']} LPARs; "
+          f"VPs changed on {t['vpsChanged']}; profile targets {t['targetChange']:+.2f}")
+    print('  LPARs by the first group of terms that differs (order of the sizing chain):')
+    for name, c in result['byFirstDifferingGroup'].items():
+        print('    %-32s %4d LPARs  target %+8.2f  published %+8.2f  (published moved on %d)' % (name, c['lpars'], c['targetChange'], c['publishedChange'], c['publishedMoved']))
+    print('  Terms that differ (LPARs): ' + ('; '.join('%s %d' % kv for kv in list(result['termsDiffering'].items())[:14]) or 'none'))
+    print('  Published moves by the governing rule of each run (base -> current):')
+    for pair, c in result['publishedMovesByGoverningRule'].items():
+        print('    %-70s %4d LPARs  %+8.2f' % (pair, c['lpars'], c['publishedChange']))
+    if ranked:
+        print('  Largest moves of the published figure (pseudonyms; cores; base > current):')
+        print('    %-12s %-10s %13s %13s %13s %11s %13s %13s  %s' % ('LPAR', 'profile', 'engine base', 'model figure', 'start', 'additive', 'target', 'published', 'pressure (workload/RunQ); rule'))
+        pair = lambda r, k: '%s>%s' % tuple(('%.2f' % num(x)) if num(x) is not None else '-' for x in (r['base'].get(k), r['head'].get(k)))
+        for vm, r in ranked:
+            flags = '%s>%s / %s>%s' % (r['base'].get('IsWorkloadPressure'), r['head'].get('IsWorkloadPressure'), r['base'].get('IsRunQPressure'), r['head'].get('IsRunQPressure'))
+            rule = r['ruleHead'] if r['ruleBase'] == r['ruleHead'] else '%s > %s' % (r['ruleBase'], r['ruleHead'])
+            print('    %-12s %-10s %13s %13s %13s %11s %13s %13s  %s; %s' % (
+                names[vm], r['planningProfile'], pair(r, 'PreGrowthBasePhysC'), pair(r, 'BasePhysC'), pair(r, 'BasePlanningDemand'), pair(r, 'FinalAdditive'),
+                pair(r, 'FinalAdjustedPhysC'), '%.2f>%.2f' % (r['publishedBase'], r['publishedHead']), flags, rule))
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

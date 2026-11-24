@@ -2,8 +2,8 @@
 # ==============================================================================
 # NAME     : test/seasonal_input_compare_test.py
 # PURPOSE  : dev/seasonal-input-compare on a kept synthetic work tree: the event
-#            is sized before and after the sizing-input correction, every moved
-#            profile figure is attributed to the corrected input or to a rule
+#            is sized with the engine-input variant and with the model's demand, every moved
+#            profile figure is attributed to the different input or to a rule
 #            further down the chain, only aggregates are reported and the kept
 #            history is left as it was found.
 # USAGE    : python3 test/seasonal_input_compare_test.py
@@ -55,13 +55,13 @@ class SeasonalInputCompareTests(unittest.TestCase):
         planning = result['planningProfiles']
         self.assertGreaterEqual(planning['lpars'], 3)
         self.assertEqual(sum(c['lpars'] for c in planning['classes'].values()), planning['lpars'])
-        # One LPAR follows the corrected input (the model forecasts 0.50 where the engine's value was 0.52) ...
-        corrected = planning['classes']['corrected input']
+        # One LPAR follows the input (the model forecasts 0.50 where the engine's value was 0.52) ...
+        corrected = planning['classes']['input']
         self.assertEqual((corrected['lpars'], corrected['lowered'], corrected['raised']), (1, 1, 0))
         self.assertAlmostEqual(corrected['targetCores'], corrected['inputCores'], places=2)
         # ... and where a floor sets the figure, the changed input leaves it as it was.
         self.assertGreaterEqual(planning['classes']['unchanged: a downstream rule set the same figure']['lpars'], 2)
-        self.assertLess(planning['targetAfter'], planning['targetBefore'])
+        self.assertLess(planning['targetModelDemand'], planning['targetEngineInput'])
         self.assertLess(planning['modelDemand'], planning['engineValue'])
         self.assertEqual(result['otherSizedProfiles']['pairs'], sum(c['pairs'] for c in result['otherSizedProfiles']['classes'].values()))
         for name in ('vmA', 'vmB', 'vmS', 'vmX', M.SERIAL):

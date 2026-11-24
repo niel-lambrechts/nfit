@@ -16,6 +16,10 @@
 #               demand as it was; the estimated hidden demand of a clipped
 #               occurrence is added once, on the profile's basis.
 #            (Observed history and repeated generation: test/observed_history_test.py.)
+#            5. The peak-capacity estimate states its basis over every
+#               observation it used: occurrence peaks, or legacy profile values
+#               each with its own residual. A history holding both gives no
+#               estimate, and the same profile demand.
 #            Multiplicative seasonal and predictive peak, on the member-exposure
 #            fixture with the same synthetic earlier occurrence in two months.
 # USAGE    : python3 test/profile_demand_test.py
@@ -94,14 +98,15 @@ class Case:
             results['ClippingInfo'] = {vm: {k: {'isClipped': True, 'clippingConfidence': 0.9, 'unmetDemandEstimate': round(v * hidden, 4),
                                                 'unclippedPeakEstimate': round(v * (peak.get(k, 1.0) + hidden), 4)}
                                             for k, v in pv.items()} for vm, pv in self.values.items()}
-        for month in EARLIER:
+        for index, month in enumerate(EARLIER):
             day = month + '-01'
+            stored_form = form if isinstance(form, str) else form[index]      # one form, or one per earlier month
             mine = copy.deepcopy(results)
             if latest_peak and month == EARLIER[-1]:                     # the latest earlier occurrence on its own factors
                 for pv in mine['HistoricPeak'].values():
                     for k in latest_peak:
                         pv[k] = round(pv[k] / peak.get(k, 1.0) * latest_peak[k], 4)
-            if form == 'occurrence':
+            if stored_form == 'occurrence':
                 mine['OccurrencePeaks'] = []
                 for vm, pv in self.values.items():
                     for k, v in pv.items():
@@ -166,6 +171,7 @@ class ProfileDemandTests(unittest.TestCase):
         cls.occurrence = Case('occurrence')
         cls.moved = Case('occurrence', raw=3.0, residual=0.6)                       # only the raw peak and the residual differ
         cls.distinct = Case('occurrence', raw=2.0, peak={PROFILE: 1.1, OTHER: 1.3})
+        cls.mixed = Case(('legacy', 'occurrence'))                                  # July without, August with occurrence peaks
         cls.clipped = {form: Case(form, peak={PROFILE: 1.1, OTHER: 1.3}, hidden=0.2, latent_extra=extra)
                        for form, extra in (('legacy', 0.0), ('occurrence', 0.4))}
 
@@ -207,7 +213,7 @@ class ProfileDemandTests(unittest.TestCase):
             for profile in (PROFILE, OTHER):
                 estimate = case.capacity(model, 'vmS', profile)
                 self.assertAlmostEqual(estimate['value'], 2.0 * b[profile], delta=0.01, msg=(model, profile))
-                self.assertEqual(estimate['source'], 'occurrence_raw_peak', (model, profile))
+                self.assertEqual((estimate['source'], estimate['observations']), ('occurrence_peaks', {'raw': 2}), (model, profile))
 
     # -- 4 -------------------------------------------------------------------------------
     def test_the_raw_peak_and_the_residual_alone_do_not_move_the_profile_demand(self):
@@ -226,7 +232,31 @@ class ProfileDemandTests(unittest.TestCase):
                 self.assertAlmostEqual(legacy.demand(model, 'vmS', profile), (factor + 0.2) * b[profile], delta=0.005, msg=(model, profile))
                 # The stored latent peak is a different quantity: it does not reach the demand.
                 self.assertAlmostEqual(occurrence.demand(model, 'vmS', profile), legacy.demand(model, 'vmS', profile), places=3, msg=(model, profile))
-            self.assertEqual(occurrence.capacity(model, 'vmS')['source'], 'occurrence_latent_peak', model)
+            self.assertEqual(occurrence.capacity(model, 'vmS')['observations'], {'latent': 2}, model)
+
+    # -- 5 -------------------------------------------------------------------------------
+    def test_the_peak_capacity_estimate_states_its_basis_over_every_observation(self):
+        b = self.legacy.values['vmS'][PROFILE]
+        for model in MODELS:
+            # Legacy history: each observation is its profile value with its own residual, B + 0.25 B.
+            estimate = self.legacy.capacity(model, 'vmS')
+            self.assertEqual((estimate['source'], estimate['observations']), ('legacy_profile_values_with_residual', {'legacy': 2}), model)
+            self.assertAlmostEqual(estimate['value'], 1.25 * b, delta=0.01, msg=model)
+            # Occurrence history: the raw peaks, 1.5 B; no residual on top.
+            estimate = self.occurrence.capacity(model, 'vmS')
+            self.assertEqual((estimate['source'], estimate['observations']), ('occurrence_peaks', {'raw': 2}), model)
+            self.assertAlmostEqual(estimate['value'], 1.5 * b, delta=0.01, msg=model)
+
+    def test_a_history_of_both_forms_gives_no_peak_capacity_estimate_and_the_same_demand(self):
+        for model in MODELS:
+            for vm in LPARS:
+                estimate = self.mixed.capacity(model, vm)
+                self.assertNotIn('value', estimate, (model, vm))
+                self.assertEqual(estimate['unavailable'], 'mixed occurrence and legacy observations', (model, vm))
+                self.assertEqual(estimate['observations'], {'legacy': 1, 'raw': 1}, (model, vm))
+                for profile in (PROFILE, OTHER):
+                    self.assertAlmostEqual(self.mixed.demand(model, vm, profile), self.legacy.demand(model, vm, profile), places=3,
+                                           msg=(model, vm, profile))
 
     def test_what_a_run_observed_stays_in_its_own_record(self):
         record = self.legacy.records['multiplicative_seasonal']

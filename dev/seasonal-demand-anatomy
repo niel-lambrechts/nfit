@@ -18,8 +18,11 @@
 #                version 2): the basis the demand is built on (the ordinary
 #                value plus the estimated hidden demand of a clipped
 #                occurrence), the peak-capacity estimate kept beside the
-#                demand, and the stored occurrences the run did not read as
-#                observations.
+#                demand with its basis counted over the observations the model
+#                used, the stored occurrences the run did not read as
+#                observations, and the largest reductions against the engine's
+#                value with their baseline, multiplier, trend and protection
+#                terms.
 #            The event is sized once with the current nfit-profile; the kept
 #            history is restored afterwards. Aggregates, and the largest
 #            contributors under pseudonyms (dev/nfit-redact).
@@ -108,6 +111,21 @@ def ingredients(results, vm, profile):
             'sanitised': num(occ.get('sanitised_peak_value')), 'clipped': bool(occ.get('clipped')), 'selected': selected, 'source': source}
 
 
+def governed(member, profile):
+    """The published entitlement of the planning recommendation and the rule that governs it, from the stored proposal."""
+    block = (member.get('profiles') or {}).get(profile) or {}
+    role = member.get('role') if isinstance(member.get('role'), dict) else None
+    cycle, protection = block.get('currentCycle') or {}, block.get('cutProtection') or {}
+    if role:
+        rule = 'role: %s' % (role.get('type') or 'unnamed')
+    elif protection.get('status') == 'bound':
+        rule = 'cut protection (%s)' % (protection.get('evidence') or 'evidence')
+    else:
+        binding = cycle.get('binding') or []
+        rule = 'current cycle %s%s' % (cycle.get('status') or '?', (': ' + ', '.join(str(b) for b in binding)) if binding else '')
+    return {'entitlement': num((role or cycle).get('entitlement')), 'rule': rule, 'protection': protection.get('status')}
+
+
 def pseudonyms(names):
     """LPAR names through dev/nfit-redact; a name it does not know becomes a numbered label."""
     done = subprocess.run([str(REPO / 'dev' / 'nfit-redact')], input='\n'.join(names) + '\n', capture_output=True, text=True)
@@ -124,7 +142,7 @@ def summary(values):
     return {'n': len(v), 'p10': q(0.10), 'median': q(0.5), 'p90': q(0.90)}
 
 
-def anatomy(past, record, terms):
+def anatomy(past, record, terms, members):
     """Per LPAR on its planning profile: the model's demand and components beside the latest stored occurrence."""
     lpars = []
     for vm, t in terms.items():
@@ -148,6 +166,11 @@ def anatomy(past, record, terms):
                'residualAdded': residual_added, 'finalSource': comp.get('final_source'),
                'peakCapacity': num(((stored.get('peakCapacity') or {}).get(profile) or {}).get('value')),
                'peakCapacitySource': ((stored.get('peakCapacity') or {}).get(profile) or {}).get('source'),
+               'peakCapacityUnavailable': ((stored.get('peakCapacity') or {}).get(profile) or {}).get('unavailable'),
+               'peakCapacityObservations': ((stored.get('peakCapacity') or {}).get(profile) or {}).get('observations') or {},
+               'sized': num((stored.get('sized') or {}).get(profile)), 'target': num(d.get('FinalAdjustedPhysC')),
+               'currentEntitlement': num(d.get('EntitlementForForecast')), 'additive': num(d.get('FinalAdditive')),
+               'published': governed(members.get(vm) or {}, profile),
                'occurrences': len(held), 'sources': sorted({x['source'] for _m, x in held}),
                'latest': {k: latest.get(k) for k in ('ordinary', 'baseline', 'residual', 'raw', 'latent', 'sanitised', 'selected', 'source', 'clipped', 'hidden', 'profileBasis')},
                'selectedAboveOrdinary': above,
@@ -198,7 +221,7 @@ def main():
     if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
         args += ['--config', str(app / 'config.csv')]
     print(f'{a.event} ({model}): sizing the event once', flush=True)
-    rows, _log, seconds, _members = spc.one_run(app, case, stage, history, pristine, 'seasonal-demand', args, env)
+    rows, _log, seconds, members = spc.one_run(app, case, stage, history, pristine, 'seasonal-demand', args, env)
     record = None
     for _month, snap in snapshots(history, a.event):
         record = ((snap.get('ModelForecasts') or {}).get(model)) or record
@@ -206,7 +229,7 @@ def main():
     shutil.copytree(pristine, history)                     # the kept tree as it was found
     if not rows or record is None or not trace.is_file():
         sys.exit('seasonal-demand-anatomy: the run produced no CSV, no stored forecast or no trace (see its private log in the work tree)')
-    lpars = anatomy(past, record, json.loads(trace.read_text())['members'])
+    lpars = anatomy(past, record, json.loads(trace.read_text())['members'], members)
 
     total = lambda key: round(sum((r.get(key) or 0.0) for _vm, r in lpars), 2)
     by_source = {}
@@ -221,22 +244,31 @@ def main():
             s[key] = round(s[key] + (value or 0.0), 2)
     ratio = lambda a_, b_: (a_ / b_) if a_ is not None and b_ is not None and b_ > 0 else None
     ranked = sorted(lpars, key=lambda x: -(x[1]['demandAboveEngine'] or 0.0))[:max(0, a.top)]
-    names = pseudonyms([vm for vm, _r in ranked])
+    reduced = [x for x in sorted(lpars, key=lambda x: (x[1]['demandAboveEngine'] or 0.0)) if (x[1]['demandAboveEngine'] or 0.0) <= -EPS][:max(0, a.top)]
+    names = pseudonyms([vm for vm, _r in ranked + reduced])
     meta = record.get('_meta') or {}
     semantics = meta.get('semantics') or {}
     version = num(semantics.get('version')) or 0
     not_used = meta.get('observationsNotUsed') or {}
-    capacity_sources = {}
+    capacity_sources, capacity_missing, capacity_observations = {}, {}, {}
     for _vm, r in lpars:
         if r['peakCapacity'] is not None:
             c = capacity_sources.setdefault(r['peakCapacitySource'] or 'unknown', {'lpars': 0, 'cores': 0.0})
             c['lpars'], c['cores'] = c['lpars'] + 1, round(c['cores'] + r['peakCapacity'], 2)
+            for basis, n in r['peakCapacityObservations'].items():          # the observations the estimates were built on
+                capacity_observations[basis] = capacity_observations.get(basis, 0) + int(n)
+        else:
+            reason = r['peakCapacityUnavailable'] or 'not stored'
+            capacity_missing[reason] = capacity_missing.get(reason, 0) + 1
+    stored_with_results = sum(1 for _m, s_ in past if isinstance(s_.get('results'), dict))
     result = {
         'event': a.event, 'model': model, 'commit': pr.git_identity(),
         'recordSemantics': {k: semantics.get(k) for k in ('version', 'forecast', 'sized', 'peakCapacity', 'pair')},
         'residualIsAdded': version < 2,
         'occurrencesNotReadAsObservations': {k: not_used[k] for k in sorted(not_used) if re.fullmatch(r'\S+ \d{4}-\d{2}', k)},
+        'occurrencesRead': {'stored': stored_with_results, 'read': stored_with_results - sum(1 for k in not_used if k.startswith(a.event + ' '))},
         'peakCapacity': {'cores': total('peakCapacity'), 'lpars': sum(1 for _v, r in lpars if r['peakCapacity'] is not None), 'bySource': capacity_sources,
+                         'observationsUsed': capacity_observations, 'unavailable': capacity_missing,
                          'meaning': 'the peak-capacity estimate stored beside the demand (raw or latent occurrence peaks through the model); '
                                     'separate LPAR maxima, not a concurrent pool or frame demand, and no sizing input'},
         'method': {'ordinary': "the event's profile value as history holds it for the latest past occurrence (HistoricPeak, else PeakValue): the profile's percentile, window and hours",
@@ -262,7 +294,15 @@ def main():
                    'volatility': summary([r['volatility'] for _v, r in lpars]), 'amplification': summary([r['amplification'] for _v, r in lpars])},
         'bySelectedSource': by_source,
         'clippedLpars': sum(1 for _v, r in lpars if r['latest'].get('clipped')),
-        'largestContributors': [dict(r, lpar=names[vm]) for vm, r in ranked], 'seconds': seconds}
+        'largestContributors': [dict(r, lpar=names[vm]) for vm, r in ranked],
+        'largestReductions': [dict(r, lpar=names[vm]) for vm, r in reduced],
+        'reductions': {'lpars': sum(1 for _v, r in lpars if (r['demandAboveEngine'] or 0.0) <= -EPS),
+                       'cores': round(sum(r['demandAboveEngine'] for _v, r in lpars if (r['demandAboveEngine'] or 0.0) <= -EPS), 2),
+                       'publishedBelowCurrentEntitlement': sum(1 for _v, r in lpars if (r['demandAboveEngine'] or 0.0) <= -EPS
+                                                               and r['published']['entitlement'] is not None and r['currentEntitlement'] is not None
+                                                               and r['published']['entitlement'] < r['currentEntitlement'] - EPS),
+                       'meaning': "LPARs whose demand lies below the engine's profile value of this run's window"},
+        'seconds': seconds}
     out = Path(a.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     target = out / ('seasonal-demand-%s.json' % re.sub(r'[^A-Za-z0-9_.-]', '_', a.event))
@@ -274,9 +314,11 @@ def main():
     print(f"{a.event} ({model}): what the demand is made of, {len(lpars)} LPARs on their planning profile; "
           f"{result['pastSnapshotsWithResults']} past occurrence(s) with results in history")
     print(f"  Model demand {t['demand']:.2f} cores; the engine's profile value {t['engineValue']:.2f}; difference {t['demandAboveEngine']:+.2f}")
-    print(f"  Latest past occurrence: ordinary profile value {o['ordinary']:.2f}; selected peak {o['selected']:.2f} "
+    v2 = not result['residualIsAdded']
+    peak_word = 'occurrence peak' if v2 else 'selected peak'
+    print(f"  Latest past occurrence: ordinary profile value {o['ordinary']:.2f}; {peak_word} {o['selected']:.2f} "
           f"({t['selectedAboveOrdinary']:+.2f} above the ordinary value; of that the latent increment {t['latentIncrement']:+.2f}; "
-          f"{result['clippedLpars']} LPARs marked clipped)")
+          f"{result['clippedLpars']} LPARs marked clipped)" + ('; the occurrence peak is no part of the demand' if v2 else ''))
     if result['residualIsAdded']:
         print(f"  Residual the model adds: {t['residualAdded']:.2f} cores; already inside the selected peak: {t['residualAlreadyInPeak']:.2f}")
     else:
@@ -285,26 +327,48 @@ def main():
         print(f"    basis of the latest occurrence {o['profileBasis']:.2f} cores (hidden demand {o['hiddenDemand']:+.2f} on {o['lparsWithHiddenDemand']} LPARs); "
               f"demand / basis p10 / median / p90 {fmt(result['ratios']['demandOverProfileBasis'])}")
         print(f"    residual reported with the components, not added: {t['residualAdded']:.2f} cores")
+        print(f"    occurrences read as observations: {result['occurrencesRead']['read']} of {result['occurrencesRead']['stored']} stored")
         print(f"    peak-capacity estimate, kept beside the demand (separate LPAR maxima; no sizing input): {c['cores']:.2f} cores on {c['lpars']} LPARs"
               + ''.join('; %s %d' % (k, v['lpars']) for k, v in sorted(c['bySource'].items())))
+        print('      observations those estimates used: ' + (', '.join('%s %d' % kv for kv in sorted(c['observationsUsed'].items())) or 'none')
+              + ('; no estimate: ' + ', '.join('%s (%d LPARs)' % kv for kv in sorted(c['unavailable'].items())) if c['unavailable'] else ''))
     if result['occurrencesNotReadAsObservations']:
         print('  Stored occurrences not read as observations: ' + '; '.join('%s (%s)' % kv for kv in result['occurrencesNotReadAsObservations'].items()))
-    print(f"  Ratios p10 / median / p90: selected peak / ordinary {fmt(result['ratios']['selectedOverOrdinary'])}; demand / ordinary "
-          f"{fmt(result['ratios']['demandOverOrdinary'])}; demand / selected {fmt(result['ratios']['demandOverSelected'])}")
+    print(f"  Ratios p10 / median / p90: {peak_word} / ordinary {fmt(result['ratios']['selectedOverOrdinary'])}; demand / ordinary "
+          f"{fmt(result['ratios']['demandOverOrdinary'])}; demand / {peak_word} {fmt(result['ratios']['demandOverSelected'])}")
     print(f"    multiplier {fmt(result['ratios']['multiplier'])}; trend {fmt(result['ratios']['trend'])}; volatility {fmt(result['ratios']['volatility'])}; "
           f"amplification {fmt(result['ratios']['amplification'])}")
-    print('  By the peak the model selects:')
-    print('    %-28s %5s %9s %9s %9s %9s %10s %9s %10s' % ('source', 'LPARs', 'demand', 'engine', 'ordinary', 'selected', 'above ord.', 'residual', 'duplicated'))
-    for source, s in sorted(by_source.items(), key=lambda kv: -kv[1]['lpars']):
-        print('    %-28s %5d %9.2f %9.2f %9.2f %9.2f %+10.2f %9.2f %10.2f' % (source, s['lpars'], s['demand'], s['engineValue'], s['ordinary'], s['selected'],
-                                                                         s['selectedAboveOrdinary'], s['residualAdded'], s['residualAlreadyInPeak']))
+    if v2:
+        print('  By what the latest occurrence holds (the demand reads the ordinary value and the hidden demand; the occurrence peak feeds the peak-capacity estimate only):')
+        print('    %-28s %5s %9s %9s %9s %10s' % ('occurrence holds', 'LPARs', 'demand', 'engine', 'ordinary', 'occ. peak'))
+        for source, s_ in sorted(by_source.items(), key=lambda kv: -kv[1]['lpars']):
+            print('    %-28s %5d %9.2f %9.2f %9.2f %10.2f' % (source, s_['lpars'], s_['demand'], s_['engineValue'], s_['ordinary'], s_['selected']))
+    else:
+        print('  By the peak the model selects:')
+        print('    %-28s %5s %9s %9s %9s %9s %10s %9s %10s' % ('source', 'LPARs', 'demand', 'engine', 'ordinary', 'selected', 'above ord.', 'residual', 'duplicated'))
+        for source, s_ in sorted(by_source.items(), key=lambda kv: -kv[1]['lpars']):
+            print('    %-28s %5d %9.2f %9.2f %9.2f %9.2f %+10.2f %9.2f %10.2f' % (source, s_['lpars'], s_['demand'], s_['engineValue'], s_['ordinary'], s_['selected'],
+                                                                             s_['selectedAboveOrdinary'], s_['residualAdded'], s_['residualAlreadyInPeak']))
     print('  Largest contributors to the difference (pseudonyms; cores):')
-    print('    %-12s %-10s %8s %8s %9s %8s %8s %8s %9s  %s' % ('LPAR', 'profile', 'demand', 'engine', 'ordinary', 'raw', 'latent', 'residual', 'baseline', 'selected source'))
+    print('    %-12s %-10s %8s %8s %9s %8s %8s %8s %9s  %s' % ('LPAR', 'profile', 'demand', 'engine', 'ordinary', 'raw', 'latent', 'residual', 'baseline', 'occurrence holds' if v2 else 'selected source'))
     show = lambda x: ('%.2f' % x) if x is not None else '-'
     for vm, r in ranked:
         L = r['latest']
         print('    %-12s %-10s %8s %8s %9s %8s %8s %8s %9s  %s' % (names[vm], r['planningProfile'], show(r['demand']), show(r['engineValue']), show(L.get('ordinary')),
                                                                show(L.get('raw')), show(L.get('latent')), show(r['residualAdded']), show(r['modelBaseline']), L.get('source')))
+    if reduced:
+        rd = result['reductions']
+        print(f"  Demand below the engine's value of this run: {rd['lpars']} LPARs, {rd['cores']:+.2f} cores; published below the installed entitlement on "
+              f"{rd['publishedBelowCurrentEntitlement']} of them")
+        print('  Largest reductions against the engine value (pseudonyms; cores; hist. base and ordinary are the latest stored occurrence):')
+        print('    %-12s %-10s %7s %7s %8s %9s %8s %6s %6s %6s %7s %8s %7s %9s  %s' % (
+            'LPAR', 'profile', 'demand', 'engine', 'baseline', 'hist.base', 'ordinary', 'mult', 'trend', 'volat', 'target', 'installed', 'publ.', 'additive', 'governing rule'))
+        for vm, r in reduced:
+            L = r['latest']
+            print('    %-12s %-10s %7s %7s %8s %9s %8s %6s %6s %6s %7s %8s %7s %9s  %s' % (
+                names[vm], r['planningProfile'], show(r['demand']), show(r['engineValue']), show(r['modelBaseline']), show(L.get('baseline')), show(L.get('ordinary')),
+                show(r['multiplier']), show(r['trend']), show(r['volatility']), show(r['target']), show(r['currentEntitlement']), show(r['published']['entitlement']),
+                show(r['additive']), r['published']['rule']))
     audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
     print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
     print(f'Written: {target}')
