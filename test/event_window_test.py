@@ -141,8 +141,11 @@ class EventWindowTests(unittest.TestCase):
         log = self.with_history['log']
         self.assertIn('Event-Window Plan (event ev)', log)
         self.assertIn('Event requirements by pool and for the frame (event ev)', log)
-        self.assertRegex(log, r'\n  Frame\s+3\s+unknown\s+3\.47\s+0\s+0\.00  not assessed')      # no default pool in this system
+        self.assertRegex(log, r'\n  Frame\s+3\s+unknown\s+3\.47\s+1\s+0\.59  not assessed')      # no default pool in this system
         # (3.47: 2.00 + 0.97 + 0.50. The third is the model's forecast; the engine's own profile value, 0.52, was sized before.)
+        # vmS met no competition in the past window: its pool-borrowing allowance is withheld, and the plan shows the 0.59
+        # cores of borrowing its measured peak relies on. (The measured peak is kept in a predictive run; it was lost before.)
+        self.assertRegex(log, r'\n  9\s+1\s+2\.00\s+0\.50\s+1\s+0\.59  guarantees and relied-on borrowing fit under the pool maximum')
         self.assertRegex(log, r'\n  7\s+2\s+4\.00\s+2\.97\s+0\s+0\.00  guarantees and relied-on borrowing fit under the pool maximum')
         self.assertIn('whether the forecast level will meet competition that past occurrences did not', log)
 

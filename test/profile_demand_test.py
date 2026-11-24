@@ -20,6 +20,9 @@
 #               observation it used: occurrence peaks, or legacy profile values
 #               each with its own residual. A history holding both gives no
 #               estimate, and the same profile demand.
+#            6. Peak_P-99W1 is a measurement: neither model forecasts it, and the
+#               rules that read the measured peak get the measurement although
+#               history holds a higher event value for it.
 #            Multiplicative seasonal and predictive peak, on the member-exposure
 #            fixture with the same synthetic earlier occurrence in two months.
 # USAGE    : python3 test/profile_demand_test.py
@@ -39,6 +42,7 @@ if HERE not in sys.path:
 import member_exposure_test as M
 import event_window_test as E
 
+PEAK_PROFILE = 'Peak_P-99W1'                          # the measurement profile
 PROFILE, OTHER = 'G3-95W15', 'G2-98W10'              # the same hours; their own percentile and window
 LPARS = ('vmA', 'vmB', 'vmS')
 EARLIER = ('2026-07', '2026-08')
@@ -70,7 +74,7 @@ class Case:
     template = None
 
     def __init__(self, form='legacy', raw=1.5, residual=0.25, peak=None, hidden=0.0, latent_extra=0.0, generated=True,
-                 earlier_record=None, latest_peak=None, target_event=None, models=MODELS, repeats=1):
+                 earlier_record=None, latest_peak=None, target_event=None, models=MODELS, repeats=1, trace=False):
         fixture = M.MemberExposureTests
         if Case.template is None:
             # The fixture's months and their history, generated once and copied for every case.
@@ -137,11 +141,15 @@ class Case:
             with open(path, 'w') as fh:
                 json.dump(september, fh)
         self.before = copy.deepcopy(snapshots(self.folder))
-        self.records, self.stderr, self.passes = {}, {}, []
+        self.records, self.stderr, self.passes, self.traces = {}, {}, [], {}
         for model in models:
             self.configure(model)
             for _ in range(repeats):
-                run = fixture.run_profile(self.root, '--apply-seasonality', 'ev', '--no-cut-protection')
+                flags = ['--research-runq-trace', os.path.join(self.root, 'trace-%s.json' % model)] if trace else []
+                run = fixture.run_profile(self.root, '--apply-seasonality', 'ev', '--no-cut-protection', *flags)
+                if trace:
+                    with open(flags[1]) as fh:
+                        self.traces[model] = json.load(fh)['members']
                 self.stderr[model] = run.stderr
                 self.records[model] = record_of(self.folder, model)
                 self.passes.append((model, copy.deepcopy(self.records[model])))
@@ -171,6 +179,8 @@ class ProfileDemandTests(unittest.TestCase):
         cls.occurrence = Case('occurrence')
         cls.moved = Case('occurrence', raw=3.0, residual=0.6)                       # only the raw peak and the residual differ
         cls.distinct = Case('occurrence', raw=2.0, peak={PROFILE: 1.1, OTHER: 1.3})
+        # History holds the measurement profile half as high again in the event, or as it was: the measurement of the run is the same.
+        cls.measured = {factor: Case('legacy', peak={PEAK_PROFILE: factor, PROFILE: 1.2}, models=('predictive_peak',), trace=True) for factor in (1.5, 1.0)}
         cls.mixed = Case(('legacy', 'occurrence'))                                  # July without, August with occurrence peaks
         cls.clipped = {form: Case(form, peak={PROFILE: 1.1, OTHER: 1.3}, hidden=0.2, latent_extra=extra)
                        for form, extra in (('legacy', 0.0), ('occurrence', 0.4))}
@@ -257,6 +267,22 @@ class ProfileDemandTests(unittest.TestCase):
                 for profile in (PROFILE, OTHER):
                     self.assertAlmostEqual(self.mixed.demand(model, vm, profile), self.legacy.demand(model, vm, profile), places=3,
                                            msg=(model, vm, profile))
+
+    # -- 6 -------------------------------------------------------------------------------
+    def test_the_measurement_profile_is_not_forecast_and_stays_what_was_measured(self):
+        for case in (self.legacy, self.occurrence, self.measured[1.5]):
+            for model, record in case.records.items():
+                for vm in LPARS:
+                    self.assertNotIn(PEAK_PROFILE, record[vm]['forecast'], (model, vm))
+                    self.assertIn(PROFILE, record[vm]['forecast'], (model, vm))
+        high, level = self.measured[1.5], self.measured[1.0]
+        for vm in LPARS:
+            self.assertGreater(high.demand('predictive_peak', vm), 1.15 * high.values[vm][PROFILE], vm)       # the sized profile is forecast
+            a, b = (c.traces['predictive_peak'][vm]['profiles'][PROFILE] for c in (high, level))
+            # What the VP and guarantee rules read as the measured peak does not follow the stored event value.
+            for key in ('rVCPU_P99W1RawPeak', 'rVCPU_P99W1Floor', 'rVCPU_YieldFloorCores'):
+                self.assertEqual(a[key], b[key], (vm, key))
+            self.assertNotEqual(a['rVCPU_P99W1RawPeak'], 'N/A', vm)
 
     def test_what_a_run_observed_stays_in_its_own_record(self):
         record = self.legacy.records['multiplicative_seasonal']

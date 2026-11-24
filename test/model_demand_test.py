@@ -98,6 +98,11 @@ class ModelDemandTests(unittest.TestCase):
             if model != 'multiplicative_seasonal':                                           # its demand here lies above the protected level
                 self.assertTrue(moved, model)                                                # the protection did act on the sizing
             for vm in moved:
+                if self.terms(model, 'protected', vm).get('PeakUpliftGate', '').startswith('withheld'):
+                    # No competition in the past windows: the pool-borrowing allowance on the measured peak is withheld
+                    # with the evidence, and applied without it. The sized figure is then the lower one.
+                    self.assertLess(on[vm]['sized'][PROFILE], off[vm]['sized'][PROFILE], (model, vm))
+                    continue
                 self.assertGreater(on[vm]['sized'][PROFILE], off[vm]['sized'][PROFILE], (model, vm))   # a floor: it only raises
                 self.assertLess(on[vm]['forecast'][PROFILE], on[vm]['sized'][PROFILE], (model, vm))
 
