@@ -145,6 +145,7 @@ class Case:
             stored = {'2026-10': {'Metadata': {'ProcessedStartDate': '2026-10-01', 'ProcessedEndDate': '2026-10-28', 'ProcessedDays': 28},
                                   'MonthlyWorkloadAnalysis': E.month_of(analysis, self.values, '2026-10'),
                                   'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'periodEndDate': '2026-10-01',
+                                                                    'baselinePeriod': {'startDate': '2026-09-23', 'endDate': '2026-09-30'},
                                                                     'generatedOn': '2026-10-02T00:00:00', 'results': later}}}}
             with open(os.path.join(self.folder, 'nfit.hist.2026-10.json'), 'w') as fh:
                 json.dump(stored, fh)

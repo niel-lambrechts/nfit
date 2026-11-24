@@ -189,7 +189,8 @@ class Zone2DecoderTests(unittest.TestCase):
     # -- 3. one decoder for every consumer --------------------------------------------------
     def test_every_zone2_consumer_reads_through_the_decoder(self):
         body = SOURCE[:SOURCE.index('# Zone 2 record decoder (zone2-record-decoder-1)')]
-        self.assertGreaterEqual(body.count('zone2_eligible_forecasts('), 3)       # bootstrap median, live candidates, scoring
+        self.assertGreaterEqual(body.count('zone2_eligible_forecasts('), 2)       # bootstrap median, live candidates
+        self.assertEqual(body.count('tournament_candidates('), 1)                  # scoring: admission through the same decoder
         self.assertEqual(body.count('zone2_forecast_value('), 1)                   # strategic extraction
         self.assertEqual(body.count('zone2_block_stale_reason('), 1)               # the Zone 2 staleness gate
         # The earlier readings of a Zone 2 record are gone ...
@@ -198,7 +199,6 @@ class Zone2DecoderTests(unittest.TestCase):
             self.assertNotIn(gone, SOURCE, gone)
         # ... and the candidates nfit-forecast writes itself are still read as they are stored.
         self.assertIn("candidates_block = adaptive_block.get('candidates', {})", SOURCE)
-        self.assertIn("y_forecast = vm_map.get(vm_name, {}).get(profile_name, {}).get('forecast')", SOURCE)
         compile(SOURCE, FORECAST, 'exec')
 
 
