@@ -21,6 +21,12 @@
 #               stays in history, is not read, is named once with its reason,
 #               and the Zone 2 gate asks for the month to be re-run. The run
 #               leaves the stored observations (results) as they were.
+#            6. The Zone 1 observation gate (zone1-observation-gate-1), the
+#               same rule as nfit-profile's: stored results are read as
+#               observations only when the history generator stamped them, they
+#               are not marked, and no multiplicative or recency record from
+#               before the correction sits beside them. Every reader of
+#               results in nfit-forecast goes through it.
 #            The block is extracted from ../nfit-forecast/nfit-forecast (or
 #            $NFIT_FORECAST) and run in isolation: no third-party modules.
 # USAGE    : python3 test/zone2_decoder_test.py
@@ -148,6 +154,38 @@ class Zone2DecoderTests(unittest.TestCase):
         got = D['compute_ensemble_median'](candidates, current, 'vmA', 'G3-95W15')
         self.assertEqual((got['value'], sorted(got['contributing_models'])), (1.5, ['ets', 'predictive_peak', 'theta']))
 
+    # -- 6. the observation gate ---------------------------------------------------------------
+    def test_stored_results_are_observations_only_with_verified_provenance(self):
+        usable, read = D['zone1_observations_usable'], D['zone1_observed_results']
+        results = {'PeakValue': {'vmA': {'G3-95W15': 2.0}}}
+        stamped = {'eventName': 'ev', 'periodEndDate': '2026-08-01', 'generatedOn': '2026-08-02T00:00:00', 'results': results}
+        self.assertEqual(usable(stamped), (True, ''))
+        self.assertIs(read(stamped), results)
+        # A current record of any model beside them changes nothing.
+        self.assertTrue(usable(dict(stamped, ModelForecasts={'multiplicative_seasonal': record(vmA=LPAR), 'predictive_peak': record(None)}))[0])
+        cases = {
+            'not written by the history generator': {k: v for k, v in stamped.items() if k != 'generatedOn'},
+            'marked: a model store from before the correction': dict(stamped, observationsUnverified='a recency_decay record ...'),
+            'holds a recency_decay record from before the correction': dict(stamped, ModelForecasts={'recency_decay': record(None, vmA={'G3-95W15': 9})}),
+            'holds a multiplicative_seasonal record from before the correction':
+                dict(stamped, ModelForecasts={'multiplicative_seasonal': record({'version': 1, 'forecast': 'model-demand'}, vmA=LPAR)}),
+            'no results': {'eventName': 'ev', 'generatedOn': '2026-08-02T00:00:00'},
+        }
+        D['ZONE1_NOT_READ'].clear()
+        for expected, snapshot in cases.items():
+            ok, reason = usable(snapshot)
+            self.assertFalse(ok, expected)
+            self.assertIn(expected, reason)
+            self.assertEqual(read(snapshot, 'ev'), {}, expected)                                 # nothing is trained on
+        self.assertEqual(sorted(D['ZONE1_NOT_READ']), [('ev', '2026-08-01')])                    # what was left out is remembered, once
+        self.assertEqual(read({'generatedOn': 'x', 'results': {}}), {})                           # an empty wrapper: nothing to read, nothing to report
+        self.assertEqual(len(D['ZONE1_NOT_READ']), 1)
+        D['ZONE1_NOT_READ'].clear()
+        # No reader of results is left outside the gate.
+        body = SOURCE[:SOURCE.index('# Zone 2 record decoder (zone2-record-decoder-1)')]
+        self.assertNotIn("snapshot.get('results'", body)
+        self.assertGreaterEqual(body.count('zone1_observed_results('), 5)
+
     # -- 3. one decoder for every consumer --------------------------------------------------
     def test_every_zone2_consumer_reads_through_the_decoder(self):
         body = SOURCE[:SOURCE.index('# Zone 2 record decoder (zone2-record-decoder-1)')]
@@ -223,6 +261,9 @@ class LiveCandidateTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, text[-1500:])
         self.assertRegex(text, r'Zone 2 records not read as candidates \(zone2-record-decoder-1\): 1 x no semantics marker .*\. Read: 1\.')
         self.assertRegex(text, r'2026-08 / ev\s+: \[Z-Gate\] Zone 2 record is no candidate \(recency_decay: no semantics marker')
+        # August's results sit beside that earlier record: they are not trained on, and the run says so.
+        self.assertRegex(text, r'Stored results not read as observations \(zone1-observation-gate-1\): '
+                               r'ev 2026-08-01 \(holds a recency_decay record from before the correction\)')
         pool = re.search(r'Live Candidate Pool: (\d+) forecasts loaded', text)
         self.assertTrue(pool and int(pool.group(1)) > 0, text[-800:])
         after = P.snapshots(case.folder)

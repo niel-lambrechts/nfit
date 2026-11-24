@@ -12,6 +12,10 @@
 #               record from before the demand-quantity correction, or results no
 #               history generator stamped, is not read as an observation; the
 #               run says so and records it with its forecast.
+#            4. Training cutoff: an occurrence that ended after the run's
+#               analysis window is not read. A forecast made as of a past month
+#               is the same whether or not history already holds what happened
+#               later (the occurrence it would be scored against).
 #            On the fixture of test/profile_demand_test.py.
 # USAGE    : python3 test/observed_history_test.py
 # ==============================================================================
@@ -43,6 +47,9 @@ class ObservedHistoryTests(unittest.TestCase):
         cls.replaced = Case('legacy', models=('multiplicative_seasonal',), repeats=2,
                             target_event={'eventName': 'ev', 'periodEndDate': '2026-09-12', 'generatedOn': '2026-09-13T00:00:00',
                                           'ModelForecasts': legacy_record})
+
+        # As of September, with and without an October occurrence four times as high in history.
+        cls.as_of = {later: Case('legacy', peak={PROFILE: 1.2}, later_peak=later) for later in (None, 4.0)}
 
     @classmethod
     def tearDownClass(cls):
@@ -84,6 +91,16 @@ class ObservedHistoryTests(unittest.TestCase):
             self.assertAlmostEqual(case.demand(m, vm), case.baseline(m, vm), places=3, msg=vm)
         self.assertEqual(case.records[m]['_meta']['observationsNotUsed'],
                          {'ev 2026-07': 'not written by the history generator', 'ev 2026-08': 'not written by the history generator'})
+
+    def test_an_occurrence_after_the_analysis_window_does_not_train_the_forecast(self):
+        without, held = self.as_of[None], self.as_of[4.0]
+        self.assertIn('2026-10', held.before)                                              # history does hold the later occurrence
+        for model in ('multiplicative_seasonal', 'predictive_peak'):
+            for vm in LPARS:
+                self.assertEqual(held.records[model][vm]['forecast'], without.records[model][vm]['forecast'], (model, vm))
+                self.assertEqual(held.records[model][vm].get('peakCapacity'), without.records[model][vm].get('peakCapacity'), (model, vm))
+            self.assertGreater(held.demand(model, 'vmS'), 1.15 * held.values['vmS'][PROFILE], model)    # and the earlier ones were read
+        self.assertEqual(held.after['2026-10'], held.before['2026-10'])                    # the later month is left as it was
 
     def test_results_beside_a_replaced_record_from_before_the_correction_stay_marked(self):
         case = self.replaced

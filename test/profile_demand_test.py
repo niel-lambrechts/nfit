@@ -74,7 +74,7 @@ class Case:
     template = None
 
     def __init__(self, form='legacy', raw=1.5, residual=0.25, peak=None, hidden=0.0, latent_extra=0.0, generated=True,
-                 earlier_record=None, latest_peak=None, target_event=None, models=MODELS, repeats=1, trace=False, stored_baseline=1.0, month_before=True):
+                 earlier_record=None, latest_peak=None, target_event=None, models=MODELS, repeats=1, trace=False, stored_baseline=1.0, month_before=True, later_peak=None):
         fixture = M.MemberExposureTests
         if Case.template is None:
             # The fixture's months and their history, generated once and copied for every case.
@@ -137,6 +137,16 @@ class Case:
             stored = {month: {'Metadata': {'ProcessedStartDate': day, 'ProcessedEndDate': month + '-28', 'ProcessedDays': 28},
                               'MonthlyWorkloadAnalysis': E.month_of(analysis, self.values, month), 'SeasonalEventSnapshots': {'ev': event}}}
             with open(os.path.join(self.folder, 'nfit.hist.%s.json' % month), 'w') as fh:
+                json.dump(stored, fh)
+        if later_peak:
+            # An occurrence after the months the run sizes (October): it lies beyond any forecast made as of September.
+            later = copy.deepcopy(results)
+            later['HistoricPeak'] = {vm: {k: round(v * later_peak, 4) for k, v in pv.items()} for vm, pv in self.values.items()}
+            stored = {'2026-10': {'Metadata': {'ProcessedStartDate': '2026-10-01', 'ProcessedEndDate': '2026-10-28', 'ProcessedDays': 28},
+                                  'MonthlyWorkloadAnalysis': E.month_of(analysis, self.values, '2026-10'),
+                                  'SeasonalEventSnapshots': {'ev': {'eventName': 'ev', 'periodEndDate': '2026-10-01',
+                                                                    'generatedOn': '2026-10-02T00:00:00', 'results': later}}}}
+            with open(os.path.join(self.folder, 'nfit.hist.2026-10.json'), 'w') as fh:
                 json.dump(stored, fh)
         if target_event:
             # A snapshot already stored for the month the run sizes.
