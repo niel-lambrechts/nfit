@@ -15,6 +15,8 @@
 #               --research-engine-seasonal-input gives the earlier behaviour.
 #            3. The aggregated multiplicative record says that its demand is an
 #               aggregate and its sized figures are the final occurrence's.
+#            4. The historical-evidence checks of the chain read the engine's
+#               value of the window, not the model's forecast.
 #            On the event-window fixture, for the three seasonal models.
 # USAGE    : python3 test/model_demand_test.py
 # ==============================================================================
@@ -126,6 +128,19 @@ class ModelDemandTests(unittest.TestCase):
             self.assertAlmostEqual(float(d['BasePlanningDemand']), demand, places=3, msg=vm)  # no additive on this fixture
             self.assertGreaterEqual(float(run['rows'][vm][PROFILE]), demand - 0.006, vm)     # the chain's rules only add to it
         self.assertAlmostEqual(float(run['rows']['vmS'][PROFILE]), 0.60, places=2)           # 0.50 x 1.2: published, where 0.50 was before
+
+    def test_historical_evidence_checks_read_the_measured_value_of_the_window(self):
+        # CPU ceiling and flatlining, hot-thread and low-utilisation dampening judge what was measured.
+        for model in ('multiplicative_seasonal', 'predictive_peak'):
+            for name in ('unprotected', 'engineInput'):
+                for vm in LPARS:
+                    d = self.terms(model, name, vm)
+                    measured = float(d['PreGrowthBasePhysC']) + float(d['GrowthAdjUsed'])
+                    self.assertEqual(d['EvidencePhysCSource'], 'engine value of the window', (model, name, vm))
+                    self.assertAlmostEqual(float(d['EvidencePhysC']), measured, places=3, msg=(model, name, vm))
+        # The forecast is a fifth above the measurement here, and is not what they read.
+        d = self.terms('multiplicative_seasonal', 'unprotected', 'vmS')
+        self.assertGreater(float(d['BasePhysC']), float(d['EvidencePhysC']) * 1.15)
 
     def test_the_engine_values_stay_what_was_measured(self):
         for model in ('multiplicative_seasonal', 'predictive_peak'):
