@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/seasonal-demand-anatomy
+# PURPOSE  : Research (no figure changes). What a seasonal model's demand is made
+#            of, on a kept work tree: for each LPAR on its planning profile, the
+#            ingredients history holds for the event's latest past occurrence
+#            (the ordinary profile value of the event, the baseline, the peak
+#            residual, the raw and latent occurrence peaks, and which of them the
+#            model selects as "the peak"), beside the model's own components and
+#            its demand, and the engine's profile value of the run.
+#            It reports, in cores:
+#              - how far the selected peak lies above the event's ordinary
+#                profile value (the raw maximum has no percentile and no
+#                smoothing window; the profile value has both);
+#              - the residual the model adds on top;
+#              - how much of that residual is already inside the selected peak.
+#            The event is sized once with the current nfit-profile; the kept
+#            history is restored afterwards. Aggregates, and the largest
+#            contributors under pseudonyms (dev/nfit-redact).
+# INPUT    : the work tree kept by dev/history-integration-check --keep
+# USAGE    : dev/seasonal-demand-anatomy --event NAME [--work DIR] [--seasonality FILE] [--top N]
+# OUTPUT   : <out>/seasonal-demand-<event>.json and a table
+# ==============================================================================
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+EPS = 0.005
+
+
+def _module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+sys.dont_write_bytecode = True
+spc = _module('seasonal_protection_compare', REPO / 'dev' / 'seasonal-protection-compare')
+pr = spc.pr
+
+
+def num(value):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v else None
+
+
+def snapshots(history, event):
+    """The event's stored snapshots, oldest first: (month, snapshot)."""
+    out = []
+    for path in sorted(Path(history).glob('nfit.hist.*.json')):
+        try:
+            doc = json.loads(path.read_text())
+        except ValueError:
+            continue
+        for month, data in sorted(doc.items()):
+            snap = ((data.get('SeasonalEventSnapshots') or {}).get(event)) if isinstance(data, dict) else None
+            if isinstance(snap, dict):
+                out.append((month, snap))
+    return out
+
+
+def ingredients(results, vm, profile):
+    """What one stored occurrence holds for an LPAR and profile, and the peak the models select from it
+    (as nfit-profile's _resolve_layer_a_peak_from_snapshot: latent, raw, legacy unclipped estimate, legacy peak)."""
+    dig = lambda key: num(((results.get(key) or {}).get(vm) or {}).get(profile)) if isinstance(results.get(key), dict) else None
+    ordinary = dig('HistoricPeak')
+    ordinary = dig('PeakValue') if ordinary is None else ordinary
+    baseline = dig('HistoricBaseline')
+    baseline = dig('BaselineValue') if baseline is None else baseline
+    occ = [o for o in (results.get('OccurrencePeaks') or []) if isinstance(o, dict) and o.get('vm') == vm and o.get('profile') == profile]
+    occ = occ[-1] if occ else {}
+    raw, latent = num(occ.get('raw_peak_value')), num(occ.get('latent_peak_value'))
+    unclipped = num(((((results.get('ClippingInfo') or {}).get(vm) or {}).get(profile)) or {}).get('unclippedPeakEstimate')) \
+        if isinstance(results.get('ClippingInfo'), dict) else None
+    if latent is not None:
+        selected, source = latent, 'occurrence latent peak'
+    elif raw is not None:
+        selected, source = raw, 'occurrence raw peak'
+    elif unclipped is not None:
+        selected, source = unclipped, 'legacy unclipped estimate'
+    elif ordinary is not None:
+        selected, source = ordinary, 'legacy profile peak'
+    else:
+        selected, source = None, 'none'
+    return {'ordinary': ordinary, 'baseline': baseline, 'residual': dig('PeakResidual'), 'raw': raw, 'latent': latent,
+            'sanitised': num(occ.get('sanitised_peak_value')), 'clipped': bool(occ.get('clipped')), 'selected': selected, 'source': source}
+
+
+def pseudonyms(names):
+    """LPAR names through dev/nfit-redact; a name it does not know becomes a numbered label."""
+    done = subprocess.run([str(REPO / 'dev' / 'nfit-redact')], input='\n'.join(names) + '\n', capture_output=True, text=True)
+    lines = done.stdout.splitlines() if done.returncode == 0 else []
+    return {name: (lines[i].strip() if i < len(lines) and lines[i].strip() and lines[i].strip() != name else 'lpar-%02d' % (i + 1))
+            for i, name in enumerate(names)}
+
+
+def summary(values):
+    v = sorted(x for x in values if x is not None)
+    if not v:
+        return {'n': 0}
+    q = lambda p: round(v[min(len(v) - 1, int(p * (len(v) - 1) + 0.5))], 3)
+    return {'n': len(v), 'p10': q(0.10), 'median': q(0.5), 'p90': q(0.90)}
+
+
+def anatomy(past, record, terms):
+    """Per LPAR on its planning profile: the model's demand and components beside the latest stored occurrence."""
+    lpars = []
+    for vm, t in terms.items():
+        profile = t.get('planningProfile')
+        d = (t.get('profiles') or {}).get(profile) or {}
+        stored = record.get(vm) or {}
+        demand = num((stored.get('forecast') or {}).get(profile)) if isinstance(stored, dict) else None
+        if profile is None or demand is None:
+            continue
+        held = [(month, ingredients(snap['results'], vm, profile)) for month, snap in past if isinstance(snap.get('results'), dict)]
+        held = [(m, x) for m, x in held if x['selected'] is not None]
+        latest = held[-1][1] if held else {}
+        comp = (stored.get('components') or {}).get(profile) or {}
+        residual_added = num(comp.get('forecasted_residual'))
+        residual_added = num(comp.get('predicted_residual')) if residual_added is None else residual_added
+        above = (latest['selected'] - latest['ordinary']) if latest.get('selected') is not None and latest.get('ordinary') is not None else None
+        row = {'planningProfile': profile, 'demand': demand, 'engineValue': num(d.get('SizingInputEngineValue')),
+               'modelBaseline': num((stored.get('baseline') or {}).get(profile)),
+               'multiplier': num(comp.get('seasonal_multiplier')), 'trend': num(comp.get('trend_factor')), 'volatility': num(comp.get('volatility_buffer')),
+               'amplification': num(comp.get('amplification_factor')), 'predictedPeak': num(comp.get('predicted_peak')),
+               'residualAdded': residual_added, 'finalSource': comp.get('final_source'),
+               'occurrences': len(held), 'sources': sorted({x['source'] for _m, x in held}),
+               'latest': {k: latest.get(k) for k in ('ordinary', 'baseline', 'residual', 'raw', 'latent', 'sanitised', 'selected', 'source', 'clipped')},
+               'selectedAboveOrdinary': above,
+               'latentIncrement': (latest['latent'] - latest['raw']) if latest.get('latent') is not None and latest.get('raw') is not None else None,
+               'residualAlreadyInPeak': (min(residual_added, max(0.0, above)) if residual_added is not None and above is not None else None),
+               'residualProfileValue': (latest['ordinary'] + latest['residual']) if latest.get('ordinary') is not None and (latest.get('residual') or 0) > 0 else None}
+        row['demandAboveEngine'] = (demand - row['engineValue']) if row['engineValue'] is not None else None
+        lpars.append((vm, row))
+    return lpars
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--event', help='the seasonal event')
+    ap.add_argument('--work', default=str(REPO / '.private' / 'history-check-prod'), help='the work tree kept by dev/history-integration-check --keep')
+    ap.add_argument('--out', default=str(REPO / 'design' / 'acceptance' / 'seasonal'))
+    ap.add_argument('--seasonality', default=str(REPO / 'etc' / 'nfit.seasonality.cfg'), help='the seasonality file to use')
+    ap.add_argument('--top', type=int, default=8, help='how many of the largest contributors to list (pseudonyms)')
+    a = ap.parse_args()
+    work = Path(a.work).resolve()
+    app, case = work / 'app', work / 'case'
+    stage = next(iter(sorted((case / 'stage').glob('*'))), None) if (case / 'stage').is_dir() else None
+    if stage is None or not (case / 'history' / stage.name).is_dir():
+        sys.exit('seasonal-demand-anatomy: no kept work tree with history (run dev/history-integration-check --keep first)')
+    seasonality = Path(a.seasonality).resolve()
+    known = spc.events(seasonality) if seasonality.is_file() else []
+    if not a.event or a.event not in [name for name, _ in known]:
+        print('Events of the seasonality file (give one with --event):')
+        for name, model in known:
+            print(f'  {name:<28} {model}')
+        return 2
+    model = dict(known)[a.event]
+
+    for name in pr.EXECUTABLES:
+        shutil.copy(REPO / name, app / name)
+        (app / name).chmod(0o700)
+    shutil.copy(seasonality, app / 'etc' / 'nfit.seasonality.cfg')
+    history = case / 'history' / stage.name
+    pristine = case / 'history.pristine' / stage.name
+    if not pristine.is_dir():
+        pristine.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(history, pristine)
+    past = snapshots(pristine, a.event)                    # what history held before this run
+    env = pr.perl_env()
+    trace = work / 'seasonal-demand.private.json'
+    trace.unlink(missing_ok=True)
+    args = ['--nmondir', str(stage), '--apply-seasonality', a.event, '--research-runq-trace', str(trace)]
+    if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size:
+        args += ['--config', str(app / 'config.csv')]
+    print(f'{a.event} ({model}): sizing the event once', flush=True)
+    rows, _log, seconds, _members = spc.one_run(app, case, stage, history, pristine, 'seasonal-demand', args, env)
+    record = None
+    for _month, snap in snapshots(history, a.event):
+        record = ((snap.get('ModelForecasts') or {}).get(model)) or record
+    shutil.rmtree(history)
+    shutil.copytree(pristine, history)                     # the kept tree as it was found
+    if not rows or record is None or not trace.is_file():
+        sys.exit('seasonal-demand-anatomy: the run produced no CSV, no stored forecast or no trace (see its private log in the work tree)')
+    lpars = anatomy(past, record, json.loads(trace.read_text())['members'])
+
+    total = lambda key: round(sum((r.get(key) or 0.0) for _vm, r in lpars), 2)
+    by_source = {}
+    for _vm, r in lpars:
+        s = by_source.setdefault(r['latest'].get('source') or 'no stored occurrence', {'lpars': 0, 'demand': 0.0, 'engineValue': 0.0, 'ordinary': 0.0,
+                                                                                   'selected': 0.0, 'selectedAboveOrdinary': 0.0, 'residualAdded': 0.0,
+                                                                                   'residualAlreadyInPeak': 0.0, 'latentIncrement': 0.0})
+        s['lpars'] += 1
+        for key, value in (('demand', r['demand']), ('engineValue', r['engineValue']), ('ordinary', r['latest'].get('ordinary')),
+                           ('selected', r['latest'].get('selected')), ('selectedAboveOrdinary', r['selectedAboveOrdinary']),
+                           ('residualAdded', r['residualAdded']), ('residualAlreadyInPeak', r['residualAlreadyInPeak']), ('latentIncrement', r['latentIncrement'])):
+            s[key] = round(s[key] + (value or 0.0), 2)
+    ratio = lambda a_, b_: (a_ / b_) if a_ is not None and b_ is not None and b_ > 0 else None
+    ranked = sorted(lpars, key=lambda x: -(x[1]['demandAboveEngine'] or 0.0))[:max(0, a.top)]
+    names = pseudonyms([vm for vm, _r in ranked])
+    result = {
+        'event': a.event, 'model': model, 'commit': pr.git_identity(),
+        'method': {'ordinary': "the event's profile value as history holds it for the latest past occurrence (HistoricPeak, else PeakValue): the profile's percentile, window and hours",
+                   'selected': 'the peak the models take from that occurrence: latent peak, else raw peak (the maximum of the daily raw peaks in the profile hours; no percentile, no smoothing), else the legacy values',
+                   'residualAdded': 'the residual the model adds to its forecast (its own component)',
+                   'residualAlreadyInPeak': 'min(residual added, selected peak above the ordinary profile value), for the latest occurrence',
+                   'engineValue': "the engine's profile value of this run's window", 'scope': 'each LPAR on its planning profile'},
+        'pastSnapshotsInHistory': len(past), 'pastSnapshotsWithResults': sum(1 for _m, s in past if isinstance(s.get('results'), dict)), 'lpars': len(lpars),
+        'totals': {k: total(k) for k in ('demand', 'engineValue', 'demandAboveEngine', 'selectedAboveOrdinary', 'latentIncrement', 'residualAdded', 'residualAlreadyInPeak')},
+        'totalsOfLatestOccurrence': {'ordinary': round(sum((r['latest'].get('ordinary') or 0) for _v, r in lpars), 2),
+                                     'selected': round(sum((r['latest'].get('selected') or 0) for _v, r in lpars), 2),
+                                     'residualProfileValue': round(sum((r['residualProfileValue'] or 0) for _v, r in lpars), 2),
+                                     'lparsWithResidualProfileValue': sum(1 for _v, r in lpars if r['residualProfileValue'] is not None)},
+        'ratios': {'selectedOverOrdinary': summary([ratio(r['latest'].get('selected'), r['latest'].get('ordinary')) for _v, r in lpars]),
+                   'demandOverOrdinary': summary([ratio(r['demand'], r['latest'].get('ordinary')) for _v, r in lpars]),
+                   'demandOverEngineValue': summary([ratio(r['demand'], r['engineValue']) for _v, r in lpars]),
+                   'demandOverSelected': summary([ratio(r['demand'], r['latest'].get('selected')) for _v, r in lpars]),
+                   'multiplier': summary([r['multiplier'] for _v, r in lpars]), 'trend': summary([r['trend'] for _v, r in lpars]),
+                   'volatility': summary([r['volatility'] for _v, r in lpars]), 'amplification': summary([r['amplification'] for _v, r in lpars])},
+        'bySelectedSource': by_source,
+        'clippedLpars': sum(1 for _v, r in lpars if r['latest'].get('clipped')),
+        'largestContributors': [dict(r, lpar=names[vm]) for vm, r in ranked], 'seconds': seconds}
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / ('seasonal-demand-%s.json' % re.sub(r'[^A-Za-z0-9_.-]', '_', a.event))
+    target.write_text(json.dumps(result, indent=1) + '\n')
+
+    t, o = result['totals'], result['totalsOfLatestOccurrence']
+    fmt = lambda s: ('%s / %s / %s' % (s['p10'], s['median'], s['p90'])) if s.get('n') else '-'
+    print()
+    print(f"{a.event} ({model}): what the demand is made of, {len(lpars)} LPARs on their planning profile; "
+          f"{result['pastSnapshotsWithResults']} past occurrence(s) with results in history")
+    print(f"  Model demand {t['demand']:.2f} cores; the engine's profile value {t['engineValue']:.2f}; difference {t['demandAboveEngine']:+.2f}")
+    print(f"  Latest past occurrence: ordinary profile value {o['ordinary']:.2f}; selected peak {o['selected']:.2f} "
+          f"({t['selectedAboveOrdinary']:+.2f} above the ordinary value; of that the latent increment {t['latentIncrement']:+.2f}; "
+          f"{result['clippedLpars']} LPARs marked clipped)")
+    print(f"  Residual the model adds: {t['residualAdded']:.2f} cores; already inside the selected peak: {t['residualAlreadyInPeak']:.2f}")
+    print(f"  Ratios p10 / median / p90: selected peak / ordinary {fmt(result['ratios']['selectedOverOrdinary'])}; demand / ordinary "
+          f"{fmt(result['ratios']['demandOverOrdinary'])}; demand / selected {fmt(result['ratios']['demandOverSelected'])}")
+    print(f"    multiplier {fmt(result['ratios']['multiplier'])}; trend {fmt(result['ratios']['trend'])}; volatility {fmt(result['ratios']['volatility'])}; "
+          f"amplification {fmt(result['ratios']['amplification'])}")
+    print('  By the peak the model selects:')
+    print('    %-28s %5s %9s %9s %9s %9s %10s %9s %10s' % ('source', 'LPARs', 'demand', 'engine', 'ordinary', 'selected', 'above ord.', 'residual', 'duplicated'))
+    for source, s in sorted(by_source.items(), key=lambda kv: -kv[1]['lpars']):
+        print('    %-28s %5d %9.2f %9.2f %9.2f %9.2f %+10.2f %9.2f %10.2f' % (source, s['lpars'], s['demand'], s['engineValue'], s['ordinary'], s['selected'],
+                                                                         s['selectedAboveOrdinary'], s['residualAdded'], s['residualAlreadyInPeak']))
+    print('  Largest contributors to the difference (pseudonyms; cores):')
+    print('    %-12s %-10s %8s %8s %9s %8s %8s %8s %9s  %s' % ('LPAR', 'profile', 'demand', 'engine', 'ordinary', 'raw', 'latent', 'residual', 'baseline', 'selected source'))
+    show = lambda x: ('%.2f' % x) if x is not None else '-'
+    for vm, r in ranked:
+        L = r['latest']
+        print('    %-12s %-10s %8s %8s %9s %8s %8s %8s %9s  %s' % (names[vm], r['planningProfile'], show(r['demand']), show(r['engineValue']), show(L.get('ordinary')),
+                                                               show(L.get('raw')), show(L.get('latent')), show(r['residualAdded']), show(r['modelBaseline']), L.get('source')))
+    audit = subprocess.run([str(REPO / 'dev' / 'nfit-redact'), '--audit', str(target)], capture_output=True, text=True)
+    print(audit.stdout.strip().splitlines()[-1] if audit.stdout.strip() else 'audit: no output')
+    print(f'Written: {target}')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
