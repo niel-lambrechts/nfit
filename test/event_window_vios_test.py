@@ -50,7 +50,7 @@ class EventWindowViosTests(unittest.TestCase):
             fh.write(E.EVENT % ('predictive_peak', '2026-09-01:2026-09-01', 1, 1, 1))
         cls.fixture.run_profile(root, '--update-history', '--min-history-days', '1', '--pool-history', '--force')
         cls.fixture.run_profile(root, '--apply-seasonality', 'ev')
-        with open(glob.glob(os.path.join(root, 'output', '*.ev.*.csv'))[0]) as fh:
+        with open([p for p in glob.glob(os.path.join(root, 'output', '*.ev.*.csv')) if '.capacity-plan.' not in p][0]) as fh:
             rows = {row['VM']: row for row in csv.DictReader(fh)}
         with open(glob.glob(os.path.join(root, 'output', '*.ev.proposal.*.json'))[0]) as fh:
             members = json.load(fh)['members']

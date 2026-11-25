@@ -127,7 +127,7 @@ class SelectedDemandTests(unittest.TestCase):
         before = set(glob.glob(os.path.join(cls.root, 'output', '*')))
         run = cls.fixture.run_profile(cls.root, '--apply-seasonality', event, '--research-runq-trace', trace, *flags)
         new = set(glob.glob(os.path.join(cls.root, 'output', '*'))) - before
-        path, = [p for p in new if re.search(r'\.%s\.[^/]*\.csv$' % event, p) and '.proposal.' not in p]
+        path, = [p for p in new if re.search(r'\.%s\.[^/]*\.csv$' % event, p) and '.proposal.' not in p and '.capacity-plan.' not in p]
         with open(path) as fh:
             rows = {row['VM']: row for row in csv.DictReader(fh)}
         log = max(glob.glob(os.path.join(cls.root, 'output', '*.log')), key=os.path.getmtime)

@@ -109,7 +109,7 @@ class EventWindowTests(unittest.TestCase):
             with open(os.path.join(folder, 'nfit.hist.2026-07.json'), 'w') as fh:
                 json.dump(july, fh)
         run = cls.fixture.run_profile(root, '--apply-seasonality', 'ev', *flags)
-        path, = glob.glob(os.path.join(root, 'output', '*.ev.*.csv'))
+        path, = [p for p in glob.glob(os.path.join(root, 'output', '*.ev.*.csv')) if '.capacity-plan.' not in p]
         with open(path) as fh:
             rows = {row['VM']: row for row in csv.DictReader(fh)}
         log, = glob.glob(os.path.join(root, 'output', '*.ev.*.log'))

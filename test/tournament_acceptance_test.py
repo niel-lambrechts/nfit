@@ -152,6 +152,37 @@ class SizingReportTests(unittest.TestCase):
         self.assertEqual(A.sizing_report(None, predictive), ['  the adaptive run wrote no proposal'])
 
 
+class CapacityPlanReportTests(unittest.TestCase):
+
+    def test_the_plan_is_summarised_and_its_rules_checked(self):
+        def cp(action, ient, ivp, pent, pvp, **extra):
+            return {'capacityPlan': dict({'action': action, 'unresolved': [], 'installed': {'entitlement': ient, 'VPs': ivp},
+                                          'plan': {'entitlement': pent, 'VPs': pvp},
+                                          'additional': {'entitlement': round(pent - ient, 2), 'VPs': pvp - ivp, 'workloadEntitlement': round(pent - ient, 2),
+                                                         'workloadVPs': pvp - ivp, 'platformMinimumEntitlement': 0, 'widthVPs': 0},
+                                          'combinedEvents': [], 'overlaps': []}, **extra)}
+        context = {'capacityPlan': {'produced': True, 'occurrence': {'start': '2026-11-24', 'end': '2026-11-30'}, 'requiredBy': '2026-11-24 00:00',
+                                    'timeBasis': 'UTC', 'alternatives': ['month-end-predictive'],
+                                    'overlaps': [{'event': 'bf', 'overlapStart': '2026-11-24', 'overlapEnd': '2026-11-27'}],
+                                    'pools': [{'pool': 7, 'verdict': 'raise', 'planned': 7.4, 'reliedOn': 0, 'maximum': 7, 'requiredMaximum': 8}],
+                                    'normalPlan': {'model': 'hybrid-state-decay', 'status': 'matching'}}}
+        members = {'a': cp('increase', 2.0, 4, 2.6, 4, unresolved=['overlap'], overlaps=[{'event': 'bf', 'combined': False}],
+                           step={'entitlement': 2.4, 'VPs': 4, 'limit': 'the size of pool 7 (7)'}),
+                   'b': cp('retain', 1.5, 3, 1.5, 3, normalPlanConflict={'entitlement': 1.2}),
+                   'c': cp('increase', 1.6, 2, 1.6, 3, overlaps=[{'event': 'bf', 'combined': False}])}       # its overlap left out
+        text = '\n'.join(A.capacity_plan_report({'context': context, 'members': members}))
+        self.assertIn('occurrence 2026-11-24 to 2026-11-30; required by 2026-11-24 00:00 (UTC)', text)
+        self.assertIn('LPARs: 3 (increase 2, retain 1)', text)
+        self.assertIn('additional: +0.60 ENT (workload +0.60, PowerVM minimum +0.00), +1 VPs (workload +1, to carry the entitlement +0)', text)
+        self.assertIn('checks: plan below installed 0; pair outside 0.05 to 1.00 per VP 0; increase without its dependency 1', text)
+        self.assertIn("this cycle's pair stops short of the plan: 1 (the size of pool 7 1)", text)
+        self.assertIn('pool 7: raise; planned 7.40, relied on 0.00, maximum 7 -> at least 8', text)
+        self.assertIn('overlaps: bf 2026-11-24 to 2026-11-27; LPARs whose forecast combined one: 0', text)
+        self.assertIn('normal plan (hybrid-state-decay): matching; conflicts 1', text)
+        self.assertEqual(A.capacity_plan_report({'context': {'capacityPlan': {'produced': False, 'reason': 'x'}}}), ['  not produced: x'])
+        self.assertEqual(A.capacity_plan_report(None), ['  the adaptive run wrote no capacity plan'])
+
+
 class MatchedTests(unittest.TestCase):
 
     def test_models_are_compared_on_the_cases_both_were_scored_on(self):
@@ -232,6 +263,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertRegex(text, r'source model\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+\1\s+0\s+0\n')
         self.assertIn('LPARs on another planning profile than in the source event run: 0', text)
         self.assertIn('not assessed by either run: PowerHA role sizing (standard runs only), frame capacity', text)
+        self.assertIn('6. Seasonal Capacity Plan of the adaptive run (counts and cores; no LPAR names)', text)
+        self.assertIn('checks: plan below installed 0; pair outside 0.05 to 1.00 per VP 0; increase without its dependency 0', text)
         self.assertIn('history after the adaptive run: unchanged', text)
         self.assertIn('Kept tree: history as it was found', text)
         for name in P.LPARS + (M.SERIAL,):
