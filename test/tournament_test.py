@@ -37,6 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import csv
 import unittest
 from datetime import datetime
 
@@ -284,6 +285,52 @@ class ParticipationTests(unittest.TestCase):
         self.assertFalse(T['tournament_live_pool'](self.raw, 'ad', 'ev')['target']['observed'])
         self.assertIn('Occurrence ahead: 2026-10-01 to 2026-10-02\n', T['format_tournament_live_pool'](T['tournament_live_pool'](self.raw, 'ad', 'ev')))
         self.assertEqual(T['tournament_live_pool']({}, 'ad', 'ev')['pool'], {})
+
+    def test_the_pool_states_its_data_end_definitions_and_an_observed_target_only_from_observations(self):
+        pool = T['tournament_live_pool'](self.raw, 'ad', 'ev')
+        self.assertEqual(pool['dataEnds'], '2026-09-12')
+        self.assertEqual(pool['definitions'], {'profileDefinitions': 'flags-1:p1', 'exclusions': 'NONE'})
+        self.assertTrue(pool['target']['observed'])
+        # October's results without the generator's stamp are no observation: the occurrence is not observed.
+        self.raw['2026-10']['SeasonalEventSnapshots']['ev'].pop('generatedOn')
+        self.assertFalse(T['tournament_live_pool'](self.raw, 'ad', 'ev')['target']['observed'])
+        T['ZONE1_NOT_READ'].clear()
+
+    def test_the_pool_is_completed_with_the_live_multiplier_before_selection(self):
+        complete, resolve_all = T['complete_live_pool'], T['resolve_pool_selections']
+        pool = T['tournament_live_pool'](self.raw, 'ad', 'ev')
+        live = {'vmA': {P1: {'forecast': 9.0, 'target_start': '2026-10-01', 'target_date': '2026-10-02', 'data_end': '2026-09-20'}},
+                'vmB': {P1: {'forecast': 1.4, 'pi_lower': 1.2, 'pi_upper': 1.6, 'target_start': '2026-10-01', 'target_date': '2026-10-02',
+                             'data_end': '2026-09-20', 'evidence_penalty': 0.25}},
+                'vmC': {P1: {'forecast': 2.2, 'target_start': '2026-10-08', 'target_date': '2026-10-09'}},       # another occurrence
+                'vmD': {P1: {'forecast': None, 'target_start': '2026-10-01', 'target_date': '2026-10-02'}}}
+        added = complete(pool, live)
+        # vmA already holds a stored event_multiplier: it is not replaced. vmB lacks one: this run's joins, whole.
+        self.assertNotEqual(pool['pool']['vmA'][P1]['event_multiplier'], 9.0)
+        self.assertEqual(added, {('vmB', P1): ['event_multiplier']})
+        self.assertEqual(pool['pool']['vmB'][P1]['event_multiplier']['pi_upper'], 1.6)
+        self.assertNotIn('vmC', pool['pool'])
+        self.assertNotIn('vmD', pool['pool'])
+        self.assertEqual(pool['dataEnds'], '2026-09-20')
+        # One resolution per pair, for the pool's pairs and any others asked for; the ledger is called once per pair.
+        calls = []
+
+        def select(vm, profile, names, penalty):
+            calls.append((vm, profile, tuple(sorted(names)), penalty))
+            return {'selection_mode': 'tournament', 'chosen_model': 'event_multiplier', 'rationale': 'r'}
+        got = resolve_all(pool, select, pairs=[('vmZ', P1)])
+        self.assertEqual(got['vmB'][P1]['resolved'], {'model': 'event_multiplier', 'mode': 'tournament', 'forecast': 1.4,
+                                                     'pi_lower': 1.2, 'pi_upper': 1.6, 'rationale': 'r'})
+        self.assertIn(('vmB', P1, tuple(sorted(pool['pool']['vmB'][P1])), 0.25), calls)
+        self.assertEqual(got['vmZ'][P1]['resolved']['mode'], 'no eligible forecast')
+        self.assertEqual(len(calls), len({(c[0], c[1]) for c in calls}))
+        self.assertNotIn(('vmZ', P1), [(c[0], c[1]) for c in calls])
+        # A pool that states no occurrence takes the live forecasts only when they all state the same one.
+        empty = {'pool': {}, 'target': None, 'dataEnds': None}
+        self.assertEqual(complete(empty, {'vmA': live['vmA'], 'vmC': live['vmC']}), {})
+        self.assertIsNone(empty['target'])
+        self.assertEqual(complete(empty, {'vmA': live['vmA']}), {('vmA', P1): ['event_multiplier']})
+        self.assertEqual(empty['target'], {'occurrenceStart': '2026-10-01', 'occurrenceEnd': '2026-10-02', 'observed': False})
 
     def test_the_next_occurrence_follows_from_the_event_definition(self):
         nxt = T['next_occurrence_after']
@@ -562,6 +609,63 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual((october['data_end'], october['target_start'], october['target_date']), ('2026-10-01', '2026-11-01', '2026-11-01'))
         self.assertEqual((em['data_end'], em['target_start'], em['target_date']), ('2026-09-12', '2026-10-01', '2026-10-01'))
         self.assertEqual(em['horizon_days'], 19)                                   # the baseline is projected to that occurrence
+        # -- one selection, stored once and read alike by the CSV
+        # (The backfill leaves an empty selection placeholder in every month: the block is found by its meta.)
+        holders = [m for m in sorted(snaps) if 'selection_meta' in ((snaps[m].get('ad') or {}).get('AdaptiveForecast') or {})]
+        self.assertEqual(len(holders), 1, holders)
+        adaptive = snaps[holders[0]]['ad']['AdaptiveForecast']
+        meta = adaptive['selection_meta']
+        self.assertEqual((meta['semantics'], meta['quantity'], meta['event'], meta['source_event'], meta['written_to'], meta['candidates_stored_in']),
+                         ('selected-demand-1', 'profile-demand', 'ad', 'ev', holders[0], '2026-10'))
+        self.assertEqual(meta['target_occurrence'], {'occurrenceStart': '2026-11-01', 'occurrenceEnd': '2026-11-01', 'observed': False})
+        self.assertEqual(meta['data_ends'], '2026-10-01')
+        selection = adaptive['selection']
+        for by_profile in selection.values():
+            for entry in by_profile.values():
+                self.assertEqual((entry['candidates_stored_in'], entry['target_occurrence']), ('2026-10', meta['target_occurrence']))
+        csvs = sorted(glob.glob(os.path.join(case.root, 'output', 'nfit-forecast.*.ad.*.csv')), key=os.path.getmtime)
+        self.assertTrue(csvs)
+        with open(csvs[-1], newline='') as fh:
+            rows = list(csv.DictReader(fh))
+        vm_key = next(k for k in rows[0] if k in ('VM', 'VMName', 'VM_Name', 'vm_name'))
+        compared = 0
+        for row in rows:
+            for profile, entry in (selection.get(row[vm_key]) or {}).items():
+                if '%s_Mode' % profile not in row:
+                    continue
+                self.assertEqual((row['%s_Mode' % profile], row['%s_Model' % profile]), (entry['selection_mode'], entry['chosen_model']))
+                if entry['forecast'] is None:
+                    self.assertIn(row['%s_Forecast' % profile], ('', 'None', 'nan'))
+                else:
+                    self.assertAlmostEqual(float(row['%s_Forecast' % profile]), entry['forecast'], places=3)
+                compared += 1
+        self.assertGreater(compared, 0)
+        # It states the definitions as nfit-profile states them: those of the source event's own record.
+        record_meta = case.records['predictive_peak']['_meta']
+        self.assertEqual((meta['profile_definitions'], meta['exclusion_definitions']),
+                         (record_meta['profile_definitions'], record_meta['exclusion_definitions']))
+        # nfit-profile reads the block nfit-forecast wrote. The selection is for November (the candidates of
+        # October); the source model of an adaptive run on this data (ending in September) forecasts an earlier
+        # occurrence: every check before that one passes, and the selection is withheld on it, whole, with
+        # nothing stored.
+        config = os.path.join(case.root, 'etc', 'nfit.seasonality.cfg')
+        with open(config) as fh:
+            text = fh.read()
+        # The source event was last configured for the multiplicative model: an adaptive run refuses it.
+        refused = subprocess.run(['perl', os.path.join(case.root, 'nfit-profile'), '--nmondir', os.path.join(case.root, 'stage', M.SERIAL),
+                                  '--apply-seasonality', 'ad'], capture_output=True, text=True, cwd=case.root, timeout=120)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("The source event 'ev' of 'ad' uses model 'multiplicative_seasonal'; an adaptive run sizes through a predictive_peak source event only.",
+                      refused.stderr)
+        head, tail = text.split('[ad]', 1)
+        with open(config, 'w') as fh:
+            fh.write(head.replace('model = multiplicative_seasonal', 'model = predictive_peak') + '[ad]' + tail)
+        before = self.files()
+        sized = M.MemberExposureTests.run_profile(case.root, '--apply-seasonality', 'ad')
+        self.assertRegex(sized.stderr, r'Selected forecast not used: it is for the occurrence 2026-11-01 to 2026-11-01; this run sizes 2026-\d\d-\d\d to ')
+        self.assertEqual({k: v for k, v in self.files().items() if k.startswith('nfit.hist.')},
+                         {k: v for k, v in before.items() if k.startswith('nfit.hist.')})
+
         # The stored scoring block says who took part against which occurrence.
         scoring = snaps['2026-09']['ad']['AdaptiveForecast']['scoring']
         self.assertEqual((scoring['_meta']['scoring_semantics'], scoring['_meta']['scored_against_month']), ('profile-requirement-1', '2026-10'))

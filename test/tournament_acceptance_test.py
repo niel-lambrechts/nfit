@@ -117,6 +117,36 @@ class PartsTests(unittest.TestCase):
         self.assertEqual(chosen[('ensemble_median', 'bootstrap')], 4)
 
 
+class SizingReportTests(unittest.TestCase):
+
+    def test_the_sizing_is_compared_lpar_by_lpar_on_the_planning_profile(self):
+        def member(planning, ent, ds, role=None):
+            out = {'planningProfile': planning, 'profiles': {planning: {'entitlement': ent, 'currentCycle': {'entitlement': ent}, 'demandSource': ds}}}
+            if role:
+                out['role'] = {'entitlement': role}
+            return out
+        sel = lambda mode, demand, source: {'source': 'selection', 'mode': mode, 'demand': demand, 'sourceModelDemand': source}
+        adaptive = {'context': {'selection': {'status': 'used', 'storedIn': '2026-09', 'candidatesStoredIn': '2026-09',
+                                              'target': {'occurrenceStart': '2026-10-28', 'occurrenceEnd': '2026-10-31'},
+                                              'withheld': {'no eligible forecast': 1}},
+                                'notAssessed': ['PowerHA role sizing (standard runs only)', 'frame capacity']},
+                    'members': {'a': member('G', 2.5, sel('tournament', 2.5, 2.0)), 'b': member('G', 1.0, sel('bootstrap', 0.8, 1.0)),
+                                'c': member('P', 3.0, {'source': 'source model', 'demand': 3.0, 'reason': 'no eligible forecast'}, role=3.2)}}
+        predictive = {'members': {'a': member('G', 2.0, {}), 'b': member('G', 1.0, {}), 'c': member('G', 3.0, {}, role=3.2)}}
+        text = '\n'.join(A.sizing_report(adaptive, predictive))
+        self.assertIn('selection used: stored in 2026-09, candidates of 2026-09, for the occurrence 2026-10-28 to 2026-10-31', text)
+        self.assertIn('proposal profiles by demand source: 1 tournament, 1 bootstrap median, 1 source model', text)
+        self.assertRegex(text, r'tournament\s+1\s+2\.00\s+2\.50\s+1\.250\s+2\.50\s+2\.00\s+1\s+0')
+        self.assertRegex(text, r'bootstrap median\s+1\s+1\.00\s+0\.80\s+0\.800\s+1\.00\s+1\.00\s+0\s+0')
+        self.assertRegex(text, r'source model\s+1\s+3\.00\s+3\.00\s+1\.000\s+3\.20\s+3\.20\s+0\s+0')    # a VIOS role publishes its own figure
+        self.assertIn('LPARs on another planning profile than in the source event run: 1', text)
+        self.assertIn('VIOS roles: 1 in this run, 1 in the source event run', text)
+        self.assertIn('1  sized pairs from the source model: no eligible forecast', text)
+        withheld = dict(adaptive, context={'selection': {'status': 'withheld', 'reason': 'its target occurrence is already observed'}})
+        self.assertIn('selection NOT used: its target occurrence is already observed', '\n'.join(A.sizing_report(withheld, None)))
+        self.assertEqual(A.sizing_report(None, predictive), ['  the adaptive run wrote no proposal'])
+
+
 class MatchedTests(unittest.TestCase):
 
     def test_models_are_compared_on_the_cases_both_were_scored_on(self):
@@ -160,7 +190,9 @@ class EndToEndTests(unittest.TestCase):
         seasonality = work.parent / 'nfit.seasonality.cfg'
         with open(os.path.join(case.root, 'etc', 'nfit.seasonality.cfg')) as fh:
             text = fh.read()
+        # (The source event is a predictive peak event, as an adaptive event's must be for the sizing of section 5.)
         seasonality.write_text(text.replace(P.NEXT_DATES, P.NEXT_DATES + ', 2026-11-01:2026-11-01').replace('2026-09-01:2026-09-01, ', '')
+                               .replace('model = multiplicative_seasonal', 'model = predictive_peak')
                                + '\n[ad]\nmodel = adaptive_peak\nsource_event = ev\npriority = 10\n')
         before = A.fingerprint(work)
 
@@ -187,6 +219,15 @@ class EndToEndTests(unittest.TestCase):
         self.assertRegex(text, r'\d+ x bootstrap: the median of the pool, no interval reported')
         for wrong in ('differs', 'although', 'is not the median', 'not in the pool\n', 'DIFFERENT', 'HISTORY CHANGED'):
             self.assertNotIn(wrong, text.split('Selection for the occurrence ahead')[1] if wrong == 'although' else text, wrong)
+        # 5. The adaptive event sized through its source event. The selection is for November; the source model on this
+        # data forecasts an earlier occurrence, so every pair keeps the source model's demand, and the two runs agree.
+        self.assertIn("5. Sizing from the selection ('ad' through 'ev', latest bucket)", text)
+        self.assertRegex(text, r'selection NOT used: it is for the occurrence 2026-11-01 to 2026-11-01; this run sizes ')
+        self.assertRegex(text, r'proposal profiles by demand source: \d+ source model\n')
+        self.assertRegex(text, r'source model\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+\1\s+0\s+0\n')
+        self.assertIn('LPARs on another planning profile than in the source event run: 0', text)
+        self.assertIn('not assessed by either run: PowerHA role sizing (standard runs only), frame capacity', text)
+        self.assertIn('history after the adaptive run: unchanged', text)
         self.assertIn('Kept tree: history as it was found', text)
         for name in P.LPARS + (M.SERIAL,):
             self.assertNotIn(name, text)

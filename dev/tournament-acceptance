@@ -19,11 +19,17 @@
 #                models, each on its own;
 #              - whether the rebuilt ledger is identical;
 #              - whether each selection carries the chosen candidate's own
-#                forecast and interval, and where that candidate came from.
+#                forecast and interval, and where that candidate came from;
+#              - the sizing from the selection (unless --no-sizing): the
+#                adaptive event run with nfit-profile against its source event's
+#                latest bucket, from the two proposals: demand from the selection
+#                against the source model's, and the published entitlement, by
+#                selection mode; whether the planning profile and VIOS roles
+#                agree, and whether the adaptive run left history unchanged.
 #            No LPAR, system or serial number is printed.
 # USAGE    : dev/tournament-acceptance --event NAME [--work DIR]
 #                [--candidate-sources A,B] [--scope all|latest]
-#                [--no-seasonal-run] [--keep]
+#                [--no-seasonal-run] [--no-sizing] [--keep]
 # ==============================================================================
 import argparse
 import configparser
@@ -307,6 +313,93 @@ def matched_report(cases, minimum):
     return lines
 
 
+def proposal_of(output, event):
+    """The newest proposal copy nfit-profile wrote for an event into an output folder, or None."""
+    found = sorted(Path(output).glob(f'nfit-profile.*.{event}.proposal.*.json'), key=lambda p: p.stat().st_mtime)
+    return json.loads(found[-1].read_text(encoding='utf-8')) if found else None
+
+
+SIZING_GROUPS = ('tournament', 'unopposed', 'bootstrap median', 'source model')
+
+
+def _published(member, profile):
+    """The entitlement a member's row publishes: its role's (VIOS pair) where it has one, else the planning profile's
+    current-cycle entitlement."""
+    role = member.get('role')
+    if isinstance(role, dict) and role.get('entitlement') is not None:
+        return float(role['entitlement'])
+    cycle = ((member.get('profiles') or {}).get(profile) or {}).get('currentCycle') or {}
+    return float(cycle['entitlement']) if cycle.get('entitlement') is not None else None
+
+
+def sizing_report(adaptive, predictive):
+    """Lines comparing the adaptive run's proposal with the source event's, in counts and core sums.
+    Each LPAR is read on its planning profile and grouped by where that profile's demand came from."""
+    if not adaptive:
+        return ['  the adaptive run wrote no proposal']
+    context = adaptive.get('context') or {}
+    sel = context.get('selection') or {}
+    target = sel.get('target') or {}
+    lines = [('  selection used: stored in %s, candidates of %s, for the occurrence %s to %s'
+              % (sel.get('storedIn'), sel.get('candidatesStoredIn'), target.get('occurrenceStart'), target.get('occurrenceEnd')))
+             if sel.get('status') == 'used' else '  selection NOT used: %s' % sel.get('reason')]
+    pairs = {}
+    for member in (adaptive.get('members') or {}).values():
+        for prof in (member.get('profiles') or {}).values():
+            ds = prof.get('demandSource') or {}
+            key = ('bootstrap median' if ds.get('mode') == 'bootstrap' else ds.get('mode')) if ds.get('source') == 'selection' else 'source model'
+            pairs[key] = pairs.get(key, 0) + 1
+    lines.append('  proposal profiles by demand source: ' + (', '.join('%d %s' % (pairs[g], g) for g in SIZING_GROUPS if g in pairs) or 'none'))
+    for reason, n in sorted((sel.get('withheld') or {}).items(), key=lambda kv: (-kv[1], kv[0])):
+        lines.append('    %6d  sized pairs from the source model: %s' % (n, reason))
+    groups, moved_profile, roles = {}, 0, [0, 0]
+    others = (predictive or {}).get('members') or {}
+    for vm, member in (adaptive.get('members') or {}).items():
+        planning = member.get('planningProfile')
+        prof = (member.get('profiles') or {}).get(planning) or {}
+        ds = prof.get('demandSource') or {}
+        key = ('bootstrap median' if ds.get('mode') == 'bootstrap' else ds.get('mode')) if ds.get('source') == 'selection' else 'source model'
+        row = groups.setdefault(key, {'lpars': 0, 'source': 0.0, 'selected': 0.0, 'ratios': [], 'ent': 0.0, 'other': 0.0, 'up': 0, 'down': 0, 'compared': 0})
+        row['lpars'] += 1
+        source = ds.get('sourceModelDemand') if ds.get('source') == 'selection' else ds.get('demand')
+        demand = ds.get('demand')
+        if source is not None and demand is not None:
+            row['source'] += float(source)
+            row['selected'] += float(demand)
+            if float(source) > 0:
+                row['ratios'].append(float(demand) / float(source))
+        other = others.get(vm)
+        mine = _published(member, planning)
+        if other is not None:
+            moved_profile += other.get('planningProfile') != planning
+            roles[0] += isinstance(member.get('role'), dict)
+            roles[1] += isinstance(other.get('role'), dict)
+            theirs = _published(other, other.get('planningProfile'))
+            if mine is not None and theirs is not None:
+                row['compared'] += 1
+                row['ent'] += mine
+                row['other'] += theirs
+                row['up'] += mine > theirs + 0.005
+                row['down'] += mine < theirs - 0.005
+    lines.append('  LPARs on their planning profile, by where its demand came from (cores):')
+    lines.append('    %-18s %6s %12s %12s %10s %14s %14s %6s %6s' % ('demand source', 'LPARs', 'source model', 'selected', 'median x',
+                                                                     'published', 'source event', 'up', 'down'))
+    for key in SIZING_GROUPS:
+        row = groups.get(key)
+        if not row:
+            continue
+        ratio = '%.3f' % statistics.median(row['ratios']) if row['ratios'] else '-'
+        lines.append('    %-18s %6d %12.2f %12.2f %10s %14.2f %14.2f %6d %6d' % (key, row['lpars'], row['source'], row['selected'], ratio,
+                                                                            row['ent'], row['other'], row['up'], row['down']))
+    if predictive is None:
+        lines.append('  (no proposal of the source event to compare with)')
+    else:
+        lines.append('  LPARs on another planning profile than in the source event run: %d' % moved_profile)
+        lines.append('  VIOS roles: %d in this run, %d in the source event run' % tuple(roles))
+    lines.append('  not assessed by either run: ' + ', '.join(context.get('notAssessed') or ['(not stated)']))
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--event', help='the tournament event (an adaptive_peak event)')
@@ -316,6 +409,7 @@ def main():
                                                 'candidate_sources in the seasonality file, else its source event alone)')
     ap.add_argument('--scope', default='all', choices=('all', 'latest'), help='which history months the seasonal runs fill (default: all)')
     ap.add_argument('--no-seasonal-run', action='store_true', help='use the records history already holds')
+    ap.add_argument('--no-sizing', action='store_true', help='leave out the sizing from the selection (section 5)')
     ap.add_argument('--keep', action='store_true', help='keep the working copy')
     a = ap.parse_args()
 
@@ -510,9 +604,31 @@ def main():
             for what, n in sorted(tally.items()):
                 print(f"    {n:>5} x {what}")
 
+        sizing_ok = True
+        if not a.no_sizing:
+            # 5. The adaptive event through nfit-profile's sizing chain, against its source event's latest bucket.
+            print(f"\n5. Sizing from the selection ('{a.event}' through '{source}', latest bucket)")
+            config = ['--config', str(app / 'config.csv')] if (app / 'config.csv').is_file() and (app / 'config.csv').stat().st_size else []
+            held = fingerprint(history)
+            try:
+                print('  Running the adaptive event ...', flush=True)
+                pr.invoke(app, case, 'tournament-acceptance-adaptive', ['--nmondir', str(stage), '--apply-seasonality', a.event] + config, env)
+                unchanged = fingerprint(history) == held
+                adaptive = proposal_of(app / 'output', a.event)
+                print('  Running the source event on its latest bucket ...', flush=True)
+                pr.invoke(app, case, 'tournament-acceptance-source-latest',
+                          ['--nmondir', str(stage), '--apply-seasonality', source, '--seasonal-scope', 'latest', '--force'] + config, env)
+            except RuntimeError as failure:
+                a.keep = True
+                sys.exit(f'tournament-acceptance: {failure}. The working copy is kept for its log.')
+            predictive = proposal_of(app / 'output', source)
+            print('\n'.join(sizing_report(adaptive, predictive)))
+            print('  history after the adaptive run: ' + ('unchanged' if unchanged else 'CHANGED (it should not have)'))
+            sizing_ok = unchanged and adaptive is not None
+
         after = {name: fingerprint(work / 'case' / name) for name in kept}
         print('\nKept tree: ' + ('history as it was found' if after == kept else 'HISTORY CHANGED (it should not have)'))
-        status = 0 if after == kept and (first == rebuilt) else 1
+        status = 0 if after == kept and (first == rebuilt) and sizing_ok else 1
     finally:
         if a.keep:
             print(f'Working copy kept: {copy.name} (beside the work tree).')
