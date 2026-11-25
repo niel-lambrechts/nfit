@@ -908,7 +908,12 @@ my $is_predictive_peak_model_run = 0;
 # The Global Lock ensures atomic access to the history directory.
 my $HISTORY_LOCK_FILENAME = ".nfit.history.lock";
 
-GetOptions(
+my ($cycle_dir, $cycle_systems_file);
+my $CYCLE_FORMAT = 'nfit-cycle-1';
+# Options that name the frame, a path whose content is fingerprinted, or only what is printed.
+my %CYCLE_OPTIONS_LEFT_OUT = map { $_ => 1 } qw(nmondir mgsys vm help version v d nfit-path config profiles-config
+                                                 cycle cycle-systems research-runq-trace);
+my @option_spec = (
     'nmondir=s'                  => \$nmon_dir,
     'config=s'                   => \$vm_config_file_arg,
     'profiles-config=s'          => \$profiles_config_file_arg,
@@ -965,7 +970,14 @@ GetOptions(
     "d|debug"                    => \$debug,
     'force'                      => \$force_update,
     'use-l1-baseline'            => \$use_l1_baseline,
-) or die usage_wrapper();
+    'cycle=s'                    => \$cycle_dir,
+    'cycle-systems=s'            => \$cycle_systems_file,
+);
+GetOptions(@option_spec) or die usage_wrapper();
+# The options as resolved, before any of them is adjusted for a system (planning cycle; saved plans).
+my %RESOLVED_OPTIONS = %{ _resolved_options(\@option_spec, \%CYCLE_OPTIONS_LEFT_OUT) };
+# This process's part in a planning cycle: { dir, id, runs => { system => {...} } }. Empty outside one.
+my %CYCLE;
 
 print STDERR "nfit-profile version $VERSION\n" if (!defined $show_version);
 
@@ -1803,6 +1815,9 @@ die "--candidate-proposals takes one system and uses the saved model, VM scope a
     if defined $candidate_snapshot && (@target_systems_to_process != 1 || defined $start_date_str || defined $end_date_str ||
         defined $target_vm_name || $nfit_enable_windowed_decay || $nfit_decay_over_states || defined $enddate_clamp_str);
 die "--candidate-window requires --candidate-test\n" if defined $candidate_window && !$candidate_test;
+die "--cycle takes whole-frame runs of the standard models: not a seasonal or history run, --vm or a candidate replay\n"
+    if (defined $cycle_dir && ($is_seasonal_run || $seasonal_auto_flag || defined $target_vm_name || $candidate_test));
+die "--cycle-systems requires --cycle\n" if (defined $cycle_systems_file && !defined $cycle_dir);
 die "--candidate-test requires a tactical run with pool exposure enabled\n"
     if $candidate_test && ($is_seasonal_run || (defined $pool_exposure_flag && !$pool_exposure_flag));
 my ($replay_from, $replay_to);
@@ -2020,6 +2035,10 @@ foreach my $system_serial (@target_systems_to_process)
     }
     # Initialise the run end date to the effective end date by default
     my $run_end_date_obj = $effective_end_date_obj;
+    # Planning cycle: the compatibility check and the attempt marker, before the engine starts.
+    _cycle_join($system_identifier, $current_cache_path, $run_end_date_obj->ymd,
+        ($nfit_decay_over_states ? 'hybrid-state-decay' : $nfit_enable_windowed_decay ? 'windowed-decay' : 'state-based'))
+        if (defined $cycle_dir);
 
     if ($system_identifier && $system_identifier ne '.')
     {
@@ -3299,6 +3318,18 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                 File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.proposal.%s.json',
                     (map { s/[^a-zA-Z0-9_.-]//gr } ($system_identifier || 'standard', $report_type_for_filename)), $unique_date_suffix)));
             push @generated_files, $proposal_copy if defined $proposal_copy;
+            # Planning cycle: what this analysis registers once its outputs are complete.
+            if (%CYCLE && ref($CYCLE{runs}{$system_identifier}) eq 'HASH')
+            {
+                my $run = $CYCLE{runs}{$system_identifier};
+                my %peer_dirs = map { (basename($_) => $_) } grep { basename($_) ne $run->{frame} } map { map { @$_ } values %{ $_->{DirsOf} // {} } } @$role_evidence;
+                @{$run}{qw(proposal rationale files lpars coverage)} = ($proposal_copy, $log_file_path_for_run,
+                    [ @generated_files[ $run->{firstFile} .. $#generated_files ] ], scalar(@vm_order),
+                    { start => $effective_start_date_obj->ymd, end => $run_end_date_obj->ymd });
+                $run->{peers} = { map { ($_ => { dir => $peer_dirs{$_}, capture => _capture_identity($peer_dirs{$_}) }) } keys %peer_dirs };
+                $run->{totals} = _entitlement_totals($assimilation_map_ref, \@vm_order, \@profiles, \%vm_tier_overrides, \%lpar_roles)->{Groups};
+                $run->{pending} = [ map { { lpar => $_, %{ $proposals{$_}{pendingRole} } } } grep { ref($proposals{$_}{pendingRole}) eq 'HASH' } sort keys %proposals ];
+            }
 
         }
     }
@@ -3374,6 +3405,9 @@ foreach my $system_id (keys %open_log_files) {
         close $log_fh;
     }
 }
+
+# Planning cycle: register the completed analyses, now that their outputs are complete.
+exit 3 if (%CYCLE && _cycle_register_all());
 
 exit 0;
 
@@ -14253,7 +14287,7 @@ sub _ha_sizing_plan
 #             installed as this run saw it, and with the same reading of the
 #             cluster's roles and policy. Pure.
 # ARGUMENTS:  1. stored proposal (decoded)  2. primary name
-#             3. hashref { end, argv, files, guaranteePolicy, contestedLevel,
+#             3. hashref { end, options, files, guaranteePolicy, contestedLevel,
 #                revision, installed {Ent, VP}, role, members, sizing, share }
 # RETURNS:    reason (string) or undef
 # ==============================================================================
@@ -14271,8 +14305,9 @@ sub _ha_peer_plan_mismatch
         return 'its saved plan was made with another nFit or other configuration files'
             unless ($same->($want->{files}{$key}, _safe_dig($settings, 'filesSHA256', $key)));
     }
+    return 'its saved plan is provisional (its planning cycle is not finalised)' if ((_safe_dig($doc, 'cycle', 'state') // '') eq 'provisional');
     return 'its saved plan was made with other options'
-        unless (join("\0", @{ _comparable_argv($settings->{argv}) }) eq join("\0", @{ $want->{argv} // [] })
+        unless (ref($settings->{options}) eq 'HASH' && !_option_differences($want->{options}, $settings->{options})
                 && $same->($want->{guaranteePolicy}, $settings->{guaranteePolicy})
                 && $same->($want->{contestedLevel}, $settings->{contestedLevel}));
     return 'its saved plan was made on other data'
@@ -14316,7 +14351,8 @@ sub _ha_peer_target
     my %installed = (Ent => (looks_like_number($meta->{entitlement} // '') ? $meta->{entitlement} + 0 : undef),
                      VP => (looks_like_number($meta->{virtual_cpus} // '') ? $meta->{virtual_cpus} + 0 : undef));
     my (@candidates, $reason);
-    foreach my $dir (@{ $dirs_aref // [] })
+    # In a planning cycle no other frame's plan is read: the floor is set when the cycle is finalised.
+    foreach my $dir (($want && $want->{pending}) ? () : @{ $dirs_aref // [] })
     {
         my $store = File::Spec->catdir($dir, '.nfit.store', 'proposals', 'v1', $model);
         next unless (-d $store);
@@ -14366,8 +14402,9 @@ sub _ha_peer_target
         return \%target;
     }
     return undef unless (defined $installed{Ent} && $installed{Ent} > 0);
-    return { Ent => $installed{Ent}, VP => $installed{VP}, Source => 'installed',
-             Reason => ($reason // 'its frame has no saved plan of this analysis') };
+    return { Ent => $installed{Ent}, VP => $installed{VP}, Source => 'installed', Pending => (($want && $want->{pending}) ? 1 : 0),
+             Reason => (($want && $want->{pending}) ? 'its floor is set when the planning cycle is finalised'
+                        : ($reason // 'its frame has no saved plan of this analysis')) };
 }
 
 # ==============================================================================
@@ -14448,7 +14485,7 @@ sub _apply_ha_sizing
                 {
                     $target = _ha_peer_target($cluster->{DirsOf}{$primary}, $primary, $model, $cluster->{Window}[1],
                         $cluster->{StatesOf}{$primary},
-                        { argv => _comparable_argv(\@original_argv), files => _run_file_hashes(), guaranteePolicy => $guarantee_policy,
+                        { options => \%RESOLVED_OPTIONS, pending => (%CYCLE ? 1 : 0), files => _run_file_hashes(), guaranteePolicy => $guarantee_policy,
                           contestedLevel => (_contested_level_on() ? $CONTESTED_LEVEL_RULE : 'off'), revisions => $cluster->{Caches},
                           role => $cluster->{Roles}{$primary}{Effective}, members => $cluster->{Members},
                           sizing => $policy->{Sizing}, share => $policy->{Share} });
@@ -14464,7 +14501,13 @@ sub _apply_ha_sizing
                 my $st = _ha_standby_target($own_ent, $own_vp, $target->{Ent}, $policy->{Share}, ($unresolved ? ($current_ent // 0) : undef));
                 $pair = _resolve_current_cycle_pair({ target_ent => $st->{TargetEnt}, target_vp => $st->{TargetVP}, step_vp => $step,
                     current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
-                if ($unresolved)
+                if ($unresolved && $target->{Pending})
+                {
+                    push @action, sprintf('Provisional: the PowerHA floor from %s is set when the planning cycle is finalised. Until then %d%% of its installed %.2f limits a cut to %.2f and adds no increase.',
+                        $primary, int(100 * $policy->{Share} + 0.5), $target->{Ent}, $st->{Floor});
+                    push @action, _current_cycle_action_text($pair, $current_ent, $current_vp, $cfg->{pool_id});
+                }
+                elsif ($unresolved)
                 {
                     push @action, sprintf('PowerHA standby for %s (%s): unresolved, %s. %d%% of its installed %.2f limits a cut to %.2f and adds no increase.',
                         $primary, $cluster->{Roles}{$vm}{Source}, $target->{Reason}, int(100 * $policy->{Share} + 0.5), $target->{Ent}, $st->{Floor});
@@ -14485,7 +14528,8 @@ sub _apply_ha_sizing
                            OwnTargetEnt => $own_ent, OwnTargetVP => $own_vp, Floor => $st->{Floor}, Share => $policy->{Share},
                            Primary => $primary, PrimaryTargetEnt => $target->{Ent}, PrimaryTargetVP => $target->{VP},
                            PrimarySource => $target->{Source}, PrimaryWindowEnd => $target->{WindowEnd},
-                           PrimarySnapshot => $target->{Snapshot}, PrimaryReason => $target->{Reason}, Pair => $pair);
+                           PrimarySnapshot => $target->{Snapshot}, PrimaryReason => $target->{Reason}, Pending => $target->{Pending},
+                           PrimaryFrames => [ map { basename($_) } @{ $cluster->{DirsOf}{$primary} // [] } ], Pair => $pair);
             }
             else
             {
@@ -14535,6 +14579,11 @@ sub _apply_ha_sizing
                         : (since => $result{Since})),
                     (($result{PrimarySource} // '') eq 'installed' ? (unresolved => $result{PrimaryReason}) : ()),
                 };
+                # What the finalisation of a planning cycle must resolve for this standby.
+                $proposals->{$vm}{pendingRole} = { type => 'haStandby', primary => $result{Primary}, share => $result{Share},
+                                                    cluster => [ @{ $cluster->{Members} } ], primaryFrames => $result{PrimaryFrames},
+                                                    roleSource => $cluster->{Roles}{$vm}{Source} }
+                    if ($result{Pending});
             }
             $changed++;
         }
@@ -14740,6 +14789,13 @@ sub _log_powerha_roles
                     sizing => { policy => $policy->{Sizing}, share => $policy->{Share},
                                 treatment => ($entry ? $entry->{Treatment} : 'none') },
                     reason => $cluster->{Reason},
+                    # Each member as installed when this run read it (its latest configuration state).
+                    configuration => { map {
+                        my ($state) = sort { ($b->{start_epoch} // 0) <=> ($a->{start_epoch} // 0) } grep { ref($_) eq 'HASH' } @{ $cluster->{StatesOf}{$_} // [] };
+                        my $meta = ($state && ref($state->{metadata}) eq 'HASH') ? $state->{metadata} : {};
+                        ($_ => { entitlement => (looks_like_number($meta->{entitlement} // '') ? 0 + $meta->{entitlement} : undef),
+                                 VPs => (looks_like_number($meta->{virtual_cpus} // '') ? 0 + $meta->{virtual_cpus} : undef) })
+                    } @members },
                 };
             }
         }
@@ -17477,6 +17533,7 @@ sub _write_standard_csv_report {
                 planningProfile => $policy_resolution->{ResolvedPlanningProfile},
                 installedEntitlement => $numeric_cell->('Current - ENT'),
                 installedVPs => $numeric_cell->('Current - VCPU'), poolId => $cfg->{pool_id},
+                poolSize => (looks_like_number($cfg->{pool_cpu} // '') ? 0 + $cfg->{pool_cpu} : undef),
                 tier => $data_row_csv[$column{TIER}], hint => $hint_type_tier,
                 profiles => \%by_profile,
             };
@@ -17515,6 +17572,9 @@ sub _write_standard_csv_report {
     foreach my $pending (@pending_csv_rows)
     {
         my ($row_vm, $row, $planner_cells) = @$pending;
+        # The row's own action and comments, before the notes that depend on the other LPARs of its pool.
+        my $own_action = (ref($planner_cells) eq 'HASH') ? $planner_cells->{'NFIT - Action'} : undef;
+        my $own_comments = defined $idx_vm_comments ? $row->[$idx_vm_comments] : undef;
         if (ref($planner_cells) eq 'HASH' && $COARSE_REVIEW{$row_vm})
         {
             $planner_cells->{'NFIT - Action'} = _coarse_review_action($planner_cells->{'NFIT - Action'}, $COARSE_REVIEW{$row_vm});
@@ -17536,6 +17596,12 @@ sub _write_standard_csv_report {
             my $existing = $row->[$idx_vm_comments] // '';
             $row->[$idx_vm_comments] = join('; ', @{ $structural_tags->{$row_vm} }, ($existing ne '' ? $existing : ()));
         }
+        # The cells as published, kept with the plan (a planning cycle's finalisation rewrites rows from them).
+        $proposals->{$row_vm}{published} = {
+            entitlement => $planner_cells->{'NFIT - ENT'}, VPs => $planner_cells->{'NFIT - VCPU'},
+            action => $planner_cells->{'NFIT - Action'}, ownAction => $own_action,
+            comments => (defined $idx_vm_comments ? $row->[$idx_vm_comments] : undef), ownComments => $own_comments,
+        } if (ref($proposals) eq 'HASH' && ref($proposals->{$row_vm}) eq 'HASH' && ref($planner_cells) eq 'HASH');
         my $published = _planner_csv_row($planner_header, \%column, $row, $planner_cells);
         print {$out_fh} join(",", map { quote_csv($_) } @$published) . "\n";
     }
@@ -17596,40 +17662,369 @@ sub _load_candidate_snapshot
     return $record;
 }
 
+# The executables and the configuration files this run reads, by role (a path may be undef).
+sub _run_files
+{
+    return { engine => $nfit_script_path, profiler => abs_path($0),
+             profiles => $profiles_config_path_to_load, tiers => "$script_dir/etc/nfit.vms.cfg",
+             vmConfig => $vm_config_file_path, seasonality => $seasonality_config_path };
+}
+
 # SHA-256 of the executables and configuration files of this run, as a stored proposal states
 # them (undef for a file that is not there).
 sub _run_file_hashes
 {
     require Digest::SHA;
-    my %files = (engine => $nfit_script_path, profiler => abs_path($0),
-                 profiles => $profiles_config_path_to_load, tiers => "$script_dir/etc/nfit.vms.cfg",
-                 vmConfig => $vm_config_file_path, seasonality => $seasonality_config_path);
+    my %files = %{ _run_files() };
     return { map { my $f = $files{$_};
         $_ => (defined($f) && -f $f ? Digest::SHA->new(256)->addfile($f, 'b')->hexdigest : undef)
     } keys %files };
 }
 
-# A run's command line without the options that name the frame or only change what is printed
-# (--nmondir, the system options, verbosity), in the order given: what two runs of different
-# frames must share to have been made with the same options. Pure.
-sub _comparable_argv
+# ==============================================================================
+# Planning cycle (v10 C7 with B11; design "Planning Cycle and Cross-Frame Role
+# Finalisation"). A planning cycle is a set of analyses that may be read
+# together: made by the same nFit, with the same configuration and options, to
+# the same analysis end date, each frame on one unchanged capture.
+#
+#   DIR/cycle.json                     cycle ID, shared context, its fingerprint
+#   DIR/models/<model>.json            the model's options, as resolved
+#   DIR/inputs/<hash>.<name>           one copy of each configuration file read
+#   DIR/expected-systems               optional list of the frames expected
+#   DIR/runs/<frame>.<model>.started   attempt marker with a token
+#   DIR/runs/<frame>.<model>.json      registration of a completed analysis
+#   DIR/plans/<sha256>.json.gz         provisional plans, named by content
+#   DIR/publish.lock                   held briefly while a result is published
+#
+# A run joins before its engine starts (one compatibility check) and registers
+# after its outputs are complete (the same check again). A difference in a
+# recorded input closes the cycle: nothing is invalidated or merged.
+# ==============================================================================
+
+# The options of a run as the option parser resolved them: { name => value }, for every option
+# with a value in effect (an option given twice counts once, with the value that took effect).
+# Pure. $spec_aref: the Getopt::Long specification (name => reference pairs).
+sub _resolved_options
 {
-    my ($argv) = @_;
-    my @kept;
-    my @words = @{ $argv // [] };
-    while (@words)
+    my ($spec_aref, $left_out) = @_;
+    my %out;
+    for (my $i = 0; $i < $#{$spec_aref}; $i += 2)
     {
-        my $word = shift @words;
-        if ($word =~ /^--?(?:nmondir|mgsys|system|serial|host)(=.*)?$/)
+        my ($spec, $ref) = @{$spec_aref}[ $i, $i + 1 ];
+        my ($name) = ($spec // '') =~ /^([A-Za-z0-9][A-Za-z0-9-]*)/;
+        next unless (defined $name && !$left_out->{$name});
+        next unless (ref($ref) eq 'SCALAR' && defined $$ref);
+        $out{$name} = "$$ref";
+    }
+    return \%out;
+}
+
+# Where two sets of resolved options differ: a list of texts naming the option. Pure.
+sub _option_differences
+{
+    my ($mine, $theirs) = @_;
+    my @out;
+    foreach my $name (sort keys %{ { %{ $mine // {} }, %{ $theirs // {} } } })
+    {
+        my ($x, $y) = ($mine->{$name}, $theirs->{$name});
+        next if (defined $x && defined $y && $x eq $y);
+        push @out, sprintf('--%s (%s here, %s there)', $name, (defined $x ? "'$x'" : 'not set'), (defined $y ? "'$y'" : 'not set'));
+    }
+    return @out;
+}
+
+# The identity of a staged capture: for the CPU data, the configuration states and the pool
+# observations, the content revision its manifest states (where the stager wrote one) with the
+# size and modification time of the file itself. An unchanged manifest is no proof when the
+# file under it was replaced, so both are kept and compared. No large file is read.
+sub _capture_identity
+{
+    my ($cache) = @_;
+    my %meta;
+    if (open my $fh, '<', File::Spec->catfile($cache, '.nfit.cache.manifest'))
+    {
+        while (my $line = <$fh>)
         {
-            shift @words unless (defined $1);        # its value is the next word
+            $meta{$1} = $2 if ($line =~ /^\s*([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$/);
+        }
+        close $fh;
+    }
+    my (%identity, $hashed, $files);
+    foreach my $item ([ data => '.nfit.cache.data', 'data_revision' ], [ states => '.nfit.cache.states', 'states_revision' ],
+                      [ pool => $POOL_OBSERVATIONS_FILE, 'pool_revision' ])
+    {
+        my ($label, $file, $key) = @$item;
+        my @st = stat(File::Spec->catfile($cache, $file));
+        if (!@st)
+        {
+            $identity{$label} = 'absent';
             next;
         }
-        next if ($word =~ /^-(?:v+|d|-verbose|-debug)$/);
-        push @kept, $word;
+        $files++;
+        $hashed++ if (defined $meta{$key} && length $meta{$key});
+        $identity{$label} = { revision => ((defined $meta{$key} && length $meta{$key}) ? $meta{$key} : undef), size => $st[7] + 0, modified => $st[9] + 0 };
     }
-    return \@kept;
+    $identity{kind} = ($files && $hashed && $hashed == $files) ? 'content hash' : 'size and time (weaker)';
+    return \%identity;
 }
+
+sub _cycle_canonical
+{
+    return JSON->new->utf8->canonical->encode($_[0]);
+}
+
+sub _cycle_read_json
+{
+    my ($path) = @_;
+    open my $fh, '<:raw', $path or return undef;
+    my $text = do { local $/; <$fh> };
+    close $fh;
+    return eval { decode_json($text) };
+}
+
+# Writes a JSON file whole: to a temporary name, then renamed.
+sub _cycle_write_json
+{
+    my ($path, $data) = @_;
+    my ($fh, $tmp) = tempfile('.pending-XXXXXXXX', DIR => dirname($path), UNLINK => 0);
+    binmode $fh;
+    print {$fh} _cycle_canonical($data), "\n" or die "Cannot write $path: $!\n";
+    close $fh or die "Cannot write $path: $!\n";
+    rename $tmp, $path or die "Cannot publish $path: $!\n";
+    return 1;
+}
+
+# Creates a JSON file only when none is there (parallel first runs: one wins, with its content
+# complete). Returns 1 when this call created it.
+sub _cycle_create_json
+{
+    my ($path, $data) = @_;
+    return 0 if (-e $path);
+    my ($fh, $tmp) = tempfile('.pending-XXXXXXXX', DIR => dirname($path), UNLINK => 0);
+    binmode $fh;
+    print {$fh} _cycle_canonical($data), "\n";
+    close $fh or die "Cannot write $path: $!\n";
+    my $created = link($tmp, $path) ? 1 : 0;
+    unlink $tmp;
+    return $created;
+}
+
+# The short publication lock of a cycle (registration and finalisation). The analysis never holds it.
+sub _cycle_lock
+{
+    my ($dir) = @_;
+    open my $fh, '>>', File::Spec->catfile($dir, 'publish.lock') or die "Cannot open the publication lock of $dir: $!\n";
+    flock($fh, 2) or die "Cannot lock $dir: $!\n";
+    return $fh;
+}
+
+# The shared context of a cycle, as this run has it.
+sub _cycle_context
+{
+    my ($end_ymd) = @_;
+    my $hashes = _run_file_hashes();
+    return { analysisEnd => $end_ymd,
+             executables => { 'nfit-profile' => { version => $VERSION, sha256 => $hashes->{profiler} },
+                              'nfit' => { version => $nfit_ver, sha256 => $hashes->{engine} } },
+             configuration => { map { $_ => ($hashes->{$_} // 'absent') } qw(profiles tiers vmConfig seasonality) } };
+}
+
+# Where two contexts differ, in the planner's words. Pure.
+sub _cycle_context_differences
+{
+    my ($mine, $theirs) = @_;
+    my @out;
+    push @out, sprintf('the analysis end date (%s here, %s in the cycle)', $mine->{analysisEnd} // '?', $theirs->{analysisEnd} // '?')
+        unless (($mine->{analysisEnd} // '') eq ($theirs->{analysisEnd} // ''));
+    foreach my $program (sort keys %{ { %{ $mine->{executables} // {} }, %{ $theirs->{executables} // {} } } })
+    {
+        my ($x, $y) = ($mine->{executables}{$program} // {}, $theirs->{executables}{$program} // {});
+        push @out, sprintf('%s (version %s here, %s in the cycle%s)', $program, $x->{version} // '?', $y->{version} // '?',
+                           (($x->{version} // '') eq ($y->{version} // '') ? '; the program file differs' : ''))
+            unless (($x->{sha256} // '') eq ($y->{sha256} // '') && ($x->{version} // '') eq ($y->{version} // ''));
+    }
+    my %label = (profiles => 'the profile file', tiers => 'nfit.vms.cfg', vmConfig => 'the VM configuration file (--config)',
+                 seasonality => 'the seasonality file');
+    foreach my $file (sort keys %{ { %{ $mine->{configuration} // {} }, %{ $theirs->{configuration} // {} } } })
+    {
+        my ($x, $y) = ($mine->{configuration}{$file} // 'absent', $theirs->{configuration}{$file} // 'absent');
+        next if ($x eq $y);
+        push @out, ($label{$file} // $file) . ($x eq 'absent' ? ' (not there now)' : $y eq 'absent' ? ' (not there when the cycle began)' : ' (changed)');
+    }
+    return @out;
+}
+
+# Marks a cycle closed: it takes no more runs and is not finalised again. Its results stay.
+sub _cycle_close
+{
+    my ($dir, $reason) = @_;
+    my $lock = _cycle_lock($dir);
+    my $path = File::Spec->catfile($dir, 'cycle.json');
+    my $cycle = _cycle_read_json($path);
+    if (ref($cycle) eq 'HASH' && !$cycle->{closed})
+    {
+        $cycle->{closed} = { reason => $reason, at => gmtime()->datetime . 'Z' };
+        _cycle_write_json($path, $cycle);
+    }
+    close $lock;
+    return;
+}
+
+# The frame's name in a cycle's file names.
+sub _cycle_frame
+{
+    my ($cache) = @_;
+    return basename($cache) =~ s/[^A-Za-z0-9_.-]//gr;
+}
+
+# Joins a planning cycle, before the engine starts: creates it when it is new, then makes the
+# compatibility check (shared context, the model's options, this frame's capture against any
+# earlier registration of it) and writes the attempt marker. Dies, naming what differs.
+sub _cycle_join
+{
+    my ($system, $cache, $end_ymd, $model) = @_;
+    require Digest::SHA;
+    require File::Copy;
+    my $dir = $cycle_dir;
+    make_path(map { File::Spec->catdir($dir, $_) } qw(runs plans models inputs));
+    my $context = _cycle_context($end_ymd);
+    my $stamp = gmtime();
+    _cycle_create_json(File::Spec->catfile($dir, 'cycle.json'), {
+        cycle => $CYCLE_FORMAT, created => $stamp->datetime . 'Z',
+        id => $stamp->strftime('%Y%m%dT%H%M%S') . '-' . substr(Digest::SHA::sha256_hex(join('|', $stamp->epoch, $$, rand(), $dir)), 0, 6),
+        context => $context, contextFingerprint => Digest::SHA::sha256_hex(_cycle_canonical($context)) });
+    my $cycle = _cycle_read_json(File::Spec->catfile($dir, 'cycle.json'));
+    die "[ERROR] '$dir' is not a planning cycle of this nFit (cycle.json cannot be read).\n"
+        unless (ref($cycle) eq 'HASH' && ($cycle->{cycle} // '') eq $CYCLE_FORMAT);
+    die "[ERROR] Planning cycle $cycle->{id} is closed ($cycle->{closed}{reason}). Start a new cycle: name another --cycle directory.\n"
+        if (ref($cycle->{closed}) eq 'HASH');
+    my @differs = _cycle_context_differences($context, $cycle->{context});
+    die "[ERROR] This analysis does not belong to planning cycle $cycle->{id}. It differs in: " . join('; ', @differs)
+        . ".\n        Start a new cycle: name another --cycle directory.\n" if (@differs);
+
+    # The model's options: set by its first run in the cycle, equal for every later one.
+    my $model_path = File::Spec->catfile($dir, 'models', "$model.json");
+    _cycle_create_json($model_path, { model => $model, options => { %RESOLVED_OPTIONS } });
+    my $registered = _cycle_read_json($model_path);
+    my @options = _option_differences(\%RESOLVED_OPTIONS, (ref($registered) eq 'HASH' ? $registered->{options} : undef));
+    die "[ERROR] This analysis does not belong to planning cycle $cycle->{id}: its options differ from the cycle's $model runs: "
+        . join('; ', map { s/ there\)$/ in the cycle)/r } @options) . ".\n" if (@options);
+
+    # One capture per frame for the life of the cycle.
+    my $frame = _cycle_frame($cache);
+    my $identity = _capture_identity($cache);
+    foreach my $file (glob(File::Spec->catfile($dir, 'runs', "$frame.*.json")))
+    {
+        my $earlier = _cycle_read_json($file);
+        next unless (ref($earlier) eq 'HASH' && ref($earlier->{capture}) eq 'HASH');
+        next if (_cycle_canonical($earlier->{capture}) eq _cycle_canonical($identity));
+        _cycle_close($dir, "the staged data of $frame changed after it was analysed in this cycle");
+        die "[ERROR] The staged data of $frame is not the data analysed earlier in planning cycle $cycle->{id}. The cycle is closed.\n"
+          . "        Start a new cycle: name another --cycle directory.\n";
+    }
+
+    # One copy of each configuration file read (small files; never the staged data).
+    my $files = _run_files();
+    foreach my $label (qw(profiles tiers vmConfig seasonality))
+    {
+        my $hash = $context->{configuration}{$label};
+        next unless (defined $files->{$label} && $hash ne 'absent');
+        my $copy = File::Spec->catfile($dir, 'inputs', substr($hash, 0, 12) . '.' . basename($files->{$label}));
+        File::Copy::copy($files->{$label}, $copy) unless (-e $copy);
+    }
+    if (defined $cycle_systems_file)
+    {
+        my $expected = File::Spec->catfile($dir, 'expected-systems');
+        die "[ERROR] Cannot read --cycle-systems '$cycle_systems_file'.\n" unless (-f $cycle_systems_file);
+        File::Copy::copy($cycle_systems_file, $expected) unless (-e $expected);
+    }
+
+    my $token = join('.', time(), $$, substr(Digest::SHA::sha256_hex(rand() . $frame), 0, 8));
+    _cycle_write_json(File::Spec->catfile($dir, 'runs', "$frame.$model.started"), { token => $token, started => gmtime()->datetime . 'Z' });
+    $CYCLE{dir} = $dir;
+    $CYCLE{id} = $cycle->{id};
+    $CYCLE{runs}{$system} = { frame => $frame, cache => $cache, model => $model, token => $token, capture => $identity, end => $end_ymd,
+                              firstFile => scalar(@generated_files) };
+    print STDERR "  ◆ Planning cycle $cycle->{id}: this analysis joins it ($model)\n";
+    print STDERR "    ↳  The cycle was finalised before this analysis: finalise it again when the analyses are complete\n"
+        if (-e File::Spec->catfile($dir, 'finalised.json'));
+    return;
+}
+
+# Registers the completed analyses of this process in the cycle, after their outputs are
+# complete and closed. The compatibility check is made again first: a recorded input that
+# changed during the analysis rejects the result and closes the cycle. Returns the number of
+# analyses that could not be registered.
+sub _cycle_register_all
+{
+    require Digest::SHA;
+    require IO::Compress::Gzip;
+    my $dir = $CYCLE{dir} or return 0;
+    my $failed = 0;
+    foreach my $system (sort keys %{ $CYCLE{runs} // {} })
+    {
+        my $run = $CYCLE{runs}{$system};
+        unless (defined $run->{proposal} && -f $run->{proposal})
+        {
+            print STDERR "  [WARN] Planning cycle $CYCLE{id}: $run->{model} of this frame produced no plan; it is not registered\n";
+            $failed++;
+            next;
+        }
+        my $cycle = _cycle_read_json(File::Spec->catfile($dir, 'cycle.json')) // {};
+        my @changed = (ref($cycle->{closed}) eq 'HASH') ? ("the cycle was closed meanwhile ($cycle->{closed}{reason})")
+                    : _cycle_context_differences(_cycle_context($run->{end}), $cycle->{context} // {});
+        push @changed, 'the staged data of this frame' unless (_cycle_canonical(_capture_identity($run->{cache})) eq _cycle_canonical($run->{capture}));
+        foreach my $peer (sort keys %{ $run->{peers} // {} })
+        {
+            push @changed, "the staged data of frame $peer, read for the PowerHA roles"
+                unless (_cycle_canonical(_capture_identity($run->{peers}{$peer}{dir})) eq _cycle_canonical($run->{peers}{$peer}{capture}));
+        }
+        if (@changed)
+        {
+            _cycle_close($dir, 'an input changed during an analysis: ' . join('; ', @changed)) unless (ref($cycle->{closed}) eq 'HASH');
+            print STDERR "  [ERROR] Planning cycle $CYCLE{id}: this analysis is not registered. Changed while it ran: " . join('; ', @changed)
+                       . ". The cycle is closed; start a new one.\n";
+            $failed++;
+            next;
+        }
+        my $lock = _cycle_lock($dir);
+        my $marker = _cycle_read_json(File::Spec->catfile($dir, 'runs', "$run->{frame}.$run->{model}.started")) // {};
+        if (($marker->{token} // '') ne $run->{token})
+        {
+            close $lock;
+            print STDERR "  [ERROR] Planning cycle $CYCLE{id}: a later analysis of this frame and model has started; this one is not registered\n";
+            $failed++;
+            next;
+        }
+        open my $in, '<:raw', $run->{proposal} or die "Cannot read $run->{proposal}: $!\n";
+        my $bytes = do { local $/; <$in> };
+        close $in;
+        my $plan = Digest::SHA::sha256_hex($bytes);
+        my $stored = File::Spec->catfile($dir, 'plans', "$plan.json.gz");
+        unless (-e $stored)
+        {
+            my ($fh, $tmp) = tempfile('.pending-XXXXXXXX', DIR => File::Spec->catdir($dir, 'plans'), UNLINK => 0);
+            close $fh;
+            IO::Compress::Gzip::gzip(\$bytes => $tmp, -Level => 9, Minimal => 1, Time => 0, Name => '')
+                or die "Cannot store the plan in the cycle: $IO::Compress::Gzip::GzipError\n";
+            rename $tmp, $stored or die "Cannot store the plan in the cycle: $!\n";
+        }
+        my @outputs = map { { kind => ($_ eq $run->{rationale} ? 'rationale' : /\.proposal\.[^\/]*\.json$/ ? 'plan' : /\.decisions\.[^\/]*\.csv$/ ? 'decisions' : 'csv'),
+                              path => (abs_path($_) // $_), sha256 => Digest::SHA->new(256)->addfile($_, 'b')->hexdigest } }
+                      grep { defined && -f } (@{ $run->{files} // [] }, $run->{rationale});
+        _cycle_write_json(File::Spec->catfile($dir, 'runs', "$run->{frame}.$run->{model}.json"), {
+            cycle => $CYCLE{id}, system => $run->{frame}, model => $run->{model}, token => $run->{token},
+            registered => gmtime()->datetime . 'Z', capture => $run->{capture},
+            peers => { map { $_ => $run->{peers}{$_}{capture} } keys %{ $run->{peers} // {} } },
+            coverage => $run->{coverage}, lpars => $run->{lpars}, plan => $plan, outputs => \@outputs,
+            totals => $run->{totals}, pending => $run->{pending} // [] });
+        close $lock;
+        printf STDERR "  ◆ Planning cycle %s: analysis registered (%s; %d standby%s awaiting finalisation)\n", $CYCLE{id}, $run->{model},
+            scalar(@{ $run->{pending} // [] }), (@{ $run->{pending} // [] } == 1 ? '' : 's');
+    }
+    return $failed;
+}
+
 
 sub _publish_tactical_proposals
 {
@@ -17639,13 +18034,15 @@ sub _publish_tactical_proposals
     my %hashes = %{ _run_file_hashes() };
     my $payload = JSON->new->utf8->canonical->encode({
         schemaVersion => 2, system => basename($cache), model => $model, window => {start => $start, end => $end},
-        inputRevision => $revision, settings => { argv => \@original_argv, filesSHA256 => \%hashes,
+        inputRevision => $revision, settings => { argv => \@original_argv, options => { %RESOLVED_OPTIONS }, filesSHA256 => \%hashes,
             analysisReferenceDate => $nfit_analysis_reference_date_str, vmFilter => $target_vm_name,
             guaranteePolicy => $guarantee_policy,
             contestedLevel => (_contested_level_on() ? $CONTESTED_LEVEL_RULE : 'off') },
         members => $members,
         # Optional run context (an adaptive run: the selection used, the checks not made).
         ((ref($context) eq 'HASH') ? (context => $context) : ()),
+        # A plan made in a planning cycle is provisional until the cycle is finalised.
+        (%CYCLE ? (cycle => { id => $CYCLE{id}, state => 'provisional' }) : ()),
     });
     my $dir = File::Spec->catdir($cache, '.nfit.store', 'proposals', 'v1', $model);
     make_path($dir, {mode => 0700});
@@ -31500,6 +31897,13 @@ Model behaviour depends on the event configuration:
                                               rationale section): the capacity to have in place before the occurrence.
   --normal-plan <model>                     : The standard model whose stored plan the Seasonal Capacity Plan is
                                               compared with (default hybrid-state-decay). Reported only.
+
+  --cycle <dir>                             : Join the planning cycle kept in <dir> (created when new): analyses made
+                                              by the same nFit, with the same configuration and options, to the same
+                                              analysis end date, each frame on one unchanged capture. Whole-frame runs
+                                              of the standard models. A PowerHA standby whose primary is on another
+                                              frame stays provisional until the cycle is finalised.
+  --cycle-systems <file>                    : With --cycle: the frames the cycle is expected to hold, one per line.
 
   --seasonal                                : Execute all configured seasonal models applicable to the analysis period.
 
