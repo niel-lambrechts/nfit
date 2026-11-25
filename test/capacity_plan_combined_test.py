@@ -79,8 +79,8 @@ class CapacityPlanCombinedTests(unittest.TestCase):
         self.assertTrue(run['plan'])
         for vm, row in run['plan'].items():
             self.assertEqual(row['Overlap'], 'bf 2026-09-02 to 2026-10-03, overlapping 2026-10-01 to 2026-10-01: combined requirement '
-                                             'not assessed (no stored plan on the same data)', vm)
-            self.assertIn('overlap', row['Unresolved'].split('; '), vm)
+                                             'not assessed (no saved plan of that event on the same data)', vm)
+            self.assertIn('overlapping event', row['Unresolved'].split('; '), vm)
             self.assertEqual(run['snapshot']['members'][vm]['capacityPlan']['combinedEvents'], [], vm)
         flat = ' '.join(run['log'].split())
         self.assertIn('bf (02 Sep to 03 Oct 2026) overlaps this occurrence on 01 Oct 2026; combined requirement not assessed for all', flat)
@@ -90,9 +90,9 @@ class CapacityPlanCombinedTests(unittest.TestCase):
         run = self.recency
         self.assertEqual(run['plans'], 0)
         self.assertEqual(run['log'].count('Seasonal Capacity Plan'), 1)
-        self.assertIn('Not produced: recency decay sizes the last completed occurrence and names no later one.', run['log'])
+        self.assertIn('Not produced: the recency-decay model sizes the last completed occurrence of the event, not the next one.', run['log'])
         self.assertEqual(run['snapshot']['context']['capacityPlan'],
-                         {'produced': False, 'reason': 'recency decay sizes the last completed occurrence and names no later one'})
+                         {'produced': False, 'reason': 'the recency-decay model sizes the last completed occurrence of the event, not the next one'})
 
 
 if __name__ == '__main__':

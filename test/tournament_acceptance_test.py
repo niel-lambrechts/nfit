@@ -166,24 +166,24 @@ class CapacityPlanReportTests(unittest.TestCase):
                                     'overlaps': [{'event': 'bf', 'overlapStart': '2026-11-24', 'overlapEnd': '2026-11-27'}],
                                     'pools': [{'pool': 7, 'verdict': 'raise', 'planned': 7.4, 'reliedOn': 0, 'maximum': 7, 'requiredMaximum': 8}],
                                     'normalPlan': {'model': 'hybrid-state-decay', 'status': 'matching'}}}
-        members = {'a': cp('increase', 2.0, 4, 2.6, 4, unresolved=['overlap', 'confirm before event'], overlaps=[{'event': 'bf', 'combined': False}],
+        members = {'a': cp('increase', 2.0, 4, 2.6, 4, unresolved=['overlapping event', 'confirm before the event'], overlaps=[{'event': 'bf', 'combined': False}],
                            confirmBeforeEvent='the run queue is implausibly high (XRQ); find its cause',
-                           step={'entitlement': 2.4, 'VPs': 4, 'limit': 'the size of pool 7 (7); the normal incremental step'}),
+                           step={'entitlement': 2.4, 'VPs': 4, 'limit': "limited by pool 7's maximum (7); it adds VPs only to carry the entitlement"}),
                    'b': cp('retain', 1.5, 3, 1.5, 3, normalPlanConflict={'entitlement': 1.2}),
                    'c': dict(cp('increase', 1.6, 2, 1.6, 3, overlaps=[{'event': 'bf', 'combined': False}]),           # its overlap left out
                              planningProfile='G', profiles={'G': {'currentCycle': {'VPs': 2, 'reviewVPs': 3}}})}
         members['c']['capacityPlan']['eventRequirement'] = {'entitlement': 1.5}
         text = '\n'.join(A.capacity_plan_report({'context': context, 'members': members}))
-        self.assertIn('occurrence 2026-11-24 to 2026-11-30; required by 2026-11-24 00:00 (UTC)', text)
-        self.assertIn('LPARs: 3 (increase 2, retain 1)', text)
-        self.assertIn('additional: +0.60 ENT (workload +0.60, PowerVM minimum +0.00), +1 VPs (workload +1, to carry the entitlement +0)', text)
-        self.assertIn('checks: plan below installed 0; pair outside 0.05 to 1.00 per VP 0; increase without its dependency 1', text)
-        self.assertIn("this cycle's pair stops short of the plan: 1 LPARs (the normal incremental step 1, the size of pool 7 1)", text)
-        self.assertIn('increases to confirm before the event (run-queue evidence concern): 1 LPARs, +0.60 ENT, +0 VPs', text)
-        self.assertIn('totals: installed 5.10 ENT / 9 VPs; event requirement 1.50 ENT; planned 5.70 ENT / 10 VPs', text)
-        self.assertIn('pool 7: raise; planned 7.40, relied on 0.00, maximum 7 -> at least 8', text)
-        self.assertIn('overlaps: bf 2026-11-24 to 2026-11-27; LPARs whose forecast combined one: 0', text)
-        self.assertIn('normal plan (hybrid-state-decay): matching; conflicts 1', text)
+        self.assertIn('event days 2026-11-24 to 2026-11-30; capacity needed by 2026-11-24 00:00 (time zone: UTC)', text)
+        self.assertIn('LPARs: 3 (2 to increase, 1 already sufficient)', text)
+        self.assertIn('to add: +0.60 processing units (of which +0.00 only to reach the PowerVM minimum per VP), +1 VPs (of which +0 only to carry the entitlement)', text)
+        self.assertIn('checks: planned below installed 0; entitlement and VPs PowerVM cannot configure together 0; increases missing a dependency in their row 1', text)
+        self.assertIn("this cycle's recommendation (NFIT - ENT / NFIT - VCPU) below the event figure: 1 LPAR (it adds VPs only to carry the entitlement: 1; limited by pool 7's maximum: 1)", text)
+        self.assertIn('increases resting on run-queue readings flagged as doubtful (confirm before the event): 1 LPAR, +0.60 processing units, +0 VPs', text)
+        self.assertIn('totals: installed 5.10 processing units / 9 VPs; event requirement 1.50 processing units; planned 5.70 / 10 VPs (installed kept where it is higher)', text)
+        self.assertIn('pool 7: raise the maximum from 7 to at least 8 (planned entitlements 7.40)', text)
+        self.assertIn('overlapping events: bf 2026-11-24 to 2026-11-27; LPARs whose forecast included one: 0', text)
+        self.assertIn('normal recommendation (hybrid-state-decay run): saved on the same data; 1 LPAR below the event requirement', text)
         self.assertEqual(A.capacity_plan_report({'context': {'capacityPlan': {'produced': False, 'reason': 'x'}}}), ['  not produced: x'])
         self.assertEqual(A.capacity_plan_report(None), ['  the adaptive run wrote no capacity plan'])
 
@@ -268,8 +268,8 @@ class EndToEndTests(unittest.TestCase):
         self.assertRegex(text, r'source model\s+\d+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+)\s+\1\s+0\s+0\n')
         self.assertIn('LPARs on another planning profile than in the source event run: 0', text)
         self.assertIn('not assessed by either run: PowerHA role sizing (standard runs only), frame capacity', text)
-        self.assertIn('6. Seasonal Capacity Plan of the adaptive run (counts and cores; no LPAR names)', text)
-        self.assertIn('checks: plan below installed 0; pair outside 0.05 to 1.00 per VP 0; increase without its dependency 0', text)
+        self.assertIn('6. Seasonal Capacity Plan of the adaptive run (totals only; no LPAR names)', text)
+        self.assertIn('checks: planned below installed 0; entitlement and VPs PowerVM cannot configure together 0; increases missing a dependency in their row 0', text)
         self.assertIn('history after the adaptive run: unchanged', text)
         self.assertIn('Kept tree: history as it was found', text)
         for name in P.LPARS + (M.SERIAL,):

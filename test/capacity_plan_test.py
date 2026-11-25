@@ -225,28 +225,28 @@ class CapacityPlanTests(unittest.TestCase):
     def test_a_confirmation_never_replaces_the_figure(self):
         for run in (self.a, self.b):
             for vm, row in run['plan'].items():
-                marked = 'confirm before event' in row['Unresolved'].split('; ')
-                self.assertEqual(marked, row['Confirmation'].startswith('confirm before event: '), vm)
+                marked = 'confirm before the event' in row['Unresolved'].split('; ')
+                self.assertEqual(marked, row['Confirmation'].startswith('confirm before the event: '), vm)
                 if marked:
                     self.assertEqual(row['Action'], 'increase', vm)
                     self.assertAlmostEqual(num(row['Plan_ENT']), max(num(row['Installed_ENT']), num(row['Event_ENT'])) + num(row['PlatformMinimum_ENT']), places=2)
-                if row['StepLimit'] and 'the size of pool' not in row['StepLimit']:
-                    self.assertIn('the normal incremental step', row['StepLimit'], vm)
+                if row['ThisCycleReason'] and 'pool' not in row['ThisCycleReason']:
+                    self.assertIn('it adds VPs only to carry the entitlement', row['ThisCycleReason'], vm)
 
     def test_the_full_requirement_is_planned_with_the_held_step_beside_it(self):
         row, published = self.b['plan']['vmS'], self.b['rows']['vmS']
         self.assertGreater(num(row['Event_ENT']), 2.0 + EPS)                   # above pool 9's size
         self.assertEqual(num(row['Plan_ENT']), num(row['Event_ENT']))          # the full requirement, not the step
-        self.assertEqual(num(row['Step_ENT']), num(published['NFIT - ENT']))   # this cycle's pair, as published
-        self.assertLessEqual(num(row['Step_ENT']), 2.0 + EPS)
-        self.assertIn('the size of pool 9', row['StepLimit'])
+        self.assertEqual(num(row['ThisCycle_ENT']), num(published['NFIT - ENT']))   # this cycle's recommendation, as published
+        self.assertLessEqual(num(row['ThisCycle_ENT']), 2.0 + EPS)
+        self.assertIn("limited by pool 9's maximum", row['ThisCycleReason'])
         self.assertEqual(row['Action'], 'increase')
-        self.assertRegex(self.b['flat'], r"vmS 1\.50 / 2 -> %s / \d+ \(\+[0-9.]+ ENT;.* this cycle's pair stops at %s / \d+: the size of pool 9"
-                         % (re.escape(row['Plan_ENT']), re.escape(row['Step_ENT'])))
+        self.assertRegex(self.b['flat'], r"vmS 1\.50 / 2 -> %s / \d+ \(\+[0-9.]+ ENT;.* this cycle's recommendation is %s / \d+: limited by pool 9's maximum"
+                         % (re.escape(row['Plan_ENT']), re.escape(row['ThisCycle_ENT'])))
         for vm, row in self.b['plan'].items():
-            if row['Step_ENT'] == '':
+            if row['ThisCycle_ENT'] == '':
                 continue
-            self.assertTrue(num(row['Step_ENT']) < num(row['Plan_ENT']) - EPS or int(row['Step_VP']) < int(row['Plan_VP']), vm)
+            self.assertTrue(num(row['ThisCycle_ENT']) < num(row['Plan_ENT']) - EPS or int(row['ThisCycle_VP']) < int(row['Plan_VP']), vm)
 
     def test_pools_on_the_planned_entitlements(self):
         plan = self.b['plan']
@@ -257,13 +257,13 @@ class CapacityPlanTests(unittest.TestCase):
             needed = int(total - 1e-9) + 1
             if total > size + EPS:
                 for r in members:
-                    self.assertEqual(r['PoolPrerequisite'], 'pool %s maximum to at least %d first (calculated requirement %.2f)' % (pool, needed, total))
-                    self.assertIn('pool prerequisite', r['Unresolved'].split('; '))
-                self.assertIn('Pool %s: calculated requirement %.2f processing units; set the maximum to at least %d (now %d).'
+                    self.assertEqual(r['PoolPrerequisite'], "raise pool %s's maximum to at least %d first (calculated requirement %.2f)" % (pool, needed, total))
+                    self.assertIn('pool change first', r['Unresolved'].split('; '))
+                self.assertIn("Pool %s: calculated requirement %.2f processing units; raise the pool's maximum to at least %d (now %d)."
                               % (pool, total, needed, size), self.b['flat'])
             else:
                 self.assertTrue(all(r['PoolPrerequisite'] == '' for r in members))
-        self.assertIn('pool prerequisite', plan['vmS']['Unresolved'])
+        self.assertIn('pool change first', plan['vmS']['Unresolved'])
         self.assertIn('Reserved pool capacity is not collected; check licensing.', self.b['flat'])
 
     def test_an_overlap_stays_unresolved_beside_an_increase(self):
@@ -271,43 +271,43 @@ class CapacityPlanTests(unittest.TestCase):
         for vm, row in self.b['plan'].items():
             reference = stored[vm]['profiles'][stored[vm]['planningProfile']]['entitlement']
             self.assertEqual(row['Overlap'], 'bf 2026-09-28 to 2026-10-03, overlapping 2026-10-01 to 2026-10-01: combined requirement not '
-                                             'assessed (bf %.2f, stored plan, same data)' % reference, vm)
-            self.assertIn('overlap', row['Unresolved'].split('; '), vm)
+                                             'assessed (bf %.2f, its saved plan on the same data)' % reference, vm)
+            self.assertIn('overlapping event', row['Unresolved'].split('; '), vm)
         self.assertEqual(self.b['plan']['vmA']['Action'], 'increase')         # the increase is kept, and so is the overlap
         self.assertIn('bf (28 Sep to 03 Oct 2026) overlaps this occurrence on 01 Oct 2026; combined requirement not assessed for all',
                       self.b['flat'])
-        self.assertRegex(self.b['flat'], r'Separate requirements, ad and bf \(stored plan, same data\): vmA [0-9.]+ and [0-9.]+')
+        self.assertRegex(self.b['flat'], r"Each event's own requirement, ad and bf \(bf from its saved plan on the same data\): vmA [0-9.]+ and [0-9.]+")
         # Without a stored plan of the overlapping event, the overlap is still stated.
-        self.assertIn('bf: no stored plan on the same data', self.a['flat'])
-        self.assertTrue(all('combined requirement not assessed (no stored plan on the same data)' in r['Overlap'] for r in self.a['plan'].values()))
+        self.assertIn('bf: no saved plan of that event on the same data', self.a['flat'])
+        self.assertTrue(all('combined requirement not assessed (no saved plan of that event on the same data)' in r['Overlap'] for r in self.a['plan'].values()))
 
     def test_events_on_the_same_days_are_alternatives(self):
-        self.assertIn('Same occurrence, other forecasts (alternatives, not overlaps): alt, ev.', self.b['flat'])
-        self.assertIn('Same occurrence, other forecasts (alternatives, not overlaps): alt.', self.a['flat'])
+        self.assertIn('Other forecasts of the same event days (for reference; not overlapping events): alt, ev.', self.b['flat'])
+        self.assertIn('Other forecasts of the same event days (for reference; not overlapping events): alt.', self.a['flat'])
         for run in (self.a, self.b):
             self.assertTrue(all('alt ' not in r['Overlap'] and not r['Overlap'].startswith('ev ') for r in run['plan'].values()))
 
     def test_powerha_is_stated_as_not_assessed(self):
         for vm, peer in (('vmS', 'vmX'), ('vmX', 'vmS')):
             row = self.b['plan'][vm]
-            self.assertRegex(row['RoleLimitation'], r'^PowerHA role not assessed for the event: confirm takeover capacity for the event '
-                                                    r'allocation of %s [0-9.]+ / \d+$' % peer)
+            self.assertRegex(row['RoleLimitation'], r'^PowerHA roles are not assessed for events: confirm this node can take over the event '
+                                                    r'allocation of %s \([0-9.]+ / \d+\)$' % peer)
             self.assertIn('PowerHA role', row['Unresolved'].split('; '))
         self.assertEqual(self.b['plan']['vmA']['RoleLimitation'], '')
 
     def test_the_normal_plan_is_compared_only(self):
         row = self.b['plan']['vmB']
-        self.assertRegex(row['NormalPlanConflict'], r'^hybrid-state-decay 0\.10 / \d+ below the event requirement$')
-        self.assertRegex(self.b['flat'], r"vmB: the normal plan's 0\.10 / \d+ is below the event requirement [0-9.]+ / \d+ for 01 Oct 2026\.")
+        self.assertRegex(row['NormalPlanConflict'], r'^normal recommendation \(hybrid-state-decay\) of 0\.10 / \d+ is below the event requirement$')
+        self.assertRegex(self.b['flat'], r"vmB: the normal recommendation of 0\.10 / \d+ is below the event requirement [0-9.]+ / \d+ for 01 Oct 2026\.")
         self.assertEqual(self.normal_before, self.normal_after)              # the normal plan is not changed
         self.assertEqual(self.b['snapshot']['context']['capacityPlan']['normalPlan']['status'], 'matching')
-        self.assertIn('Normal plan (hybrid-state-decay): no stored plan for this system; not compared.', self.a['flat'])
+        self.assertIn('Normal recommendation (hybrid-state-decay run): none saved for this system; not compared.', self.a['flat'])
 
     def test_time_basis(self):
-        self.assertTrue(all(r['TimeBasis'] == 'not verified' and r['RequiredBy'] == '2026-10-01 00:00' for r in self.a['plan'].values()))
-        self.assertIn("01 Oct 2026 00:00 on the data's time basis, which is not verified", self.a['flat'])
+        self.assertTrue(all(r['TimeBasis'] == 'not confirmed' and r['RequiredBy'] == '2026-10-01 00:00' for r in self.a['plan'].values()))
+        self.assertIn('01 Oct 2026 00:00 in the time zone of the collected data. nFit confirms that time zone (UTC) only for data collected through InfluxDB.', self.a['flat'])
         self.assertTrue(all(r['TimeBasis'] == 'UTC' for r in self.b['plan'].values()))
-        self.assertIn("Capacity available before the event starts: 01 Oct 2026 00:00 (UTC, the data's time basis).", self.b['flat'])
+        self.assertIn('Capacity available before the event starts: 01 Oct 2026 00:00 UTC (the time zone of the collected data).', self.b['flat'])
 
     def test_the_proposal_record(self):
         context = self.b['snapshot']['context']['capacityPlan']

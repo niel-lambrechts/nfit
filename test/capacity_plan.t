@@ -108,7 +108,7 @@ $write->("cache_build_status: success\nstaged_by: nfit-stage-influxdb.py v1.9\n"
 is_deeply(UUT::_capacity_plan_time_basis($dir), { Basis => 'UTC', Verified => 1 }, 'InfluxDB-staged data: UTC');
 $write->("cache_build_status: success\nbuild_timestamp: 2026-11-01T10:00:00+0200\n");
 is(UUT::_capacity_plan_time_basis($dir)->{Verified}, 0, 'NMON-staged data: not verified');
-is(UUT::_capacity_plan_time_basis(File::Spec->catdir($dir, 'none'))->{Basis}, 'not verified', 'no manifest: not verified');
+is(UUT::_capacity_plan_time_basis(File::Spec->catdir($dir, 'none'))->{Basis}, 'not confirmed', 'no manifest: not confirmed');
 
 # -- the worked example ---------------------------------------------------------------------
 sub member
@@ -150,7 +150,7 @@ my $plan = UUT::_capacity_plan_build(\%members, \%ctx);
 my %row = map { ($_->{vm} => $_) } @{ $plan->{Rows} };
 
 is_deeply([ $row{DB01}{action}, $row{DB01}{pair}{Ent}, $row{DB01}{pair}{AddEnt} ], [ 'increase', 2.6, 0.6 ], 'DB01: +0.60 ENT');
-ok((grep { $_ eq 'overlap' } @{ $row{DB01}{unresolved} }) && (grep { $_ eq 'PowerHA role' } @{ $row{DB01}{unresolved} }),
+ok((grep { $_ eq 'overlapping event' } @{ $row{DB01}{unresolved} }) && (grep { $_ eq 'PowerHA role' } @{ $row{DB01}{unresolved} }),
    'an increase does not hide the overlap or the role dependency');
 is_deeply([ $row{DB01}{overlaps}[0]{reference}{entitlement}, !!$row{DB01}{overlaps}[0]{combined} ], [ 2.4, '' ],
           'the overlapping event\'s stored requirement is a reference; the combined requirement is not assessed');
@@ -159,45 +159,47 @@ is_deeply([ $row{APP02}{action}, $row{APP02}{pair}{Ent}, $row{APP02}{normalConfl
 ok(!$row{DB01}{normalConflict}, 'a normal plan at or above the event requirement is no conflict');
 is_deeply([ @{ $row{BAT04}{pair} }{qw(Ent VP AddVP)}, $row{BAT04}{step}{VP} ], [ 1.6, 3, 1, 2 ],
           'BAT04: +1 VP; this cycle\'s VP step is shown beside it');
-is($row{BAT04}{step}{Limit}, 'the normal incremental step', 'a VP figure short of the plan without a VP limit is the normal step');
+is($row{BAT04}{step}{Limit}, 'it adds VPs only to carry the entitlement', 'a VP figure short of the plan without a VP limit is the normal step');
 is_deeply([ $row{DB01}{confirm}, @{ $row{DB01}{pair} }{qw(Ent VP)} ], [ 'the run queue is implausibly high (XRQ); find its cause', 2.6, 4 ],
           'an evidence concern marks the increase for confirmation; the full figure stays');
-ok((grep { $_ eq 'confirm before event' } @{ $row{DB01}{unresolved} }) && !defined $row{WEB03}{confirm},
+ok((grep { $_ eq 'confirm before the event' } @{ $row{DB01}{unresolved} }) && !defined $row{WEB03}{confirm},
    'confirmation is unresolved beside the increase; nothing to confirm where nothing is added');
 ok(!defined $row{BAT04}{confirm}, 'the normal step alone is no evidence concern');
 is_deeply([ @{ $row{ERP05}{pair} }{qw(Ent VP)}, @{ $row{ERP05}{step} }{qw(Ent VP)} ], [ 3.1, 4, 3, 4 ],
           'ERP05: the full requirement 3.10 is planned, the step 3.00 shown beside it, never in its place');
-is($row{ERP05}{step}{Limit}, 'the size of pool 9 (3)', 'the step\'s limit is the pool\'s size');
+is($row{ERP05}{step}{Limit}, "limited by pool 9's maximum (3)", 'the step\'s limit is the pool\'s size');
 is_deeply([ $row{WEB03}{action}, @{ $row{WEB03}{pair} }{qw(Ent VP)} ], [ 'retain', 2, 4 ], 'WEB03: already large enough, nothing cut');
 is_deeply([ map { [ $row{$_}{pair}{Ent}, $row{$_}{pair}{AddEnt}, $row{$_}{role} ] } qw(vios1 vios2) ],
           [ [ 1.5, 0.5, 'VIOS pair with vios2' ], [ 1.5, 0.5, 'VIOS pair with vios1' ] ], 'the VIOS pair is planned together on its pair figure');
-like($row{DBHA}{roleLimitation}, qr/^PowerHA role not assessed for the event: confirm takeover capacity for the event allocation of DB01 2\.60 \/ 4$/,
+like($row{DBHA}{roleLimitation}, qr/^PowerHA roles are not assessed for events: confirm this node can take over the event allocation of DB01 \(2\.60 \/ 4\)$/,
      'DBHA: PowerHA role not assessed, the peer\'s event allocation named');
 is_deeply([ @{ $row{DBHA}{pair} }{qw(Ent VP)} ], [ 0.5, 2 ], 'nothing of a PowerHA node is lowered');
 my %pool = map { ($_->{PoolId} => $_) } @{ $plan->{Pools} };
 is_deeply([ @{ $pool{7} }{qw(Planned RequiredMax)}, @{ $pool{9} }{qw(Planned RequiredMax)} ], [ 7.4, 8, 3.1, 4 ],
           'pools on the retained and increased allocations: 7.40 -> 8, 3.10 -> 4');
-like($row{APP02}{poolPrerequisite}, qr/^pool 7 maximum to at least 8 first/, 'a retained member carries its pool\'s prerequisite');
+like($row{APP02}{poolPrerequisite}, qr/^raise pool 7's maximum to at least 8 first/, 'a retained member carries its pool\'s prerequisite');
 is_deeply([ @{ $plan->{Totals} }{qw(Increases AddEnt AddVP Retained)} ], [ 5, 2.3, 1, 4 ], 'increases: 5 LPARs, +2.30, +1 VP');
 
 my $text = join("\n", UUT::_capacity_plan_lines($plan, \%ctx));
 (my $flat = $text) =~ s/\s+/ /g;
-like($text, qr/Capacity available before the event starts: 24 Nov 2026 00:00 \(UTC, the data's time basis\)\./, 'required by the event start, UTC');
-like($text, qr/Pool 7: calculated requirement 7\.40 processing units; set the maximum to at least 8 \(now 7\)\./, 'pool 7 prerequisite');
-like($text, qr/Pool 9: calculated requirement 3\.10 processing units; set the maximum to at least 4 \(now 3\)\./, 'pool 9 prerequisite');
-like($flat, qr/black-friday \(20 Nov to 27 Nov 2026\) overlaps this occurrence on 24 Nov to 27 Nov 2026; combined requirement not assessed for all 9 LPARs of this run\./,
+diag($text) if $ENV{SHOW};          # the worked example's section, for the design note
+like($text, qr/Capacity available before the event starts: 24 Nov 2026 00:00 UTC \(the time zone of the collected data\)\./, 'required by the event start, UTC');
+like($flat, qr/Pool 7: calculated requirement 7\.40 processing units; raise the pool's maximum to at least 8 \(now 7\)\./, 'pool 7 prerequisite');
+like($flat, qr/Pool 9: calculated requirement 3\.10 processing units; raise the pool's maximum to at least 4 \(now 3\)\./, 'pool 9 prerequisite');
+like($flat, qr/black-friday \(20 Nov to 27 Nov 2026\) overlaps this occurrence on 24 Nov to 27 Nov 2026; combined requirement not assessed for all 9 LPARs analysed\./,
      'the overlap is unresolved');
-like($flat, qr/Separate requirements, month-end-adaptive and black-friday \(stored plan, same data\): DB01 2\.60 and 2\.40\./, 'separate requirements as references');
-like($flat, qr/APP02: the normal plan's 1\.20 \/ 3 is below the event requirement 1\.30 \/ 3 for 24 Nov to 30 Nov 2026\./, 'the conflict, reported only');
+like($flat, qr/Each event's own requirement, month-end-adaptive and black-friday \(black-friday from its saved plan on the same data\): DB01 2\.60 and 2\.40\./, 'separate requirements as references');
+like($flat, qr/Normal recommendation below the event requirement \(hybrid-state-decay run on the same data; reported only, not changed\):/, 'the conflict heading');
+like($flat, qr/APP02: the normal recommendation of 1\.20 \/ 3 is below the event requirement 1\.30 \/ 3 for 24 Nov to 30 Nov 2026\./, 'the conflict, reported only');
 like($text, qr/\n    ERP05  2\.40 \/ 4  ->  3\.10 \/ 4   \(\+0\.70 ENT;/, 'ERP05 line, columns kept');
-like($flat, qr/ERP05 2\.40 \/ 4 -> 3\.10 \/ 4 \(\+0\.70 ENT; this cycle's pair stops at 3\.00 \/ 4: the size of pool 9 \(3\)\)/, 'ERP05: the step beside the full requirement');
+like($flat, qr/ERP05 2\.40 \/ 4 -> 3\.10 \/ 4 \(\+0\.70 ENT; this cycle's recommendation is 3\.00 \/ 4: limited by pool 9's maximum \(3\)\)/, 'ERP05: the step beside the full requirement');
 like($flat, qr/BAT04 1\.60 \/ 2 -> 1\.60 \/ 3 \(\+1 VP; entitlement sufficient;/, 'BAT04 line');
-like($text, qr/Same occurrence, other forecasts \(alternatives, not overlaps\): month-end-predictive\./, 'alternatives listed');
-like($flat, qr/DB01 2\.00 \/ 4 -> 2\.60 \/ 4 \(\+0\.60 ENT; confirm before event: the run queue is implausibly high \(XRQ\); find its cause\)/,
+like($flat, qr/Other forecasts of the same event days \(for reference; not overlapping events\): month-end-predictive\./, 'alternatives listed');
+like($flat, qr/DB01 2\.00 \/ 4 -> 2\.60 \/ 4 \(\+0\.60 ENT; confirm before the event: the run queue is implausibly high \(XRQ\); find its cause\)/,
      'the increase line keeps the figure and asks for confirmation');
-like($flat, qr/Of these, 1 LPAR \(\+0\.60 processing units, \+0 VPs\) requires confirmation before the event \(run-queue evidence concern\); the full figures stay in the plan\./,
+like($flat, qr/Of these, 1 LPAR \(\+0\.60 processing units, \+0 VPs\) rests on run-queue readings flagged as doubtful: confirm that increase before the event\. The figures stay in the plan\./,
      'how many additions need confirmation');
-like($flat, qr/1 LPAR needs more VPs than the normal incremental step stages; the event target, not the step, is the preparation figure\./,
+like($flat, qr/1 LPAR needs more VPs than this cycle's recommendation adds \(it adds VPs only to carry the entitlement\): prepare the event figure, not this cycle's\./,
      'the normal step is secondary');
 like($flat, qr/Already sufficient: 4 LPARs \(APP02, WEB03, OTH, DBHA\)/, 'already sufficient, summarised');
 like($text, qr/Post-event allocation is determined by the normal capacity review\.\n*\z/, 'one footer, last');
@@ -218,11 +220,11 @@ is_deeply([ @{ $pool{9} }{qw(Verdict Planned Relied Requirement RequiredMax)} ],
           'only the borrowing relied on exceeds pool 9');
 $text = join("\n", UUT::_capacity_plan_lines($plan, \%ctx));
 ($flat = $text) =~ s/\s+/ /g;
-like($text, qr/24 Nov 2026 00:00 on the data's time basis, which is not\n\s+verified/, 'an unverified time basis is said so');
-like($flat, qr/Normal plan \(hybrid-state-decay\): no stored plan for this system; not compared\./, 'a missing normal plan is stated');
+like($flat, qr/24 Nov 2026 00:00 in the time zone of the collected data\. nFit confirms that time zone \(UTC\) only for data collected through InfluxDB\./, 'an unconfirmed time zone is said so');
+like($flat, qr/Normal recommendation \(hybrid-state-decay run\): none saved for this system; not compared\./, 'a missing normal plan is stated');
 like($text, qr/Overlaps combined in this forecast:\n\s+black-friday .*\n?.*combined in this forecast for 1 LPAR \(DB01\)\./, 'the combined overlap');
 like($flat, qr/combined requirement not assessed for 8 LPARs \(APP02, BAT04, ERP05, WEB03, OTH, vios1, vios2, DBHA\)\./, 'the others stay unresolved');
-like($flat, qr/Pool 9: the planned entitlements \(3\.10\) fit the maximum of 4, but with the borrowing relied on \(1\.20\) the requirement is 4\.30: raise the maximum to at least 5, or accept the reliance\./,
+like($flat, qr/Pool 9: the planned entitlements \(3\.10\) fit the maximum of 4, but with the capacity its LPARs are expected to draw above their entitlement \(1\.20\) the requirement is 4\.30: raise the maximum to at least 5, or accept that this capacity may not be there\./,
      'borrowing-only wording') or diag($text);
 
 # A stored plan of the overlapping event that combined this one is flagged as such.
