@@ -27,6 +27,7 @@ my @names = qw(
     _log_structural_feasibility _resolve_vm_tier_pattern_policy
     _pool_units_text _pool_shortfall_action _pool_prerequisites _rationale_wrap _log_recommended_actions
     _structural_planning_profile _lpar_role_hint _entitlement_totals _log_entitlement_totals _ha_standby_target
+    _cycle_provisional_note
 );
 my $code = '';
 for my $name (@names)
