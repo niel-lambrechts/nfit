@@ -144,7 +144,8 @@ my %ctx = (event => 'month-end-adaptive', start => '2026-11-24', end => '2026-11
            calendar => { Overlaps => [ { event => 'black-friday', start => '2026-11-20', end => '2026-11-27', overlapStart => '2026-11-24', overlapEnd => '2026-11-27' } ],
                          Alternatives => [ 'month-end-predictive' ] },
            references => { 'black-friday' => $bf }, normal => $normal, normalModel => 'hybrid-state-decay',
-           clusters => [ [ 'DB01', 'DBHA' ] ], combined => {}, windowPlan => { Members => {} }, roleBinding => {});
+           clusters => [ [ 'DB01', 'DBHA' ] ], combined => {}, windowPlan => { Members => {} }, roleBinding => {},
+           evidence => { DB01 => 'the run queue is implausibly high (XRQ); find its cause', WEB03 => 'x' });
 my $plan = UUT::_capacity_plan_build(\%members, \%ctx);
 my %row = map { ($_->{vm} => $_) } @{ $plan->{Rows} };
 
@@ -158,7 +159,12 @@ is_deeply([ $row{APP02}{action}, $row{APP02}{pair}{Ent}, $row{APP02}{normalConfl
 ok(!$row{DB01}{normalConflict}, 'a normal plan at or above the event requirement is no conflict');
 is_deeply([ @{ $row{BAT04}{pair} }{qw(Ent VP AddVP)}, $row{BAT04}{step}{VP} ], [ 1.6, 3, 1, 2 ],
           'BAT04: +1 VP; this cycle\'s VP step is shown beside it');
-like($row{BAT04}{step}{Limit}, qr/this cycle's VP step/, 'the VP step named as the limit');
+is($row{BAT04}{step}{Limit}, 'the normal incremental step', 'a VP figure short of the plan without a VP limit is the normal step');
+is_deeply([ $row{DB01}{confirm}, @{ $row{DB01}{pair} }{qw(Ent VP)} ], [ 'the run queue is implausibly high (XRQ); find its cause', 2.6, 4 ],
+          'an evidence concern marks the increase for confirmation; the full figure stays');
+ok((grep { $_ eq 'confirm before event' } @{ $row{DB01}{unresolved} }) && !defined $row{WEB03}{confirm},
+   'confirmation is unresolved beside the increase; nothing to confirm where nothing is added');
+ok(!defined $row{BAT04}{confirm}, 'the normal step alone is no evidence concern');
 is_deeply([ @{ $row{ERP05}{pair} }{qw(Ent VP)}, @{ $row{ERP05}{step} }{qw(Ent VP)} ], [ 3.1, 4, 3, 4 ],
           'ERP05: the full requirement 3.10 is planned, the step 3.00 shown beside it, never in its place');
 is($row{ERP05}{step}{Limit}, 'the size of pool 9 (3)', 'the step\'s limit is the pool\'s size');
@@ -187,6 +193,12 @@ like($text, qr/\n    ERP05  2\.40 \/ 4  ->  3\.10 \/ 4   \(\+0\.70 ENT;/, 'ERP05
 like($flat, qr/ERP05 2\.40 \/ 4 -> 3\.10 \/ 4 \(\+0\.70 ENT; this cycle's pair stops at 3\.00 \/ 4: the size of pool 9 \(3\)\)/, 'ERP05: the step beside the full requirement');
 like($flat, qr/BAT04 1\.60 \/ 2 -> 1\.60 \/ 3 \(\+1 VP; entitlement sufficient;/, 'BAT04 line');
 like($text, qr/Same occurrence, other forecasts \(alternatives, not overlaps\): month-end-predictive\./, 'alternatives listed');
+like($flat, qr/DB01 2\.00 \/ 4 -> 2\.60 \/ 4 \(\+0\.60 ENT; confirm before event: the run queue is implausibly high \(XRQ\); find its cause\)/,
+     'the increase line keeps the figure and asks for confirmation');
+like($flat, qr/Of these, 1 LPAR \(\+0\.60 processing units, \+0 VPs\) requires confirmation before the event \(run-queue evidence concern\); the full figures stay in the plan\./,
+     'how many additions need confirmation');
+like($flat, qr/1 LPAR needs more VPs than the normal incremental step stages; the event target, not the step, is the preparation figure\./,
+     'the normal step is secondary');
 like($flat, qr/Already sufficient: 4 LPARs \(APP02, WEB03, OTH, DBHA\)/, 'already sufficient, summarised');
 like($text, qr/Post-event allocation is determined by the normal capacity review\.\n*\z/, 'one footer, last');
 unlike($text, qr/partition profile|return to|rerun|re-run/i, 'no profile-maximum warning, no return schedule, no rerun date');

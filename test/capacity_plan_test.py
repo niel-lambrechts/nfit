@@ -222,6 +222,17 @@ class CapacityPlanTests(unittest.TestCase):
                 self.assertEqual(int(row['Additional_VP']), pvp - ivp, vm)
                 self.assertEqual(row['Action'], 'increase' if (pent > ient + EPS or pvp > ivp) else 'retain', vm)
 
+    def test_a_confirmation_never_replaces_the_figure(self):
+        for run in (self.a, self.b):
+            for vm, row in run['plan'].items():
+                marked = 'confirm before event' in row['Unresolved'].split('; ')
+                self.assertEqual(marked, row['Confirmation'].startswith('confirm before event: '), vm)
+                if marked:
+                    self.assertEqual(row['Action'], 'increase', vm)
+                    self.assertAlmostEqual(num(row['Plan_ENT']), max(num(row['Installed_ENT']), num(row['Event_ENT'])) + num(row['PlatformMinimum_ENT']), places=2)
+                if row['StepLimit'] and 'the size of pool' not in row['StepLimit']:
+                    self.assertIn('the normal incremental step', row['StepLimit'], vm)
+
     def test_the_full_requirement_is_planned_with_the_held_step_beside_it(self):
         row, published = self.b['plan']['vmS'], self.b['rows']['vmS']
         self.assertGreater(num(row['Event_ENT']), 2.0 + EPS)                   # above pool 9's size

@@ -166,8 +166,9 @@ class CapacityPlanReportTests(unittest.TestCase):
                                     'overlaps': [{'event': 'bf', 'overlapStart': '2026-11-24', 'overlapEnd': '2026-11-27'}],
                                     'pools': [{'pool': 7, 'verdict': 'raise', 'planned': 7.4, 'reliedOn': 0, 'maximum': 7, 'requiredMaximum': 8}],
                                     'normalPlan': {'model': 'hybrid-state-decay', 'status': 'matching'}}}
-        members = {'a': cp('increase', 2.0, 4, 2.6, 4, unresolved=['overlap'], overlaps=[{'event': 'bf', 'combined': False}],
-                           step={'entitlement': 2.4, 'VPs': 4, 'limit': "the size of pool 7 (7); this cycle's VP step"}),
+        members = {'a': cp('increase', 2.0, 4, 2.6, 4, unresolved=['overlap', 'confirm before event'], overlaps=[{'event': 'bf', 'combined': False}],
+                           confirmBeforeEvent='the run queue is implausibly high (XRQ); find its cause',
+                           step={'entitlement': 2.4, 'VPs': 4, 'limit': 'the size of pool 7 (7); the normal incremental step'}),
                    'b': cp('retain', 1.5, 3, 1.5, 3, normalPlanConflict={'entitlement': 1.2}),
                    'c': dict(cp('increase', 1.6, 2, 1.6, 3, overlaps=[{'event': 'bf', 'combined': False}]),           # its overlap left out
                              planningProfile='G', profiles={'G': {'currentCycle': {'VPs': 2, 'reviewVPs': 3}}})}
@@ -177,8 +178,8 @@ class CapacityPlanReportTests(unittest.TestCase):
         self.assertIn('LPARs: 3 (increase 2, retain 1)', text)
         self.assertIn('additional: +0.60 ENT (workload +0.60, PowerVM minimum +0.00), +1 VPs (workload +1, to carry the entitlement +0)', text)
         self.assertIn('checks: plan below installed 0; pair outside 0.05 to 1.00 per VP 0; increase without its dependency 1', text)
-        self.assertIn("this cycle's pair stops short of the plan: 1 LPARs (the size of pool 7 1, this cycle's VP step 1)", text)
-        self.assertIn("added VPs this run's current-cycle pair holds for review (run-queue or peak evidence only): 1 LPARs, +1 VPs", text)
+        self.assertIn("this cycle's pair stops short of the plan: 1 LPARs (the normal incremental step 1, the size of pool 7 1)", text)
+        self.assertIn('increases to confirm before the event (run-queue evidence concern): 1 LPARs, +0.60 ENT, +0 VPs', text)
         self.assertIn('totals: installed 5.10 ENT / 9 VPs; event requirement 1.50 ENT; planned 5.70 ENT / 10 VPs', text)
         self.assertIn('pool 7: raise; planned 7.40, relied on 0.00, maximum 7 -> at least 8', text)
         self.assertIn('overlaps: bf 2026-11-24 to 2026-11-27; LPARs whose forecast combined one: 0', text)
