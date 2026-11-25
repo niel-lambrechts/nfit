@@ -128,7 +128,7 @@ class SizingReportTests(unittest.TestCase):
         sel = lambda mode, demand, source: {'source': 'selection', 'mode': mode, 'demand': demand, 'sourceModelDemand': source}
         adaptive = {'context': {'selection': {'status': 'used', 'storedIn': '2026-09', 'candidatesStoredIn': '2026-09',
                                               'target': {'occurrenceStart': '2026-10-28', 'occurrenceEnd': '2026-10-31'},
-                                              'withheld': {'no eligible forecast': 1}},
+                                              'withheld': {'no eligible forecast': 1}, 'modes': {'tournament': 9, 'bootstrap': 3}},
                                 'notAssessed': ['PowerHA role sizing (standard runs only)', 'frame capacity']},
                     'members': {'a': member('G', 2.5, sel('tournament', 2.5, 2.0)), 'b': member('G', 1.0, sel('bootstrap', 0.8, 1.0)),
                                 'c': member('P', 3.0, {'source': 'source model', 'demand': 3.0, 'reason': 'no eligible forecast'}, role=3.2)}}
@@ -141,6 +141,11 @@ class SizingReportTests(unittest.TestCase):
         self.assertRegex(text, r'source model\s+1\s+3\.00\s+3\.00\s+1\.000\s+3\.20\s+3\.20\s+0\s+0')    # a VIOS role publishes its own figure
         self.assertIn('LPARs on another planning profile than in the source event run: 1', text)
         self.assertIn('VIOS roles: 1 in this run, 1 in the source event run', text)
+        self.assertIn('sized pairs from the selection: 3 bootstrap median, 9 tournament', text)
+        # With two or more LPARs in a group: the spread of selected against source demand, and how many are equal.
+        two = dict(adaptive, members=dict(adaptive['members'], d=member('G', 2.2, sel('tournament', 2.0, 2.0))))
+        self.assertIn('tournament         selected / source model: quartiles 1.062, 1.125, 1.188; equal within 0.05%: 1 of 2',
+                      '\n'.join(A.sizing_report(two, predictive)))
         self.assertIn('1  sized pairs from the source model: no eligible forecast', text)
         withheld = dict(adaptive, context={'selection': {'status': 'withheld', 'reason': 'its target occurrence is already observed'}})
         self.assertIn('selection NOT used: its target occurrence is already observed', '\n'.join(A.sizing_report(withheld, None)))

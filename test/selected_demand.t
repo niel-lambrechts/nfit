@@ -106,13 +106,20 @@ is_deeply([ UUT::_selection_pair_verdict(pair(selection_mode => 'unopposed'), $M
 is_deeply([ UUT::_selection_pair_verdict(pair(selection_mode => 'bootstrap', chosen_model => 'ensemble_median', pi_lower => undef, pi_upper => undef), $M) ],
           [ 2.5, undef ], 'bootstrap median is used, without an interval');
 is_deeply([ UUT::_selection_pair_verdict(pair(forecast => 0), $M) ], [ 0, undef ], 'a selected demand of zero is a demand');
+is_deeply([ UUT::_selection_pair_verdict(pair(forecast => '1.5e3'), $M) ], [ 1500, undef ], 'an exponent within range is a number');
 my @pair_cases = (
     [ undef, 'no selection for the pair' ],
     [ pair(selection_mode => 'no eligible forecast', forecast => undef), 'no eligible forecast' ],
     [ pair(selection_mode => 'ensemble'), "selection mode 'ensemble' not recognised" ],
-    [ pair(forecast => undef), 'the selected value is not a number of zero or more' ],
-    [ pair(forecast => -0.1), 'the selected value is not a number of zero or more' ],
-    [ pair(forecast => 'NaN'), 'the selected value is not a number of zero or more' ],
+    [ pair(forecast => undef), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => -0.1), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => 'NaN'), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => 'Inf'), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => '-Infinity'), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => '1e999'), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => 9**9**9), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => 'abc'), 'the selected value is not a finite number of zero or more' ],
+    [ pair(forecast => [ 1 ]), 'the selected value is not a finite number of zero or more' ],
     [ pair(quantity => 'weekly-raw-peak'), 'the pair selects another quantity' ],
     [ pair(target_occurrence => { %$TARGET, occurrenceEnd => '2026-11-30' }), 'the pair is for another occurrence' ],
 );
