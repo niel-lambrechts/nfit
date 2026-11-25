@@ -79,7 +79,7 @@ def build(root, with_peer, extra=''):
     return os.path.join(root, 'stage', 'SYSHA1'), last
 
 
-def run(with_peer, extra='', systems=('SYSHA1',)):
+def run(with_peer, extra='', systems=('SYSHA1',), last_flags=()):
     """Runs nfit-profile on each system in turn in one tree; returns the outputs of the last."""
     root = tempfile.mkdtemp(prefix='powerha-')
     cache, last = build(root, with_peer, extra)
@@ -88,8 +88,9 @@ def run(with_peer, extra='', systems=('SYSHA1',)):
         for f in glob.glob(os.path.join(out, '*')):
             os.remove(f)
         cache = os.path.join(root, 'stage', serial)
+        flags = list(last_flags) if serial == systems[-1] else []
         proc = subprocess.run(['perl', os.path.join(root, 'nfit-profile'), '--runq-perc-behavior=match',
-                               '--enddate', last, '--nmondir', cache], capture_output=True, text=True, timeout=300, cwd=root)
+                               '--enddate', last, '--nmondir', cache] + flags, capture_output=True, text=True, timeout=300, cwd=root)
     csvs = [f for f in glob.glob(os.path.join(out, '*.csv')) if '.decisions.' not in f]
     logs = glob.glob(os.path.join(out, '*.log'))
     result = {'root': root, 'cache': cache, 'proc': proc, 'csv': '', 'log': ''}
@@ -178,6 +179,12 @@ class PowerHASizingTests(unittest.TestCase):
     def setUpClass(cls):
         share = '[GLOBAL]\nha_sizing = standby_share\n'
         cls.fallback = run(True, share)                              # the primary's system has not run
+        INSTALLED['hanodeA'] = 0.20                                  # the standby installed below the fallback floor
+        try:
+            cls.fallback_low = run(True, share)
+        finally:
+            INSTALLED.clear()
+        cls.other_settings = run(True, share, systems=('SYSHA2', 'SYSHA1'), last_flags=('--no-cut-protection',))
         cls.ordered = run(True, share, systems=('SYSHA2', 'SYSHA1'))  # it has: its proposal is used
         cls.took_over = run(True, '', systems=('SYSHA2',))           # independent; the node that took over
         INSTALLED['hanodeB'] = 0.30                                  # the same node, installed below what it needs
@@ -188,15 +195,30 @@ class PowerHASizingTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        for r in (cls.fallback, cls.ordered, cls.took_over, cls.took_over_low):
+        for r in (cls.fallback, cls.fallback_low, cls.other_settings, cls.ordered, cls.took_over, cls.took_over_low):
             shutil.rmtree(r['root'], ignore_errors=True)
 
     def test_standby_floor_with_the_primary_installed_as_fallback(self):
         r = rows(self.fallback['csv'])['hanodeA']
-        self.assertTrue(r['NFIT - Action'].startswith('PowerHA standby for hanodeB (inferred): 25% of its 1.50 target '
-                                                      '(not sized: its installed entitlement, a fallback)'), r['NFIT - Action'])
-        self.assertIn('takeover capacity not verified', r['NFIT - Action'])
+        self.assertTrue(r['NFIT - Action'].startswith('PowerHA standby for hanodeB (inferred): unresolved, its frame has no saved plan of '
+                                                      'this analysis. 25% of its installed 1.50 limits a cut to 0.38 and adds no increase.'),
+                        r['NFIT - Action'])
+        self.assertIn('Takeover capacity not verified: analyse hanodeB with the same settings.', r['NFIT - Action'])
         self.assertGreaterEqual(float(r['NFIT - ENT']), 0.38 - 1e-9)
+        self.assertLessEqual(float(r['NFIT - ENT']), float(r['Current - ENT']) + 1e-9)
+        self.assertIn('hanodeA: unresolved, its frame has no saved plan of this analysis.', ' '.join(self.fallback['log'].split()))
+
+    def test_a_fallback_never_raises_a_standby(self):
+        r = rows(self.fallback_low['csv'])['hanodeA']
+        own = float(r[r['Planning Profile']])
+        self.assertIn('limits a cut to 0.20 and adds no increase', r['NFIT - Action'])
+        # Installed 0.20, the share of the primary's installed entitlement 0.38: nothing above the larger of installed and own workload.
+        self.assertLessEqual(float(r['NFIT - ENT']), max(0.20, own) + 0.005)
+
+    def test_a_plan_made_with_other_options_is_not_used(self):
+        r = rows(self.other_settings['csv'])['hanodeA']
+        self.assertTrue(r['NFIT - Action'].startswith('PowerHA standby for hanodeB (inferred): unresolved, its saved plan was made with '
+                                                      'other options.'), r['NFIT - Action'])
 
     def test_standby_floor_from_the_primary_proposal(self):
         r = rows(self.ordered['csv'])['hanodeA']

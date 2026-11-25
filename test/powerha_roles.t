@@ -223,6 +223,14 @@ $st = UUT::_ha_standby_target(0.90, 2, 2.40, 0.25);
 is_deeply([ @$st{qw(TargetEnt TargetVP FloorBinds)} ], [0.90, 2, 0], 'standby: own workload above the share wins (never reduced by the share)');
 is(UUT::_ha_standby_target(0.10, 1, 3.33, 0.25)->{Floor}, 0.84, 'standby: the floor is rounded up to 0.01 (0.8325)');
 is(UUT::_ha_standby_target(0.10, 1, 5.00, 0.25)->{TargetVP}, 2, 'standby: VPs carry the floor');
+# A fallback floor (the primary's installed entitlement) stops at the standby's installed entitlement.
+$st = UUT::_ha_standby_target(0.12, 1, 2.40, 0.25, 0.30);
+is_deeply([ @{$st}{qw(Floor TargetEnt FloorBinds)} ], [ 0.30, 0.30, 1 ], 'fallback: a cut is limited at the installed entitlement, no increase');
+$st = UUT::_ha_standby_target(0.12, 1, 2.40, 0.25, 1.00);
+is_deeply([ @{$st}{qw(Floor TargetEnt)} ], [ 0.60, 0.60 ], 'fallback: a floor below installed limits the cut as before');
+$st = UUT::_ha_standby_target(0.90, 2, 2.40, 0.25, 0.30);
+is_deeply([ @{$st}{qw(Floor TargetEnt TargetVP FloorBinds)} ], [ 0.30, 0.90, 2, 0 ], 'fallback: an increase from own workload stays');
+is(UUT::_ha_standby_target(0.12, 1, 2.40, 0.25, 0)->{TargetEnt}, 0.12, 'fallback: installed unknown - own workload only');
 
 my $roles_as = sub { my (%r) = @_; return { map { $_ => { Effective => $r{$_} } } keys %r }; };
 my $cl = { Members => [qw(pa pb)], Roles => $roles_as->(pa => 'active', pb => 'standby'), Detection => { Transitions => [] } };

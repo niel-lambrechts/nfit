@@ -14175,17 +14175,23 @@ sub _ha_cluster_policy
 #             larger of its own workload target and the share of its
 #             primary's target (rounded up to 0.01); VPs enough to carry it.
 #             The share is a floor, never a reduction below own workload.
+#             With a cap (the standby's installed entitlement, when the
+#             primary's figure is only its installed entitlement, a fallback)
+#             the floor may limit a cut and never creates an increase.
 # ARGUMENTS:  1. own target entitlement  2. own target VPs
 #             3. primary target entitlement  4. share (fraction)
+#             5. cap on the floor (optional)
 # RETURNS:    hashref { Floor, TargetEnt, TargetVP, FloorBinds (0/1) }
 # ==============================================================================
 sub _ha_standby_target
 {
-    my ($own_ent, $own_vp, $primary_ent, $share) = @_;
+    my ($own_ent, $own_vp, $primary_ent, $share, $floor_cap) = @_;
     my $scaled = ($primary_ent // 0) * ($share // 0) * 100;
     my $cents = int($scaled);
     $cents++ if ($scaled - $cents > 1e-6);
     my $floor = $cents / 100;
+    $floor = $floor_cap if (defined $floor_cap && looks_like_number($floor_cap) && $floor > $floor_cap);
+    $floor = 0 if ($floor < 0);
     my $own = (defined $own_ent && $own_ent > 0) ? $own_ent : 0;
     my $target = ($floor > $own) ? $floor : $own;
     my $whole = int($target);
@@ -14452,18 +14458,29 @@ sub _apply_ha_sizing
                     $entry->{Note} = "no target for $primary is available: sized on its own workload";
                     next;
                 }
-                my $st = _ha_standby_target($own_ent, $own_vp, $target->{Ent}, $policy->{Share});
+                # Without a plan of the primary, its installed entitlement stands in: that may limit a cut of
+                # the standby, and never creates an increase (the floor stops at the standby's installed figure).
+                my $unresolved = ($target->{Source} eq 'installed') ? 1 : 0;
+                my $st = _ha_standby_target($own_ent, $own_vp, $target->{Ent}, $policy->{Share}, ($unresolved ? ($current_ent // 0) : undef));
                 $pair = _resolve_current_cycle_pair({ target_ent => $st->{TargetEnt}, target_vp => $st->{TargetVP}, step_vp => $step,
                     current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
-                my $source = ($target->{Source} eq 'run') ? 'analysed in this run'
-                           : ($target->{Source} eq 'proposal') ? "its proposal for data ending $target->{WindowEnd}"
-                           : 'not sized: its installed entitlement, a fallback';
-                push @action, sprintf('PowerHA standby for %s (%s): %d%% of its %.2f target (%s) = %.2f entitlement%s.', $primary,
-                    $cluster->{Roles}{$vm}{Source}, int(100 * $policy->{Share} + 0.5), $target->{Ent}, $source, $st->{Floor},
-                    ($st->{FloorBinds} ? sprintf('; own workload needs %.2f', $own_ent // 0) : '; its own workload needs more'));
-                push @action, _current_cycle_action_text($pair, $current_ent, $current_vp, $cfg->{pool_id});
-                push @action, sprintf('At failover it needs up to %.2f entitlement%s; takeover capacity not verified.', $target->{Ent},
-                    (defined $target->{VP} ? ($target->{VP} == 1 ? ' and 1 VP' : sprintf(' and %d VPs', $target->{VP})) : ''));
+                if ($unresolved)
+                {
+                    push @action, sprintf('PowerHA standby for %s (%s): unresolved, %s. %d%% of its installed %.2f limits a cut to %.2f and adds no increase.',
+                        $primary, $cluster->{Roles}{$vm}{Source}, $target->{Reason}, int(100 * $policy->{Share} + 0.5), $target->{Ent}, $st->{Floor});
+                    push @action, _current_cycle_action_text($pair, $current_ent, $current_vp, $cfg->{pool_id});
+                    push @action, sprintf('Takeover capacity not verified: analyse %s with the same settings.', $primary);
+                }
+                else
+                {
+                    my $source = ($target->{Source} eq 'run') ? 'analysed in this run' : "its proposal for data ending $target->{WindowEnd}";
+                    push @action, sprintf('PowerHA standby for %s (%s): %d%% of its %.2f target (%s) = %.2f entitlement%s.', $primary,
+                        $cluster->{Roles}{$vm}{Source}, int(100 * $policy->{Share} + 0.5), $target->{Ent}, $source, $st->{Floor},
+                        ($st->{FloorBinds} ? sprintf('; own workload needs %.2f', $own_ent // 0) : '; its own workload needs more'));
+                    push @action, _current_cycle_action_text($pair, $current_ent, $current_vp, $cfg->{pool_id});
+                    push @action, sprintf('At failover it needs up to %.2f entitlement%s; takeover capacity not verified.', $target->{Ent},
+                        (defined $target->{VP} ? ($target->{VP} == 1 ? ' and 1 VP' : sprintf(' and %d VPs', $target->{VP})) : ''));
+                }
                 %result = (Source => 'HA_STANDBY', Profile => $profile, TargetEnt => $st->{TargetEnt}, TargetVP => $st->{TargetVP},
                            OwnTargetEnt => $own_ent, OwnTargetVP => $own_vp, Floor => $st->{Floor}, Share => $policy->{Share},
                            Primary => $primary, PrimaryTargetEnt => $target->{Ent}, PrimaryTargetVP => $target->{VP},
@@ -14516,6 +14533,7 @@ sub _apply_ha_sizing
                                               snapshot => $result{PrimarySnapshot},
                                               (defined $result{PrimaryReason} ? (reason => $result{PrimaryReason}) : ()) })
                         : (since => $result{Since})),
+                    (($result{PrimarySource} // '') eq 'installed' ? (unresolved => $result{PrimaryReason}) : ()),
                 };
             }
             $changed++;
@@ -14686,7 +14704,14 @@ sub _log_powerha_roles
             my $rr = (ref($map_ref) eq 'HASH' && ref($map_ref->{$name}) eq 'HASH' && ref($map_ref->{$name}{CoreResults}) eq 'HASH')
                 ? $map_ref->{$name}{CoreResults}{RoleResult} : undef;
             my $entry = $plan->{$name};
-            if (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_STANDBY')
+            if (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_STANDBY' && ($rr->{PrimarySource} // '') eq 'installed')
+            {
+                push @out, _rationale_wrap(sprintf('%s: unresolved, %s. %d%% of the primary\'s installed %.2f limits a cut to %.2f and adds no '
+                    . 'increase; own workload target %.2f; sized to %.2f, current cycle %.2f on %s VPs. Takeover capacity not verified.',
+                    $name, ($rr->{PrimaryReason} // 'no plan of the primary'), int(100 * $rr->{Share} + 0.5), $rr->{PrimaryTargetEnt}, $rr->{Floor},
+                    ($rr->{OwnTargetEnt} // 0), $rr->{TargetEnt}, ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?')), '        ', '          ');
+            }
+            elsif (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_STANDBY')
             {
                 push @out, _rationale_wrap(sprintf('%s: standby floor %.2f entitlement (%d%% of %.2f); own workload target %.2f; '
                     . 'sized to %.2f, current cycle %.2f on %s VPs. At failover it needs up to %.2f; takeover capacity not verified.',
