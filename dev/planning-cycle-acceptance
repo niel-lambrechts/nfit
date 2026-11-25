@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+# ==============================================================================
+# NAME     : dev/planning-cycle-acceptance
+# PURPOSE  : Bounded acceptance of a planning cycle and its finalisation (v10 C7
+#            with B11) on two frames that share a PowerHA cluster: the frame of
+#            the standby node and the frame of its primary.
+#
+#            The two frames are named by their pseudonyms (sys_...). Their staged
+#            captures are cloned into a disposable work tree (copy-on-write where
+#            the file system offers it), with this repository's nfit, nfit-profile
+#            and etc/. The captures themselves are not written to.
+#
+#            On the work tree it
+#              1. analyses both frames into one planning cycle (one model);
+#              2. finalises the cycle, and finalises it once more;
+#              3. with --both-orders, repeats 1 and 2 in the opposite order in a
+#                 second cycle;
+#            and reports
+#              - each analysis and finalisation: exit status and elapsed time;
+#              - each PowerHA standby whose primary is on the other frame: its
+#                provisional and final entitlement / VPs, whether it was set or
+#                left unresolved (with the reason), and its final action;
+#              - whether the CSV row and the saved plan agree;
+#              - whether the second finalisation changed any output;
+#              - with --both-orders, whether both orders give the same final row;
+#              - from the saved plans: which partner supplied each floor and from
+#                which target, how each frame read the roles, the role evidence
+#                window and the latest role period against the period the
+#                primary was sized on, and any handover hold;
+#              - whether CSV, saved plan and the rationale's finalisation block
+#                agree on the pool totals, pool alerts and pool prerequisites;
+#              - the cycle status, and the cycle's size on disk.
+#            --read WORK gives the last two from a kept work tree (--keep),
+#            without running anything.
+#            The report passes through dev/nfit-redact: LPARs and frames appear
+#            by pseudonym only. Nothing is printed if the filter cannot run.
+#
+#            Needs in etc/nfit.vms.cfg: ha_peer for the cluster, and
+#            ha_sizing = standby_share. Without them no standby is sized from
+#            its primary and there is nothing to finalise; the tool stops before
+#            the analyses unless --force.
+# USAGE    : dev/planning-cycle-acceptance sys_FIRST sys_SECOND
+#                --captures DIR | --stage DIR ... [--model MODEL]
+#            (NFIT_CAPTURES may hold the capture root; no location is built in)
+#                [--enddate YYYY-MM-DD] [--config FILE] [--both-orders]
+#                [--work DIR] [--keep] [--force]
+#            dev/planning-cycle-acceptance --read WORK
+# ==============================================================================
+import argparse
+import csv
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+REPO = Path(__file__).resolve().parent.parent
+MODEL_FLAGS = {'state-based': [], 'hybrid-state-decay': ['--decay-over-states'], 'windowed-decay': ['--enable-windowed-decay']}
+
+
+def namer():
+    """The system pseudonym of a serial, as dev/nfit-redact names it (existing secret only)."""
+    secret = Path(os.environ.get('NFIT_REDACT_SECRET_FILE') or REPO / '.private' / 'redact.secret').expanduser()
+    if not secret.is_file():
+        raise SystemExit('The redaction secret was not found; no secret is created here.')
+    loader = importlib.machinery.SourceFileLoader('nfit_acceptance_redact', str(REPO / 'dev' / 'nfit-redact'))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    redactor = module.Redactor({}, module.load_or_create_secret(secret))
+    return lambda serial: redactor.pseudonym(serial, 'sys')
+
+
+def locate(stages, pseudonym, name_of):
+    """The one staged capture of a frame, by pseudonym. No name is printed."""
+    found = [folder for stage in stages for folder in sorted(stage.iterdir())
+             if folder.is_dir() and (folder / '.nfit.cache.states').is_file() and name_of(folder.name) == pseudonym]
+    if not found:
+        raise SystemExit('%s: no staged capture found. Check the pseudonym and --captures / --stage.' % pseudonym)
+    if len(found) > 1:
+        raise SystemExit('%s: found in %d captures. Name one with --stage.' % (pseudonym, len(found)))
+    return found[0]
+
+
+def clone(src, dst):
+    """A copy of a folder with its file times: a copy-on-write clone where the file system offers one."""
+    cmd = ['cp', '-cRp', str(src), str(dst)] if platform.system() == 'Darwin' else ['cp', '-Rp', '--reflink=auto', str(src), str(dst)]
+    if subprocess.run(cmd, capture_output=True).returncode == 0:
+        return
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst, symlinks=True)
+
+
+def sha(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load(path):
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def size_of(root):
+    return sum(p.stat().st_size for p in Path(root).rglob('*') if p.is_file())
+
+
+def config_ready(path):
+    """Whether nfit.vms.cfg names a PowerHA peer and sizes a standby from its primary (two yes/no answers only)."""
+    try:
+        text = Path(path).read_text(errors='replace')
+    except OSError:
+        return False, False
+    lines = [l.split('#', 1)[0] for l in text.splitlines()]
+    return (any(re.match(r'\s*ha_peer\s*=\s*\S', l) for l in lines),
+            any(re.match(r'\s*ha_sizing\s*=\s*standby_share\b', l) for l in lines))
+
+
+class Acceptance:
+
+    def __init__(self, work, args, out):
+        self.work, self.args, self.out, self.failed = Path(work), args, out, 0
+
+    def say(self, text=''):
+        self.out.append(text)
+
+    def check(self, ok, text):
+        self.failed += 0 if ok else 1
+        self.say('  [%s] %s' % ('ok' if ok else 'FAIL', text))
+        return ok
+
+    def progress(self, text):
+        print(text, file=sys.stderr, flush=True)
+
+    def profile(self, label, *flags):
+        began = time.time()
+        self.progress('  %s ...' % label)
+        run = subprocess.run(['perl', str(self.work / 'nfit-profile')] + list(flags), capture_output=True, text=True, cwd=self.work)
+        elapsed = time.time() - began
+        self.progress('    exit %d after %.0f s' % (run.returncode, elapsed))
+        return run, elapsed
+
+    def analyse(self, cycle, serial, position):
+        flags = ['--runq-perc-behavior=match'] + MODEL_FLAGS[self.args.model]
+        flags += ['--enddate', self.args.enddate] if self.args.enddate else ['--enddate-clamp', 'last-complete-month-end']
+        flags += ['--config', str(Path(self.args.config).expanduser().resolve())] if self.args.config else []
+        flags += ['--nmondir', str(self.work / 'stage' / serial), '--cycle', str(cycle)]
+        run, elapsed = self.profile('analysis %d of 2 (%s)' % (position, self.args.model), *flags)
+        ok = self.check(run.returncode == 0, 'analysis %d (frame %s): exit %d, %.0f s' % (position, serial, run.returncode, elapsed))
+        if not ok:
+            self.say('      ' + '\n      '.join(run.stderr.strip().splitlines()[-6:]))
+        return ok
+
+    def finalise(self, cycle, label):
+        run, elapsed = self.profile(label, '--finalise-cycle', str(cycle))
+        self.check(run.returncode == 0, '%s: exit %d, %.2f s' % (label, run.returncode, elapsed))
+        if run.returncode != 0:
+            self.say('      ' + '\n      '.join(run.stderr.strip().splitlines()[-6:]))
+        return run.returncode
+
+    def registrations(self, cycle):
+        return {r['system']: r for r in (load(p) for p in sorted((cycle / 'runs').glob('*.%s.json' % self.args.model)))}
+
+    def outputs(self, registration):
+        return {o['kind']: o['path'] for o in registration['outputs']}
+
+    def hashes(self, cycle):
+        return {(serial, kind): sha(path) for serial, reg in self.registrations(cycle).items() for kind, path in self.outputs(reg).items()}
+
+    def row(self, registration, lpar):
+        with open(self.outputs(registration)['csv'], newline='') as fh:
+            return next((r for r in csv.DictReader(fh) if r.get('VM') == lpar), None)
+
+    def one_cycle(self, name, order):
+        """Analyses, finalisation and the checks of one cycle. Returns {standby: (ENT, VPs, action)} or None."""
+        cycle = self.work / name
+        self.say('')
+        self.say('%s: frames analysed in the order %s, then %s' % (name, order[0], order[1]))
+        for position, serial in enumerate(order, 1):
+            if not self.analyse(cycle, serial, position):
+                return None
+        regs = self.registrations(cycle)
+        if not self.check(len(regs) == 2, 'both analyses registered in the cycle (%d of 2)' % len(regs)):
+            return None
+        pending = [(serial, p) for serial, reg in regs.items() for p in reg.get('pending', [])]
+        self.check(bool(pending), 'standbys whose primary is on the other frame: %d' % len(pending))
+        if not pending:
+            self.say('      Nothing to finalise. Check ha_peer and ha_sizing = standby_share in etc/nfit.vms.cfg, and that the')
+            self.say('      roles were resolved (PowerHA Roles in the rationale of the standby\'s frame).')
+        provisional = {}
+        for serial, p in pending:
+            row = self.row(regs[serial], p['lpar']) or {}
+            provisional[p['lpar']] = (row.get('NFIT - ENT'), row.get('NFIT - VCPU'))
+            self.check((row.get('NFIT - Action') or '').startswith('Provisional: the PowerHA floor'),
+                       '%s is provisional before finalisation (%s / %s)' % (p['lpar'], row.get('NFIT - ENT'), row.get('NFIT - VCPU')))
+
+        if self.finalise(cycle, 'finalisation') != 0:
+            return None
+        final = {}
+        for serial, p in pending:
+            lpar = p['lpar']
+            row = self.row(regs[serial], lpar) or {}
+            member = load(self.outputs(regs[serial])['plan']).get('members', {}).get(lpar, {})
+            state = member.get('finalisation', {})
+            final[lpar] = (row.get('NFIT - ENT'), row.get('NFIT - VCPU'), row.get('NFIT - Action'))
+            self.check(state.get('state') == 'resolved', '%s on %s, primary %s: %s / %s provisional, now %s / %s; %s' % (
+                lpar, serial, p.get('primary'), provisional[lpar][0], provisional[lpar][1], row.get('NFIT - ENT'), row.get('NFIT - VCPU'),
+                ('set from the primary\'s analysis' if state.get('state') == 'resolved' else 'UNRESOLVED: %s' % state.get('reason'))))
+            self.say('      Action: %s' % row.get('NFIT - Action'))
+            published = member.get('published', {})
+            self.check((published.get('entitlement'), str(published.get('VPs')), published.get('action'))
+                       == (row.get('NFIT - ENT'), row.get('NFIT - VCPU'), row.get('NFIT - Action')), '%s: CSV row and saved plan agree' % lpar)
+            rationale = Path(self.outputs(regs[serial])['rationale']).read_text(errors='replace')
+            self.check(rationale.count('Cycle Finalisation (planning cycle') == 1 and
+                       re.search(r'%s: \S+ / \S+ provisional, now %s / %s\.' % (re.escape(lpar), re.escape(row.get('NFIT - ENT') or ''), re.escape(row.get('NFIT - VCPU') or '')),
+                                 rationale[rationale.rfind('Cycle Finalisation (planning cycle'):]) is not None,
+                       '%s: the rationale\'s Cycle Finalisation block states the same pair' % lpar)
+
+        self.evidence(cycle)
+        before = self.hashes(cycle)
+        if self.finalise(cycle, 'second finalisation') == 0:
+            self.check(self.hashes(cycle) == before, 'second finalisation: no output changed (%d files compared)' % len(before))
+        self.say('  Cycle status:')
+        self.say('      ' + '\n      '.join((cycle / 'cycle-status.txt').read_text().strip().splitlines()))
+        self.say('  Cycle on disk: %.0f KB in %d files' % (size_of(cycle) / 1024.0, sum(1 for p in cycle.rglob('*') if p.is_file())))
+        return final
+
+
+def day(epoch):
+    return time.strftime('%d %b %Y', time.gmtime(epoch)) if isinstance(epoch, (int, float)) else '?'
+
+
+def shown(value):
+    """A stored entitlement as the CSV shows it (two decimals), or None."""
+    try:
+        return round(float(value), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def evidence_methods():
+    def evidence(self, cycle):
+        """From the saved results only: where each standby's floor came from, and whether the outputs agree on the pools."""
+        regs = self.registrations(cycle)
+        plans = {serial: load(self.outputs(reg)['plan']) for serial, reg in regs.items()}
+        self.say('  Where each floor came from (saved plans of both frames):')
+        for serial, reg in sorted(regs.items()):
+            for p in reg.get('pending', []):
+                self.role_lines(p, serial, plans)
+        self.say('  Pools and totals after finalisation (CSV, saved plan, rationale block):')
+        for serial, reg in sorted(regs.items()):
+            if reg.get('pending'):
+                self.pool_lines(serial, reg, plans[serial])
+
+    def role_lines(self, p, serial, plans):
+        lpar, primary = p['lpar'], p.get('primary')
+        member = plans[serial].get('members', {}).get(lpar, {})
+        role, proof = member.get('role', {}), member.get('roleEvidence', {})
+        frame = next((f for f in p.get('primaryFrames', []) if f in plans), None)
+        source = plans.get(frame, {})
+        partner = source.get('members', {}).get(primary, {})
+        profile = partner.get('planningProfile')
+        own = (partner.get('profiles', {}).get(profile) or {})
+        held = partner.get('role') if (partner.get('role') or {}).get('type') == 'haHold' else None
+        expected = shown(own.get('entitlement'))
+        if held and shown(held.get('entitlement')) is not None and (expected is None or shown(held['entitlement']) > expected):
+            expected = shown(held['entitlement'])
+        used = shown((role.get('primaryTarget') or {}).get('entitlement'))
+        self.say('    %s (frame %s):' % (lpar, serial))
+        self.check(used is not None and expected is not None and abs(used - expected) < 0.006,
+                   'its floor is %s%% of %s: the %s target of %s on frame %s (planning profile %s, %s VPs)%s' % (
+                       ('%d' % round(100 * role.get('share', 0))), used, ('held' if held and expected != shown(own.get('entitlement')) else 'own-workload'),
+                       primary, frame, profile, own.get('recommendedVPs'), '' if expected == used else '; that plan states %s' % expected))
+        theirs = partner.get('roleEvidence', {})
+        for name, e in ((lpar, proof), (primary, theirs)):
+            r = e.get('role', {})
+            self.say('      %s: role %s (%s); configured %s, inferred %s' % (name, r.get('effective'), r.get('source'), r.get('configured'), r.get('inferred')))
+        self.check((proof.get('role', {}).get('effective'), theirs.get('role', {}).get('effective')) == ('standby', 'active')
+                   and sorted(proof.get('cluster', [])) == sorted(theirs.get('cluster', [])),
+                   'both frames read the cluster alike: %s standby, %s active' % (lpar, primary))
+        window = proof.get('window', {})
+        moves = proof.get('transitions', [])
+        lasting = [t for t in moves if t.get('sustained')]
+        self.say('      Role evidence: %s to %s (%s); handovers seen: %d sustained, %d short%s' % (
+            day(window.get('start')), day((window.get('end') or 0) - 1), proof.get('metric'), len(lasting), len(moves) - len(lasting),
+            (', %d with a configuration change at the same time' % sum(1 for t in moves if t.get('ambiguous'))) if any(t.get('ambiguous') for t in moves) else ''))
+        if lasting:
+            last = lasting[-1]
+            since = last.get('to') or last.get('from')
+            self.say('      Latest role period: from %s to the end of the evidence (%.0f days); the workload moved to %s then' % (
+                day(since), ((window.get('end') or since) - since) / 86400.0, last.get('rises')))
+        else:
+            self.say('      Latest role period: the whole evidence (%.0f days); no sustained handover in it' % (
+                ((window.get('end') or 0) - (window.get('start') or 0)) / 86400.0))
+        span = source.get('window', {})
+        self.say('      Sizing of %s: workload of %s to %s (%s)%s' % (primary, span.get('start'), span.get('end'), source.get('model') or self.args.model,
+                 ('; %.0f days of it before the latest handover' % ((since - window.get('start', since)) / 86400.0)) if lasting else '; all of it in the present roles'))
+        self.say('      Handover treatment: %s %s; %s %s' % (
+            primary, ('reductions held since %s' % day(held.get('since'))) if held else (theirs.get('sizing', {}).get('treatment') or 'none'),
+            lpar, proof.get('sizing', {}).get('treatment') or 'none'))
+
+    def pool_lines(self, serial, reg, plan):
+        files = self.outputs(reg)
+        with open(files['csv'], newline='') as fh:
+            rows = list(csv.DictReader(fh))
+        members = plan.get('members', {})
+        text = Path(files['rationale']).read_text(errors='replace')
+        block = ' '.join(text[text.rfind('Cycle Finalisation (planning cycle'):].split())
+        number = lambda v: shown(v) if shown(v) is not None else None
+        pool_of = lambda r: (r.get('Pool ID') or '').strip()
+        in_csv, in_plan = {}, {}
+        for r in rows:
+            if re.fullmatch(r'\d+', pool_of(r)) and int(pool_of(r)) != 0:
+                ent = number(r.get('NFIT - ENT')) if number(r.get('NFIT - ENT')) is not None else number(r.get('Current - ENT'))
+                bucket = in_csv.setdefault(str(int(pool_of(r))), {'cycle': 0.0, 'alert': 0, 'rows': 0, 'first': 0})
+                bucket['cycle'] += ent or 0
+                bucket['rows'] += 1
+                bucket['alert'] += 1 if '[POOL_SHORTFALL]' in (r.get('VM_Comments') or '') else 0
+                bucket['first'] += 1 if re.search(r'raise the maximum of pool \S+ from', r.get('NFIT - Action') or '') else 0
+        for name, m in members.items():
+            pm = m.get('poolMember') or {}
+            try:
+                pool = str(int(float(pm.get('pool_id'))))
+            except (TypeError, ValueError):
+                continue
+            if pool == '0':
+                continue
+            current = number(pm.get('current_ent'))
+            bucket = in_plan.setdefault(pool, {'cycle': 0.0, 'target': 0.0, 'alert': 0, 'first': 0})
+            bucket['cycle'] += (number(pm.get('cycle_ent')) if number(pm.get('cycle_ent')) is not None else current) or 0
+            bucket['target'] += (number(pm.get('proposed_ent')) if number(pm.get('proposed_ent')) is not None else current) or 0
+            published = m.get('published') or {}
+            bucket['alert'] += 1 if '[POOL_SHORTFALL]' in (published.get('comments') or '') else 0
+            bucket['first'] += 1 if re.search(r'raise the maximum of pool \S+ from', published.get('action') or '') else 0
+        self.say('    Frame %s:' % serial)
+        same = sum(1 for r in rows if (members.get(r.get('VM'), {}).get('published') or {}).get('action') == r.get('NFIT - Action')
+                   and str((members.get(r.get('VM'), {}).get('published') or {}).get('comments') or '') == (r.get('VM_Comments') or ''))
+        self.check(same == len(rows), 'action and comments of every CSV row are those of the saved plan (%d of %d rows)' % (same, len(rows)))
+        stated = list(re.finditer(r'Pool (\S+): entitlements ([\d.]+) this cycle, ([\d.]+) at the targets; maximum (.*?)\.(?= (?:Pool \S+: entitlements|Entitlement of all|Unresolved|\[End))', block))
+        if not stated:
+            self.say('      No user-defined pool holds a standby of this frame: the block states no pool.')
+        for m in stated:
+            pool, cycle, target, rest = m.group(1), float(m.group(2)), float(m.group(3)), m.group(4)
+            c, q = in_csv.get(pool, {}), in_plan.get(pool, {})
+            short = 'raise it to at least' in rest
+            self.check(abs(c.get('cycle', -1) - cycle) < 0.011 and abs(q.get('cycle', -1) - cycle) < 0.011 and abs(q.get('target', -1) - target) < 0.011,
+                       'pool %s: %.2f this cycle and %.2f at the targets in the block; CSV %.2f; saved plan %.2f and %.2f' % (
+                           pool, cycle, target, c.get('cycle', float('nan')), q.get('cycle', float('nan')), q.get('target', float('nan'))))
+            self.check(c.get('alert') == q.get('alert') == (c.get('rows') if short else 0) and c.get('first') == q.get('first'),
+                       'pool %s: maximum %s; [POOL_SHORTFALL] on %s of %s CSV rows (saved plan %s); "first raise the pool" on %s rows (saved plan %s)' % (
+                           pool, rest, c.get('alert'), c.get('rows'), q.get('alert'), c.get('first'), q.get('first')))
+        total = re.search(r'Entitlement of all LPARs: installed ([\d.]+), current cycle ([\d.]+), target ([\d.]+)\.', block)
+        installed = sum(number(r.get('Current - ENT')) or 0 for r in rows)
+        cycle = sum((number(r.get('NFIT - ENT')) if number(r.get('NFIT - ENT')) is not None else number(r.get('Current - ENT'))) or 0 for r in rows)
+        self.check(total is not None and abs(float(total.group(1)) - installed) < 0.011 and abs(float(total.group(2)) - cycle) < 0.011,
+                   'frame totals: block installed %s, current cycle %s, target %s; CSV installed %.2f, current cycle %.2f' % (
+                       (total.group(1), total.group(2), total.group(3), installed, cycle) if total else ('?', '?', '?', installed, cycle)))
+
+    Acceptance.evidence, Acceptance.role_lines, Acceptance.pool_lines = evidence, role_lines, pool_lines
+
+
+evidence_methods()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Acceptance of a planning cycle and its finalisation on two frames of one PowerHA cluster.')
+    parser.add_argument('systems', nargs='*', metavar='sys_PSEUDONYM', help='the two frames, in the order of analysis')
+    parser.add_argument('--captures', type=Path, default=(Path(os.environ['NFIT_CAPTURES']) if os.environ.get('NFIT_CAPTURES') else None),
+                        help='capture root searched for */stage (default: $NFIT_CAPTURES)')
+    parser.add_argument('--stage', action='append', type=Path, help='a stage directory to search instead; repeatable')
+    parser.add_argument('--model', choices=sorted(MODEL_FLAGS), default='hybrid-state-decay', help='the standard model to run (default: %(default)s)')
+    parser.add_argument('--enddate', help='analysis end date for both frames (default: the last complete month end)')
+    parser.add_argument('--config', help='VM configuration file passed to nfit-profile (--config)')
+    parser.add_argument('--both-orders', action='store_true', help='also run a second cycle in the opposite order and compare (doubles the run time)')
+    parser.add_argument('--work', type=Path, help='parent directory of the work tree (default: the system temporary directory)')
+    parser.add_argument('--keep', action='store_true', help='keep the work tree (it holds customer data)')
+    parser.add_argument('--read', type=Path, metavar='WORK', help='report from a kept work tree (cycle-1); nothing is run or changed')
+    parser.add_argument('--force', action='store_true', help='run even when nfit.vms.cfg names no PowerHA peer or standby share')
+    args = parser.parse_args()
+    if args.read:
+        work, out = args.read.expanduser().resolve(), []
+        if not (work / 'cycle-1' / 'cycle.json').is_file():
+            parser.error('--read: no kept work tree with a cycle there.')
+        run = Acceptance(work, args, out)
+        models = sorted({p.name.split('.')[-2] for p in (work / 'cycle-1' / 'runs').glob('*.json')})
+        args.model = models[0] if models else args.model
+        out.append('Planning cycle acceptance, read from the kept results (model %s; nothing run)' % args.model)
+        run.evidence(work / 'cycle-1')
+        out.append('')
+        out.append('Result: %s' % ('all checks passed' if run.failed == 0 else '%d check%s FAILED' % (run.failed, '' if run.failed == 1 else 's')))
+        filtered = subprocess.run([sys.executable, str(REPO / 'dev' / 'nfit-redact'), '--extra-root', str(work),
+                                   '--vm-config', str(work / 'etc' / 'nfit.vms.cfg')], input='\n'.join(out) + '\n', capture_output=True, text=True)
+        if filtered.returncode != 0:
+            print('The privacy filter could not run; the report is withheld.', file=sys.stderr)
+            return 2
+        sys.stdout.write(filtered.stdout)
+        return 0 if run.failed == 0 else 1
+    if len(args.systems) != 2:
+        parser.error('Name the two frames (sys_ pseudonyms), or give --read WORK.')
+    for pseudonym in args.systems:
+        if not re.fullmatch(r'sys_[0-9a-f]{6,64}', pseudonym):
+            parser.error('Expected two sys_ pseudonyms.')
+    if args.systems[0] == args.systems[1]:
+        parser.error('Name two different frames.')
+    if not args.stage and args.captures is None:
+        parser.error('Say where the staged captures are: --captures DIR (or NFIT_CAPTURES), or --stage DIR.')
+    stages = [p.expanduser() for p in args.stage] if args.stage else sorted(p for p in args.captures.expanduser().glob('*/stage') if p.is_dir())
+    if not stages or any(not p.is_dir() for p in stages):
+        parser.error('No stage directory found. Give --captures or --stage.')
+
+    peer, share = config_ready(REPO / 'etc' / 'nfit.vms.cfg')
+    if not (peer and share) and not args.force:
+        raise SystemExit('etc/nfit.vms.cfg: %s. Without both, no standby is sized from its primary and there is nothing to finalise.\n'
+                         'Add them, or run with --force.' % '; '.join(
+                             ([] if peer else ['no ha_peer is set']) + ([] if share else ['ha_sizing = standby_share is not set'])))
+
+    name_of = namer()
+    sources = [locate(stages, pseudonym, name_of) for pseudonym in args.systems]
+    work = Path(tempfile.mkdtemp(prefix='nfit-cycle-acceptance-', dir=(str(args.work.expanduser()) if args.work else None)))
+    out = []
+    status = 2
+    try:
+        for program in ('nfit', 'nfit-profile'):
+            shutil.copy2(REPO / program, work / program)
+        shutil.copytree(REPO / 'etc', work / 'etc')
+        for folder in ('stage', 'output'):
+            (work / folder).mkdir()
+        print('Cloning the two captures into the work tree ...', file=sys.stderr, flush=True)
+        for source in sources:
+            clone(source, work / 'stage' / source.name)
+        order = [source.name for source in sources]
+
+        run = Acceptance(work, args, out)
+        out.append('Planning cycle acceptance: model %s, %s' % (args.model, ('end date ' + args.enddate) if args.enddate else 'end date the last complete month end'))
+        first = run.one_cycle('cycle-1', order)
+        if args.both_orders and first is not None:
+            second = run.one_cycle('cycle-2', order[::-1])
+            out.append('')
+            out.append('Order of analysis:')
+            if second is not None:
+                run.check(first == second and bool(first), 'both orders give the same final entitlement, VPs and action for %d standby%s'
+                          % (len(first), '' if len(first) == 1 else 's'))
+        out.append('')
+        out.append('Result: %s' % ('all checks passed' if run.failed == 0 else '%d check%s FAILED' % (run.failed, '' if run.failed == 1 else 's')))
+        status = 0 if run.failed == 0 else 1
+        # The report leaves only through the privacy filter, with this work tree's names in its vocabulary.
+        filtered = subprocess.run([sys.executable, str(REPO / 'dev' / 'nfit-redact'), '--extra-root', str(work),
+                                   '--vm-config', str(work / 'etc' / 'nfit.vms.cfg')], input='\n'.join(out) + '\n', capture_output=True, text=True)
+        if filtered.returncode != 0:
+            print('The privacy filter could not run; the report is withheld.', file=sys.stderr)
+            return 2
+        sys.stdout.write(filtered.stdout)
+    finally:
+        if args.keep:
+            print('Work tree kept (customer data): %s' % work, file=sys.stderr)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+    return status
+
+
+if __name__ == '__main__':
+    sys.exit(main())
