@@ -19,7 +19,7 @@ my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
 for my $name (qw(_ha_role_rules _ha_median_mad _ha_percentile _ha_blocks _ha_detect_pair _ha_resolve_roles
-                 _ha_cluster_policy _ha_standby_target _ha_sizing_plan))
+                 _ha_cluster_policy _ha_standby_target _ha_sizing_plan _safe_dig _comparable_argv _ha_peer_plan_mismatch))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
@@ -241,5 +241,36 @@ is_deeply(UUT::_ha_sizing_plan($cl, { Sizing => 'standby_share' }), {}, 'plan: u
 $cl->{Roles} = $roles_as->(pa => 'multiple', pb => 'multiple');
 is_deeply(UUT::_ha_sizing_plan($cl, { Sizing => 'standby_share' }), {}, 'plan: multiple active - independent');
 is_deeply(UUT::_ha_sizing_plan({ Members => [qw(a b c)], Roles => {} }, { Sizing => 'standby_share' }), {}, 'plan: three nodes - independent');
+
+# -- A primary's stored plan is used only when it is the plan of this analysis --
+is_deeply(UUT::_comparable_argv([qw(--runq-perc-behavior=match --nmondir /x/stage/A -v --enddate 2026-09-21 --mgsys=A --decay-over-states -vv)]),
+          [qw(--runq-perc-behavior=match --enddate 2026-09-21 --decay-over-states)], 'options: the frame and verbosity are left out, the order kept');
+my %files = (engine => 'e1', profiler => 'p1', profiles => 'f1', tiers => 't1', vmConfig => undef, seasonality => 's1');
+my $peer_plan = sub
+{
+    my (%over) = @_;
+    return { window => { end => '2026-09-21' }, inputRevision => { data => 'rev:abc' },
+             settings => { argv => [qw(--nmondir /x/B --enddate 2026-09-21)], filesSHA256 => { %files }, guaranteePolicy => 'tier',
+                           contestedLevel => 'off', vmFilter => undef, %{ $over{settings} // {} } },
+             members => { pb => { installedEntitlement => 1.5, installedVPs => 4,
+                                  roleEvidence => { cluster => [qw(pa pb)], role => { effective => 'active' },
+                                                    sizing => { policy => 'standby_share', share => 0.25 } }, %{ $over{member} // {} } } },
+             %{ $over{top} // {} } };
+};
+my %want = (end => '2026-09-21', argv => [qw(--enddate 2026-09-21)], files => { %files }, guaranteePolicy => 'tier', contestedLevel => 'off',
+            revision => 'rev:abc', installed => { Ent => 1.5, VP => 4 }, role => 'active', members => [qw(pb pa)], sizing => 'standby_share', share => 0.25);
+is(UUT::_ha_peer_plan_mismatch($peer_plan->(), 'pb', \%want), undef, 'peer plan: the plan of this analysis is used');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(top => { window => { end => '2026-08-31' } }), 'pb', \%want), qr/another analysis end/, 'peer plan: another analysis end');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(settings => { vmFilter => 'pb' }), 'pb', \%want), qr/selected LPARs only/, 'peer plan: not a whole-frame run');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(settings => { filesSHA256 => { %files, profiles => 'f2' } }), 'pb', \%want), qr/other configuration files/, 'peer plan: another profile file');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(settings => { filesSHA256 => { %files, vmConfig => 'c1' } }), 'pb', \%want), qr/other configuration files/, 'peer plan: a file this run did not have');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(settings => { argv => [qw(--nmondir /x/B --enddate 2026-09-21 --no-cut-protection)] }), 'pb', \%want), qr/other options/, 'peer plan: other options');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(settings => { guaranteePolicy => 'none' }), 'pb', \%want), qr/other options/, 'peer plan: another guarantee policy');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(top => { inputRevision => { data => 'rev:zzz' } }), 'pb', \%want), qr/other data/, 'peer plan: other data than the role evidence read');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(member => { installedEntitlement => 2.0 }), 'pb', \%want), qr/installed configuration differs/, 'peer plan: the primary installed differently');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(member => { roleEvidence => { cluster => [qw(pa pb)], role => { effective => 'standby' }, sizing => { policy => 'standby_share', share => 0.25 } } }), 'pb', \%want),
+     qr/roles differently/, 'peer plan: the roles read differently');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(member => { roleEvidence => undef }), 'pb', \%want), qr/roles differently/, 'peer plan: no role evidence');
+like(UUT::_ha_peer_plan_mismatch($peer_plan->(), 'px', \%want), qr/does not hold it/, 'peer plan: the primary is not in it');
 
 done_testing();

@@ -14238,23 +14238,78 @@ sub _ha_sizing_plan
 }
 
 # ==============================================================================
+# SUBROUTINE: _ha_peer_plan_mismatch
+# PURPOSE:    Why a stored proposal of a primary's frame is not the plan of this
+#             analysis, or undef when it is. A plan counts only when it was made
+#             to the same analysis end, for the whole frame, with the same
+#             options, executables and configuration files, on the data this
+#             run's role evidence read for that frame, with the primary
+#             installed as this run saw it, and with the same reading of the
+#             cluster's roles and policy. Pure.
+# ARGUMENTS:  1. stored proposal (decoded)  2. primary name
+#             3. hashref { end, argv, files, guaranteePolicy, contestedLevel,
+#                revision, installed {Ent, VP}, role, members, sizing, share }
+# RETURNS:    reason (string) or undef
+# ==============================================================================
+sub _ha_peer_plan_mismatch
+{
+    my ($doc, $vm, $want) = @_;
+    my $member = _safe_dig($doc, 'members', $vm);
+    return 'its saved plan does not hold it' unless (ref($member) eq 'HASH');
+    return 'its saved plans are of another analysis end' unless ((_safe_dig($doc, 'window', 'end') // '') eq ($want->{end} // ''));
+    my $settings = (ref($doc->{settings}) eq 'HASH') ? $doc->{settings} : {};
+    return 'its saved plan covers selected LPARs only' if (defined $settings->{vmFilter});
+    my $same = sub { my ($x, $y) = @_; return (defined $x ? (defined $y && $x eq $y) : !defined $y) ? 1 : 0; };
+    foreach my $key (sort keys %{ { %{ $want->{files} // {} }, %{ (ref($settings->{filesSHA256}) eq 'HASH') ? $settings->{filesSHA256} : {} } } })
+    {
+        return 'its saved plan was made with another nFit or other configuration files'
+            unless ($same->($want->{files}{$key}, _safe_dig($settings, 'filesSHA256', $key)));
+    }
+    return 'its saved plan was made with other options'
+        unless (join("\0", @{ _comparable_argv($settings->{argv}) }) eq join("\0", @{ $want->{argv} // [] })
+                && $same->($want->{guaranteePolicy}, $settings->{guaranteePolicy})
+                && $same->($want->{contestedLevel}, $settings->{contestedLevel}));
+    return 'its saved plan was made on other data'
+        unless (defined $want->{revision} && (_safe_dig($doc, 'inputRevision', 'data') // '') eq $want->{revision});
+    my $installed = $want->{installed} // {};
+    return 'its installed configuration differs from its saved plan'
+        unless (looks_like_number($installed->{Ent} // '') && looks_like_number($member->{installedEntitlement} // '')
+                && abs($installed->{Ent} - $member->{installedEntitlement}) < 0.005
+                && $same->((defined $installed->{VP} ? 0 + $installed->{VP} : undef),
+                           (looks_like_number($member->{installedVPs} // '') ? 0 + $member->{installedVPs} : undef)));
+    my $evidence = $member->{roleEvidence};
+    return 'its saved plan read the cluster roles differently'
+        unless (ref($evidence) eq 'HASH'
+                && (_safe_dig($evidence, 'role', 'effective') // '') eq ($want->{role} // '')
+                && join("\0", sort @{ (ref($evidence->{cluster}) eq 'ARRAY') ? $evidence->{cluster} : [] }) eq join("\0", sort @{ $want->{members} // [] })
+                && (_safe_dig($evidence, 'sizing', 'policy') // '') eq ($want->{sizing} // '')
+                && abs((_safe_dig($evidence, 'sizing', 'share') // -1) - ($want->{share} // 0)) < 1e-9);
+    return undef;
+}
+
+# ==============================================================================
 # SUBROUTINE: _ha_peer_target
 # PURPOSE:    A primary's planning-profile target from its own system's stored
-#             proposals, read only: the snapshot of the same model whose
-#             period ends latest on or before this run's period end. Without
+#             proposals, read only: the newest snapshot of the same model that
+#             is the plan of this analysis (_ha_peer_plan_mismatch). Without
 #             one, the primary's installed entitlement from its states, marked
-#             as a fallback (not a measured requirement).
+#             as a fallback (not a measured requirement), with the reason.
 # ARGUMENTS:  1. cache directories of the primary (arrayref)  2. primary name
 #             3. model  4. this run's period end (epoch, exclusive)
 #             5. the primary's states (arrayref)
+#             6. what a plan must match (hashref; revisions by cache name)
 # RETURNS:    hashref { Ent, VP, Profile, Source (proposal | installed),
-#             WindowEnd, Snapshot } or undef
+#             WindowEnd, Snapshot, Reason (installed only) } or undef
 # ==============================================================================
 sub _ha_peer_target
 {
-    my ($dirs_aref, $vm, $model, $end_epoch, $states_aref) = @_;
+    my ($dirs_aref, $vm, $model, $end_epoch, $states_aref, $want) = @_;
     my $end_ymd = gmtime($end_epoch - 1)->ymd;
-    my @candidates;
+    my ($latest) = sort { ($b->{start_epoch} // 0) <=> ($a->{start_epoch} // 0) } grep { ref($_) eq 'HASH' } @{ $states_aref // [] };
+    my $meta = ($latest && ref($latest->{metadata}) eq 'HASH') ? $latest->{metadata} : {};
+    my %installed = (Ent => (looks_like_number($meta->{entitlement} // '') ? $meta->{entitlement} + 0 : undef),
+                     VP => (looks_like_number($meta->{virtual_cpus} // '') ? $meta->{virtual_cpus} + 0 : undef));
+    my (@candidates, $reason);
     foreach my $dir (@{ $dirs_aref // [] })
     {
         my $store = File::Spec->catdir($dir, '.nfit.store', 'proposals', 'v1', $model);
@@ -14271,36 +14326,42 @@ sub _ha_peer_target
             };
             next unless (ref($doc) eq 'HASH' && ref($doc->{members}) eq 'HASH' && ref($doc->{members}{$vm}) eq 'HASH');
             my $window_end = (ref($doc->{window}) eq 'HASH') ? ($doc->{window}{end} // '') : '';
-            next unless ($window_end ne '' && $window_end le $end_ymd);
-            push @candidates, [ $window_end, basename($file), $doc->{members}{$vm} ];
+            push @candidates, [ $window_end, ((stat($file))[9] // 0), basename($file), $doc,
+                                _safe_dig($want, 'revisions', basename($dir)) ];
         }
     }
-    if (@candidates)
+    # The plans of this analysis end first, the newest first; the first that matches is used.
+    foreach my $c (sort { ($b->[0] eq $end_ymd) <=> ($a->[0] eq $end_ymd) || $b->[1] <=> $a->[1] || $a->[2] cmp $b->[2] } @candidates)
     {
-        my ($best) = sort { $b->[0] cmp $a->[0] || $a->[1] cmp $b->[1] } @candidates;
-        my $member = $best->[2];
+        my $why = _ha_peer_plan_mismatch($c->[3], $vm, { %{ $want // {} }, end => $end_ymd, revision => $c->[4], installed => \%installed });
+        if (defined $why)
+        {
+            $reason //= $why;
+            next;
+        }
+        my $member = $c->[3]{members}{$vm};
         my $profile = $member->{planningProfile};
         my $p = (defined $profile && ref($member->{profiles}) eq 'HASH') ? $member->{profiles}{$profile} : undef;
-        if (ref($p) eq 'HASH' && defined $p->{entitlement} && looks_like_number($p->{entitlement}) && $p->{entitlement} > 0)
+        unless (ref($p) eq 'HASH' && defined $p->{entitlement} && looks_like_number($p->{entitlement}) && $p->{entitlement} > 0)
         {
-            my %target = (Ent => $p->{entitlement} + 0, VP => (looks_like_number($p->{recommendedVPs} // '') ? $p->{recommendedVPs} + 0 : undef),
-                          Profile => $profile, Source => 'proposal', WindowEnd => $best->[0], Snapshot => $best->[1]);
-            # A primary whose reductions were held after it took over: its
-            # target is diluted, so the held pair is the reference.
-            my $role = $member->{role};
-            if (ref($role) eq 'HASH' && ($role->{type} // '') eq 'haHold')
-            {
-                $target{Ent} = $role->{entitlement} + 0 if (looks_like_number($role->{entitlement} // '') && $role->{entitlement} > $target{Ent});
-                $target{VP}  = $role->{VPs} + 0 if (looks_like_number($role->{VPs} // '') && $role->{VPs} > ($target{VP} // 0));
-            }
-            return \%target;
+            $reason //= 'its saved plan holds no target for it';
+            next;
         }
+        my %target = (Ent => $p->{entitlement} + 0, VP => (looks_like_number($p->{recommendedVPs} // '') ? $p->{recommendedVPs} + 0 : undef),
+                      Profile => $profile, Source => 'proposal', WindowEnd => $c->[0], Snapshot => $c->[2]);
+        # A primary whose reductions were held after it took over: its
+        # target is diluted, so the held pair is the reference.
+        my $role = $member->{role};
+        if (ref($role) eq 'HASH' && ($role->{type} // '') eq 'haHold')
+        {
+            $target{Ent} = $role->{entitlement} + 0 if (looks_like_number($role->{entitlement} // '') && $role->{entitlement} > $target{Ent});
+            $target{VP}  = $role->{VPs} + 0 if (looks_like_number($role->{VPs} // '') && $role->{VPs} > ($target{VP} // 0));
+        }
+        return \%target;
     }
-    my ($latest) = sort { ($b->{start_epoch} // 0) <=> ($a->{start_epoch} // 0) } grep { ref($_) eq 'HASH' } @{ $states_aref // [] };
-    my $meta = ($latest && ref($latest->{metadata}) eq 'HASH') ? $latest->{metadata} : {};
-    return undef unless (looks_like_number($meta->{entitlement} // '') && $meta->{entitlement} > 0);
-    return { Ent => $meta->{entitlement} + 0, VP => (looks_like_number($meta->{virtual_cpus} // '') ? $meta->{virtual_cpus} + 0 : undef),
-             Source => 'installed' };
+    return undef unless (defined $installed{Ent} && $installed{Ent} > 0);
+    return { Ent => $installed{Ent}, VP => $installed{VP}, Source => 'installed',
+             Reason => ($reason // 'its frame has no saved plan of this analysis') };
 }
 
 # ==============================================================================
@@ -14380,7 +14441,11 @@ sub _apply_ha_sizing
                 else
                 {
                     $target = _ha_peer_target($cluster->{DirsOf}{$primary}, $primary, $model, $cluster->{Window}[1],
-                        $cluster->{StatesOf}{$primary});
+                        $cluster->{StatesOf}{$primary},
+                        { argv => _comparable_argv(\@original_argv), files => _run_file_hashes(), guaranteePolicy => $guarantee_policy,
+                          contestedLevel => (_contested_level_on() ? $CONTESTED_LEVEL_RULE : 'off'), revisions => $cluster->{Caches},
+                          role => $cluster->{Roles}{$primary}{Effective}, members => $cluster->{Members},
+                          sizing => $policy->{Sizing}, share => $policy->{Share} });
                 }
                 if (!$target || !defined $target->{Ent} || $target->{Ent} <= 0)
                 {
@@ -14403,7 +14468,7 @@ sub _apply_ha_sizing
                            OwnTargetEnt => $own_ent, OwnTargetVP => $own_vp, Floor => $st->{Floor}, Share => $policy->{Share},
                            Primary => $primary, PrimaryTargetEnt => $target->{Ent}, PrimaryTargetVP => $target->{VP},
                            PrimarySource => $target->{Source}, PrimaryWindowEnd => $target->{WindowEnd},
-                           PrimarySnapshot => $target->{Snapshot}, Pair => $pair);
+                           PrimarySnapshot => $target->{Snapshot}, PrimaryReason => $target->{Reason}, Pair => $pair);
             }
             else
             {
@@ -14448,7 +14513,8 @@ sub _apply_ha_sizing
                         ? (primary => $result{Primary}, share => $result{Share}, floor => $result{Floor},
                            primaryTarget => { entitlement => $result{PrimaryTargetEnt}, VPs => $result{PrimaryTargetVP},
                                               source => $result{PrimarySource}, windowEnd => $result{PrimaryWindowEnd},
-                                              snapshot => $result{PrimarySnapshot} })
+                                              snapshot => $result{PrimarySnapshot},
+                                              (defined $result{PrimaryReason} ? (reason => $result{PrimaryReason}) : ()) })
                         : (since => $result{Since})),
                 };
             }
@@ -17505,17 +17571,47 @@ sub _load_candidate_snapshot
     return $record;
 }
 
+# SHA-256 of the executables and configuration files of this run, as a stored proposal states
+# them (undef for a file that is not there).
+sub _run_file_hashes
+{
+    require Digest::SHA;
+    my %files = (engine => $nfit_script_path, profiler => abs_path($0),
+                 profiles => $profiles_config_path_to_load, tiers => "$script_dir/etc/nfit.vms.cfg",
+                 vmConfig => $vm_config_file_path, seasonality => $seasonality_config_path);
+    return { map { my $f = $files{$_};
+        $_ => (defined($f) && -f $f ? Digest::SHA->new(256)->addfile($f, 'b')->hexdigest : undef)
+    } keys %files };
+}
+
+# A run's command line without the options that name the frame or only change what is printed
+# (--nmondir, the system options, verbosity), in the order given: what two runs of different
+# frames must share to have been made with the same options. Pure.
+sub _comparable_argv
+{
+    my ($argv) = @_;
+    my @kept;
+    my @words = @{ $argv // [] };
+    while (@words)
+    {
+        my $word = shift @words;
+        if ($word =~ /^--?(?:nmondir|mgsys|system|serial|host)(=.*)?$/)
+        {
+            shift @words unless (defined $1);        # its value is the next word
+            next;
+        }
+        next if ($word =~ /^-(?:v+|d|-verbose|-debug)$/);
+        push @kept, $word;
+    }
+    return \@kept;
+}
+
 sub _publish_tactical_proposals
 {
     my ($cache, $model, $start, $end, $members, $copy_path, $context) = @_;
     require Digest::SHA;
     my $revision = _proposal_revision($cache);
-    my %files = (engine => $nfit_script_path, profiler => abs_path($0),
-                 profiles => $profiles_config_path_to_load, tiers => "$script_dir/etc/nfit.vms.cfg",
-                 vmConfig => $vm_config_file_path, seasonality => $seasonality_config_path);
-    my %hashes = map { my $f = $files{$_};
-        $_ => (defined($f) && -f $f ? Digest::SHA->new(256)->addfile($f, 'b')->hexdigest : undef)
-    } keys %files;
+    my %hashes = %{ _run_file_hashes() };
     my $payload = JSON->new->utf8->canonical->encode({
         schemaVersion => 2, system => basename($cache), model => $model, window => {start => $start, end => $end},
         inputRevision => $revision, settings => { argv => \@original_argv, filesSHA256 => \%hashes,
