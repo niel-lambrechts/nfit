@@ -19,7 +19,7 @@ my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
 for my $name (qw(_ha_role_rules _ha_median_mad _ha_percentile _ha_blocks _ha_detect_pair _ha_resolve_roles
-                 _ha_member_frame _ha_standby_policy _ha_standby_target _ha_sizing_plan _safe_dig _option_differences _ha_peer_plan_mismatch))
+                 _ha_member_frame _ha_member_states _ha_plan_dirs _ha_standby_policy _ha_standby_target _ha_sizing_plan _safe_dig _option_differences _ha_peer_plan_mismatch))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
@@ -262,6 +262,30 @@ is(UUT::_ha_member_frame(['/s/FRAME_B', '/s/FRAME_A'], { FRAME_A => $T0, FRAME_B
 is(UUT::_ha_member_frame(['/s/FRAME_A', '/s/FRAME_B'], { FRAME_A => $T0 + 3600, FRAME_B => $T0 }), undef, 'member frame: sampled on two frames at the end - not established');
 is(UUT::_ha_member_frame(['/s/FRAME_A', '/s/FRAME_B'], {}), undef, 'member frame: named on two frames, sampled on none - not established');
 is(UUT::_ha_member_frame(['/s/FRAME_A', '/s/FRAME_B'], { FRAME_B => $T0 }), 'FRAME_B', 'member frame: sampled on one of two');
+
+# A member's configuration states when it is named on more than one frame (it moved, B15).
+my $old = [ { start_epoch => $T0, end_epoch => $T0 + 20 * $DAY, metadata => { entitlement => 2 } } ];              # runs to the capture end (D-025)
+my $new = [ { start_epoch => $T0 + 10 * $DAY, end_epoch => $T0 + 20 * $DAY, metadata => { entitlement => 3 } } ];
+my $ms = UUT::_ha_member_states({ FRAME_A => $old }, { FRAME_A => $T0 + 5 * $DAY });
+is_deeply($ms, $old, 'member states: on one frame, as staged');
+$ms = UUT::_ha_member_states({ FRAME_A => $old, FRAME_B => $new }, { FRAME_A => $T0 + 10 * $DAY - 60, FRAME_B => $T0 + 20 * $DAY - 60 });
+is_deeply([ map { [ $_->{metadata}{entitlement}, $_->{start_epoch}, $_->{end_epoch} ] } sort { $a->{start_epoch} <=> $b->{start_epoch} } @$ms ],
+          [ [ 2, $T0, $T0 + 10 * $DAY ], [ 3, $T0 + 10 * $DAY, $T0 + 20 * $DAY ] ],
+          'member states: moved - the frame it left counts to its last sample there; no overlap with the frame that holds it');
+is($old->[0]{end_epoch}, $T0 + 20 * $DAY, 'member states: the staged state is not altered');
+my ($latest) = sort { $b->{start_epoch} <=> $a->{start_epoch} } @$ms;
+is($latest->{metadata}{entitlement}, 3, 'member states: the latest state is that of the frame that holds it');
+$ms = UUT::_ha_member_states({ FRAME_A => $old, FRAME_B => $new }, { FRAME_B => $T0 + 20 * $DAY - 60 });
+is_deeply([ map { $_->{metadata}{entitlement} } @$ms ], [3], 'member states: a frame that did not sample it in the period contributes nothing');
+$ms = UUT::_ha_member_states({ FRAME_A => $old, FRAME_B => $new }, {});
+is(scalar(@$ms), 2, 'member states: sampled on no frame - all states stand, as staged');
+$ms = UUT::_ha_member_states({ FRAME_A => [ @$old, { start_epoch => $T0 + 15 * $DAY, end_epoch => $T0 + 20 * $DAY, metadata => { entitlement => 9 } } ], FRAME_B => $new },
+                             { FRAME_A => $T0 + 10 * $DAY - 60, FRAME_B => $T0 + 20 * $DAY - 60 });
+ok(!(grep { $_->{metadata}{entitlement} == 9 } @$ms), 'member states: a state that begins after the frame last sampled it is left out');
+
+is_deeply(UUT::_ha_plan_dirs(['/s/FRAME_A', '/s/FRAME_B'], 'FRAME_B'), ['/s/FRAME_B'], 'plan dirs: a moved primary - the frame that holds it');
+is_deeply(UUT::_ha_plan_dirs(['/s/FRAME_A', '/s/FRAME_B'], undef), ['/s/FRAME_A', '/s/FRAME_B'], 'plan dirs: frame not established - every frame that names it');
+is_deeply(UUT::_ha_plan_dirs(['/s/FRAME_A'], 'FRAME_A'), ['/s/FRAME_A'], 'plan dirs: one frame');
 
 my $st = UUT::_ha_standby_target(0.12, 1, 2.40, 0.25);
 is_deeply([ @$st{qw(Floor TargetEnt TargetVP FloorBinds)} ], [0.60, 0.60, 1, 1], 'standby: 25% of 2.40 is the floor above own 0.12');
