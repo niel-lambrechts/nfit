@@ -40,10 +40,22 @@
 #            ha_sizing = standby_share. Without them no standby is sized from
 #            its primary and there is nothing to finalise; the tool stops before
 #            the analyses unless --force.
+#
+#            --standby-fixed sys_PSEUDONYM=ENT gives one of the two frames a
+#            fixed standby entitlement for this run: a [MGSYS:<frame>] stanza
+#            (ha_sizing = standby_fixed, standby_entitlement = ENT) is added to
+#            the work tree's copy of nfit.vms.cfg only. The tool resolves the
+#            frame's name itself; etc/nfit.vms.cfg is not changed. Each standby
+#            on that frame is then checked: it takes the fixed figure (or waits
+#            in a conflict, with a valid pair), is final at analysis, is not
+#            touched by finalisation, and both orders agree. An LPAR whose own
+#            stanza sets ha_sizing keeps its own policy; the report says which
+#            source each standby's policy came from.
 # USAGE    : dev/planning-cycle-acceptance sys_FIRST sys_SECOND
 #                --captures DIR | --stage DIR ... [--model MODEL]
 #            (NFIT_CAPTURES may hold the capture root; no location is built in)
 #                [--enddate YYYY-MM-DD] [--config FILE] [--both-orders]
+#                [--standby-fixed sys_PSEUDONYM=ENT]
 #                [--work DIR] [--keep] [--force]
 #            dev/planning-cycle-acceptance --read WORK
 # ==============================================================================
@@ -196,9 +208,10 @@ class Acceptance:
         if not self.check(len(regs) == 2, 'both analyses registered in the cycle (%d of 2)' % len(regs)):
             return None
         pending = [(serial, p) for serial, reg in regs.items() for p in reg.get('pending', [])]
-        self.check(bool(pending), 'standbys whose primary is on the other frame: %d' % len(pending))
-        if not pending:
-            self.say('      Nothing to finalise. Check ha_peer and ha_sizing = standby_share in etc/nfit.vms.cfg, and that the')
+        fixed_before = self.fixed_standbys(regs, {lpar for _, p in pending for lpar in [p['lpar']]})
+        self.check(bool(pending) or bool(fixed_before), 'standbys whose primary is on the other frame: %d' % len(pending))
+        if not pending and not fixed_before:
+            self.say('      Nothing to finalise and no fixed standby. Check ha_peer and ha_sizing (standby_share, or --standby-fixed) and that the')
             self.say('      roles were resolved (PowerHA Roles in the rationale of the standby\'s frame).')
         provisional = {}
         for serial, p in pending:
@@ -229,6 +242,12 @@ class Acceptance:
                                  rationale[rationale.rfind('Cycle Finalisation (planning cycle'):]) is not None,
                        '%s: the rationale\'s Cycle Finalisation block states the same pair' % lpar)
 
+        # A fixed standby is final at analysis: finalisation leaves its row as it was.
+        fixed_after = self.fixed_standbys(regs, set(), quiet=True)
+        for lpar in sorted(fixed_before):
+            self.check(fixed_after.get(lpar) == fixed_before[lpar], '%s: finalisation left the fixed standby\'s entitlement, VPs and action unchanged' % lpar)
+        final.update(fixed_after)
+
         self.evidence(cycle)
         before = self.hashes(cycle)
         if self.finalise(cycle, 'second finalisation') == 0:
@@ -240,6 +259,59 @@ class Acceptance:
             self.say('  Allocation footprint (cycle-footprint.txt):')
             self.say('      ' + '\n      '.join((cycle / 'cycle-footprint.txt').read_text().rstrip().splitlines()))
         return final
+
+
+def fixed_methods():
+    def fixed_standbys(self, regs, pending_lpars, quiet=False):
+        """The standbys sized on a fixed standby entitlement, checked from CSV and saved plan: {lpar: (ENT, VPs, action)}."""
+        found = {}
+        wanted = getattr(self, 'fixed', {})
+        for serial, reg in sorted(regs.items()):
+            members = load(self.outputs(reg)['plan']).get('members', {})
+            here = {lpar: m for lpar, m in members.items() if (m.get('role') or {}).get('type') == 'haStandbyFixed'}
+            if serial in wanted and not quiet:
+                self.check(bool(here), 'frame %s: standbys on the fixed standby entitlement %.2f asked for this run: %d' % (serial, wanted[serial], len(here)))
+                others = sorted(lpar for lpar, m in members.items() if (m.get('role') or {}).get('type') == 'haStandby')
+                if others:
+                    self.say('      Standbys of this frame still sized on a share of their primary (their own stanza sets the policy): %s' % ', '.join(others))
+            for lpar, member in sorted(here.items()):
+                role, row = member['role'], (self.row(reg, lpar) or {})
+                found[lpar] = (row.get('NFIT - ENT'), row.get('NFIT - VCPU'), row.get('NFIT - Action'))
+                if quiet:
+                    continue
+                source = {'lpar': 'its own stanza', 'mgsys': 'the managed-system stanza', 'global': '[GLOBAL]'}.get(role.get('source'), role.get('source'))
+                self.say('    Fixed standby %s on %s: %.2f from %s; installed %s / %s, own workload needs %s on %s VP(s)' % (
+                    lpar, serial, role.get('fixedEntitlement'), source, row.get('Current - ENT'), row.get('Current - VCPU'),
+                    shown((role.get('ownRequirement') or {}).get('entitlement')), (role.get('ownRequirement') or {}).get('VPs')))
+                if serial in wanted:
+                    self.check(abs(role.get('fixedEntitlement', -1) - wanted[serial]) < 0.005 if role.get('source') == 'mgsys' else True,
+                               '%s: %s' % (lpar, 'the figure is the one asked for this run' if role.get('source') == 'mgsys'
+                                           else 'its policy comes from %s, which takes precedence over the managed-system stanza' % source))
+                self.check(role.get('managedSystem') == serial, '%s: the policy was resolved for the frame that holds it' % lpar)
+                self.check(lpar not in pending_lpars and 'pendingRole' not in member, '%s: final at analysis, not pending in the cycle' % lpar)
+                try:
+                    ent, vps = float(row.get('NFIT - ENT')), int(row.get('NFIT - VCPU'))
+                    cur_ent, cur_vps = float(row.get('Current - ENT')), int(row.get('Current - VCPU'))
+                except (TypeError, ValueError):
+                    self.check(False, '%s: the CSV row has no pair' % lpar)
+                    continue
+                self.check(0.05 * vps - 1e-9 <= ent <= vps + 1e-9, '%s: %.2f on %d VPs is a pair PowerVM accepts' % (lpar, ent, vps))
+                comments, action = row.get('VM_Comments') or '', row.get('NFIT - Action') or ''
+                if 'conflict' in role:
+                    self.check('[STANDBY_FIXED_CONFLICT]' in comments and abs(ent - cur_ent) < 0.005 and vps <= cur_vps
+                               and bool(role.get('vpStepOnly')) == (vps < cur_vps),
+                               '%s: the fixed figure waits (%s); entitlement kept at %.2f, VPs %d to %d' % (lpar, role['conflict'], ent, cur_vps, vps))
+                else:
+                    self.check('[STANDBY_FIXED]' in comments and abs(ent - role.get('fixedEntitlement', -1)) < 0.005,
+                               '%s: set to the fixed %.2f on %d VPs (installed %.2f / %d)' % (lpar, ent, vps, cur_ent, cur_vps))
+                self.check('Its own workload needs' in action and 'apacity at takeover is arranged outside nFit and is not verified' in action,
+                           '%s: the action states the own-workload requirement and that takeover capacity is not verified' % lpar)
+                self.say('      Action: %s' % action)
+                published = member.get('published', {})
+                self.check((published.get('entitlement'), str(published.get('VPs')), published.get('action')) == found[lpar],
+                           '%s: CSV row and saved plan agree' % lpar)
+        return found
+    return fixed_standbys
 
 
 def day(epoch):
@@ -443,6 +515,7 @@ def evidence_methods():
 
 
 evidence_methods()
+Acceptance.fixed_standbys = fixed_methods()
 
 
 def main():
@@ -459,6 +532,8 @@ def main():
     parser.add_argument('--keep', action='store_true', help='keep the work tree (it holds customer data)')
     parser.add_argument('--read', type=Path, metavar='WORK', help='report from a kept work tree (cycle-1); nothing is run or changed')
     parser.add_argument('--force', action='store_true', help='run even when nfit.vms.cfg names no PowerHA peer or standby share')
+    parser.add_argument('--standby-fixed', action='append', default=[], metavar='sys_PSEUDONYM=ENT',
+                        help='give this frame a fixed standby entitlement in the work tree copy of nfit.vms.cfg only; repeatable')
     args = parser.parse_args()
     if args.read:
         work, out = args.read.expanduser().resolve(), []
@@ -494,11 +569,19 @@ def main():
     if not stages or any(not p.is_dir() for p in stages):
         parser.error('No stage directory found. Give --captures or --stage.')
 
+    fixed_for = {}
+    for item in args.standby_fixed:
+        match = re.fullmatch(r'(sys_[0-9a-f]{6,64})=(\d+(?:\.\d{1,2})?|\.\d{1,2})', item)
+        if not match or match.group(1) not in args.systems or float(match.group(2)) < 0.05:
+            parser.error('--standby-fixed takes one of the two frames and an entitlement of 0.05 or more, as sys_PSEUDONYM=0.10.')
+        fixed_for[match.group(1)] = float(match.group(2))
+
     peer, share = config_ready(REPO / 'etc' / 'nfit.vms.cfg')
+    share = share or bool(fixed_for)
     if not (peer and share) and not args.force:
         raise SystemExit('etc/nfit.vms.cfg: %s. Without both, no standby is sized from its primary and there is nothing to finalise.\n'
                          'Add them, or run with --force.' % '; '.join(
-                             ([] if peer else ['no ha_peer is set']) + ([] if share else ['ha_sizing = standby_share is not set'])))
+                             ([] if peer else ['no ha_peer is set']) + ([] if share else ['ha_sizing = standby_share is not set and no --standby-fixed is given'])))
 
     name_of = namer()
     sources = [locate(stages, pseudonym, name_of) for pseudonym in args.systems]
@@ -515,9 +598,24 @@ def main():
         for source in sources:
             clone(source, work / 'stage' / source.name)
         order = [source.name for source in sources]
+        # A fixed standby entitlement for this run goes into the work tree's copy of the configuration only.
+        fixed = {source.name: fixed_for[pseudonym] for pseudonym, source in zip(args.systems, sources) if pseudonym in fixed_for}
+        if fixed:
+            config = work / 'etc' / 'nfit.vms.cfg'
+            text = config.read_text(errors='replace') if config.is_file() else ''
+            for serial in fixed:
+                if re.search(r'^\s*\[\s*MGSYS\s*:\s*%s\s*\]' % re.escape(serial), text, re.I | re.M):
+                    raise SystemExit('etc/nfit.vms.cfg already has a managed-system stanza for one of the frames named in --standby-fixed. '
+                                     'Run without --standby-fixed for that frame, or remove the stanza for the test.')
+            with open(config, 'a') as fh:
+                for serial, value in sorted(fixed.items()):
+                    fh.write('\n[MGSYS:%s]\nha_sizing = standby_fixed\nstandby_entitlement = %.2f\n' % (serial, value))
 
         run = Acceptance(work, args, out)
+        run.fixed = fixed
         out.append('Planning cycle acceptance: model %s, %s' % (args.model, ('end date ' + args.enddate) if args.enddate else 'end date the last complete month end'))
+        for serial, value in sorted(fixed.items()):
+            out.append('Fixed standby entitlement %.2f for frame %s, in the work tree copy of nfit.vms.cfg only.' % (value, serial))
         first = run.one_cycle('cycle-1', order)
         if args.both_orders and first is not None:
             second = run.one_cycle('cycle-2', order[::-1])

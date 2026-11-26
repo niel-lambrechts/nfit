@@ -102,6 +102,38 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
             self.assertNotIn(name, run.stderr)
         self.assertEqual(tree_hash(self.capture), before)                              # the capture is not written to
 
+    def test_a_fixed_standby_entitlement_for_the_run_is_checked_in_both_orders(self):
+        # The standby's frame is given a fixed standby entitlement in the work tree's copy of the configuration only.
+        with open(os.path.join(self.repo, 'etc', 'nfit.vms.cfg')) as fh:
+            config = fh.read()
+        run = self.tool(self.standby, self.primary, '--both-orders', '--enddate', self.last, '--standby-fixed', self.standby + '=0.15')
+        self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
+        report = run.stdout
+        self.assertIn('Result: all checks passed', report)
+        self.assertNotIn('FAIL', report)
+        self.assertIn('Fixed standby entitlement 0.15 for frame %s, in the work tree copy of nfit.vms.cfg only.' % self.standby, report)
+        self.assertRegex(report, r'\[ok\] frame %s: standbys on the fixed standby entitlement 0\.15 asked for this run: 1' % self.standby)
+        self.assertRegex(report, r'Fixed standby vm_[0-9a-f]{6} on %s: 0\.15 from the managed-system stanza; installed 1\.50 / 4, own workload needs \S+ on \d VP' % self.standby)
+        self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.15 on 3 VPs \(installed 1\.50 / 4\)')
+        self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: final at analysis, not pending in the cycle')
+        self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: finalisation left the fixed standby\'s entitlement, VPs and action unchanged')
+        self.assertIn('[ok] both orders give the same final entitlement, VPs and action for 1 standby', report)
+        for name in ('SYSHA1', 'SYSHA2', 'hanodeA', 'hanodeB'):
+            self.assertNotIn(name, report)
+        with open(os.path.join(self.repo, 'etc', 'nfit.vms.cfg')) as fh:
+            self.assertEqual(fh.read(), config)                                         # the repository's configuration is not changed
+
+    def test_a_fixed_figure_that_waits_is_reported_as_such(self):
+        run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.10')
+        self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
+        self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: the fixed figure waits \(0\.10 carries at most 2 VPs .*\); entitlement kept at 1\.50, VPs 4 to 3')
+        self.assertIn('Result: all checks passed', run.stdout)
+
+    def test_a_frame_outside_the_run_is_refused_for_a_fixed_entitlement(self):
+        run = self.tool(self.standby, self.primary, '--standby-fixed', 'sys_000000=0.10')
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('--standby-fixed takes one of the two frames', run.stderr)
+
     def test_the_saved_results_are_read_again_without_a_run(self):
         run = self.tool(self.standby, self.primary, '--enddate', self.last, '--model', 'state-based', '--keep', '--work', self.root)
         self.assertEqual(run.returncode, 0, run.stdout[-2500:] + run.stderr[-800:])
