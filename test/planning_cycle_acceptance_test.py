@@ -116,10 +116,13 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         self.assertRegex(report, r'Fixed standby policy, vm_[0-9a-f]{6} on %s \(primary vm_[0-9a-f]{6}, role inferred\): 0\.15 from the managed-system stanza; installed 1\.50 / 4, own workload needs \S+ on 2 VPs' % self.standby)
         self.assertRegex(report, r'VP requirements: strategic 2 \(run-queue width \S+, peak-throughput floor \S+, configured-burst floor \S+\); VPs that preserve the installed entitlement 2 ')
         self.assertRegex(report, r'reduction safety CLEAR \(.*\); 0\.15 carries at most 3 VPs')
+        self.assertRegex(report, r'Guarantee check of the strategic pair: Yes \(.+\)')
         self.assertRegex(report, r'Sustained workload \(at least 1\.00 cores for a full hour, PhysC, since \d\d \w+ 2026\): 0 day\(s\); not found')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.15 on 2 VPs \(installed 1\.50 / 4\)')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: the VPs are no fewer than its workload needs \(2\) and no more than the fixed figure carries')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: final at analysis, not pending in the cycle')
+        # The active node of the pair is on the other frame; a PowerHA node the policy did not reach is listed with its role.
+        self.assertRegex(report, r'PowerHA nodes of sys_[0-9a-f]{6} outside the fixed standby policy \(1\):\n\s+vm_[0-9a-f]{6} \(cluster with vm_[0-9a-f]{6}\): role active \(inferred; configured auto, inferred active\)')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: finalisation left the fixed standby\'s entitlement, VPs and action unchanged')
         self.assertIn('[ok] both orders give the same final entitlement, VPs and action for 1 standby', report)
         for name in ('SYSHA1', 'SYSHA2', 'hanodeA', 'hanodeB'):
