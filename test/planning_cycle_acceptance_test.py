@@ -132,9 +132,17 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
 
     def test_a_fixed_figure_goes_with_the_vps_the_workload_needs(self):
         # 0.10 carries two VPs and the standby's workload needs two: set at once, past the step of 4 to 3.
-        run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.10')
+        run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.10', '--keep', '--work', self.root)
         self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
         self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.10 on 2 VPs \(installed 1\.50 / 4\)')
+        # The kept results give the same lines again without a run, and the PowerHA nodes the policy did not reach.
+        work = re.search(r'Work tree kept \(customer data\): (\S+)', run.stderr).group(1)
+        again = subprocess.run([sys.executable, os.path.join(self.repo, 'dev', TOOL), '--read', work], capture_output=True, text=True, env=self.env)
+        self.assertEqual(again.returncode, 0, again.stderr[-600:])
+        self.assertIn('  Fixed standby entitlement (saved plans of both frames):', again.stdout)
+        self.assertRegex(again.stdout, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.10 on 2 VPs \(installed 1\.50 / 4\)')
+        self.assertRegex(again.stdout, r'PowerHA nodes of %s outside the fixed standby policy \(1\):\n\s+vm_[0-9a-f]{6} \(cluster with vm_[0-9a-f]{6}\): role active \(inferred; configured auto, inferred active\)' % self.primary)
+        self.assertIn('Result: all checks passed', again.stdout)
         self.assertIn('The workload supports fewer VPs; the previous limit came from preserving installed entitlement.', run.stdout)
         self.assertIn('Result: all checks passed', run.stdout)
 
@@ -172,6 +180,7 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         again = subprocess.run([sys.executable, os.path.join(self.repo, 'dev', TOOL), '--read', work], capture_output=True, text=True, env=self.env)
         self.assertEqual(again.returncode, 0, again.stderr[-600:])
         self.assertIn('read from the kept results (model state-based; nothing run)', again.stdout)
+        self.assertIn('No standby under a fixed standby entitlement in these results.', again.stdout)
         self.assertIn(report[report.index('  Where each floor'):report.index('  [ok] second finalisation')], again.stdout)
         self.assertEqual(tree_hash(work), before)
         for name in ('SYSHA1', 'SYSHA2', 'hanodeA', 'hanodeB'):
