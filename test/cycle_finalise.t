@@ -235,7 +235,7 @@ like($all, qr/Model: hybrid-state-decay \(primary view\)\n-+\n  Not analysed in 
 like($all, qr/^  FA\s+4\s+5\.00\s+7\.00\s+6\.00\s+9\/8\/10\s+final$/m, 'a frame: installed, full and cycle apart');
 like($all, qr/of which VIOS\s+1\s+1\.00\s+2\.00\s+1\.50/, 'VIOS shown as part of the frame, not added to it');
 like($all, qr/Standbys across frames: 1 set, 2 UNRESOLVED/, 'unresolved standbys are stated on their frame');
-like(join(' ', map { s/^\s+//r } @$text), qr/Not counted: 1 LPAR last sampled before the analysis end \(48 days earlier\), installed entitlement 19\.00\. It appears to have left the frame; its recommendation in the CSV is not an action for this frame\./, 'the LPAR that left is named as not counted');
+like(join(' ', map { s/^\s+//r } @$text), qr/Not counted: 1 LPAR last sampled before the analysis end \(48 days earlier\), installed entitlement 19\.00\. It is marked \[HISTORIC\] in the CSV: its figures are a record, not an action for this frame\./, 'the LPAR that left is named as not counted');
 like($frames->[1], qr/,"9","8","10","1","19\.00",/, 'frame file: LPARs that left and their installed entitlement');
 like($all, qr/^  FC\s+not analysed$/m, 'an expected frame that was not analysed is listed without figures');
 like($all, qr/Frames analysed\s+10\.00\s+14\.00\s+12\.00\s+\(2 frames analysed; a sum of entitlements, not a capacity statement\)/, 'the sum over frames is labelled as no capacity statement');

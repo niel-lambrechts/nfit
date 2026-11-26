@@ -3250,6 +3250,17 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         # per system before proceeding to the next.
         if (@vm_order) {
             my %proposals;
+            # Which LPARs are still on the frame at the analysis end (B15): those no longer sampled keep
+            # their row as a record and are left out of the totals, the pool check and the footprint.
+            my $sample_spans = _sample_spans($current_cache_path);
+            foreach my $vm (@vm_order)
+            {
+                next unless (ref($assimilation_map_ref->{$vm}) eq 'HASH');
+                my $span = ($sample_spans && ref($sample_spans->{$vm}) eq 'HASH') ? $sample_spans->{$vm} : {};
+                my $end_ymd = ($run_end_date_obj // $effective_end_date_obj)->ymd;
+                $assimilation_map_ref->{$vm}{Presence} = { %$span, left => (_lpar_present($span->{lastDay}, $end_ymd) ? 0 : 1),
+                                                           daysBefore => _days_before_end($span->{lastDay}, $end_ymd) };
+            }
             # PowerHA role evidence (v10 stage 3.1b, steps 6c/6d): worked out
             # before the CSV, because the role-aware sizing is applied there.
             my $role_evidence = [];
@@ -3337,15 +3348,16 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             # Each LPAR's last sampled day (from the engine's sample store manifest: no data is read again) and
             # its role in the totals go into the saved plan, so that a planning cycle's footprint counts the
             # LPARs that were on the frame at the analysis end.
-            my $last_sampled = _last_sampled_days($current_cache_path);
             foreach my $vm (keys %proposals)
             {
                 next unless (ref($proposals{$vm}) eq 'HASH');
-                $proposals{$vm}{lastSampled} = $last_sampled->{$vm} if ($last_sampled && defined $last_sampled->{$vm});
+                my $presence = _safe_dig($assimilation_map_ref, $vm, 'Presence') // {};
+                $proposals{$vm}{lastSampled} = $presence->{lastDay} if (defined $presence->{lastDay});
+                $proposals{$vm}{sampled}     = { first => $presence->{first}, last => $presence->{last} } if (defined $presence->{last});
                 $proposals{$vm}{estateRole}  = $lpar_roles{$vm} if (defined $lpar_roles{$vm} && $lpar_roles{$vm} ne '');
             }
             $FRAME_SHARED_CAPACITY = _frame_shared_capacity($assimilation_map_ref,
-                [ grep { _lpar_present(($last_sampled ? $last_sampled->{$_} : undef), $run_end_date_obj->ymd) } @vm_order ]);
+                [ grep { !_safe_dig($assimilation_map_ref, $_, 'Presence', 'left') } @vm_order ]);
             my $proposal_copy = _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
                 $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals,
                 File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.proposal.%s.json',
@@ -14896,6 +14908,7 @@ sub _collect_structural_findings
     {
         next unless (exists $map_ref->{$vm_name} && ref($map_ref->{$vm_name}) eq 'HASH');
         my $vm_map  = $map_ref->{$vm_name};
+        next if (ref($vm_map->{Presence}) eq 'HASH' && $vm_map->{Presence}{left});      # no longer on the frame (B15)
         my $cfg     = (exists $vm_map->{Configuration} && ref($vm_map->{Configuration}) eq 'HASH') ? $vm_map->{Configuration} : {};
         my $core    = (exists $vm_map->{CoreResults}   && ref($vm_map->{CoreResults}) eq 'HASH')   ? $vm_map->{CoreResults}   : {};
         my $hinting = (exists $vm_map->{Hinting}       && ref($vm_map->{Hinting}) eq 'HASH')       ? $vm_map->{Hinting}       : {};
@@ -15085,6 +15098,12 @@ sub _entitlement_totals
             my $cfg  = (ref($vm_map->{Configuration}) eq 'HASH') ? $vm_map->{Configuration} : {};
             my $core = (ref($vm_map->{CoreResults}) eq 'HASH')   ? $vm_map->{CoreResults}   : {};
             my $installed = $number->($cfg->{entitlement});
+            if (ref($vm_map->{Presence}) eq 'HASH' && $vm_map->{Presence}{left})
+            {                                                # no longer on the frame (B15): stated apart
+                $totals{Left}{Count}++;
+                $totals{Left}{Installed} = ($totals{Left}{Installed} // 0) + $in_cents->($installed // 0) / 100;
+                next;
+            }
             if (!defined $installed)
             {
                 $totals{NoInstalled}++;
@@ -15199,6 +15218,12 @@ sub _log_entitlement_totals
         push @out, _rationale_wrap(sprintf('%d LPAR%s without a planning-profile result %s counted at the installed '
             . 'entitlement in the current-cycle and target totals.', $totals->{Held},
             ($totals->{Held} == 1 ? '' : 's'), ($totals->{Held} == 1 ? 'is' : 'are')), '  ', '  ');
+    }
+    if (ref($totals->{Left}) eq 'HASH' && $totals->{Left}{Count})
+    {
+        push @out, _rationale_wrap(sprintf('Not counted: %d LPAR%s no longer sampled on this frame at the analysis end, installed '
+            . 'entitlement %.2f (marked [HISTORIC] in the CSV).', $totals->{Left}{Count}, ($totals->{Left}{Count} == 1 ? '' : 's'),
+            $totals->{Left}{Installed}), '  ', '  ');
     }
     if ($totals->{NoInstalled})
     {
@@ -17648,6 +17673,13 @@ sub _write_standard_csv_report {
     foreach my $pending (@pending_csv_rows)
     {
         my ($row_vm, $row, $planner_cells) = @$pending;
+        # An LPAR no longer sampled on this frame: its row is a record, marked as such (B15).
+        my $presence = _safe_dig($assimilation_map_ref, $row_vm, 'Presence');
+        if (ref($presence) eq 'HASH' && $presence->{left})
+        {
+            $planner_cells->{'NFIT - Action'} = _historic_action($presence, $planner_cells->{'NFIT - Action'}) if (ref($planner_cells) eq 'HASH');
+            unshift @{ $structural_tags->{$row_vm} }, '[HISTORIC]';
+        }
         # The row's own action and comments, before the notes that depend on the other LPARs of its pool.
         my $own_action = (ref($planner_cells) eq 'HASH') ? $planner_cells->{'NFIT - Action'} : undef;
         my $own_comments = defined $idx_vm_comments ? $row->[$idx_vm_comments] : undef;
@@ -18344,10 +18376,11 @@ sub _frame_shared_capacity
     return \%out;
 }
 
-# The last day each LPAR has samples on, from the manifest of the engine's sample store (a small file;
-# the staged data is not read). undef when there is no store, or it is older than the staged data.
-# Workaround for D-025: a migrated LPAR's configuration state runs to the end of the capture.
-sub _last_sampled_days
+# When each LPAR was sampled on this frame, from the manifest of the engine's sample store (a small
+# file; the staged data is not read): { LPAR => { first, last (epochs), lastDay } }. undef when there
+# is no store, or it is older than the staged data. A configuration state does not show an LPAR that
+# left the frame (D-025: its last state runs to the end of the capture); the samples do.
+sub _sample_spans
 {
     my ($cache) = @_;
     my $manifest = File::Spec->catfile($cache, '.nfit.store', 'samples', 'store.json');
@@ -18356,13 +18389,27 @@ sub _last_sampled_days
     return undef if (@data && $store[9] < $data[9]);
     my $store = _cycle_read_json($manifest);
     return undef unless (ref($store) eq 'HASH' && !$store->{unusable} && ref($store->{vms}) eq 'HASH');
-    my %last;
+    my %span;
     foreach my $vm (keys %{ $store->{vms} })
     {
-        my ($day) = reverse sort grep { /^\d{4}-\d{2}-\d{2}$/ } keys %{ (ref($store->{vms}{$vm}) eq 'HASH' ? $store->{vms}{$vm}{days} : undef) // {} };
-        $last{$vm} = $day if (defined $day);
+        my $days = (ref($store->{vms}{$vm}) eq 'HASH' && ref($store->{vms}{$vm}{days}) eq 'HASH') ? $store->{vms}{$vm}{days} : {};
+        my @dates = sort grep { /^\d{4}-\d{2}-\d{2}$/ && ref($days->{$_}) eq 'ARRAY' } keys %$days;
+        next unless (@dates);
+        $span{$vm} = { first => $days->{ $dates[0] }[0], last => $days->{ $dates[-1] }[1], lastDay => $dates[-1] };
     }
-    return \%last;
+    return \%span;
+}
+
+# The planning action of an LPAR that is no longer sampled on this frame: its figures stand as a
+# record of what it needed here; they are not an action for this frame. Neutral: sampling that
+# stopped is not proof of a move (a planning cycle's finalisation names the present frame). Pure.
+sub _historic_action
+{
+    my ($presence, $action) = @_;
+    my $since = (defined $presence->{lastDay} && $presence->{lastDay} =~ /^(\d{4})-(\d{2})-(\d{2})$/)
+        ? sprintf('%d %s %d', $3, (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$2 - 1], $1) : 'an earlier date';
+    return sprintf('Historic: not sampled on this frame since %s (%d days before the analysis end); not counted in this frame\'s totals.%s',
+                   $since, $presence->{daysBefore} // 0, ((defined $action && $action ne '') ? " As analysed: $action" : ''));
 }
 
 # Days between an LPAR's last sampled day and the analysis end; undef when either is not known. Pure.
@@ -18558,9 +18605,9 @@ sub _cycle_footprint_lines
             $counted++;
             $sum{$_} += _safe_dig($groups, 'All', $_) // 0 foreach (@bases);
             push @text, _rationale_wrap(sprintf('Not counted: %d LPAR%s last sampled before the analysis end (%s days earlier), installed entitlement %s. '
-                . '%s to have left the frame; %s recommendation in the CSV is not an action for this frame.', $f->{left}{Count},
+                . '%s marked [HISTORIC] in the CSV: %s figures are a record, not an action for this frame.', $f->{left}{Count},
                 ($f->{left}{Count} == 1 ? '' : 's'), join(', ', @{ $f->{left}{days} }), $two->($f->{left}{Installed}),
-                ($f->{left}{Count} == 1 ? 'It appears' : 'They appear'), ($f->{left}{Count} == 1 ? 'its' : 'their')), '    ', '      ') if ($f->{left}{Count});
+                ($f->{left}{Count} == 1 ? 'It is' : 'They are'), ($f->{left}{Count} == 1 ? 'its' : 'their')), '    ', '      ') if ($f->{left}{Count});
             push @text, '    Last sampled day not recorded for this frame: every LPAR analysed is counted.' unless ($f->{presenceKnown});
             foreach my $group ([ Vios => 'VIOS' ], [ Standby => 'PowerHA standbys' ])
             {
