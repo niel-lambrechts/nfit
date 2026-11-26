@@ -37,7 +37,8 @@ foreach my $name (qw(_safe_dig _cycle_canonical _option_differences _ha_peer_pla
                      _coarse_review_text _coarse_review_advisories _coarse_review_action _assess_pool_entitlement_feasibility
                      _structural_shown_value _pool_units_text _pool_prerequisites _structural_csv_tags _rationale_wrap quote_csv
                      _cycle_finalise_frame _cycle_finalise_lines _cycle_rewrite_csv
-                     _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines _days_before_end _lpar_present))
+                     _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines _days_before_end _lpar_present
+                     _plain_day _historic_action _cycle_membership))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n";
@@ -115,7 +116,7 @@ is($r->{rows}{x1}{comments}, '[POOL_SHORTFALL]; [VP_MISMATCH]; kept', 'so does t
 like($r->{rows}{sa}{action}, qr/pool 5 raised to at least 5 processing units|raise the maximum of pool 5 from .* to at least 5 processing units/,
      'the increase waits for the pool maximum');
 is_deeply([ @{ $r->{rows}{x1} }{qw(entitlement VPs action)} ], [ '1.50', 2, 'No change.' ], 'an LPAR that does not rise keeps its figures and action');
-ok(abs($r->{delta}{Target} - 1) < 1e-9, 'the frame totals move by the standby\'s change');
+ok(abs($r->{delta}{All}{Target} - 1) < 1e-9 && abs($r->{delta}{Standby}{Target} - 1) < 1e-9, 'the frame totals move by the standby\'s change');
 my $again = UUT::_cycle_finalise_frame($plan{planA}, $reg_a, { FA => $reg_a, FB => $reg_b }, {}, $plan_of, 'C1');
 is(UUT::_cycle_canonical($again->{doc}), UUT::_cycle_canonical($r->{doc}), 'finalising again gives the same plan: the floor does not compound');
 
@@ -201,7 +202,7 @@ my $frame = sub
         n1 => { installedVPs => 1, planningProfile => 'P', profiles => { P => {} }, poolMember => { pool_id => undef, current_ent => 0.5 } } } };
 };
 my $fp = UUT::_cycle_footprint_frame($frame->({ status => 'agreed', processors => 8, reporters => 1, values => { 8 => 1 } }));
-is_deeply($fp->{left}, { Count => 1, Installed => 19, days => [48] }, 'an LPAR last sampled 48 days before the analysis end is stated apart, with its entitlement');
+is_deeply($fp->{left}, { Count => 1, Moved => 0, Installed => 19, days => [48] }, 'an LPAR last sampled 48 days before the analysis end is stated apart, with its entitlement');
 is_deeply($fp->{groups}{All}, { Count => 4, Installed => 5, Full => 7, CurrentCycle => 6 }, 'the frame totals count the LPARs still there; one sampled the day before the end is there');
 is_deeply($fp->{groups}{Vios}, { Count => 1, Installed => 1, Full => 2, CurrentCycle => 1.5 }, 'VIOS subtotal from the role the analysis recorded');
 is(UUT::_cycle_footprint_frame($frame->(undef, g1 => '2026-10-29'))->{left}{Count}, 0, 'two days without samples at the end is not a departure');
@@ -235,13 +236,60 @@ like($all, qr/Model: hybrid-state-decay \(primary view\)\n-+\n  Not analysed in 
 like($all, qr/^  FA\s+4\s+5\.00\s+7\.00\s+6\.00\s+9\/8\/10\s+final$/m, 'a frame: installed, full and cycle apart');
 like($all, qr/of which VIOS\s+1\s+1\.00\s+2\.00\s+1\.50/, 'VIOS shown as part of the frame, not added to it');
 like($all, qr/Standbys across frames: 1 set, 2 UNRESOLVED/, 'unresolved standbys are stated on their frame');
-like(join(' ', map { s/^\s+//r } @$text), qr/Not counted: 1 LPAR last sampled before the analysis end \(48 days earlier\), installed entitlement 19\.00\. It is marked \[HISTORIC\] in the CSV: its figures are a record, not an action for this frame\./, 'the LPAR that left is named as not counted');
-like($frames->[1], qr/,"9","8","10","1","19\.00",/, 'frame file: LPARs that left and their installed entitlement');
+like(join(' ', map { s/^\s+//r } @$text), qr/Not counted: 1 LPAR last sampled before the analysis end \(48 days earlier\), installed entitlement 19\.00\. It is marked \[HISTORIC\] in the CSV: its figures are a record, not an action for this frame\. Of these, 0 moved to another frame analysed and 1 is seen on no other frame analysed \(not confirmed as moved or removed\)\./, 'the LPAR that left is named as not counted');
+like($frames->[1], qr/,"9","8","10","1","0","19\.00","0",/, 'frame file: LPARs that left (and how many are confirmed as moved), their installed entitlement, and LPARs on two frames');
 like($all, qr/^  FC\s+not analysed$/m, 'an expected frame that was not analysed is listed without figures');
 like($all, qr/Frames analysed\s+10\.00\s+14\.00\s+12\.00\s+\(2 frames analysed; a sum of entitlements, not a capacity statement\)/, 'the sum over frames is labelled as no capacity statement');
 unlike($all, qr/\bfits\b|procure|consolidat|spare/i, 'no fit, procurement, consolidation or spare-capacity wording');
 is(scalar(@$frames), 4, 'frame file: a header and one row per frame of the model');
 is(scalar(@$pools), 5, 'pool file: each pool of each analysed frame on its own row');
 like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement"$/, 'a pool row counts the LPARs still there: maximum, the three sums and the maximum each needs');
+
+# -- Where an LPAR is at the analysis end, across the frames of a cycle (B15) --
+my $t = sub { my ($ymd, $hms) = @_; return Time::Piece->strptime("$ymd " . ($hms // '00:00:00'), '%Y-%m-%d %H:%M:%S')->epoch; };
+my $span = sub { my ($from, $to, @time) = @_; return { first => $t->($from), last => $t->($to, ($time[0] // '23:59:00')), lastDay => $to }; };
+my $where = UUT::_cycle_membership({ FA => { m1 => $span->('2026-08-08', '2026-09-13', '10:00:00'), s1 => $span->('2026-08-08', '2026-09-13'),
+                                            c1 => $span->('2026-08-08', '2026-10-31'), l1 => $span->('2026-08-08', '2026-10-30', '09:00:00'),
+                                            a1 => $span->('2026-08-08', '2026-11-02', '08:00:00'), p1 => $span->('2026-08-08', '2026-10-31') },
+                                     FB => { m1 => { first => $t->('2026-09-13', '10:00:30'), last => $t->('2026-10-31', '23:59:00'), lastDay => '2026-10-31' },
+                                            c1 => $span->('2026-08-20', '2026-10-31'),
+                                            l1 => { first => $t->('2026-10-30', '09:05:00'), last => $t->('2026-10-31', '23:59:00'), lastDay => '2026-10-31' },
+                                            a1 => { first => $t->('2026-11-02', '08:01:00'), last => $t->('2026-11-05', '10:00:00'), lastDay => '2026-11-05' } } }, '2026-10-31');
+is_deeply($where->{FA}{m1}, { class => 'moved', to => 'FB', from => '2026-09-13', lastDay => '2026-09-13' }, 'a confirmed move: stopped on one frame as it began on the other');
+ok(!exists $where->{FB}{m1}, 'the frame it moved to holds it as an ordinary LPAR');
+is_deeply($where->{FA}{s1}, { class => 'unconfirmed', lastDay => '2026-09-13' }, 'collection stopped and no other frame shows it: not confirmed as moved');
+is_deeply([ $where->{FA}{c1}, $where->{FB}{c1} ], [ { class => 'conflict', with => 'FB' }, { class => 'conflict', with => 'FA' } ],
+          'sampled on two frames over the same time: a conflict on both, neither chosen');
+is($where->{FA}{l1}{class}, 'moved', 'a move in the last two days is settled from the sample times, not the days');
+ok(!exists $where->{FA}{a1} && !exists $where->{FB}{a1}, 'a move after the analysis end changes nothing: the LPAR is where it was at the end');
+ok(!exists $where->{FA}{p1}, 'an LPAR on one frame to the end needs no entry');
+like(UUT::_historic_action({ lastDay => '2026-09-13' }, 'Reduce entitlement 2.00 to 1.00.', $where->{FA}{m1}),
+     qr/^Historic: moved to frame FB \(last sampled on this frame 13 Sep 2026, sampled there from 13 Sep 2026\); its plan is the row on that frame\. Not counted in this frame's totals\. As analysed: Reduce entitlement 2\.00 to 1\.00\.$/,
+     'the historic action names the frame once the move is established');
+like(UUT::_historic_action({ lastDay => '2026-09-13', daysBefore => 48 }, undef), qr/^Historic: not sampled on this frame since 13 Sep 2026 \(48 days before the analysis end\); not counted in this frame's totals\.$/,
+     'without a destination the wording stays neutral');
+
+# A frame of the cycle with an LPAR that moved in the last two days (still counted by the analysis) and one on two frames.
+my $moved_doc = $standby_doc->();
+$moved_doc->{members}{x1}{lastSampled} = '2026-09-20';
+$moved_doc->{members}{x1}{estateRole} = '';
+$moved_doc->{members}{sa}{lastSampled} = '2026-09-21';
+$plan{planM} = $moved_doc;
+my $reg_m = { system => 'FA', model => 'state-based', plan => 'planM', peers => { FB => { %capture_b } }, pending => [ { lpar => 'sa', primary => 'pb' } ] };
+my $mv = UUT::_cycle_finalise_frame($plan{planM}, $reg_m, { FA => $reg_m, FB => $reg_b }, {}, $plan_of, 'C1',
+                                    { x1 => { class => 'moved', to => 'FB', from => '2026-09-20', lastDay => '2026-09-20' } }, {});
+like($mv->{rows}{x1}{action}, qr/^Historic: moved to frame FB \(last sampled on this frame 20 Sep 2026, sampled there from 20 Sep 2026\); its plan is the row on that frame\./, 'the row of the LPAR that moved becomes historic and names the frame');
+is($mv->{rows}{x1}{entitlement}, '1.50', 'its figures stay as a record');
+like($mv->{rows}{x1}{comments}, qr/^\[HISTORIC\]; /, 'and the row is tagged');
+is_deeply($mv->{delta}{ExclStandby}, { Count => -1, Installed => -1.5, Target => -1.5, CurrentCycle => -1.5 }, 'it leaves the frame totals it was counted in');
+is_deeply([ map { ($_->{PoolId}, $_->{Status}, 0 + sprintf('%.2f', $_->{ProposedSum})) } @{ $mv->{pools} } ], [ 5, 'FITS', 3 ], 'and its pool: the standby\'s increase now fits');
+is($mv->{rows}{sa}{comments}, 'note', 'so the standby\'s row carries no pool alert');
+ok((grep { /x1: moved to frame FB/ } UUT::_cycle_finalise_lines('C1', $mv, {})), 'the finalisation block states the move');
+my $cf = UUT::_cycle_finalise_frame($plan{planM}, $reg_m, { FA => $reg_m, FB => $reg_b }, {}, $plan_of, 'C1', { x1 => { class => 'conflict', with => 'FB' } }, {});
+like($cf->{rows}{x1}{action}, qr/^Also sampled on frame FB over the same time: which frame holds this LPAR is unresolved, and it is counted on both\. No change\.$/, 'a conflict is stated on the row');
+like($cf->{rows}{x1}{comments}, qr/\[ON_TWO_FRAMES\]/, 'and tagged');
+ok(!$cf->{delta}{ExclStandby}, 'it stays counted: nothing is dropped silently');
+my $cfp = UUT::_cycle_footprint_frame({ %{ $cf->{doc} }, frame => { sharedProcessors => { status => 'agreed', processors => 8, reporters => 1, values => { 8 => 1 } } } });
+like($cfp->{assessment}, qr/^not assessed: 1 LPAR is sampled on this frame and on another over the same time; which frame holds it is unresolved$/, 'and the frame\'s capacity is not assessed while it is unresolved');
 
 done_testing();

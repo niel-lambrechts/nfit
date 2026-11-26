@@ -3260,6 +3260,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
                 my $end_ymd = ($run_end_date_obj // $effective_end_date_obj)->ymd;
                 $assimilation_map_ref->{$vm}{Presence} = { %$span, left => (_lpar_present($span->{lastDay}, $end_ymd) ? 0 : 1),
                                                            daysBefore => _days_before_end($span->{lastDay}, $end_ymd) };
+                # First sampled here well after the analysis began: the row says how much data it rests on.
+                if ($effective_start_date_obj && looks_like_number($span->{first} // '')
+                    && $span->{first} > $effective_start_date_obj->epoch + $PRESENCE_GRACE_DAYS * 86400)
+                {
+                    $assimilation_map_ref->{$vm}{Presence}{since} = gmtime($span->{first})->ymd;
+                    $assimilation_map_ref->{$vm}{Presence}{daysHere} = _days_before_end(gmtime($span->{first})->ymd, $end_ymd) + 1;
+                }
             }
             # PowerHA role evidence (v10 stage 3.1b, steps 6c/6d): worked out
             # before the CSV, because the role-aware sizing is applied there.
@@ -17675,10 +17682,17 @@ sub _write_standard_csv_report {
         my ($row_vm, $row, $planner_cells) = @$pending;
         # An LPAR no longer sampled on this frame: its row is a record, marked as such (B15).
         my $presence = _safe_dig($assimilation_map_ref, $row_vm, 'Presence');
+        my $analysed_action = (ref($planner_cells) eq 'HASH') ? $planner_cells->{'NFIT - Action'} : undef;
         if (ref($presence) eq 'HASH' && $presence->{left})
         {
             $planner_cells->{'NFIT - Action'} = _historic_action($presence, $planner_cells->{'NFIT - Action'}) if (ref($planner_cells) eq 'HASH');
             unshift @{ $structural_tags->{$row_vm} }, '[HISTORIC]';
+        }
+        elsif (ref($presence) eq 'HASH' && defined $presence->{since} && ref($planner_cells) eq 'HASH' && ($planner_cells->{'NFIT - Action'} // '') ne '')
+        {
+            $planner_cells->{'NFIT - Action'} .= sprintf(' On this frame since %s: sized on %d day%s of data.', _plain_day($presence->{since}),
+                $presence->{daysHere}, ($presence->{daysHere} == 1 ? '' : 's'));
+            $analysed_action = $planner_cells->{'NFIT - Action'};
         }
         # The row's own action and comments, before the notes that depend on the other LPARs of its pool.
         my $own_action = (ref($planner_cells) eq 'HASH') ? $planner_cells->{'NFIT - Action'} : undef;
@@ -17709,7 +17723,7 @@ sub _write_standard_csv_report {
             entitlement => $planner_cells->{'NFIT - ENT'}, VPs => $planner_cells->{'NFIT - VCPU'},
             action => $planner_cells->{'NFIT - Action'}, ownAction => $own_action,
             comments => (defined $idx_vm_comments ? $row->[$idx_vm_comments] : undef), ownComments => $own_comments,
-            alerts => [ @{ $structural_tags->{$row_vm} // [] } ],
+            alerts => [ @{ $structural_tags->{$row_vm} // [] } ], analysedAction => $analysed_action,
             trialNote => ($pool_first->{$row_vm} ? $pool_first->{$row_vm}{Trial} : undef),
         } if (ref($proposals) eq 'HASH' && ref($proposals->{$row_vm}) eq 'HASH' && ref($planner_cells) eq 'HASH');
         # The LPAR as the pool check counted it.
@@ -18189,16 +18203,68 @@ sub _cycle_finalise_context
 #     pools [ assessed pools of the standbys ], delta { CurrentCycle, Target } }.
 sub _cycle_finalise_frame
 {
-    my ($doc, $reg, $frame_reg, $incomplete, $plan_of, $cycle_id) = @_;
+    my ($doc, $reg, $frame_reg, $incomplete, $plan_of, $cycle_id, $membership, $membership_of) = @_;
     my $final = decode_json(_cycle_canonical($doc));          # a copy: the provisional plan stays as it is
     my $members = $final->{members};
     my $settings = (ref($doc->{settings}) eq 'HASH') ? $doc->{settings} : {};
-    my (@standbys, %resolved, %pool_touched, %delta);
+    my $end = _safe_dig($doc, 'window', 'end');
+    my (@standbys, %resolved, %pool_touched, %delta, @moves);
+    my $groups_of = sub
+    {
+        my ($role) = @_;
+        return ('All', ($role eq 'standby' ? 'Standby' : 'ExclStandby'), ($role eq 'vios' ? 'Vios' : ()),
+                (($role ne 'standby' && $role ne 'vios') ? 'ExclStandbyVios' : ()));
+    };
+
+    # LPARs found on another frame of the cycle (B15). One that moved is historic here: its row names
+    # the frame it is on, and it leaves this frame's totals and pools if the analysis still counted it.
+    foreach my $vm (sort keys %{ $membership // {} })
+    {
+        my ($m, $where) = ($members->{$vm}, $membership->{$vm});
+        next unless (ref($m) eq 'HASH' && ref($m->{published}) eq 'HASH');
+        my $published = $m->{published};
+        my $analysed = $published->{analysedAction} // $published->{ownAction};
+        if ($where->{class} eq 'moved')
+        {
+            if (_lpar_present($m->{lastSampled}, $end) && ref($m->{poolMember}) eq 'HASH')
+            {
+                my $pm = delete $m->{poolMember};
+                my $current = _structural_shown_value($pm->{current_ent}) // 0;
+                my %ent = (Installed => $current, Target => (_structural_shown_value($pm->{proposed_ent}) // $current),
+                           CurrentCycle => (_structural_shown_value($pm->{cycle_ent}) // $current));
+                foreach my $group ($groups_of->($m->{estateRole} // ''))
+                {
+                    $delta{$group}{Count}--;
+                    $delta{$group}{$_} -= $ent{$_} foreach (keys %ent);
+                }
+                $pool_touched{ $pm->{pool_id} + 0 } = 1 if (looks_like_number($pm->{pool_id} // ''));
+            }
+            $resolved{$vm} = { entitlement => $published->{entitlement}, VPs => $published->{VPs},
+                               action => _historic_action({ lastDay => $where->{lastDay} }, $analysed, $where) };
+            $published->{alerts} = [ '[HISTORIC]', grep { $_ ne '[HISTORIC]' } @{ $published->{alerts} // [] } ];
+            delete $m->{pendingRole};
+        }
+        elsif ($where->{class} eq 'conflict')
+        {
+            $resolved{$vm} = { entitlement => $published->{entitlement}, VPs => $published->{VPs},
+                               action => sprintf('Also sampled on frame %s over the same time: which frame holds this LPAR is unresolved, and it is counted on both. %s',
+                                                 $where->{with}, $analysed // '') };
+            $published->{alerts} = [ '[ON_TWO_FRAMES]', grep { $_ ne '[ON_TWO_FRAMES]' } @{ $published->{alerts} // [] } ];
+        }
+        else
+        {
+            next;
+        }
+        $m->{membership} = { %$where };
+        push @moves, { lpar => $vm, %$where };
+    }
+
     foreach my $pending (@{ $reg->{pending} // [] })
     {
         my $vm = $pending->{lpar};
         my $m = $members->{$vm};
         next unless (ref($m) eq 'HASH' && ref($m->{pendingRole}) eq 'HASH');
+        next unless (_lpar_present($m->{lastSampled}, $end));      # a standby no longer on this frame is a record here
         my $role_pending = $m->{pendingRole};
         my $primary = $role_pending->{primary};
         my $profile = _safe_dig($m, 'role', 'profile') // $m->{planningProfile};
@@ -18211,7 +18277,11 @@ sub _cycle_finalise_frame
 
         # The primary's plan in this cycle, when it is the plan of this analysis.
         my ($target, $reason);
-        my ($frame) = grep { $frame_reg->{$_} } @{ $role_pending->{primaryFrames} // [] };
+        # The primary is read from the frame it is on at the analysis end, where it was seen on more than one.
+        my ($frame) = sort { (_safe_dig($membership_of, $a, $primary, 'class') // '') cmp (_safe_dig($membership_of, $b, $primary, 'class') // '') }
+                      grep { $frame_reg->{$_} && (_safe_dig($membership_of, $_, $primary, 'class') // '') !~ /^(?:moved|unconfirmed)$/ }
+                      @{ $role_pending->{primaryFrames} // [] };
+        ($frame) = grep { $frame_reg->{$_} } @{ $role_pending->{primaryFrames} // [] } unless (defined $frame);
         if (!defined $frame)
         {
             $reason = (grep { $incomplete->{$_} } @{ $role_pending->{primaryFrames} // [] })
@@ -18250,8 +18320,11 @@ sub _cycle_finalise_frame
 
         my $before = $m->{role} // {};
         my $published = $m->{published} // {};
-        $delta{CurrentCycle} += ($pair->{Ent} // 0) - (looks_like_number($published->{entitlement} // '') ? $published->{entitlement} : 0);
-        $delta{Target} += $st->{TargetEnt} - ($before->{targetEntitlement} // 0);
+        foreach my $group (qw(All Standby))
+        {
+            $delta{$group}{CurrentCycle} += ($pair->{Ent} // 0) - (looks_like_number($published->{entitlement} // '') ? $published->{entitlement} : 0);
+            $delta{$group}{Target} += $st->{TargetEnt} - ($before->{targetEntitlement} // 0);
+        }
         $m->{role} = { type => 'haStandby', profile => $profile, targetEntitlement => $st->{TargetEnt}, targetVPs => $st->{TargetVP},
                        entitlement => $pair->{Ent}, VPs => $pair->{VP}, status => $pair->{Status}, primary => $primary, share => $share,
                        floor => $st->{Floor},
@@ -18312,7 +18385,7 @@ sub _cycle_finalise_frame
         $rows{$vm} = \%cells;
     }
     $final->{cycle} = { id => $cycle_id, state => 'final', provisionalPlan => $reg->{plan} };
-    return { doc => $final, rows => \%rows, standbys => \@standbys, delta => \%delta,
+    return { doc => $final, rows => \%rows, standbys => \@standbys, delta => \%delta, moves => \@moves,
              pools => [ grep { $pool_touched{ $_->{PoolId} } } @{ $findings->{Pools} } ] };
 }
 
@@ -18323,11 +18396,20 @@ sub _cycle_finalise_lines
     my $pair = sub { my ($p) = @_; return sprintf('%s / %s', (looks_like_number($p->[0] // '') ? sprintf('%.2f', $p->[0]) : '?'), $p->[1] // '?'); };
     my @lines = ('', ('=' x 70), "Cycle Finalisation (planning cycle $cycle_id)", ('=' x 70),
                  '  PowerHA standbys whose primary is on another frame, set from the analyses of this planning cycle.',
-                 '  These figures are the ones in the CSV; they replace the provisional figures above.');
+                 '  These figures are the ones in the CSV; they replace the provisional figures above.',
+                 ((@{ $job->{moves} // [] }) ? '  LPARs found on another frame of the cycle are stated below.' : ()));
     foreach my $s (@{ $job->{standbys} })
     {
         push @lines, _rationale_wrap(sprintf('%s: %s provisional, now %s. %s', $s->{lpar}, $pair->($s->{before}), $pair->($s->{after}), $s->{action}),
                                      '    ', '      ');
+    }
+    foreach my $move (@{ $job->{moves} // [] })
+    {
+        push @lines, _rationale_wrap((($move->{class} eq 'moved')
+            ? sprintf('%s: moved to frame %s (last sampled on this frame %s, sampled there from %s). Its row is now historic; this frame no longer counts it.',
+                      $move->{lpar}, $move->{to}, _plain_day($move->{lastDay}), _plain_day($move->{from}))
+            : sprintf('%s: also sampled on frame %s over the same time. Which frame holds it is UNRESOLVED; it is counted on both.',
+                      $move->{lpar}, $move->{with})), '    ', '      ');
     }
     foreach my $pool (@{ $job->{pools} })
     {
@@ -18400,16 +18482,79 @@ sub _sample_spans
     return \%span;
 }
 
-# The planning action of an LPAR that is no longer sampled on this frame: its figures stand as a
-# record of what it needed here; they are not an action for this frame. Neutral: sampling that
-# stopped is not proof of a move (a planning cycle's finalisation names the present frame). Pure.
+# A day as the planner reads it: 13 Sep 2026.
+sub _plain_day
+{
+    my ($ymd) = @_;
+    return (defined $ymd && $ymd =~ /^(\d{4})-(\d{2})-(\d{2})$/)
+        ? sprintf('%d %s %d', $3, (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$2 - 1], $1) : 'an earlier date';
+}
+
+# The planning action of an LPAR that is no longer on this frame: its figures stand as a record of
+# what it needed here; they are not an action for this frame. Without a destination the wording is
+# neutral: sampling that stopped is not proof of a move. With one (a planning cycle's finalisation
+# found the LPAR sampled on another frame from that time) the move and the frame are named. Pure.
 sub _historic_action
 {
-    my ($presence, $action) = @_;
-    my $since = (defined $presence->{lastDay} && $presence->{lastDay} =~ /^(\d{4})-(\d{2})-(\d{2})$/)
-        ? sprintf('%d %s %d', $3, (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[$2 - 1], $1) : 'an earlier date';
+    my ($presence, $action, $moved) = @_;
+    my $tail = (defined $action && $action ne '') ? " As analysed: $action" : '';
+    return sprintf('Historic: moved to frame %s (last sampled on this frame %s, sampled there from %s); its plan is the row on that frame. '
+        . 'Not counted in this frame\'s totals.%s', $moved->{to}, _plain_day($presence->{lastDay}), _plain_day($moved->{from}), $tail)
+        if (ref($moved) eq 'HASH' && defined $moved->{to});
     return sprintf('Historic: not sampled on this frame since %s (%d days before the analysis end); not counted in this frame\'s totals.%s',
-                   $since, $presence->{daysBefore} // 0, ((defined $action && $action ne '') ? " As analysed: $action" : ''));
+                   _plain_day($presence->{lastDay}), $presence->{daysBefore} // 0, $tail);
+}
+
+# Where each LPAR of a planning cycle is at the analysis end, from when it was sampled on each frame
+# analysed (one model). Identity is the LPAR name; the times decide. Pure.
+#   $seen  { frame => { LPAR => { first, last (epochs), lastDay } } }   (LPARs without times are left out)
+#   $end   analysis end (YYYY-MM-DD)
+# Returns { frame => { LPAR => { class, ... } } } for the LPARs that are not simply present:
+#   moved        sampling here stopped as it began on frame `to` (from = its first day there)
+#   unconfirmed  no longer sampled here, and on no other frame analysed from that time
+#   conflict     sampled here and on frame `with` over the same time, both up to the analysis end
+# A frame on which the LPAR is first sampled after the analysis end does not count: it is not there yet.
+sub _cycle_membership
+{
+    my ($seen, $end) = @_;
+    my $end_epoch = eval { Time::Piece->strptime($end, '%Y-%m-%d')->epoch + 86399 } // return {};
+    my $slack = 3600;                    # collectors on both frames may report during the move itself
+    my (%frames_of, %out);
+    foreach my $frame (sort keys %{ $seen // {} })
+    {
+        foreach my $vm (keys %{ $seen->{$frame} // {} })
+        {
+            my $span = $seen->{$frame}{$vm};
+            next unless (ref($span) eq 'HASH' && looks_like_number($span->{first} // '') && looks_like_number($span->{last} // ''));
+            next if ($span->{first} > $end_epoch);
+            push @{ $frames_of{$vm} }, $frame;
+        }
+    }
+    foreach my $vm (sort keys %frames_of)
+    {
+        my %span = map { ($_ => $seen->{$_}{$vm}) } @{ $frames_of{$vm} };
+        my %here = map { ($_ => _lpar_present($span{$_}{lastDay}, $end)) } keys %span;
+        foreach my $frame (sort keys %span)
+        {
+            my @others = grep { $_ ne $frame && $here{$_} } sort keys %span;
+            # Sampling on this frame ended as it began on another that still has the LPAR.
+            my ($to) = sort { $span{$b}{first} <=> $span{$a}{first} } grep { $span{$frame}{last} <= $span{$_}{first} + $slack } @others;
+            if (defined $to)
+            {
+                $out{$frame}{$vm} = { class => 'moved', to => $to, from => gmtime($span{$to}{first})->ymd, lastDay => $span{$frame}{lastDay} };
+            }
+            elsif (!$here{$frame})
+            {
+                $out{$frame}{$vm} = { class => 'unconfirmed', lastDay => $span{$frame}{lastDay} };
+            }
+            else
+            {
+                my ($with) = grep { !($span{$_}{last} <= $span{$frame}{first} + $slack) } @others;
+                $out{$frame}{$vm} = { class => 'conflict', with => $with } if (defined $with);
+            }
+        }
+    }
+    return \%out;
 }
 
 # Days between an LPAR's last sampled day and the analysis end; undef when either is not known. Pure.
@@ -18447,16 +18592,19 @@ sub _cycle_footprint_frame
     my $members = (ref($doc) eq 'HASH' && ref($doc->{members}) eq 'HASH') ? $doc->{members} : {};
     my $number = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? $v + 0 : undef; };
     my (%vp, %shared, %default, @pool_members, %groups, @left_days);
-    my ($lpars, $no_pool, $known) = (0, 0, 0);
-    my %left = (Count => 0, Installed => 0);
+    my ($lpars, $no_pool, $known, $conflicts) = (0, 0, 0, 0);
+    my %left = (Count => 0, Installed => 0, Moved => 0);
     my $end = (ref($doc) eq 'HASH') ? _safe_dig($doc, 'window', 'end') : undef;
     foreach my $vm (sort keys %$members)
     {
         my $m = $members->{$vm};
         next unless (ref($m) eq 'HASH');
         $known++ if (defined $m->{lastSampled});
-        unless (_lpar_present($m->{lastSampled}, $end))
+        my $class = _safe_dig($m, 'membership', 'class') // '';
+        $conflicts++ if ($class eq 'conflict');
+        unless (_lpar_present($m->{lastSampled}, $end) && $class ne 'moved')
         {
+            $left{Moved}++ if ($class eq 'moved');
             $left{Count}++;
             $left{Installed} += _structural_shown_value(_safe_dig($m, 'poolMember', 'current_ent')) // $number->($m->{installedEntitlement}) // 0;
             push @left_days, _days_before_end($m->{lastSampled}, $end);
@@ -18499,7 +18647,8 @@ sub _cycle_footprint_frame
     my $capacity = (ref($doc) eq 'HASH' && ref(_safe_dig($doc, 'frame', 'sharedProcessors')) eq 'HASH')
         ? $doc->{frame}{sharedProcessors} : { status => 'absent', reporters => 0, values => {} };
     my %out = (lpars => $lpars, vps => { map { ($_ => ($vp{$_} // 0)) } @bases }, noPool => $no_pool, capacity => $capacity,
-               presenceKnown => $known, left => { Count => $left{Count}, Installed => 0 + sprintf('%.2f', $left{Installed}),
+               conflicts => $conflicts,
+               presenceKnown => $known, left => { Count => $left{Count}, Moved => $left{Moved}, Installed => 0 + sprintf('%.2f', $left{Installed}),
                                                   days => [ sort { $a <=> $b } grep { defined } @left_days ] },
                groups => { map { my $g = $_; ($g => { Count => ($groups{$g}{Count} // 0), map { ($_ => 0 + sprintf('%.2f', $groups{$g}{$_} // 0)) } @bases }) }
                            qw(All Vios Standby) },
@@ -18528,7 +18677,12 @@ sub _cycle_footprint_frame
     # Guaranteed allocations against the shared capacity reported. An excess is a finding; staying
     # within it is no statement about the whole frame (LPARs outside the analysis, dedicated
     # processors and pool reserves are not counted) and none about measured spare CPU.
-    if (($capacity->{status} // '') eq 'agreed')
+    if ($conflicts)
+    {
+        $out{assessment} = sprintf('not assessed: %d LPAR%s sampled on this frame and on another over the same time; which frame holds %s is unresolved',
+                                   $conflicts, ($conflicts == 1 ? ' is' : 's are'), ($conflicts == 1 ? 'it' : 'them'));
+    }
+    elsif (($capacity->{status} // '') eq 'agreed')
     {
         my $n = $capacity->{processors};
         $out{uncommitted} = { map { ($_ => 0 + sprintf('%.2f', $n - $out{shared}{$_})) } @bases };
@@ -18561,7 +18715,7 @@ sub _cycle_footprint_lines
     my $two = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? sprintf('%.2f', $v) : ''; };
     my @frame_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame State LPARs Installed_ENT Full_ENT CurrentCycle_ENT
         VIOS_Installed_ENT VIOS_Full_ENT VIOS_CurrentCycle_ENT Standby_Installed_ENT Standby_Full_ENT Standby_CurrentCycle_ENT
-        Installed_VP Full_VP CurrentCycle_VP LPARs_Left Left_Installed_ENT Standbys_Unresolved Shared_Capacity Shared_Capacity_Check
+        Installed_VP Full_VP CurrentCycle_VP LPARs_Left LPARs_Left_Moved Left_Installed_ENT LPARs_On_Two_Frames Standbys_Unresolved Shared_Capacity Shared_Capacity_Check
         Installed_ENT_Uncommitted Full_ENT_Uncommitted CurrentCycle_ENT_Uncommitted Assessment Not_Counted)));
     my @pool_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame Pool LPARs Maximum Installed_ENT Full_ENT CurrentCycle_ENT
         Minimum_Maximum_Full Minimum_Maximum_CurrentCycle Status)));
@@ -18596,7 +18750,7 @@ sub _cycle_footprint_lines
                       : ($capacity->{status} // '') eq 'conflict' ? 'conflict' : 'not reported';
             push @frame_csv, join(',', map { quote_csv($_) } $cycle_id, $model, $r->{frame}, $r->{state}, ($f ? $f->{lpars} : ''),
                 (map { $cell->('All', $_) } @bases), (map { $cell->('Vios', $_) } @bases), (map { $cell->('Standby', $_) } @bases),
-                (map { $f ? $f->{vps}{$_} : '' } @bases), ($f ? ($f->{left}{Count}, $two->($f->{left}{Installed})) : ('', '')), ($r->{unresolved} // ''),
+                (map { $f ? $f->{vps}{$_} : '' } @bases), ($f ? ($f->{left}{Count}, $f->{left}{Moved}, $two->($f->{left}{Installed}), $f->{conflicts}) : ('', '', '', '')), ($r->{unresolved} // ''),
                 ($f && defined $capacity->{processors} ? $capacity->{processors} : ''), $check,
                 (map { ($f && $f->{uncommitted}) ? $two->($f->{uncommitted}{$_}) : '' } @bases), ($f ? $f->{assessment} : ''), ($f ? $limits : ''));
             push @text, sprintf('  %-14s %5s %10s %10s %10s   %-13s %s', $r->{frame}, ($f ? $f->{lpars} : ''), (map { $cell->('All', $_) } @bases),
@@ -18605,9 +18759,11 @@ sub _cycle_footprint_lines
             $counted++;
             $sum{$_} += _safe_dig($groups, 'All', $_) // 0 foreach (@bases);
             push @text, _rationale_wrap(sprintf('Not counted: %d LPAR%s last sampled before the analysis end (%s days earlier), installed entitlement %s. '
-                . '%s marked [HISTORIC] in the CSV: %s figures are a record, not an action for this frame.', $f->{left}{Count},
+                . '%s marked [HISTORIC] in the CSV: %s figures are a record, not an action for this frame. Of these, %d moved to another '
+                . 'frame analysed and %d %s on no other frame analysed (not confirmed as moved or removed).', $f->{left}{Count},
                 ($f->{left}{Count} == 1 ? '' : 's'), join(', ', @{ $f->{left}{days} }), $two->($f->{left}{Installed}),
-                ($f->{left}{Count} == 1 ? 'It is' : 'They are'), ($f->{left}{Count} == 1 ? 'its' : 'their')), '    ', '      ') if ($f->{left}{Count});
+                ($f->{left}{Count} == 1 ? 'It is' : 'They are'), ($f->{left}{Count} == 1 ? 'its' : 'their'), $f->{left}{Moved},
+                $f->{left}{Count} - $f->{left}{Moved}, (($f->{left}{Count} - $f->{left}{Moved}) == 1 ? 'is seen' : 'are seen')), '    ', '      ') if ($f->{left}{Count});
             push @text, '    Last sampled day not recorded for this frame: every LPAR analysed is counted.' unless ($f->{presenceKnown});
             foreach my $group ([ Vios => 'VIOS' ], [ Standby => 'PowerHA standbys' ])
             {
@@ -18787,26 +18943,36 @@ sub _cycle_finalise
     {
         my %frame_reg = map { ($reg{$_}{system} => $reg{$_}) } keys %{ $models{$model} };
         my %frame_incomplete = map { (($_ =~ s/\.\Q$model\E$//r) => 1) } grep { /\.\Q$model\E$/ } keys %incomplete;
+        # Where each LPAR is at the analysis end, over every frame analysed with this model (B15).
+        my %seen = map { my $r = $frame_reg{$_}; my $members = $plan_of->($r->{plan})->{members} // {};
+                         ($_ => { map { my $m = $members->{$_};
+                                        (ref($m) eq 'HASH' && ref($m->{sampled}) eq 'HASH') ? ($_ => { %{ $m->{sampled} }, lastDay => $m->{lastSampled} }) : () }
+                                  keys %$members }) } keys %frame_reg;
+        my ($end_of_cycle) = map { _safe_dig($plan_of->($_->{plan}), 'window', 'end') } values %frame_reg;
+        my $membership = _cycle_membership(\%seen, $end_of_cycle);
         foreach my $key (sort keys %{ $models{$model} })
         {
             my $r = $reg{$key};
-            unless (@{ $r->{pending} // [] })
+            my $here = $membership->{ $r->{system} } // {};
+            unless (@{ $r->{pending} // [] } || grep { $_->{class} ne 'unconfirmed' } values %$here)
             {
                 $state{$key} = { state => 'final', resolved => 0, unresolved => 0, totals => $r->{totals} };
                 next;
             }
-            my $result = _cycle_finalise_frame($plan_of->($r->{plan}), $r, \%frame_reg, \%frame_incomplete, $plan_of, $cycle->{id});
+            my $result = _cycle_finalise_frame($plan_of->($r->{plan}), $r, \%frame_reg, \%frame_incomplete, $plan_of, $cycle->{id}, $here, $membership);
             return $refuse->($result->{integrity}) if (defined $result->{integrity});
             my %totals = map { ($_ => { %{ $r->{totals}{$_} // {} } }) } keys %{ $r->{totals} // {} };
-            foreach my $group (qw(All Standby))
+            foreach my $group (keys %{ $result->{delta} })
             {
                 next unless (ref($totals{$group}) eq 'HASH');
-                $totals{$group}{$_} = 0 + sprintf('%.2f', ($totals{$group}{$_} // 0) + ($result->{delta}{$_} // 0)) foreach (qw(CurrentCycle Target));
+                $totals{$group}{Count} = ($totals{$group}{Count} // 0) + ($result->{delta}{$group}{Count} // 0);
+                $totals{$group}{$_} = 0 + sprintf('%.2f', ($totals{$group}{$_} // 0) + ($result->{delta}{$group}{$_} // 0)) foreach (qw(Installed CurrentCycle Target));
             }
             my $unresolved = scalar(grep { $_->{state} ne 'resolved' } @{ $result->{standbys} });
+            my $conflicts = scalar(grep { $_->{class} eq 'conflict' } @{ $result->{moves} });
             $job{$key} = { %$result, totals => \%totals };
-            $state{$key} = { state => ($unresolved ? 'standbys unresolved' : 'final'), resolved => scalar(@{ $result->{standbys} }) - $unresolved,
-                             unresolved => $unresolved, totals => \%totals };
+            $state{$key} = { state => ($conflicts ? 'LPARs on two frames unresolved' : $unresolved ? 'standbys unresolved' : 'final'),
+                             resolved => scalar(@{ $result->{standbys} }) - $unresolved, unresolved => $unresolved, totals => \%totals };
         }
     }
 
