@@ -11,6 +11,9 @@
 #            - the last sample of each VM is tracked over every metric acquired;
 #            - in an append run a VM without new samples is not merged, so its
 #              states are not extended by a carried-forward configuration value.
+#            - a VM that reported from two managed systems in one run (D-026): its
+#              states are filed under the managed system each names, and each
+#              sample under the managed system of the state in force at its time.
 # USAGE    : python3 test/stager_states_test.py
 # ==============================================================================
 import importlib.machinery
@@ -88,6 +91,62 @@ class StateTimelineTests(unittest.TestCase):
         self.assertEqual(merged['gone'], existing['gone'])
         self.assertEqual(merged['here'][-1]['end_epoch'], T0 + 91 * DAY)
 
+
+
+@unittest.skipUnless(READY, 'the stager could not be loaded here')
+class MovedVmTests(unittest.TestCase):
+
+    def states(self):
+        # On FRAME_A for ten days (a configuration change on day 4), then on FRAME_B; last sampled on day 15.
+        return S.build_vm_states(events((0, {'serial_number': 'FRAME_A', 'entitlement': 1.0}), (4, {'entitlement': 2.0}),
+                                        (10, {'serial_number': 'FRAME_B', 'entitlement': 3.0})), T0 + 20 * DAY, T0 + 15 * DAY)
+
+    def test_each_state_is_filed_under_the_managed_system_it_names(self):
+        per = S.states_by_serial(self.states())
+        self.assertEqual(sorted(per), ['FRAME_A', 'FRAME_B'])
+        self.assertEqual([st['metadata']['entitlement'] for st in per['FRAME_A']], [1.0, 2.0])
+        self.assertEqual([st['metadata']['entitlement'] for st in per['FRAME_B']], [3.0])
+        # The states of the frame it left end where it left; the frame that holds it ends at its last sample.
+        self.assertEqual(per['FRAME_A'][-1]['end_epoch'], T0 + 10 * DAY - 1)
+        self.assertEqual((per['FRAME_B'][0]['start_epoch'], per['FRAME_B'][0]['end_epoch']), (T0 + 10 * DAY, T0 + 15 * DAY))
+
+    def test_a_vm_on_one_managed_system_is_filed_as_before(self):
+        states = S.build_vm_states(events((0, {'serial_number': 'FRAME_A', 'entitlement': 1.0}), (4, {'entitlement': 2.0})), T0 + 20 * DAY, T0 + 20 * DAY)
+        self.assertEqual(S.states_by_serial(states), {'FRAME_A': states})
+
+    def test_each_sample_goes_to_the_managed_system_of_the_state_in_force(self):
+        states = self.states()
+        self.assertEqual(S.serial_of_sample(states, T0 + 1 * DAY), 'FRAME_A')
+        self.assertEqual(S.serial_of_sample(states, T0 + 10 * DAY - 1), 'FRAME_A')
+        self.assertEqual(S.serial_of_sample(states, T0 + 10 * DAY), 'FRAME_B')
+        self.assertEqual(S.serial_of_sample(states, T0 + 15 * DAY), 'FRAME_B')
+        self.assertEqual(S.serial_of_sample(states, T0 - 60), 'FRAME_A')              # before the first state
+        self.assertEqual(S.serial_of_sample(states, T0 + 19 * DAY), 'FRAME_B')        # after the last
+        self.assertIsNone(S.serial_of_sample([], T0))
+
+    def test_a_state_without_a_serial_is_kept_apart(self):
+        states = [{'start_epoch': T0, 'end_epoch': T0 + DAY, 'metadata': {'entitlement': 1.0}}]
+        self.assertEqual(list(S.states_by_serial(states)), ['UNKNOWN_SERIAL'])
+        self.assertEqual(S.serial_of_sample(states, T0 + 60), 'UNKNOWN_SERIAL')
+
+    def test_the_rows_of_a_moved_vm_are_split_between_the_two_caches(self):
+        moved = {'vmM': self.states()}
+        rows = ['2026-07-26 00:00:00', '2026-08-04 12:00:00', '2026-08-05 12:00:00', '2026-08-09 00:00:00']   # two before the move, two after
+        epochs = [S._row_epoch(r) for r in rows]
+        expected = ['FRAME_A' if e < T0 + 10 * DAY else 'FRAME_B' for e in epochs]
+        self.assertEqual(sorted(set(expected)), ['FRAME_A', 'FRAME_B'])                # the rows span the move
+        for row, where in zip(rows, expected):
+            for serial in ('FRAME_A', 'FRAME_B'):
+                self.assertEqual(S.sample_is_of_serial('vmM', row, serial, {'vmM', 'vmS'}, moved), serial == where, (row, serial))
+        # A VM on one managed system: every row, as before; a VM without a state there: none.
+        self.assertTrue(S.sample_is_of_serial('vmS', rows[0], 'FRAME_A', {'vmM', 'vmS'}, moved))
+        self.assertFalse(S.sample_is_of_serial('vmX', rows[0], 'FRAME_A', {'vmM', 'vmS'}, moved))
+        self.assertFalse(S.sample_is_of_serial('vmM', 'not a time', 'FRAME_A', {'vmM'}, moved))
+
+    def test_a_row_timestamp_is_read_as_utc(self):
+        self.assertEqual(S._row_epoch('2026-09-01 00:00:00'), 1788220800)
+        self.assertEqual(S._row_epoch('2026-09-01T00:01:00'), 1788220860)
+        self.assertIsNone(S._row_epoch('not a time'))
 
 if __name__ == '__main__':
     unittest.main(verbosity=1)

@@ -900,6 +900,54 @@ def build_vm_states(events, capture_end_epoch, last_sample_epoch=None):
     return state_list
 
 
+def states_by_serial(states):
+    """
+    The configuration states of one VM, kept apart by the managed system each state
+    names: {serial: [states]}, each list in time order (D-026). A VM that moved
+    between managed systems in one staging run has states under more than one serial.
+    """
+    by_serial = defaultdict(list)
+    for state in sorted(states or [], key=lambda st: st.get('start_epoch', 0)):
+        by_serial[(state.get('metadata') or {}).get('serial_number') or 'UNKNOWN_SERIAL'].append(state)
+    return dict(by_serial)
+
+
+def serial_of_sample(states, epoch):
+    """
+    The managed system a sample of a VM belongs to: the serial of the configuration
+    state in force at that time (D-026). States are in time order. A sample before the
+    first state takes the first state's serial; one after the last, the last's.
+    """
+    serial = None
+    for state in states:
+        if serial is not None and state.get('start_epoch', 0) > epoch:
+            break
+        serial = (state.get('metadata') or {}).get('serial_number') or 'UNKNOWN_SERIAL'
+    return serial
+
+
+def _row_epoch(row_ts):
+    """Epoch (UTC) of an L1 row timestamp 'YYYY-MM-DD HH:MM:SS'; None when it cannot be read."""
+    try:
+        return calendar.timegm(time.strptime(row_ts[:19].replace('T', ' '), '%Y-%m-%d %H:%M:%S'))
+    except (ValueError, TypeError):
+        return None
+
+
+def sample_is_of_serial(vm, row_ts, serial, vms_of_serial, moved_vm_states):
+    """
+    Whether one L1 row of a VM belongs in the cache of a managed system (D-026): the VM
+    has a configuration state there, and, where it reported from more than one managed
+    system in this run, the row was sampled while its state named this one.
+    """
+    if vm not in vms_of_serial:
+        return False
+    if vm not in moved_vm_states:
+        return True
+    row_epoch = _row_epoch(row_ts)
+    return row_epoch is not None and serial_of_sample(moved_vm_states[vm], row_epoch) == serial
+
+
 def _merge_config_states(existing_states, new_states):
     """
     Merges two per-VM configuration-state dicts into a single coherent timeline.
@@ -3314,18 +3362,20 @@ def main():
 
             data_by_serial = defaultdict(lambda: {'states': {}})
             vm_to_serial_map = {}
+            moved_vm_states = {}      # VM -> its whole state list, where it reported from more than one managed system
             for vm, states in all_states.items():
                 if states:
-                    serial = states[0].get('metadata', {}).get('serial_number', 'UNKNOWN_SERIAL')
-                    vm_to_serial_map[vm] = serial
-                    data_by_serial[serial]['states'][vm] = states
-                    # D-026: a VM that reported from more than one managed system in this run is filed,
-                    # states and samples, under the first. One managed system per run keeps them apart.
-                    serials_seen = {s.get('metadata', {}).get('serial_number') for s in states} - {None}
-                    if len(serials_seen) > 1:
-                        print(f"WARNING: '{vm}' reported from {len(serials_seen)} managed systems in this run; all of it is "
-                              f"filed under the first. Stage each managed system in its own run (--mgsys with one serial).",
-                              file=sys.stderr)
+                    # D-026: each state is filed under the managed system it names, and each sample under
+                    # the managed system of the state in force at its time. A VM that moved in this run
+                    # used to be filed whole, states and samples, under the first.
+                    per_serial = states_by_serial(states)
+                    vm_to_serial_map[vm] = states[0].get('metadata', {}).get('serial_number', 'UNKNOWN_SERIAL')
+                    for serial, serial_states in per_serial.items():
+                        data_by_serial[serial]['states'][vm] = serial_states
+                    if len(per_serial) > 1:
+                        moved_vm_states[vm] = sorted(states, key=lambda st: st.get('start_epoch', 0))
+                        print(f"- '{vm}' reported from {len(per_serial)} managed systems in this run: its configuration "
+                              f"states and samples are filed under each.")
 
             # Handle VMs discovered from performance data that have no configuration in InfluxDB.
             # This logic can only reliably assign these 'orphan' VMs if a single managed system is the target.
@@ -3422,7 +3472,8 @@ def main():
                                     rows_trimmed += 1
                                     break
 
-                                if parts[1] not in vms_for_this_serial:
+                                # Of a VM that moved, only the samples taken while it was on this managed system.
+                                if not sample_is_of_serial(parts[1], row_ts, serial, vms_for_this_serial, moved_vm_states):
                                     continue
 
                                 # Append mode: skip rows at or before the trimmed cutoff
