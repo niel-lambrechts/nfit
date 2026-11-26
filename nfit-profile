@@ -2465,8 +2465,10 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "  entitlement        standby (standby_entitlement), for sites that add capacity at takeover.\n";
         print {$LOG_FH} "                     Not a floor: it replaces the entitlement the node's own workload asks\n";
         print {$LOG_FH} "                     for, which is still shown. VPs follow the usual VP rules. Where the\n";
-        print {$LOG_FH} "                     entitlement cannot carry this cycle's VPs (0.05 per VP) nothing is changed:\n";
-        print {$LOG_FH} "                     [STANDBY_FIXED_CONFLICT]. nFit does not arrange or verify takeover capacity.\n";
+        print {$LOG_FH} "                     entitlement cannot carry this cycle's VPs (0.05 per VP) it waits, marked\n";
+        print {$LOG_FH} "                     [STANDBY_FIXED_CONFLICT]: the VP step the workload supports is still taken\n";
+        print {$LOG_FH} "                     with the entitlement unchanged, where that pair is valid; no VP is removed\n";
+        print {$LOG_FH} "                     to make the fixed figure fit. nFit does not arrange or verify takeover capacity.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
@@ -14268,6 +14270,14 @@ sub _ha_role_evidence
         {
             $c{Reason} = sprintf('no samples for %s in this period', join(', ', @missing));
         }
+        elsif (my @unplaced = grep { @{ $dirs_of{$_} // [] } > 1 && !defined $c{FrameOf}{$_} } @$members)
+        {
+            # Sampled on two frames to the end of the period: which configuration and which workload
+            # are the member's is not established, so no role is inferred from the two together.
+            $c{Reason} = sprintf('%s %s sampled on more than one managed system at the end of this period: roles are not inferred until '
+                . 'its managed system is established', join(', ', @unplaced), (@unplaced == 1 ? 'is' : 'are'));
+            $c{Unplaced} = [ @unplaced ];
+        }
         else
         {
             my ($node_a, $node_b) = @$members;
@@ -14434,11 +14444,17 @@ sub _policy_source_text
 #             step the existing VP rules give for the LPAR's own workload.
 #             Where the fixed entitlement and that VP count are not a pair
 #             PowerVM accepts (0.05 processors per VP; the pool's size), the
-#             installed pair is kept and the reason returned: the fixed figure
-#             is never changed and no VP reduction is invented. Pure.
+#             fixed figure waits and the reason is returned. The VP step the
+#             VP rules already give is still recommended, with the installed
+#             entitlement unchanged, where that is a valid pair; otherwise the
+#             installed pair is kept. The fixed figure is never changed and no
+#             VP reduction is invented for it. Pure.
 # ARGUMENTS:  hashref { fixed, step_vp, current_ent, current_vp, pool_size }
 # RETURNS:    (pair hashref as _resolve_current_cycle_pair gives it, conflict
-#             text or undef). A pair without Ent: nothing could be resolved.
+#             text or undef). On a conflict the pair carries VPOnly (1 where
+#             the VP step is recommended with the entitlement unchanged),
+#             CycleVP and Carries (the most VPs the fixed figure can carry).
+#             A pair without Ent: nothing could be resolved.
 # ==============================================================================
 sub _ha_fixed_standby_pair
 {
@@ -14466,8 +14482,17 @@ sub _ha_fixed_standby_pair
             : ($vp > $carries)     ? sprintf('%.2f carries at most %d VP%s (0.05 processors per VP) and the VP count of this cycle is %d, which needs at least %.2f',
                                              $t->{fixed}, $carries, ($carries == 1 ? '' : 's'), $vp, $MIN_ENT_PER_VP * $vp)
             :                        sprintf('with %d VP%s the entitlement would have to be %.2f', $vp, ($vp == 1 ? '' : 's'), $pair->{Ent});
+    # The fixed figure waits. The VP step that the node's own evidence supports does not: it is
+    # taken with the installed entitlement where the narrower width still carries that entitlement.
+    my $step = (defined $t->{step_vp} && $t->{step_vp} >= 1) ? int($t->{step_vp}) : undef;
+    if (defined $step && $step < $t->{current_vp} && $t->{current_ent} <= $step + $FLOAT_EPSILON
+        && $t->{current_ent} >= $MIN_ENT_PER_VP * $step - $FLOAT_EPSILON)
+    {
+        return ({ %$pair, Ent => $t->{current_ent}, VP => $step, Status => 'STAGED', Order => 'NONE', ReviewVP => undef,
+                  CycleVP => $vp, Carries => $carries, VPOnly => 1 }, $why);
+    }
     return ({ %$pair, Ent => $t->{current_ent}, VP => $t->{current_vp}, Status => 'HOLD', Order => 'NONE', ReviewVP => undef,
-              CycleVP => $vp }, $why);
+              CycleVP => $vp, Carries => $carries, VPOnly => 0 }, $why);
 }
 
 # The planning action of a standby with a fixed standby entitlement, as sentences. Pure.
@@ -14484,8 +14509,22 @@ sub _ha_fixed_standby_action
         : 'Capacity at takeover is arranged outside nFit and is not verified.';
     if (defined $a->{conflict})
     {
+        my $pair = (ref($a->{pair}) eq 'HASH') ? $a->{pair} : {};
+        # What the node's own workload needs decides whether the fixed figure can ever be set: said, not promised.
+        my $outlook = (defined $pair->{Carries} && looks_like_number($a->{ownVP} // '') && $a->{ownVP} > $pair->{Carries})
+            ? sprintf('Its own workload needs %d VPs, more than %.2f carries: the fixed figure cannot be set while that holds.', $a->{ownVP}, $a->{fixed})
+            : (defined $pair->{Carries})
+            ? sprintf('The fixed %.2f waits until the LPAR has %d VP%s or fewer; whether its VPs go that far is for the next measurements to show.',
+                      $a->{fixed}, $pair->{Carries}, ($pair->{Carries} == 1 ? '' : 's'))
+            : sprintf('The fixed %.2f waits.', $a->{fixed});
+        if ($pair->{VPOnly})
+        {
+            return (sprintf('%s cannot be set this cycle: %s. Reduce VPs %d to %d; the entitlement %.2f is kept.', $head, $a->{conflict},
+                            $a->{currentVP}, $pair->{VP}, $a->{currentEnt}), $outlook, $own,
+                    'PhysC can change with the VP count: re-measure before the next change.', $takeover);
+        }
         return (sprintf('%s cannot be set this cycle: %s. The installed %.2f on %d VP%s is kept; no change.', $head, $a->{conflict},
-                        $a->{currentEnt}, $a->{currentVP}, ($a->{currentVP} == 1 ? '' : 's')), $own, $takeover);
+                        $a->{currentEnt}, $a->{currentVP}, ($a->{currentVP} == 1 ? '' : 's')), $outlook, $own, $takeover);
     }
     return ("$head.", $own, _current_cycle_action_text($a->{pair}, $a->{currentEnt}, $a->{currentVP}, $a->{poolId}), $takeover);
 }
@@ -14880,7 +14919,7 @@ sub _apply_ha_sizing
                     $primary_ent = $cell->($prow, $pcells->{'Planning Profile'}) if (defined $pcells->{'Planning Profile'});
                 }
                 push @action, _ha_fixed_standby_action({ primary => $primary, roleSource => $cluster->{Roles}{$vm}{Source},
-                    fixed => $policy->{Fixed}, fixedSource => $policy->{Source}{standby_entitlement}, ownEnt => $own_ent,
+                    fixed => $policy->{Fixed}, fixedSource => $policy->{Source}{standby_entitlement}, ownEnt => $own_ent, ownVP => $own_vp,
                     conflict => $conflict, pair => $pair, currentEnt => $current_ent, currentVP => $current_vp,
                     poolId => $cfg->{pool_id}, primaryEnt => $primary_ent });
                 %result = (Source => 'HA_STANDBY_FIXED', Profile => $profile, TargetEnt => $policy->{Fixed}, TargetVP => $own_vp,
@@ -14941,7 +14980,8 @@ sub _apply_ha_sizing
                            managedSystem => $result{Frame},
                            ownRequirement => { entitlement => $result{OwnTargetEnt}, VPs => $result{OwnTargetVP} },
                            processorModeKnown => ($result{ModeKnown} ? JSON::true : JSON::false),
-                           (defined $result{Conflict} ? (conflict => $result{Conflict}) : ()))
+                           (defined $result{Conflict} ? (conflict => $result{Conflict}, fixedPending => JSON::true,
+                                                         vpStepOnly => ($pair->{VPOnly} ? JSON::true : JSON::false)) : ()))
                         : (since => $result{Since})),
                     (($result{PrimarySource} // '') eq 'installed' ? (unresolved => $result{PrimaryReason}) : ()),
                 };
@@ -15153,7 +15193,10 @@ sub _log_powerha_roles
                     $name, $rr->{Fixed}, ($rr->{OwnTargetEnt} // 0), ($rr->{OwnTargetVP} // '?'), ((($rr->{OwnTargetVP} // 0) == 1) ? '' : 's'),
                     ((($rr->{OwnTargetEnt} // 0) > $rr->{Fixed} + 0.005) ? ', above the standby allocation' : ''),
                     (defined $rr->{Conflict}
-                        ? sprintf('not set this cycle: %s; the installed %.2f on %s VPs is kept', $rr->{Conflict}, ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'))
+                        ? ($rr->{Pair}{VPOnly}
+                            ? sprintf('not set this cycle: %s; the VP step to %s is taken with the installed entitlement %.2f unchanged, and the fixed figure waits',
+                                      $rr->{Conflict}, ($rr->{Pair}{VP} // '?'), ($rr->{Pair}{Ent} // 0))
+                            : sprintf('not set this cycle: %s; the installed %.2f on %s VPs is kept', $rr->{Conflict}, ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?')))
                         : sprintf('current cycle %.2f on %s VPs', ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'))),
                     ($rr->{ModeKnown} ? '' : ' The collector does not report whether this LPAR uses shared or dedicated processors: the setting '
                         . 'is applied as configured.')), '        ', '          ');

@@ -91,7 +91,8 @@ is_deeply(UUT::_ha_sizing_plan($cluster->({ a => 'active', b => 'standby', c => 
 my ($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 2, current_ent => 3.00, current_vp => 4 });
 is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.10, 2, undef], 'installed 3.00 / 4, VP rules allow 2 this cycle: 0.10 on 2 VPs, in one step');
 ($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 3.00, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{Status} ], [3.00, 4, 'HOLD'], 'VP rules allow only 3: the installed pair is kept');
+is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{Status}, $pair->{VPOnly} ], [3.00, 3, 'STAGED', 1],
+          'VP rules allow only 3: the fixed figure waits; the supported VP step is taken with the entitlement unchanged');
 is($why, '0.10 carries at most 2 VPs (0.05 processors per VP) and the VP count of this cycle is 3, which needs at least 0.15', 'the conflict is stated with both figures and what the VPs need');
 ($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => undef, current_ent => 0.40, current_vp => 4 });
 is_deeply([ $pair->{Ent}, $pair->{VP}, defined $why ? 1 : 0 ], [0.40, 4, 1], 'no VP step this cycle and 4 VPs installed: no VP reduction is invented');
@@ -106,6 +107,18 @@ is_deeply([ $pair->{Ent}, $pair->{VP} ], [0.50, 1], 'a fixed figure above the po
 like($why, qr/^it is above the size of its pool \(2\)$/, 'and the pool named as the reason');
 ($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 1, current_ent => undef, current_vp => undef });
 is($pair->{Ent}, undef, 'no installed pair: nothing is resolved');
+
+# A conflict does not hold back a VP step the evidence already supports, and invents none.
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 1.50, current_vp => 4 });
+is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{VPOnly}, $pair->{Carries} ], [1.50, 3, 1, 2], 'installed 1.50 / 4, step 3: keep 1.50, reduce to 3 VPs; 0.10 waits for 2 VPs');
+ok(defined $why, 'the conflict is still reported');
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 2, current_ent => 3.00, current_vp => 4 });
+is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.10, 2, undef], 'where the step reaches a width the fixed figure can carry, it is set: no conflict');
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 3.50, current_vp => 6 });
+is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{Status}, $pair->{VPOnly} ], [3.50, 6, 'HOLD', 0],
+          'the installed entitlement cannot be kept on the narrower width (3.50 on 3 VPs): the installed pair stays');
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 4, current_ent => 0.40, current_vp => 4 });
+is_deeply([ $pair->{VP}, $pair->{Status}, $pair->{VPOnly} ], [4, 'HOLD', 0], 'no VP step from the evidence: none is invented to make the fixed figure fit');
 
 # --- The staging guard of ordinary sizing is kept; the exception is the fixed figure only ----
 # Ordinary sizing is coordinated: entitlement and VPs may both come down in one cycle. The staging
@@ -149,8 +162,20 @@ like($text, qr/\(its own setting in nfit\.vms\.cfg\)\. Its own workload needs 0\
 like($text, qr/Capacity at takeover is arranged outside nFit and is not verified\.$/, 'without the primary\'s target in this run, the standing sentence only');
 ($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 3.00, current_vp => 4 });
 $text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'global',
-    ownEnt => 0.30, pair => $pair, conflict => $why, currentEnt => 3.00, currentVP => 4, poolId => 0 }));
-like($text, qr/fixed standby entitlement 0\.10 \(the \[GLOBAL\] default\) cannot be set this cycle: 0\.10 carries at most 2 VPs \(0\.05 processors per VP\) and the VP count of this cycle is 3, which needs at least 0\.15\. The installed 3\.00 on 4 VPs is kept; no change\./,
-     'a conflict: both figures, the installed pair kept');
+    ownEnt => 0.30, ownVP => 1, pair => $pair, conflict => $why, currentEnt => 3.00, currentVP => 4, poolId => 0 }));
+like($text, qr/fixed standby entitlement 0\.10 \(the \[GLOBAL\] default\) cannot be set this cycle: 0\.10 carries at most 2 VPs \(0\.05 processors per VP\) and the VP count of this cycle is 3, which needs at least 0\.15\. Reduce VPs 4 to 3; the entitlement 3\.00 is kept\./,
+     'a conflict with a supported VP step: both figures, the VP step, the entitlement kept');
+like($text, qr/The fixed 0\.10 waits until the LPAR has 2 VPs or fewer; whether its VPs go that far is for the next measurements to show\./,
+     'the fixed figure stays visible as waiting, with no promise that the VPs will get there');
+like($text, qr/re-measure before the next change/, 'and the planner is told to re-measure');
+$text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'global',
+    ownEnt => 0.30, ownVP => 3, pair => $pair, conflict => $why, currentEnt => 3.00, currentVP => 4, poolId => 0 }));
+like($text, qr/Its own workload needs 3 VPs, more than 0\.10 carries: the fixed figure cannot be set while that holds\./,
+     'where the workload itself needs more VPs than the fixed figure carries, that is said: the conflict stands');
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 4, current_ent => 0.40, current_vp => 4 });
+$text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'global',
+    ownEnt => 0.30, ownVP => 1, pair => $pair, conflict => $why, currentEnt => 0.40, currentVP => 4, poolId => 0 }));
+like($text, qr/The installed 0\.40 on 4 VPs is kept; no change\. The fixed 0\.10 waits until the LPAR has 2 VPs or fewer/,
+     'no supported VP step: the installed pair is kept and the conflict explained');
 
 done_testing();

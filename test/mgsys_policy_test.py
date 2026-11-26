@@ -122,18 +122,25 @@ class ManagedSystemPolicyTests(unittest.TestCase):
         self.assertIn('own workload requirement 0.80 on 1 VP, above', text)
         self.assertIn('does not report whether', text)
 
-    def test_a_fixed_entitlement_that_cannot_carry_the_vps_changes_nothing(self):
+    def test_a_fixed_entitlement_that_cannot_carry_the_vps_waits_and_the_supported_vp_step_is_taken(self):
+        # Installed 1.50 on 4 VPs; the VP rules give 3 this cycle; 0.10 carries 2. The entitlement is kept, the
+        # VPs take their step, and the fixed figure stays visible as waiting.
         root = self.run_cycle(FIXED % '0.10', ('SYSHA2', 'SYSHA1'))
         row = P.standby_row(root)
-        self.assertEqual((row['NFIT - ENT'], row['NFIT - VCPU']), (row['Current - ENT'], row['Current - VCPU']))
+        self.assertEqual((row['Current - ENT'], row['Current - VCPU'], row['NFIT - ENT'], row['NFIT - VCPU']), ('1.50', '4', '1.50', '3'))
         self.assertIn('fixed standby entitlement 0.10 (its managed system\'s default) cannot be set this cycle: 0.10 carries at most 2 VPs '
                       '(0.05 processors per VP) and the VP count of this cycle is 3, which needs at least 0.15. '
-                      'The installed 1.50 on 4 VPs is kept; no change.', row['NFIT - Action'])
+                      'Reduce VPs 4 to 3; the entitlement 1.50 is kept.', row['NFIT - Action'])
+        self.assertIn('The fixed 0.10 waits until the LPAR has 2 VPs or fewer; whether its VPs go that far is for the next measurements to show.',
+                      row['NFIT - Action'])
         self.assertIn('Its own workload needs 0.80', row['NFIT - Action'])
         self.assertIn('[STANDBY_FIXED_CONFLICT]', row['VM_Comments'])
         role = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']['role']
-        self.assertEqual((role['fixedEntitlement'], role['entitlement'], role['VPs'], role['status']), (0.10, 1.5, 4, 'HOLD'))
+        self.assertEqual((role['fixedEntitlement'], role['entitlement'], role['VPs'], role['status']), (0.10, 1.5, 3, 'STAGED'))
+        self.assertEqual((role['fixedPending'], role['vpStepOnly']), (True, True))
         self.assertIn('conflict', role)
+        self.assertIn('the VP step to 3 is taken with the installed entitlement 1.50 unchanged, and the fixed figure waits',
+                      ' '.join(rationale(root, 'SYSHA1').split()))
 
     def test_a_fixed_policy_without_an_entitlement_for_the_standby_stops_the_run(self):
         # The file check accepts another managed system's entitlement for an LPAR stanza; the standby's own frame has none.
