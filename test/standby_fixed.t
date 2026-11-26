@@ -107,6 +107,30 @@ like($why, qr/^it is above the size of its pool \(2\)$/, 'and the pool named as 
 ($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 1, current_ent => undef, current_vp => undef });
 is($pair->{Ent}, undef, 'no installed pair: nothing is resolved');
 
+# --- The staging guard of ordinary sizing is kept; the exception is the fixed figure only ----
+# Ordinary sizing is two-stage: VPs are reduced first and the entitlement is reassessed after the
+# narrower LPAR has been observed. While a VP reduction is on its way, a cut of the entitlement
+# stops at what the more permissive of today's VP:ENT ratio and 2.00 carries on this cycle's VPs.
+my $ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 1, step_vp => 3, current_ent => 3.00, current_vp => 4 });
+is_deeply([ $ordinary->{Ent}, $ordinary->{VP}, $ordinary->{Status} ], [1.01, 3, 'STAGED'],
+          'ordinary staged reduction 4 -> 3 VPs towards 1: the entitlement cut stops at 1.01 (ratio 2.00, the more permissive of 1.33 and 2.00)');
+ok((grep { $_ eq 'RATIO_GUARD' } @{ $ordinary->{Binding} }), 'and the staging guard is named as what shaped it');
+$ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 2, step_vp => 14, current_ent => 4.00, current_vp => 15 });
+is_deeply([ $ordinary->{Ent}, $ordinary->{VP} ], [3.47, 14], 'an over-wide LPAR (15 VPs on 4.00): today\'s ratio 3.75 is kept, not forced to 2.00');
+$ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 1, step_vp => 1, current_ent => 3.00, current_vp => 4 });
+is_deeply([ $ordinary->{Ent}, $ordinary->{VP}, scalar(grep { $_ eq 'RATIO_GUARD' } @{ $ordinary->{Binding} }) ], [0.10, 1, 0],
+          'ordinary sizing that reaches its VP destination in this cycle: no staging guard');
+$ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 1, step_vp => 1, current_ent => 0.50, current_vp => 1 });
+is_deeply([ $ordinary->{Ent}, $ordinary->{VP} ], [0.10, 1], 'a one-VP LPAR has no narrower step: a small entitlement is not raised for a ratio');
+# The fixed standby figure on the same inputs: never raised by the guard; the VP count is still the permitted step.
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 1, current_ent => 0.50, current_vp => 1 });
+is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.10, 1, undef], 'fixed standby 0.10 on 1 VP: valid, not inflated');
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.20, step_vp => 3, current_ent => 3.00, current_vp => 4 });
+is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.20, 3, undef],
+          'fixed standby 0.20 during a staged VP reduction 4 -> 3: the figure stands (ordinary sizing would hold 1.01), VPs are the permitted step');
+($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.20, step_vp => 4, current_ent => 3.00, current_vp => 4 });
+is_deeply([ $pair->{Ent}, $pair->{VP} ], [0.20, 4], 'the VP rules hold the VPs (no step): the fixed figure removes no VP of its own');
+
 # --- The planning action ------------------------------------------------------------
 ($pair) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 2, current_ent => 3.00, current_vp => 4 });
 my $text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'mgsys',
