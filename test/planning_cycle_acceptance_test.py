@@ -116,7 +116,7 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         self.assertRegex(report, r'Frame %s: 2 LPARs with a configuration state on %s, installed entitlement 3\.00; 0 whose last state ended earlier, installed entitlement 0\.00' % (self.standby, self.last))
         self.assertIn('Shared capacity reported by the default-pool LPARs still there: 32 by 2', report)
         self.assertRegex(report, r'Days with samples: (2 LPARs sampled on %s, installed entitlement 3\.00; 0 last sampled earlier, installed entitlement 0\.00|no sample store in the work tree; not checked\.)' % self.last)
-        self.assertRegex(report, r'\[ok\] frame totals: block installed 3\.00, current cycle (\S+), target \S+; CSV installed 3\.00, current cycle \1')
+        self.assertRegex(report, r'\[ok\] frame totals: block installed 3\.00, current cycle (\S+), target \S+; CSV rows counted \(2\) installed 3\.00, current cycle \1')
         work = re.search(r'Work tree kept \(customer data\): (\S+)', run.stderr).group(1)
         before = tree_hash(work)
         again = subprocess.run([sys.executable, os.path.join(self.repo, 'dev', TOOL), '--read', work], capture_output=True, text=True, env=self.env)
