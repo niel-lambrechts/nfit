@@ -112,9 +112,13 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         self.assertIn('Result: all checks passed', report)
         self.assertNotIn('FAIL', report)
         self.assertIn('Fixed standby entitlement 0.15 for frame %s, in the work tree copy of nfit.vms.cfg only.' % self.standby, report)
-        self.assertRegex(report, r'\[ok\] frame %s: standbys on the fixed standby entitlement 0\.15 asked for this run: 1' % self.standby)
-        self.assertRegex(report, r'Fixed standby vm_[0-9a-f]{6} on %s: 0\.15 from the managed-system stanza; installed 1\.50 / 4, own workload needs \S+ on \d VP' % self.standby)
-        self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.15 on 3 VPs \(installed 1\.50 / 4\)')
+        self.assertRegex(report, r'\[ok\] frame %s: standbys under the fixed standby entitlement 0\.15 asked for this run: 1 \(applied to 1, not applied to 0\)' % self.standby)
+        self.assertRegex(report, r'Fixed standby policy, vm_[0-9a-f]{6} on %s \(primary vm_[0-9a-f]{6}, role inferred\): 0\.15 from the managed-system stanza; installed 1\.50 / 4, own workload needs \S+ on 2 VPs' % self.standby)
+        self.assertRegex(report, r'VP requirements: strategic 2 \(run-queue width \S+, peak-throughput floor \S+, configured-burst floor \S+\); VPs that preserve the installed entitlement 2 ')
+        self.assertRegex(report, r'reduction safety CLEAR \(.*\); 0\.15 carries at most 3 VPs')
+        self.assertRegex(report, r'Sustained workload \(at least 1\.00 cores for a full hour, PhysC, since \d\d \w+ 2026\): 0 day\(s\); not found')
+        self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.15 on 2 VPs \(installed 1\.50 / 4\)')
+        self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: the VPs are no fewer than its workload needs \(2\) and no more than the fixed figure carries')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: final at analysis, not pending in the cycle')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: finalisation left the fixed standby\'s entitlement, VPs and action unchanged')
         self.assertIn('[ok] both orders give the same final entitlement, VPs and action for 1 standby', report)
@@ -123,10 +127,21 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         with open(os.path.join(self.repo, 'etc', 'nfit.vms.cfg')) as fh:
             self.assertEqual(fh.read(), config)                                         # the repository's configuration is not changed
 
-    def test_a_fixed_figure_that_waits_is_reported_as_such(self):
+    def test_a_fixed_figure_goes_with_the_vps_the_workload_needs(self):
+        # 0.10 carries two VPs and the standby's workload needs two: set at once, past the step of 4 to 3.
         run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.10')
         self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
-        self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: the fixed figure waits \(0\.10 carries at most 2 VPs .*\); entitlement kept at 1\.50, VPs 4 to 3')
+        self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.10 on 2 VPs \(installed 1\.50 / 4\)')
+        self.assertIn('The workload supports fewer VPs; the previous limit came from preserving installed entitlement.', run.stdout)
+        self.assertIn('Result: all checks passed', run.stdout)
+
+    def test_a_fixed_figure_that_cannot_carry_the_workloads_vps_is_reported_as_not_applied(self):
+        # 0.05 carries one VP and the workload needs two: not applied, and the node keeps its ordinary recommendation.
+        run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.05')
+        self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
+        self.assertRegex(run.stdout, r'\[ok\] frame %s: standbys under the fixed standby entitlement 0\.05 asked for this run: 1 \(applied to 0, not applied to 1\)' % self.standby)
+        self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: fixed figure not applied \(width: its own workload needs 2 VPs and 0\.05 carries at most 1 '
+                                     r'\(0\.05 processors per VP\)\); the recommendation \S+ on \d VPs? follows its workload \(installed 1\.50 / 4\)')
         self.assertIn('Result: all checks passed', run.stdout)
 
     def test_a_frame_outside_the_run_is_refused_for_a_fixed_entitlement(self):

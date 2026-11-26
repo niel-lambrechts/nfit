@@ -14,16 +14,18 @@
 #            - a PowerHA policy value that cannot be read stops the run before
 #              any analysis, with every such setting listed;
 #            - a fixed standby entitlement (v10 B13) inherited from the standby's
-#              managed system is its entitlement in one step, on the VP count the
-#              VP rules give this cycle; the own-workload requirement stays on
-#              the row; no primary plan is awaited and finalisation leaves the
-#              row as it is, in either order of analysis;
-#            - a fixed entitlement that cannot carry this cycle's VPs changes
-#              nothing and says why;
+#              managed system is set together with the VPs the node's own
+#              workload needs, in one change: the VP floor that preserves the
+#              installed entitlement and the per-cycle step cap are not needs
+#              for VPs; the own-workload requirement stays on the row; no
+#              primary plan is awaited and finalisation leaves the row as it
+#              is, in either order of analysis; the plan keeps the trace;
+#            - an ordinary LPAR of the same frame is sized as without it;
 #            - a fixed policy with no entitlement for the standby stops the run.
 # USAGE    : python3 test/mgsys_policy_test.py
 # ==============================================================================
 import csv
+import re
 import os
 import shutil
 import subprocess
@@ -90,57 +92,101 @@ class ManagedSystemPolicyTests(unittest.TestCase):
         self.assertIn('Sizing: independent, each node on its own workload (policy of the standby hanodeA, from the built-in default)',
                       rationale(root, 'SYSHA1'))
 
-    def test_a_fixed_standby_entitlement_is_set_in_one_step_and_is_final_at_analysis(self):
-        # The standby is installed at 1.50 on 4 VPs; its own workload needs 0.80; the VP rules step it to 3 VPs.
-        roots = [self.run_cycle(FIXED % '0.15', order) for order in (('SYSHA2', 'SYSHA1'), ('SYSHA1', 'SYSHA2'))]
+    def test_a_fixed_standby_entitlement_is_set_with_the_workloads_width_and_is_final_at_analysis(self):
+        # The standby is installed at 1.50 on 4 VPs; its own workload needs about 0.80 on 1 VP; reduction safety is CLEAR.
+        # Ordinary sizing would step the VPs 4 to 3 (the tier's cap, towards the VPs that preserve 1.50). Neither is a
+        # need for VPs: the fixed 0.10 is set on the 1 VP the workload needs, in one coordinated change.
+        roots = [self.run_cycle(FIXED % '0.10', order) for order in (('SYSHA2', 'SYSHA1'), ('SYSHA1', 'SYSHA2'))]
         rows = [P.standby_row(root) for root in roots]
         self.assertEqual(rows[0], rows[1])
         row = rows[0]
-        self.assertEqual((row['Current - ENT'], row['Current - VCPU'], row['NFIT - ENT'], row['NFIT - VCPU']), ('1.50', '4', '0.15', '3'))
-        self.assertTrue(row['NFIT - Action'].startswith(
-            "PowerHA standby for hanodeB (inferred): fixed standby entitlement 0.15 (its managed system's default). "
-            'Its own workload needs 0.80, above the standby allocation.'), row['NFIT - Action'])
-        self.assertIn('entitlement 1.50 to 0.15', row['NFIT - Action'])
-        self.assertIn('VPs 4 to 3', row['NFIT - Action'])
+        self.assertEqual((row['Current - ENT'], row['Current - VCPU'], row['NFIT - ENT'], row['NFIT - VCPU']), ('1.50', '4', '0.10', '1'))
+        # The own-workload figure lies on a rounding boundary (0.795): 0.80 on some platforms, 0.79 on others. It is
+        # taken from the row and checked against the node's planning-profile column and the saved plan, not fixed here.
+        said = re.match(r"PowerHA standby for hanodeB \(inferred\): fixed standby entitlement 0\.10 \(its managed system's default\)\. "
+                        r'Its own workload needs (0\.\d\d), above the standby allocation\. '
+                        r'The workload supports fewer VPs; the previous limit came from preserving installed entitlement\. '
+                        r'Entitlement and VPs are assessed together\.', row['NFIT - Action'])
+        self.assertTrue(said, row['NFIT - Action'])
+        own = said.group(1)
+        self.assertIn(own, ('0.79', '0.80'))
+        self.assertEqual(row['G2-98W10'], own)                                       # the planning profile of a G2 node
+        self.assertIn('entitlement 1.50 to 0.10', row['NFIT - Action'])
+        self.assertIn('VPs 4 to 1', row['NFIT - Action'])
         self.assertIn('Capacity at takeover is arranged outside nFit and is not verified.', row['NFIT - Action'])
         self.assertNotIn('Provisional', row['NFIT - Action'])
         self.assertIn('[STANDBY_FIXED]', row['VM_Comments'])
         for root in roots:
             member = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']
             self.assertNotIn('pendingRole', member)
-            role = member['role']
+            role, policy = member['role'], member['standbyPolicy']
             self.assertEqual((role['type'], role['fixedEntitlement'], role['source'], role['managedSystem'], role['entitlement'], role['VPs']),
-                             ('haStandbyFixed', 0.15, 'mgsys', 'SYSHA1', 0.15, 3))
-            self.assertEqual(role['ownRequirement'], {'entitlement': 0.8, 'VPs': 1})
-            self.assertEqual((member['published']['entitlement'], str(member['published']['VPs'])), ('0.15', '3'))
+                             ('haStandbyFixed', 0.10, 'mgsys', 'SYSHA1', 0.10, 1))
+            self.assertEqual((policy['applied'], policy['transition'], policy['fixedEntitlement']), (True, True, 0.10))
+            self.assertEqual(policy['ownRequirement'], {'entitlement': float(own), 'VPs': 1})
+            trace = policy['trace']
+            # What held the VPs in ordinary sizing was the installed entitlement and the step cap, not the workload.
+            self.assertEqual((trace['strategicVPs'], trace['widthVPs'], trace['entitlementPreservingVPs'], trace['vpStep'], trace['safetyState'], trace['carriesVPs']),
+                             (1, 1, 2, 3, 'CLEAR', 2))
+            self.assertIn('current entitlement floor', trace['entitlementPreservingGovernedBy'])
+            self.assertEqual((member['published']['entitlement'], str(member['published']['VPs'])), ('0.10', '1'))
             # The frame's totals count the fixed figure.
             with open(F.outputs(root, 'SYSHA1')['csv']) as fh:
                 total = sum(float(r['NFIT - ENT']) for r in csv.DictReader(fh) if r['NFIT - ENT'])
             self.assertAlmostEqual(float(F.summary_row(root, 'SYSHA1')['CurrentCycle_ENT']), total, places=2)
-        text = rationale(roots[0], 'SYSHA1')
-        self.assertIn("Sizing: fixed standby entitlement 0.15 (its managed system's default)", text)
-        self.assertIn('own workload requirement 0.80 on 1 VP, above', text)
+            # The full figure of the frame is the fixed figure itself, not one raised to a VP minimum.
+            self.assertAlmostEqual(float(F.summary_row(root, 'SYSHA1')['Target_ENT']), total, places=2)
+        text = ' '.join(rationale(roots[0], 'SYSHA1').split())
+        self.assertIn("Sizing: fixed standby entitlement 0.10 (its managed system's default)", text)
+        self.assertIn('own workload requirement %s on 1 VP, above' % own, text)
+        self.assertIn('the workload supports fewer VPs than the step that preserved the installed entitlement', text)
         self.assertIn('does not report whether', text)
 
-    def test_a_fixed_entitlement_that_cannot_carry_the_vps_waits_and_the_supported_vp_step_is_taken(self):
-        # Installed 1.50 on 4 VPs; the VP rules give 3 this cycle; 0.10 carries 2. The entitlement is kept, the
-        # VPs take their step, and the fixed figure stays visible as waiting.
-        root = self.run_cycle(FIXED % '0.10', ('SYSHA2', 'SYSHA1'))
-        row = P.standby_row(root)
-        self.assertEqual((row['Current - ENT'], row['Current - VCPU'], row['NFIT - ENT'], row['NFIT - VCPU']), ('1.50', '4', '1.50', '3'))
-        self.assertIn('fixed standby entitlement 0.10 (its managed system\'s default) cannot be set this cycle: 0.10 carries at most 2 VPs '
-                      '(0.05 processors per VP) and the VP count of this cycle is 3, which needs at least 0.15. '
-                      'Reduce VPs 4 to 3; the entitlement 1.50 is kept.', row['NFIT - Action'])
-        self.assertIn('The fixed 0.10 waits until the LPAR has 2 VPs or fewer; whether its VPs go that far is for the next measurements to show.',
+    def test_the_other_lpar_of_the_frame_is_sized_as_without_the_setting(self):
+        # app1 is an ordinary LPAR on the standby's frame: the managed-system stanza does not touch it.
+        with_fixed = self.run_cycle(FIXED % '0.10', ('SYSHA2', 'SYSHA1'))
+        without = self.run_cycle(P.SHARE, ('SYSHA2', 'SYSHA1'))
+        rows = []
+        for root in (with_fixed, without):
+            with open(F.outputs(root, 'SYSHA1')['csv']) as fh:
+                rows.append(next(r for r in csv.DictReader(fh) if r['VM'] == 'app1'))
+        self.assertEqual(rows[0], rows[1])
+        self.assertNotIn('standbyPolicy', P.load(F.outputs(with_fixed, 'SYSHA1')['plan'])['members']['app1'])
+
+    def test_an_inferred_standby_that_carries_sustained_workload_keeps_its_ordinary_sizing(self):
+        # An unequal active-active pair: the larger node leads throughout, so the role evidence reads the smaller one
+        # as standby; it runs at 1.3 cores all day. The fixed allocation is withheld and the node is sized as without it.
+        def working(vm, t):
+            if vm == 'app1':
+                return 0.8
+            return 3.0 if ((t < H.SWITCH) == (vm == 'hanodeA')) else 1.3
+        saved = H.level
+        H.level = working
+        try:
+            fixed = [self.run_cycle(FIXED % '0.10', order) for order in (('SYSHA2', 'SYSHA1'), ('SYSHA1', 'SYSHA2'))]
+            plain = self.run_cycle('[GLOBAL]\nha_sizing = independent\n', ('SYSHA2', 'SYSHA1'))
+        finally:
+            H.level = saved
+        rows = [P.standby_row(root) for root in fixed]
+        self.assertEqual(rows[0], rows[1])
+        row, ordinary = rows[0], P.standby_row(plain)
+        self.assertEqual((row['NFIT - ENT'], row['NFIT - VCPU']), (ordinary['NFIT - ENT'], ordinary['NFIT - VCPU']))
+        self.assertGreater(float(row['NFIT - ENT']), 1.0)
+        self.assertTrue(row['NFIT - Action'].startswith(ordinary['NFIT - Action']), row['NFIT - Action'])
+        self.assertIn('Substantial ongoing workload conflicts with an idle-standby assumption (at least 1.00 cores consumed for a full hour on ',
                       row['NFIT - Action'])
-        self.assertIn('Its own workload needs 0.80', row['NFIT - Action'])
-        self.assertIn('[STANDBY_FIXED_CONFLICT]', row['VM_Comments'])
-        role = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']['role']
-        self.assertEqual((role['fixedEntitlement'], role['entitlement'], role['VPs'], role['status']), (0.10, 1.5, 3, 'STAGED'))
-        self.assertEqual((role['fixedPending'], role['vpStepOnly']), (True, True))
-        self.assertIn('conflict', role)
-        self.assertIn('the VP step to 3 is taken with the installed entitlement 1.50 unchanged, and the fixed figure waits',
-                      ' '.join(rationale(root, 'SYSHA1').split()))
+        self.assertIn('(PhysC: busy time is not collected for both nodes, a weaker basis)). Fixed standby allocation 0.10 '
+                      "(its managed system's default) not applied; recommendation follows this node's workload. "
+                      'Both nodes of this cluster carry sustained workload; which node owns the resource groups is not verified.', row['NFIT - Action'])
+        self.assertIn('[STANDBY_FIXED_NOT_APPLIED]', row['VM_Comments'])
+        self.assertNotIn('[STANDBY_FIXED]', row['VM_Comments'])
+        member = P.load(F.outputs(fixed[0], 'SYSHA1')['plan'])['members']['hanodeA']
+        self.assertNotEqual((member.get('role') or {}).get('type'), 'haStandbyFixed')
+        policy = member['standbyPolicy']
+        self.assertEqual((policy['applied'], policy['notApplied']['kind'], policy['roleSource']), (False, 'workload', 'inferred'))
+        self.assertEqual((policy['sustainedWorkload']['found'], policy['sustainedWorkload']['bothNodes'], policy['sustainedWorkload']['basis']),
+                         (True, True, 'PhysC'))
+        self.assertIn('substantial ongoing workload', ' '.join(rationale(fixed[0], 'SYSHA1').split()))
 
     def test_a_fixed_policy_without_an_entitlement_for_the_standby_stops_the_run(self):
         # The file check accepts another managed system's entitlement for an LPAR stanza; the standby's own frame has none.

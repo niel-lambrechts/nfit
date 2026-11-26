@@ -18,7 +18,8 @@ my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
 for my $name (qw(_resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text _policy_source_text
-                 _ha_standby_policy _ha_sizing_plan _ha_fixed_standby_pair _ha_fixed_standby_action))
+                 _ha_standby_policy _ha_sizing_plan _ha_fixed_standby_resolve _ha_fixed_standby_action _ha_fixed_not_applied_text
+    _ha_role_rules _ha_sustained_workload _ha_workload_text _ha_workload_veto_text))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
@@ -28,6 +29,7 @@ my ($ratio_max)      = $src =~ /^my \$VCPU_RATIO_MAX\s*=\s*([0-9.]+);/m or die "
 eval qq{
 package UUT;
 use Scalar::Util qw(looks_like_number);
+use List::Util qw(max);
 our \$FLOAT_EPSILON = 1e-9;
 our \$MIN_ENT_PER_VP = $min_ent_per_vp;
 our \$VCPU_RATIO_MAX = $ratio_max;
@@ -87,95 +89,130 @@ $plan = UUT::_ha_sizing_plan($cluster->({ a => 'unknown', b => 'unknown' }, [ { 
 is_deeply([ map { $plan->{$_}{Treatment} } qw(a b) ], ['hold_reductions', 'hold_reductions'], 'unresolved after a handover: both held, as without the setting');
 is_deeply(UUT::_ha_sizing_plan($cluster->({ a => 'active', b => 'standby', c => 'standby' }), $fixed_policy), {}, 'three nodes: not applied');
 
-# --- The pair: entitlement in one step; VPs by the existing VP rules ----------------
-my ($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 2, current_ent => 3.00, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.10, 2, undef], 'installed 3.00 / 4, VP rules allow 2 this cycle: 0.10 on 2 VPs, in one step');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 3.00, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{Status}, $pair->{VPOnly} ], [3.00, 3, 'STAGED', 1],
-          'VP rules allow only 3: the fixed figure waits; the supported VP step is taken with the entitlement unchanged');
-is($why, '0.10 carries at most 2 VPs (0.05 processors per VP) and the VP count of this cycle is 3, which needs at least 0.15', 'the conflict is stated with both figures and what the VPs need');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => undef, current_ent => 0.40, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, defined $why ? 1 : 0 ], [0.40, 4, 1], 'no VP step this cycle and 4 VPs installed: no VP reduction is invented');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 1, current_ent => 0.05, current_vp => 1 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.10, 1, undef], 'an override, not a ceiling: below the fixed figure the entitlement is raised to it');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 2, current_ent => 0.10, current_vp => 2 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{Status}, $why ], [0.10, 2, 'NO_CHANGE', undef], 'already there: no change, no conflict');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 2.50, step_vp => 1, current_ent => 0.50, current_vp => 1 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [2.50, 3, undef], 'a fixed figure wider than the VPs: VPs added to carry it, as for any entitlement');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 2.50, step_vp => 1, current_ent => 0.50, current_vp => 1, pool_size => 2 });
-is_deeply([ $pair->{Ent}, $pair->{VP} ], [0.50, 1], 'a fixed figure above the pool\'s size: installed pair kept');
-like($why, qr/^it is above the size of its pool \(2\)$/, 'and the pool named as the reason');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 1, current_ent => undef, current_vp => undef });
-is($pair->{Ent}, undef, 'no installed pair: nothing is resolved');
-
-# A conflict does not hold back a VP step the evidence already supports, and invents none.
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 1.50, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{VPOnly}, $pair->{Carries} ], [1.50, 3, 1, 2], 'installed 1.50 / 4, step 3: keep 1.50, reduce to 3 VPs; 0.10 waits for 2 VPs');
-ok(defined $why, 'the conflict is still reported');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 2, current_ent => 3.00, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.10, 2, undef], 'where the step reaches a width the fixed figure can carry, it is set: no conflict');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 3.50, current_vp => 6 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $pair->{Status}, $pair->{VPOnly} ], [3.50, 6, 'HOLD', 0],
-          'the installed entitlement cannot be kept on the narrower width (3.50 on 3 VPs): the installed pair stays');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 4, current_ent => 0.40, current_vp => 4 });
-is_deeply([ $pair->{VP}, $pair->{Status}, $pair->{VPOnly} ], [4, 'HOLD', 0], 'no VP step from the evidence: none is invented to make the fixed figure fit');
+# --- Entitlement and VPs resolved together ------------------------------------------
+# The VP count is the width the node's own workload needs (its strategic VP target). The floor that
+# preserves the installed entitlement and the per-cycle step cap are not needs for VPs.
+my $fx = sub { return UUT::_ha_fixed_standby_resolve({ fixed => 0.10, safety_state => 'CLEAR', @_ }); };
+my $r = $fx->(own_vp => 1, step_vp => 6, current_ent => 6.00, current_vp => 7);
+is_deeply([ $r->{Applied}, $r->{Pair}{Ent}, $r->{Pair}{VP}, $r->{Transition} ], [1, 0.10, 1, 1],
+          'high installed entitlement (6.00 on 7 VPs), quiet standby, workload width 1 VP, safety CLEAR: 0.10 on 1 VP at once');
+$r = $fx->(own_vp => 1, step_vp => 3, current_ent => 1.50, current_vp => 4);
+is_deeply([ $r->{Applied}, $r->{Pair}{Ent}, $r->{Pair}{VP}, $r->{Transition} ], [1, 0.10, 1, 1], 'a pure tier-step limit (4 to 3) does not hold the pair: 0.10 on 1 VP');
+$r = $fx->(own_vp => 2, step_vp => 2, current_ent => 3.00, current_vp => 4);
+is_deeply([ $r->{Applied}, $r->{Pair}{VP}, $r->{Transition} ], [1, 2, 0], 'where the step already reaches the workload\'s width there is no transition to explain');
+# A genuine safety concern is not bypassed: the VPs take only the step the VP rules give.
+$r = $fx->(own_vp => 1, step_vp => 7, current_ent => 6.00, current_vp => 7, safety_state => 'BLOCK', safety_reasons => 'material RunQ/workload pressure is present');
+is_deeply([ $r->{Applied}, $r->{Kind}, $r->{CycleVP} ], [0, 'safety', 7], 'a pressure-based block: the VPs stay, 0.10 cannot be carried on 7, the fixed figure is not applied');
+like($r->{Cause}, qr/^the VP reduction is limited this cycle \(BLOCK: material RunQ\/workload pressure is present\), which leaves 7 VPs, and 0\.10 carries at most 2$/,
+     'and the cause names the verdict and its evidence, not a step limit');
+$r = $fx->(own_vp => 1, step_vp => 2, current_ent => 1.50, current_vp => 3, safety_state => 'CAUTION', safety_reasons => 'positive growth adjustment 0.20 cores');
+is_deeply([ $r->{Applied}, $r->{Pair}{Ent}, $r->{Pair}{VP}, $r->{Limited} ], [1, 0.10, 2, 'CAUTION: positive growth adjustment 0.20 cores'],
+          'a caution: the VPs take the permitted step; the fixed figure is set where that step can carry it');
+$r = $fx->(own_vp => 1, step_vp => 3, current_ent => 1.50, current_vp => 4, safety_state => undef);
+is_deeply([ $r->{Applied}, $r->{Kind} ], [0, 'safety'], 'no safety verdict is not a clear one');
+# The workload's own width is never undercut, and the fixed figure is never raised.
+$r = $fx->(own_vp => 3, step_vp => 5, current_ent => 3.00, current_vp => 6);
+is_deeply([ $r->{Applied}, $r->{Kind}, $r->{Width} ], [0, 'width', 3], 'credible peaks or run queue needing 3 VPs: 0.10 carries 2, so the fixed figure is not applied');
+is($r->{Cause}, 'its own workload needs 3 VPs and 0.10 carries at most 2 (0.05 processors per VP)', 'the cause is the measured width');
+ok(!defined $r->{Pair}, 'no pair is made up: the caller keeps the node\'s ordinary pair');
+$r = $fx->(own_vp => 4, step_vp => 4, current_ent => 2.00, current_vp => 4);
+is_deeply([ $r->{Applied}, $r->{Kind} ], [0, 'width'], 'a node whose workload needs 4 VPs: not applied (its ordinary pair may be an increase)');
+$r = UUT::_ha_fixed_standby_resolve({ fixed => 0.15, safety_state => 'CLEAR', own_vp => 3, step_vp => 3, current_ent => 1.50, current_vp => 4 });
+is_deeply([ $r->{Applied}, $r->{Pair}{Ent}, $r->{Pair}{VP} ], [1, 0.15, 3], 'a fixed figure that carries the workload\'s width is set on it');
+$r = $fx->(own_vp => 1, step_vp => 1, current_ent => 0.05, current_vp => 1);
+is_deeply([ $r->{Applied}, $r->{Pair}{Ent}, $r->{Pair}{VP} ], [1, 0.10, 1], 'an override, not a ceiling: below the fixed figure the entitlement is raised to it');
+$r = $fx->(own_vp => 2, step_vp => 1, current_ent => 0.50, current_vp => 1);
+is_deeply([ $r->{Applied}, $r->{Pair}{VP}, $r->{Pair}{ReviewVP} ], [1, 1, 2], 'more VPs than installed on evidence alone stay a review, as for any LPAR');
+$r = UUT::_ha_fixed_standby_resolve({ fixed => 2.50, safety_state => 'CLEAR', own_vp => 1, step_vp => 1, current_ent => 0.50, current_vp => 1 });
+is_deeply([ $r->{Applied}, $r->{Pair}{Ent}, $r->{Pair}{VP} ], [1, 2.50, 3], 'a fixed figure wider than the VPs: VPs added to carry it');
+$r = UUT::_ha_fixed_standby_resolve({ fixed => 2.50, safety_state => 'CLEAR', own_vp => 1, step_vp => 1, current_ent => 0.50, current_vp => 1, pool_size => 2 });
+is_deeply([ $r->{Applied}, $r->{Kind} ], [0, 'pool'], 'a fixed figure above the pool\'s size is not applied');
+$r = $fx->(own_vp => undef, step_vp => 3, current_ent => 1.50, current_vp => 4);
+is_deeply([ $r->{Applied}, $r->{Kind} ], [0, 'evidence'], 'no VP requirement from the workload: insufficient evidence, not applied');
+$r = $fx->(own_vp => 1, step_vp => 1, current_ent => undef, current_vp => undef);
+is_deeply([ $r->{Applied}, $r->{Kind} ], [0, 'evidence'], 'no installed pair: not applied');
 
 # --- The staging guard of ordinary sizing is kept; the exception is the fixed figure only ----
 # Ordinary sizing is coordinated: entitlement and VPs may both come down in one cycle. The staging
-# guard is one of its safeguards and is not entitlement preservation: while a VP reduction is still
-# on its way, the entitlement cut of that cycle stops at what the more permissive of today's
-# VP:ENT ratio and 2.00 carries on the cycle's VPs. (The coordinated change itself is traced end
-# to end in stage1_reduction_test.py.)
+# guard is one of its safeguards and is not entitlement preservation. (The coordinated change itself
+# is traced end to end in stage1_reduction_test.py.)
 my $ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 1, step_vp => 3, current_ent => 3.00, current_vp => 4 });
 is_deeply([ $ordinary->{Ent}, $ordinary->{VP}, $ordinary->{Status} ], [1.01, 3, 'STAGED'],
-          'ordinary staged reduction 4 -> 3 VPs towards 1: the entitlement cut stops at 1.01 (ratio 2.00, the more permissive of 1.33 and 2.00)');
+          'ordinary staged reduction 4 -> 3 VPs towards 1: unchanged (the entitlement cut stops at 1.01)');
 ok((grep { $_ eq 'RATIO_GUARD' } @{ $ordinary->{Binding} }), 'and the staging guard is named as what shaped it');
 $ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 2, step_vp => 14, current_ent => 4.00, current_vp => 15 });
-is_deeply([ $ordinary->{Ent}, $ordinary->{VP} ], [3.47, 14], 'an over-wide LPAR (15 VPs on 4.00): today\'s ratio 3.75 is kept, not forced to 2.00');
-$ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 1, step_vp => 1, current_ent => 3.00, current_vp => 4 });
-is_deeply([ $ordinary->{Ent}, $ordinary->{VP}, scalar(grep { $_ eq 'RATIO_GUARD' } @{ $ordinary->{Binding} }) ], [0.10, 1, 0],
-          'ordinary sizing that reaches its VP destination in this cycle: no staging guard');
+is_deeply([ $ordinary->{Ent}, $ordinary->{VP} ], [3.47, 14], 'an over-wide ordinary LPAR (15 VPs on 4.00): today\'s ratio 3.75 is kept, as before');
 $ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 1, step_vp => 1, current_ent => 0.50, current_vp => 1 });
 is_deeply([ $ordinary->{Ent}, $ordinary->{VP} ], [0.10, 1], 'a one-VP LPAR has no narrower step: a small entitlement is not raised for a ratio');
-# The fixed standby figure on the same inputs: never raised by the guard; the VP count is still the permitted step.
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 1, current_ent => 0.50, current_vp => 1 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.10, 1, undef], 'fixed standby 0.10 on 1 VP: valid, not inflated');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.20, step_vp => 3, current_ent => 3.00, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP}, $why ], [0.20, 3, undef],
-          'fixed standby 0.20 during a staged VP reduction 4 -> 3: the figure stands (ordinary sizing would hold 1.01), VPs are the permitted step');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.20, step_vp => 4, current_ent => 3.00, current_vp => 4 });
-is_deeply([ $pair->{Ent}, $pair->{VP} ], [0.20, 4], 'the VP rules hold the VPs (no step): the fixed figure removes no VP of its own');
 
 # --- The planning action ------------------------------------------------------------
-($pair) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 2, current_ent => 3.00, current_vp => 4 });
+$r = $fx->(own_vp => 1, step_vp => 6, current_ent => 6.00, current_vp => 7);
 my $text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'mgsys',
-    ownEnt => 0.30, pair => $pair, currentEnt => 3.00, currentVP => 4, poolId => 0, primaryEnt => 12 }));
+    ownEnt => 0.30, resolved => $r, currentEnt => 6.00, currentVP => 7, poolId => 0, primaryEnt => 12 }));
 like($text, qr/^PowerHA standby for dbnode1 \(inferred\): fixed standby entitlement 0\.10 \(its managed system's default\)\. Its own workload needs 0\.30, above the standby allocation\./,
      'the row names the policy, its source, and the own-workload requirement above it');
-like($text, qr/entitlement 3\.00 to 0\.10/, 'the entitlement change');
-like($text, qr/VPs 4 to 2/, 'the VP step of this cycle');
+like($text, qr/The workload supports fewer VPs; the previous limit came from preserving installed entitlement\. Entitlement and VPs are assessed together\./,
+     'a pure transition constraint is explained as such');
+like($text, qr/entitlement 6\.00 to 0\.10/, 'the entitlement change');
+like($text, qr/VPs 7 to 1/, 'the VP change');
 like($text, qr/At failover it needs up to 12\.00 entitlement; capacity at takeover is arranged outside nFit and is not verified\.$/, 'the failover figure is unchanged');
 unlike($text, qr/can carry|sufficient for takeover/i, 'nothing says the standby can take the load at the fixed figure');
+$r = $fx->(own_vp => 1, step_vp => 1, current_ent => 0.10, current_vp => 1);
 $text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'configured', fixed => 0.10, fixedSource => 'lpar',
-    ownEnt => 0.05, pair => { Ent => 0.10, VP => 1, Status => 'NO_CHANGE' }, currentEnt => 0.10, currentVP => 1, poolId => 0 }));
+    ownEnt => 0.05, resolved => $r, currentEnt => 0.10, currentVP => 1, poolId => 0 }));
 like($text, qr/\(its own setting in nfit\.vms\.cfg\)\. Its own workload needs 0\.05\. /, 'own workload below the fixed figure: stated without "above"');
+unlike($text, qr/previous limit/, 'no transition sentence where nothing was held back');
 like($text, qr/Capacity at takeover is arranged outside nFit and is not verified\.$/, 'without the primary\'s target in this run, the standing sentence only');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 3, current_ent => 3.00, current_vp => 4 });
+$r = $fx->(own_vp => 1, step_vp => 2, current_ent => 1.50, current_vp => 3, safety_state => 'CAUTION', safety_reasons => 'positive growth adjustment 0.20 cores');
 $text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'global',
-    ownEnt => 0.30, ownVP => 1, pair => $pair, conflict => $why, currentEnt => 3.00, currentVP => 4, poolId => 0 }));
-like($text, qr/fixed standby entitlement 0\.10 \(the \[GLOBAL\] default\) cannot be set this cycle: 0\.10 carries at most 2 VPs \(0\.05 processors per VP\) and the VP count of this cycle is 3, which needs at least 0\.15\. Reduce VPs 4 to 3; the entitlement 3\.00 is kept\./,
-     'a conflict with a supported VP step: both figures, the VP step, the entitlement kept');
-like($text, qr/The fixed 0\.10 waits until the LPAR has 2 VPs or fewer; whether its VPs go that far is for the next measurements to show\./,
-     'the fixed figure stays visible as waiting, with no promise that the VPs will get there');
-like($text, qr/re-measure before the next change/, 'and the planner is told to re-measure');
-$text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'global',
-    ownEnt => 0.30, ownVP => 3, pair => $pair, conflict => $why, currentEnt => 3.00, currentVP => 4, poolId => 0 }));
-like($text, qr/Its own workload needs 3 VPs, more than 0\.10 carries: the fixed figure cannot be set while that holds\./,
-     'where the workload itself needs more VPs than the fixed figure carries, that is said: the conflict stands');
-($pair, $why) = UUT::_ha_fixed_standby_pair({ fixed => 0.10, step_vp => 4, current_ent => 0.40, current_vp => 4 });
-$text = join(' ', grep { $_ ne '' } UUT::_ha_fixed_standby_action({ primary => 'dbnode1', roleSource => 'inferred', fixed => 0.10, fixedSource => 'global',
-    ownEnt => 0.30, ownVP => 1, pair => $pair, conflict => $why, currentEnt => 0.40, currentVP => 4, poolId => 0 }));
-like($text, qr/The installed 0\.40 on 4 VPs is kept; no change\. The fixed 0\.10 waits until the LPAR has 2 VPs or fewer/,
-     'no supported VP step: the installed pair is kept and the conflict explained');
+    ownEnt => 0.30, resolved => $r, currentEnt => 1.50, currentVP => 3, poolId => 0 }));
+like($text, qr/The VP reduction is limited this cycle \(CAUTION: positive growth adjustment 0\.20 cores\)\./, 'a limited VP reduction names the verdict and its evidence');
+is(UUT::_ha_fixed_not_applied_text(0.10, 'mgsys', 'its own workload needs 3 VPs and 0.10 carries at most 2 (0.05 processors per VP)'),
+   'Fixed standby entitlement 0.10 (its managed system\'s default) not applied: its own workload needs 3 VPs and 0.10 carries at most 2 (0.05 processors per VP). '
+   . 'The recommendation follows this node\'s workload.', 'not applied: said on the node\'s ordinary row, with the actual cause');
+
+# --- Sustained workload: positive evidence that a node is not an idle standby ----------
+# 15-minute blocks; a block counts at 80% coverage and a median of 1.00 cores or more; four in a row
+# are a sustained hour; the days on which one completes are counted; two days make the verdict.
+my $day = 96;
+my $series = sub
+{
+    my ($n, %busy) = @_;          # block index => level; everything else quiet at 0.05
+    return [ map { { b_med => ($busy{$_} // 0.05), b_cov => 1, c_med => ($busy{$_} // 0.05) + 0.10, c_cov => 1 } } (0 .. $n - 1) ];
+};
+my $hour = sub { my ($start, $lvl) = @_; return map { ($start + $_ => $lvl) } (0 .. 3); };
+my $w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.00), $hour->(2 * $day + 40, 3.2)), 0, 0, 'PhysB');
+is_deeply([ @$w{qw(Basis Days Bearing)} ], ['PhysB', 2, 1], 'one busy core for a full hour on two days: sustained workload');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.4)), 0, 0, 'PhysB');
+is_deeply([ @$w{qw(Days Bearing)} ], [1, 0], 'one day only: not enough');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.4), $hour->(20, 1.4), $hour->(60, 1.4)), 0, 0, 'PhysB');
+is_deeply([ @$w{qw(Days Bearing)} ], [1, 0], 'several hours on the same day are one day');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, (map { ($_ => 1.4) } 10 .. 12), (map { ($_ => 1.4) } $day + 10 .. $day + 12)), 0, 0, 'PhysB');
+is_deeply([ @$w{qw(Days Bearing)} ], [0, 0], 'three blocks are not a sustained hour');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 0.95), $hour->($day + 10, 0.95)), 0, 0, 'PhysB');
+is($w->{Bearing}, 0, 'below one core: no verdict (use above entitlement is not the test)');
+my $gappy = $series->(5 * $day, $hour->(10, 1.4), $hour->($day + 10, 1.4));
+$gappy->[$day + 11]{b_cov} = 0.5;
+$w = UUT::_ha_sustained_workload($gappy, 0, 0, 'PhysB');
+is_deeply([ @$w{qw(Days Bearing)} ], [1, 0], 'a thinly sampled block ends a run: it is never taken as busy');
+# The node's current role period only: its time as the active node does not count against it.
+$w = UUT::_ha_sustained_workload($series->(5 * $day, (map { ($_ => 4.0) } 0 .. 2 * $day - 1)), 0, 2 * $day, 'PhysB');
+is_deeply([ @$w{qw(Days Bearing Since)} ], [0, 0, 2 * $day * 900], 'a node that was active and has been quiet since the handover: no sustained workload');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, (map { ($_ => 4.0) } 0 .. 2 * $day - 1), $hour->(3 * $day, 1.2), $hour->(4 * $day, 1.2)), 0, 2 * $day, 'PhysB');
+is($w->{Bearing}, 1, 'and one that kept working after it: sustained workload');
+# Without PhysB the consumed cores are read, and the weaker basis is stated.
+$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 0.95), $hour->($day + 10, 0.95)), 0, 0, 'PhysC');
+is_deeply([ @$w{qw(Basis Bearing)} ], ['PhysC', 1], 'PhysC (0.95 busy shown as 1.05 consumed here): the verdict rests on consumed cores');
+is(UUT::_ha_workload_text($w), 'at least 1.00 cores consumed for a full hour on 2 days of its current role period (PhysC: busy time is not collected for both nodes, a weaker basis)',
+   'and says so');
+my $none = UUT::_ha_sustained_workload([ map { { c_med => undef, c_cov => 0, b_med => undef, b_cov => 0 } } 1 .. 200 ], 0, 0, 'PhysB');
+is_deeply([ @$none{qw(Days Bearing)} ], [0, 0], 'no samples: no verdict either way (never a finding of idleness)');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.00), $hour->(2 * $day + 40, 3.2)), 0, 0, 'PhysB');
+is(UUT::_ha_workload_veto_text(0.10, 'mgsys', $w, 1),
+   'Substantial ongoing workload conflicts with an idle-standby assumption (at least 1.00 busy cores for a full hour on 2 days of its current role period (PhysB)). '
+   . 'Fixed standby allocation 0.10 (its managed system\'s default) not applied; recommendation follows this node\'s workload. '
+   . 'Both nodes of this cluster carry sustained workload; which node owns the resource groups is not verified.',
+   'the row of an inferred standby that carries work, both nodes working: no claim about resource-group ownership');
+unlike(UUT::_ha_workload_veto_text(0.10, 'mgsys', $w, 0), qr/Both nodes/, 'one node only: no statement about the pair');
 
 done_testing();

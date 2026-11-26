@@ -2464,11 +2464,21 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "  Fixed standby      ha_sizing = standby_fixed: the customer's entitlement for a node while it is\n";
         print {$LOG_FH} "  entitlement        standby (standby_entitlement), for sites that add capacity at takeover.\n";
         print {$LOG_FH} "                     Not a floor: it replaces the entitlement the node's own workload asks\n";
-        print {$LOG_FH} "                     for, which is still shown. VPs follow the usual VP rules. Where the\n";
-        print {$LOG_FH} "                     entitlement cannot carry this cycle's VPs (0.05 per VP) it waits, marked\n";
-        print {$LOG_FH} "                     [STANDBY_FIXED_CONFLICT]: the VP step the workload supports is still taken\n";
-        print {$LOG_FH} "                     with the entitlement unchanged, where that pair is valid; no VP is removed\n";
-        print {$LOG_FH} "                     to make the fixed figure fit. nFit does not arrange or verify takeover capacity.\n";
+        print {$LOG_FH} "                     for, which is still shown. The VPs are the width that workload needs; the\n";
+        print {$LOG_FH} "                     VP floor that preserves the installed entitlement and the per-cycle step\n";
+        print {$LOG_FH} "                     cap do not hold them, a reduction-safety concern does. Where the figure\n";
+        print {$LOG_FH} "                     cannot be set on those VPs (0.05 per VP) it is not applied and the node\n";
+        print {$LOG_FH} "                     keeps its ordinary recommendation: [STANDBY_FIXED_NOT_APPLIED]. nFit does\n";
+        print {$LOG_FH} "                     not arrange or verify takeover capacity.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Sustained workload A node that ran at one busy core or more for a full hour on at least two days\n";
+        print {$LOG_FH} "  (PowerHA node)     of its current role period (15-minute medians; PhysB, or PhysC consumed where\n";
+        print {$LOG_FH} "                     PhysB is not collected for both nodes, a weaker basis). A node the role\n";
+        print {$LOG_FH} "                     evidence reads as standby that does so is not sized as an idle standby:\n";
+        print {$LOG_FH} "                     the fixed standby entitlement is not applied to it. For a node configured\n";
+        print {$LOG_FH} "                     as standby the setting is applied and the mismatch reported:\n";
+        print {$LOG_FH} "                     [STANDBY_WORKLOAD_MISMATCH]. Provisional; its absence does not show that\n";
+        print {$LOG_FH} "                     a node is idle.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
@@ -13658,6 +13668,9 @@ sub _ha_role_rules
         minLeadBlocks    => 4,       # ... the rising node leads during (shares of separated blocks)
         relativeDrop     => 0.50,    # the falling node drops to at most half its usual level
         minSegmentBlocks => 96,      # supported blocks in profile hours for a segment verdict
+        workCores        => 1.00,    # sustained workload: at least one busy core ...
+        workBlocks       => 4,       # ... in each of four consecutive blocks (one hour) ...
+        workDays         => 2,       # ... on at least two days of the node's current role period (provisional)
     };
 }
 
@@ -14035,6 +14048,62 @@ sub _ha_detect_pair
 }
 
 # ==============================================================================
+# SUBROUTINE: _ha_sustained_workload
+# PURPOSE:    Positive evidence that a node carries substantial ongoing work
+#             (v10 B13): a full hour at one busy physical core or more, on at
+#             least two days. Measured on the detector's 15-minute blocks, all
+#             hours: a block counts when at least 80% of its minutes hold a
+#             sample and the median of its minute values is 1.00 cores or
+#             more; four consecutive such blocks are a sustained hour; the
+#             days (UTC) on which a sustained hour completes are counted. The
+#             metric is the detector's: PhysB (busy time), or PhysC (consumed)
+#             where PhysB is not collected for both nodes, a weaker basis.
+#             A missing or thin block ends a run: it is never taken as busy,
+#             and never as idle. The settings are provisional. The verdict
+#             only ever withholds an automatic standby allocation; its absence
+#             does not show that a node is inactive. Pure.
+# ARGUMENTS:  1. blocks of the node (from _ha_blocks)  2. window start (epoch)
+#             3. first block to read (the start of the node's current role
+#                period)  4. metric (PhysB | PhysC)
+# RETURNS:    hashref { Basis, Cores, Days, Since (epoch), Bearing (1/0) }
+# ==============================================================================
+sub _ha_sustained_workload
+{
+    my ($blocks, $from, $first, $metric) = @_;
+    my $rules = _ha_role_rules();
+    my ($med, $cov) = (($metric // '') eq 'PhysB') ? qw(b_med b_cov) : qw(c_med c_cov);
+    $first = 0 unless (defined $first && $first > 0);
+    my (%days, $run);
+    $run = 0;
+    foreach my $k ($first .. $#{ $blocks // [] })
+    {
+        my $blk = $blocks->[$k];
+        if (defined $blk && ($blk->{$cov} // 0) >= $rules->{minCoverage} && defined $blk->{$med} && $blk->{$med} >= $rules->{workCores} - $FLOAT_EPSILON)
+        {
+            $run++;
+            $days{ int(($from + $k * $rules->{blockSeconds}) / 86400) } = 1 if ($run >= $rules->{workBlocks});
+        }
+        else
+        {
+            $run = 0;
+        }
+    }
+    my $n = scalar(keys %days);
+    return { Basis => ((($metric // '') eq 'PhysB') ? 'PhysB' : 'PhysC'), Cores => $rules->{workCores}, Days => $n,
+             Since => $from + $first * $rules->{blockSeconds}, Bearing => ($n >= $rules->{workDays} ? 1 : 0) };
+}
+
+# The sustained-workload evidence of a node, as the planner reads it. Pure.
+sub _ha_workload_text
+{
+    my ($w) = @_;
+    return '' unless (ref($w) eq 'HASH');
+    return sprintf('at least %.2f %s for a full hour on %d day%s of its current role period (%s)', $w->{Cores},
+        ($w->{Basis} eq 'PhysB' ? 'busy cores' : 'cores consumed'), $w->{Days}, ($w->{Days} == 1 ? '' : 's'),
+        ($w->{Basis} eq 'PhysB' ? 'PhysB' : 'PhysC: busy time is not collected for both nodes, a weaker basis'));
+}
+
+# ==============================================================================
 # SUBROUTINE: _ha_resolve_roles
 # PURPOSE:    The role of each node of one cluster (6c; used by the 6d sizing), keeping
 #             the sources apart: configured (ha_role), the VM configuration's
@@ -14296,6 +14365,12 @@ sub _ha_role_evidence
             $c{Detection} = _ha_detect_pair($node_a, $node_b, @blocks, $from, \%windows);
             $c{Blocks} = \@blocks;                    # for the calibration detail only
             $c{Metric} = $c{Detection}{Metric};
+            # Sustained workload of each node in its current role period: from the latest sustained
+            # handover, so that a node's time as the active one does not count against it as a standby.
+            my $latest = (ref($c{Detection}{Segments}) eq 'ARRAY' && @{ $c{Detection}{Segments} }) ? $c{Detection}{Segments}[-1] : undef;
+            my $first = defined $latest ? int(($latest->{From} - $from) / $rules->{blockSeconds}) : 0;
+            $c{Workload} = { $node_a => _ha_sustained_workload($blocks[0], $from, $first, $c{Metric}),
+                             $node_b => _ha_sustained_workload($blocks[1], $from, $first, $c{Metric}) };
         }
         $c{Roles} = _ha_resolve_roles($members, $c{Detection}, $c{Reason}, \&_vms_config_settings, sub
         {
@@ -14428,6 +14503,106 @@ sub _ha_standby_policy
     return \%resolved;
 }
 
+# ==============================================================================
+# SUBROUTINE: _ha_fixed_standby_resolve
+# PURPOSE:    Entitlement and VPs of a standby on a fixed standby entitlement
+#             (v10 B13), resolved together.
+#             The entitlement is the customer's figure. The VP count is the
+#             width the node's own workload needs: its strategic VP target,
+#             which carries the peak-throughput, run-queue and burst evidence
+#             and no installed figure. Two things do NOT count as a need for
+#             VPs here: the VP floor that preserves the installed entitlement
+#             (the entitlement is being replaced), and the per-cycle step cap
+#             (a rate, not a requirement). So where the evidence is clear, a
+#             quiet standby goes to its fixed figure on its own width at once.
+#             What still limits it:
+#             - a reduction-safety state other than CLEAR (pressure, clipping,
+#               a peak near the reachable capacity, unreliable evidence): the
+#               VPs then take only the step the VP rules give this cycle;
+#             - the workload's own width: VPs are never taken below it;
+#             - the platform: 0.05 processors per VP, and the pool's size.
+#             Where the fixed figure cannot be set on the VP count so found,
+#             it is not applied: the caller keeps the node's ordinary
+#             workload-based pair, with its safeguards. The fixed figure is
+#             never raised, and no VP is removed to make it fit. Pure.
+# ARGUMENTS:  hashref { fixed, own_vp (strategic VP target), step_vp (the VP
+#             step of this cycle), safety_state, safety_reasons, current_ent,
+#             current_vp, pool_size }
+# RETURNS:    hashref { Applied (1/0), Pair (when applied), Kind (why not:
+#             width | safety | pool | evidence), Cause (text), Carries (the
+#             most VPs the fixed figure can carry), Width, CycleVP, Transition
+#             (1 where the installed-entitlement floor or the step cap alone
+#             stood between the installed VPs and the pair) }
+# ==============================================================================
+sub _ha_fixed_standby_resolve
+{
+    my ($t) = @_;
+    my $fixed = $t->{fixed};
+    my $carries = int($fixed / $MIN_ENT_PER_VP + 1e-6);
+    my %out = (Applied => 0, Carries => $carries, Transition => 0);
+    my $plural = sub { return ($_[0] == 1) ? '' : 's'; };
+    unless (defined $t->{current_ent} && $t->{current_ent} > 0 && defined $t->{current_vp} && $t->{current_vp} >= 1)
+    {
+        @out{qw(Kind Cause)} = ('evidence', 'its installed entitlement or VP count is not known');
+        return \%out;
+    }
+    unless (defined $t->{own_vp} && looks_like_number($t->{own_vp}) && $t->{own_vp} >= 1)
+    {
+        @out{qw(Kind Cause)} = ('evidence', 'no VP requirement could be established from its workload');
+        return \%out;
+    }
+    if (defined $t->{pool_size} && $fixed > $t->{pool_size} + $FLOAT_EPSILON)
+    {
+        @out{qw(Kind Cause)} = ('pool', sprintf('it is above the size of its pool (%s)', $t->{pool_size}));
+        return \%out;
+    }
+    # The width the workload needs, and no fewer VPs than the fixed figure itself must be carried on.
+    my $wide = int($fixed);
+    $wide++ if ($fixed - $wide > $FLOAT_EPSILON);
+    my $width = max(int($t->{own_vp}), $wide, 1);
+    $out{Width} = $width;
+    if ($width > $carries)
+    {
+        @out{qw(Kind Cause)} = ('width', sprintf('its own workload needs %d VP%s and %.2f carries at most %d (0.05 processors per VP)',
+            $width, $plural->($width), $fixed, $carries));
+        return \%out;
+    }
+    my $vp = $width;
+    my $state = $t->{safety_state} // 'N/A';
+    if ($width < $t->{current_vp} && $state ne 'CLEAR')
+    {
+        # A VP reduction that the safety evidence does not clear takes only the step the VP rules give.
+        my $step = (defined $t->{step_vp} && looks_like_number($t->{step_vp}) && $t->{step_vp} >= 1) ? int($t->{step_vp}) : $t->{current_vp};
+        $step = $t->{current_vp} if ($step > $t->{current_vp});
+        $vp = max($step, $width);
+        if ($vp > $carries)
+        {
+            @out{qw(Kind Cause CycleVP)} = ('safety', sprintf('the VP reduction is limited this cycle (%s: %s), which leaves %d VP%s, and %.2f carries at most %d',
+                $state, ($t->{safety_reasons} // 'no reason recorded'), $vp, $plural->($vp), $fixed, $carries), $vp);
+            return \%out;
+        }
+        $out{Limited} = sprintf('%s: %s', $state, ($t->{safety_reasons} // 'no reason recorded'));
+    }
+    elsif ($width > $t->{current_vp})
+    {
+        # More VPs than installed on evidence alone are a review, as for any LPAR; the fixed figure
+        # is set on the installed VPs where they carry it.
+        $vp = ($t->{current_vp} <= $carries && $t->{current_vp} >= $wide) ? $t->{current_vp} : $width;
+    }
+    my $pair = _resolve_current_cycle_pair({ target_ent => $fixed, target_vp => $vp, step_vp => $vp,
+        current_ent => $t->{current_ent}, current_vp => $t->{current_vp}, pool_size => $t->{pool_size} });
+    unless (defined $pair->{Ent} && abs($pair->{Ent} - $fixed) < 0.005)
+    {
+        @out{qw(Kind Cause CycleVP)} = ('pool', sprintf('no valid pair of %.2f and %d VP%s exists within its limits', $fixed, $vp, $plural->($vp)), $vp);
+        return \%out;
+    }
+    $pair->{ReviewVP} = $width if ($width > $pair->{VP});
+    my $step_now = (defined $t->{step_vp} && looks_like_number($t->{step_vp})) ? int($t->{step_vp}) : $t->{current_vp};
+    @out{qw(Applied Pair CycleVP)} = (1, $pair, $pair->{VP});
+    $out{Transition} = ($pair->{VP} < $t->{current_vp} && $pair->{VP} < $step_now) ? 1 : 0;
+    return \%out;
+}
+
 # Where a policy setting came from, as the planner reads it.
 sub _policy_source_text
 {
@@ -14436,97 +14611,42 @@ sub _policy_source_text
              'built-in' => 'the built-in default' }->{ $source // '' } // 'nfit.vms.cfg';
 }
 
-# ==============================================================================
-# SUBROUTINE: _ha_fixed_standby_pair
-# PURPOSE:    The pair of a standby with a fixed standby entitlement (v10 B13).
-#             The entitlement is the customer's figure, in one step. The VPs
-#             are not part of the override: the VP count of this cycle is the
-#             step the existing VP rules give for the LPAR's own workload.
-#             Where the fixed entitlement and that VP count are not a pair
-#             PowerVM accepts (0.05 processors per VP; the pool's size), the
-#             fixed figure waits and the reason is returned. The VP step the
-#             VP rules already give is still recommended, with the installed
-#             entitlement unchanged, where that is a valid pair; otherwise the
-#             installed pair is kept. The fixed figure is never changed and no
-#             VP reduction is invented for it. Pure.
-# ARGUMENTS:  hashref { fixed, step_vp, current_ent, current_vp, pool_size }
-# RETURNS:    (pair hashref as _resolve_current_cycle_pair gives it, conflict
-#             text or undef). On a conflict the pair carries VPOnly (1 where
-#             the VP step is recommended with the entitlement unchanged),
-#             CycleVP and Carries (the most VPs the fixed figure can carry).
-#             A pair without Ent: nothing could be resolved.
-# ==============================================================================
-sub _ha_fixed_standby_pair
-{
-    my ($t) = @_;
-    # The VP count of this cycle is the step the VP rules give (the installed count without one).
-    # It is passed as the VP destination too, which keeps the resolver's staging guard out of this
-    # one case. That guard is a safeguard of ordinary, coordinated sizing (entitlement and VPs may
-    # both come down in a cycle): while a VP reduction is still on its way, it stops the
-    # entitlement of that cycle being cut below what the more permissive of today's VP:ENT ratio
-    # and 2.00 carries on the cycle's VPs. It limits a simultaneous cut; it does not preserve
-    # the entitlement. Here the entitlement is the customer's explicit figure, not a cut nFit
-    # derived, so the guard must not raise it. The
-    # exception is this narrow: the VP count still comes from the evidence-based step, ordinary
-    # sizing keeps the guard, and what PowerVM itself requires (0.05 per VP, the pool's size,
-    # VPs wide enough to carry the entitlement) still decides.
-    my $cycle_vp = (defined $t->{step_vp} && $t->{step_vp} >= 1) ? $t->{step_vp} : $t->{current_vp};
-    my $pair = _resolve_current_cycle_pair({ target_ent => $t->{fixed}, target_vp => $cycle_vp, step_vp => $cycle_vp,
-        current_ent => $t->{current_ent}, current_vp => $t->{current_vp}, pool_size => $t->{pool_size} });
-    return ($pair, undef) unless (defined $pair->{Ent});
-    return ($pair, undef) if (abs($pair->{Ent} - $t->{fixed}) < 0.005);
-    my %bound = map { $_ => 1 } @{ $pair->{Binding} // [] };
-    my $vp = $pair->{VP} // $t->{current_vp};
-    my $carries = int($t->{fixed} / $MIN_ENT_PER_VP + 1e-6);
-    my $why = $bound{POOL_SIZE}    ? sprintf('it is above the size of its pool (%s)', $t->{pool_size})
-            : ($vp > $carries)     ? sprintf('%.2f carries at most %d VP%s (0.05 processors per VP) and the VP count of this cycle is %d, which needs at least %.2f',
-                                             $t->{fixed}, $carries, ($carries == 1 ? '' : 's'), $vp, $MIN_ENT_PER_VP * $vp)
-            :                        sprintf('with %d VP%s the entitlement would have to be %.2f', $vp, ($vp == 1 ? '' : 's'), $pair->{Ent});
-    # The fixed figure waits. The VP step that the node's own evidence supports does not: it is
-    # taken with the installed entitlement where the narrower width still carries that entitlement.
-    my $step = (defined $t->{step_vp} && $t->{step_vp} >= 1) ? int($t->{step_vp}) : undef;
-    if (defined $step && $step < $t->{current_vp} && $t->{current_ent} <= $step + $FLOAT_EPSILON
-        && $t->{current_ent} >= $MIN_ENT_PER_VP * $step - $FLOAT_EPSILON)
-    {
-        return ({ %$pair, Ent => $t->{current_ent}, VP => $step, Status => 'STAGED', Order => 'NONE', ReviewVP => undef,
-                  CycleVP => $vp, Carries => $carries, VPOnly => 1 }, $why);
-    }
-    return ({ %$pair, Ent => $t->{current_ent}, VP => $t->{current_vp}, Status => 'HOLD', Order => 'NONE', ReviewVP => undef,
-              CycleVP => $vp, Carries => $carries, VPOnly => 0 }, $why);
-}
-
-# The planning action of a standby with a fixed standby entitlement, as sentences. Pure.
+# The planning action of a standby whose fixed standby entitlement is applied, as sentences. Pure.
 sub _ha_fixed_standby_action
 {
     my ($a) = @_;
+    my $resolved = (ref($a->{resolved}) eq 'HASH') ? $a->{resolved} : {};
     my $own = looks_like_number($a->{ownEnt} // '')
         ? sprintf('Its own workload needs %.2f%s.', $a->{ownEnt}, ($a->{ownEnt} > $a->{fixed} + 0.005 ? ', above the standby allocation' : ''))
         : '';
-    my $head = sprintf('PowerHA standby for %s (%s): fixed standby entitlement %.2f (%s)', $a->{primary}, $a->{roleSource}, $a->{fixed},
+    my $head = sprintf('PowerHA standby for %s (%s): fixed standby entitlement %.2f (%s).', $a->{primary}, $a->{roleSource}, $a->{fixed},
                        _policy_source_text($a->{fixedSource}));
     my $takeover = defined $a->{primaryEnt}
         ? sprintf('At failover it needs up to %.2f entitlement; capacity at takeover is arranged outside nFit and is not verified.', $a->{primaryEnt})
         : 'Capacity at takeover is arranged outside nFit and is not verified.';
-    if (defined $a->{conflict})
-    {
-        my $pair = (ref($a->{pair}) eq 'HASH') ? $a->{pair} : {};
-        # What the node's own workload needs decides whether the fixed figure can ever be set: said, not promised.
-        my $outlook = (defined $pair->{Carries} && looks_like_number($a->{ownVP} // '') && $a->{ownVP} > $pair->{Carries})
-            ? sprintf('Its own workload needs %d VPs, more than %.2f carries: the fixed figure cannot be set while that holds.', $a->{ownVP}, $a->{fixed})
-            : (defined $pair->{Carries})
-            ? sprintf('The fixed %.2f waits until the LPAR has %d VP%s or fewer; whether its VPs go that far is for the next measurements to show.',
-                      $a->{fixed}, $pair->{Carries}, ($pair->{Carries} == 1 ? '' : 's'))
-            : sprintf('The fixed %.2f waits.', $a->{fixed});
-        if ($pair->{VPOnly})
-        {
-            return (sprintf('%s cannot be set this cycle: %s. Reduce VPs %d to %d; the entitlement %.2f is kept.', $head, $a->{conflict},
-                            $a->{currentVP}, $pair->{VP}, $a->{currentEnt}), $outlook, $own,
-                    'PhysC can change with the VP count: re-measure before the next change.', $takeover);
-        }
-        return (sprintf('%s cannot be set this cycle: %s. The installed %.2f on %d VP%s is kept; no change.', $head, $a->{conflict},
-                        $a->{currentEnt}, $a->{currentVP}, ($a->{currentVP} == 1 ? '' : 's')), $outlook, $own, $takeover);
-    }
-    return ("$head.", $own, _current_cycle_action_text($a->{pair}, $a->{currentEnt}, $a->{currentVP}, $a->{poolId}), $takeover);
+    my $transition = $resolved->{Transition}
+        ? 'The workload supports fewer VPs; the previous limit came from preserving installed entitlement. Entitlement and VPs are assessed together.'
+        : '';
+    my $limited = defined $resolved->{Limited} ? "The VP reduction is limited this cycle ($resolved->{Limited})." : '';
+    return ($head, $own, $transition, $limited,
+            _current_cycle_action_text($resolved->{Pair}, $a->{currentEnt}, $a->{currentVP}, $a->{poolId}), $takeover);
+}
+
+# What is added to the ordinary action of an inferred standby that carries substantial ongoing work. Pure.
+sub _ha_workload_veto_text
+{
+    my ($fixed, $source, $work, $both) = @_;
+    return sprintf('Substantial ongoing workload conflicts with an idle-standby assumption (%s). Fixed standby allocation %.2f (%s) not applied; '
+        . 'recommendation follows this node\'s workload.%s', _ha_workload_text($work), $fixed, _policy_source_text($source),
+        ($both ? ' Both nodes of this cluster carry sustained workload; which node owns the resource groups is not verified.' : ''));
+}
+
+# What is added to a node's ordinary action where its fixed standby entitlement is not applied. Pure.
+sub _ha_fixed_not_applied_text
+{
+    my ($fixed, $source, $cause) = @_;
+    return sprintf('Fixed standby entitlement %.2f (%s) not applied: %s. The recommendation follows this node\'s workload.',
+                   $fixed, _policy_source_text($source), $cause);
 }
 
 # ==============================================================================
@@ -14902,14 +15022,66 @@ sub _apply_ha_sizing
                         . 'shared-processor LPAR; sized on its own workload';
                     next;
                 }
-                my ($conflict);
-                ($pair, $conflict) = _ha_fixed_standby_pair({ fixed => $policy->{Fixed}, step_vp => $step,
-                    current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
-                if (!defined $pair->{Ent})
+                my $di = (ref($core->{ProfileDebugInfo}) eq 'HASH' && ref($core->{ProfileDebugInfo}{$profile}) eq 'HASH') ? $core->{ProfileDebugInfo}{$profile} : {};
+                my $known = sub { my ($v) = @_; return (defined $v && $v ne '' && $v ne 'N/A') ? $v : undef; };
+                # Figures are written as numbers, whatever form the VP path kept them in.
+                my $count = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? $v + 0 : undef; };
+                # A node that carries substantial ongoing work is not an idle standby, whatever the
+                # detector's relative reading of the pair says. For an inferred role that withholds the
+                # fixed allocation; a configured role is the customer's policy and is applied, with the
+                # mismatch reported.
+                my $work = _safe_dig($cluster, 'Workload', $vm);
+                my $bearing = (ref($work) eq 'HASH' && $work->{Bearing}) ? 1 : 0;
+                my $both = ($bearing && _safe_dig($cluster, 'Workload', $primary, 'Bearing')) ? 1 : 0;
+                my $configured = (($cluster->{Roles}{$vm}{Source} // '') eq 'configured') ? 1 : 0;
+                my $resolved = ($bearing && !$configured)
+                    ? { Applied => 0, Kind => 'workload', Carries => int($policy->{Fixed} / $MIN_ENT_PER_VP + 1e-6),
+                        Cause => 'substantial ongoing workload conflicts with an idle-standby assumption: ' . _ha_workload_text($work) }
+                    : _ha_fixed_standby_resolve({ fixed => $policy->{Fixed}, own_vp => $own_vp, step_vp => $step,
+                        safety_state => $known->($di->{'rVCPU_ReductionSafetyState'}), safety_reasons => $known->($di->{'rVCPU_ReductionSafetyReasons'}),
+                        current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
+                my $mismatch = ($bearing && $configured && $resolved->{Applied})
+                    ? sprintf('This node is configured as the standby and carries sustained workload (%s): the fixed standby entitlement is applied as configured; check the role.',
+                              _ha_workload_text($work))
+                    : '';
+                # What the decision rested on, kept with the plan: the width evidence, the VP path of
+                # ordinary sizing, the safety verdict, and what the fixed figure can carry.
+                my %policy_record = (
+                    type => 'fixed', fixedEntitlement => $policy->{Fixed}, source => $policy->{Source}{standby_entitlement},
+                    managedSystem => $policy->{Frame}, primary => $primary, applied => ($resolved->{Applied} ? JSON::true : JSON::false),
+                    ownRequirement => { entitlement => $count->($own_ent), VPs => $count->($own_vp) },
+                    processorModeKnown => (defined $shared ? JSON::true : JSON::false),
+                    roleSource => $cluster->{Roles}{$vm}{Source},
+                    (ref($work) eq 'HASH' ? (sustainedWorkload => { basis => $work->{Basis}, cores => $work->{Cores}, days => $work->{Days},
+                        since => $work->{Since}, found => ($bearing ? JSON::true : JSON::false), bothNodes => ($both ? JSON::true : JSON::false) }) : ()),
+                    ($mismatch ne '' ? (workloadMismatch => JSON::true) : ()),
+                    trace => {
+                        carriesVPs => $resolved->{Carries}, widthVPs => $resolved->{Width},
+                        strategicVPs => $count->($own_vp), runQueueWidthVPs => $count->($di->{'rVCPU_Raw'}),
+                        peakThroughputFloorVPs => $count->($di->{'rVCPU_P99W1Floor'}), configuredBurstFloorVPs => $count->($di->{'rVCPU_ConfiguredBurstFloor'}),
+                        entitlementPreservingVPs => $count->($di->{'rVCPU_EntBounded'}), entitlementPreservingGovernedBy => $known->($di->{'rVCPU_EntBoundedGovernedBy'}),
+                        vpStepBeforeSafety => $count->($di->{'rVCPU_TacticalPreSafety'}), vpStep => $count->($step), vpStepNote => $known->($di->{'rVCPU_TacticalNote'}),
+                        safetyState => $known->($di->{'rVCPU_ReductionSafetyState'}), safetyReasons => $known->($di->{'rVCPU_ReductionSafetyReasons'}),
+                        evidencePeriod => { start => $cluster->{Window}[0], end => $cluster->{Window}[1] },
+                    },
+                    ($resolved->{Applied} ? (transition => ($resolved->{Transition} ? JSON::true : JSON::false))
+                                          : (notApplied => { kind => $resolved->{Kind}, cause => $resolved->{Cause} })));
+                $proposals->{$vm}{standbyPolicy} = \%policy_record if (defined $proposals && ref($proposals->{$vm}) eq 'HASH');
+                if (!$resolved->{Applied})
                 {
-                    $entry->{Note} = 'the fixed standby entitlement is not applied (' . ($pair->{Reason} // 'no installed pair') . '): sized on its own workload';
+                    # Not applied: the node keeps its ordinary workload-based pair, with its safeguards,
+                    # which may be a reduction or an increase. The row and the rationale say so.
+                    $entry->{Note} = sprintf('fixed standby entitlement %.2f not applied: %s; the recommendation follows this node\'s workload',
+                        $policy->{Fixed}, $resolved->{Cause});
+                    $core->{StandbyFixedNotApplied} = $resolved->{Cause};
+                    $cells->{'NFIT - Action'} = join(' ', grep { defined $_ && $_ ne '' } $cells->{'NFIT - Action'},
+                        (($resolved->{Kind} eq 'workload')
+                            ? _ha_workload_veto_text($policy->{Fixed}, $policy->{Source}{standby_entitlement}, $work, $both)
+                            : _ha_fixed_not_applied_text($policy->{Fixed}, $policy->{Source}{standby_entitlement}, $resolved->{Cause})));
+                    $changed++;
                     next;
                 }
+                $pair = $resolved->{Pair};
                 # The primary's target, where this run analysed it: the failover figure only. The fixed
                 # allocation does not depend on it.
                 my $primary_ent;
@@ -14919,13 +15091,15 @@ sub _apply_ha_sizing
                     $primary_ent = $cell->($prow, $pcells->{'Planning Profile'}) if (defined $pcells->{'Planning Profile'});
                 }
                 push @action, _ha_fixed_standby_action({ primary => $primary, roleSource => $cluster->{Roles}{$vm}{Source},
-                    fixed => $policy->{Fixed}, fixedSource => $policy->{Source}{standby_entitlement}, ownEnt => $own_ent, ownVP => $own_vp,
-                    conflict => $conflict, pair => $pair, currentEnt => $current_ent, currentVP => $current_vp,
+                    fixed => $policy->{Fixed}, fixedSource => $policy->{Source}{standby_entitlement}, ownEnt => $own_ent,
+                    resolved => $resolved, currentEnt => $current_ent, currentVP => $current_vp,
                     poolId => $cfg->{pool_id}, primaryEnt => $primary_ent });
-                %result = (Source => 'HA_STANDBY_FIXED', Profile => $profile, TargetEnt => $policy->{Fixed}, TargetVP => $own_vp,
+                push @action, $mismatch if ($mismatch ne '');
+                %result = (Source => 'HA_STANDBY_FIXED', Mismatch => $mismatch, Profile => $profile, TargetEnt => $policy->{Fixed}, TargetVP => $resolved->{Width},
                            OwnTargetEnt => $own_ent, OwnTargetVP => $own_vp, Fixed => $policy->{Fixed},
                            FixedSource => $policy->{Source}{standby_entitlement}, Frame => $policy->{Frame}, Primary => $primary,
-                           PrimaryTargetEnt => $primary_ent, Conflict => $conflict, ModeKnown => (defined $shared ? 1 : 0), Pair => $pair);
+                           PrimaryTargetEnt => $primary_ent, Transition => $resolved->{Transition}, Limited => $resolved->{Limited},
+                           ModeKnown => (defined $shared ? 1 : 0), Pair => $pair);
             }
             else
             {
@@ -14979,9 +15153,7 @@ sub _apply_ha_sizing
                         ? (primary => $result{Primary}, fixedEntitlement => $result{Fixed}, source => $result{FixedSource},
                            managedSystem => $result{Frame},
                            ownRequirement => { entitlement => $result{OwnTargetEnt}, VPs => $result{OwnTargetVP} },
-                           processorModeKnown => ($result{ModeKnown} ? JSON::true : JSON::false),
-                           (defined $result{Conflict} ? (conflict => $result{Conflict}, fixedPending => JSON::true,
-                                                         vpStepOnly => ($pair->{VPOnly} ? JSON::true : JSON::false)) : ()))
+                           processorModeKnown => ($result{ModeKnown} ? JSON::true : JSON::false))
                         : (since => $result{Since})),
                     (($result{PrimarySource} // '') eq 'installed' ? (unresolved => $result{PrimaryReason}) : ()),
                 };
@@ -15188,18 +15360,15 @@ sub _log_powerha_roles
             elsif (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_STANDBY_FIXED')
             {
                 push @out, _rationale_wrap(sprintf('%s: fixed standby entitlement %.2f; own workload requirement %.2f on %s VP%s%s; %s. '
-                    . 'VPs follow the usual VP rules and are not part of the fixed allocation. Capacity at takeover is arranged outside nFit '
+                    . 'The VPs are the width its own workload needs. Capacity at takeover is arranged outside nFit '
                     . 'and is not verified here.%s',
                     $name, $rr->{Fixed}, ($rr->{OwnTargetEnt} // 0), ($rr->{OwnTargetVP} // '?'), ((($rr->{OwnTargetVP} // 0) == 1) ? '' : 's'),
                     ((($rr->{OwnTargetEnt} // 0) > $rr->{Fixed} + 0.005) ? ', above the standby allocation' : ''),
-                    (defined $rr->{Conflict}
-                        ? ($rr->{Pair}{VPOnly}
-                            ? sprintf('not set this cycle: %s; the VP step to %s is taken with the installed entitlement %.2f unchanged, and the fixed figure waits',
-                                      $rr->{Conflict}, ($rr->{Pair}{VP} // '?'), ($rr->{Pair}{Ent} // 0))
-                            : sprintf('not set this cycle: %s; the installed %.2f on %s VPs is kept', $rr->{Conflict}, ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?')))
-                        : sprintf('current cycle %.2f on %s VPs', ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'))),
+                    sprintf('current cycle %.2f on %s VPs%s', ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'),
+                            ($rr->{Transition} ? '; the workload supports fewer VPs than the step that preserved the installed entitlement, so entitlement and VPs are assessed together'
+                             : defined $rr->{Limited} ? "; the VP reduction is limited this cycle ($rr->{Limited})" : '')),
                     ($rr->{ModeKnown} ? '' : ' The collector does not report whether this LPAR uses shared or dedicated processors: the setting '
-                        . 'is applied as configured.')), '        ', '          ');
+                        . 'is applied as configured.') . (($rr->{Mismatch} // '') ne '' ? " $rr->{Mismatch}" : '')), '        ', '          ');
             }
             elsif (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_HOLD')
             {
@@ -18044,8 +18213,12 @@ sub _write_standard_csv_report {
         my $analysed_action = (ref($planner_cells) eq 'HASH') ? $planner_cells->{'NFIT - Action'} : undef;
         # A standby on a fixed standby entitlement (B13): marked, and marked apart where it could not be set.
         my $role_of_row = _safe_dig($assimilation_map_ref, $row_vm, 'CoreResults', 'RoleResult');
-        unshift @{ $structural_tags->{$row_vm} }, (defined $role_of_row->{Conflict} ? '[STANDBY_FIXED_CONFLICT]' : '[STANDBY_FIXED]')
+        unshift @{ $structural_tags->{$row_vm} }, '[STANDBY_FIXED]'
             if (ref($role_of_row) eq 'HASH' && ($role_of_row->{Source} // '') eq 'HA_STANDBY_FIXED');
+        unshift @{ $structural_tags->{$row_vm} }, '[STANDBY_WORKLOAD_MISMATCH]'
+            if (ref($role_of_row) eq 'HASH' && ($role_of_row->{Source} // '') eq 'HA_STANDBY_FIXED' && ($role_of_row->{Mismatch} // '') ne '');
+        unshift @{ $structural_tags->{$row_vm} }, '[STANDBY_FIXED_NOT_APPLIED]'
+            if (defined _safe_dig($assimilation_map_ref, $row_vm, 'CoreResults', 'StandbyFixedNotApplied'));
         if (ref($presence) eq 'HASH' && $presence->{left})
         {
             $planner_cells->{'NFIT - Action'} = _historic_action($presence, $planner_cells->{'NFIT - Action'}) if (ref($planner_cells) eq 'HASH');
