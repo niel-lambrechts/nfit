@@ -257,8 +257,12 @@ class AcquisitionStats:
         self.vms = set()
         self.min_ns = None
         self.max_ns = None
+        self.last_ns_by_vm = {}         # the last sample written for each VM (D-025)
 
     def merge(self, other):
+        for vm, ns in other.last_ns_by_vm.items():
+            if ns > self.last_ns_by_vm.get(vm, -1):
+                self.last_ns_by_vm[vm] = ns
         for name in ('rows', 'null_values', 'no_host', 'exact_duplicates',
                      'same_second', 'out_of_order', 'slice_retries', 'optional_without_primary'):
             setattr(self, name, getattr(self, name) + getattr(other, name))
@@ -341,6 +345,8 @@ def acquire_metric_to_file(client, database, measurement, field, entity_filter,
                         elif ts_ns // NS_PER_SECOND == previous // NS_PER_SECOND:
                             part.same_second += 1
                     last_ns_by_host[vm_name] = ts_ns
+                    if ts_ns > part.last_ns_by_vm.get(vm_name, -1):
+                        part.last_ns_by_vm[vm_name] = ts_ns
                     part.min_ns = ts_ns if part.min_ns is None else min(part.min_ns, ts_ns)
                     part.max_ns = ts_ns if part.max_ns is None else max(part.max_ns, ts_ns)
                     extras = ''.join(',' + ('' if not x or point.get(x) is None else str(point[x]))
@@ -843,6 +849,56 @@ def scan_cache_directories(cache_dir):
         }
 
     return results
+
+def last_sample_epochs(acq_stats):
+    """The second of the last sample acquired for each VM, over all metrics of this run."""
+    last = {}
+    for stats in (acq_stats or {}).values():
+        for vm, ns in getattr(stats, 'last_ns_by_vm', {}).items():
+            second = ns // NS_PER_SECOND
+            if second > last.get(vm, -1):
+                last[vm] = second
+    return last
+
+
+def build_vm_states(events, capture_end_epoch, last_sample_epoch=None):
+    """
+    The configuration-state timeline of one VM from its configuration events
+    ([{'ts', 'key', 'value'}]): a new state begins where the configuration changes.
+
+    The last state ends at the VM's own last sample (D-025). It used to end at the
+    last sample of the whole capture, so an LPAR that had left the managed system
+    still showed a current configuration there. A VM without a sample in this run
+    keeps the capture end: nothing is known about when it stopped.
+    """
+    if not events:
+        return []
+    events = sorted(events, key=lambda x: x['ts'])
+    state_list = []
+    last_known_metadata = {}
+    current_state_start_epoch = None
+    event_timeline = defaultdict(dict)
+    for event in events:
+        event_timeline[event['ts']][event['key']] = event['value']
+
+    for i, ts in enumerate(sorted(event_timeline.keys())):
+        metadata_before_change = last_known_metadata.copy()
+        last_known_metadata.update(event_timeline[ts])
+        if i == 0:
+            current_state_start_epoch = ts
+        elif json.dumps(last_known_metadata, sort_keys=True) != json.dumps(metadata_before_change, sort_keys=True):
+            # Before adding the state, enrich it with max_capacity
+            metadata_before_change['max_capacity'] = _calculate_max_capacity(metadata_before_change)
+            state_list.append({'start_epoch': current_state_start_epoch, 'end_epoch': ts - 1, 'metadata': metadata_before_change})
+            current_state_start_epoch = ts
+    if current_state_start_epoch is not None:
+        end = capture_end_epoch if last_sample_epoch is None else min(capture_end_epoch, last_sample_epoch)
+        final_end_epoch = max(current_state_start_epoch, int(end))
+        # Also enrich the final state before adding it
+        last_known_metadata['max_capacity'] = _calculate_max_capacity(last_known_metadata)
+        state_list.append({'start_epoch': current_state_start_epoch, 'end_epoch': final_end_epoch, 'metadata': last_known_metadata})
+    return state_list
+
 
 def _merge_config_states(existing_states, new_states):
     """
@@ -3242,31 +3298,10 @@ def main():
             print("- Building state timelines from all collected configuration events.")
             phase3_start_time = time.time()
             all_states = {}
+            vm_last_epoch = last_sample_epochs(acq_stats)
             for vm_name, events in all_config_events.items():
                 if not events: continue
-                events.sort(key=lambda x: x['ts'])
-                state_list = []
-                last_known_metadata = {}
-                current_state_start_epoch = None
-                event_timeline = defaultdict(dict)
-                for event in events: event_timeline[event['ts']][event['key']] = event['value']
-
-                for i, ts in enumerate(sorted(event_timeline.keys())):
-                    metadata_before_change = last_known_metadata.copy()
-                    last_known_metadata.update(event_timeline[ts])
-                    if i == 0:
-                        current_state_start_epoch = ts
-                    elif json.dumps(last_known_metadata, sort_keys=True) != json.dumps(metadata_before_change, sort_keys=True):
-                        # Before adding the state, enrich it with max_capacity
-                        metadata_before_change['max_capacity'] = _calculate_max_capacity(metadata_before_change)
-                        state_list.append({'start_epoch': current_state_start_epoch, 'end_epoch': ts - 1, 'metadata': metadata_before_change})
-                        current_state_start_epoch = ts
-                if current_state_start_epoch is not None:
-                    final_end_epoch = max(current_state_start_epoch, int(max_ts.timestamp()))
-                    # Also enrich the final state before adding it
-                    last_known_metadata['max_capacity'] = _calculate_max_capacity(last_known_metadata)
-                    state_list.append({'start_epoch': current_state_start_epoch, 'end_epoch': final_end_epoch, 'metadata': last_known_metadata})
-                all_states[vm_name] = state_list
+                all_states[vm_name] = build_vm_states(events, int(max_ts.timestamp()), vm_last_epoch.get(vm_name))
 
             # --- Phase 4: Writing Final Cache Files ---
             print("\n## Phase 4: Writing Final Cache Files")
@@ -3284,6 +3319,13 @@ def main():
                     serial = states[0].get('metadata', {}).get('serial_number', 'UNKNOWN_SERIAL')
                     vm_to_serial_map[vm] = serial
                     data_by_serial[serial]['states'][vm] = states
+                    # D-026: a VM that reported from more than one managed system in this run is filed,
+                    # states and samples, under the first. One managed system per run keeps them apart.
+                    serials_seen = {s.get('metadata', {}).get('serial_number') for s in states} - {None}
+                    if len(serials_seen) > 1:
+                        print(f"WARNING: '{vm}' reported from {len(serials_seen)} managed systems in this run; all of it is "
+                              f"filed under the first. Stage each managed system in its own run (--mgsys with one serial).",
+                              file=sys.stderr)
 
             # Handle VMs discovered from performance data that have no configuration in InfluxDB.
             # This logic can only reliably assign these 'orphan' VMs if a single managed system is the target.
@@ -3301,7 +3343,9 @@ def main():
                             print(f"  WARNING: Configuration for '{vm}' not found. Creating synthetic state.", file=sys.stderr)
                             metadata = { "entitlement": 0.1, "smt": 8, "virtual_cpus": 1, "pool_id": 0, "pool_cpu": 0, "proc_clock": 0.0, "serial_number": authoritative_serial, "capped": 0, "proc_type": "Unknown", "proc_version": "Unknown"}
                         # Add the synthetic state to the main data structure
-                        synthetic_state = [{'start_epoch': int(min_ts.timestamp()), 'end_epoch': int(max_ts.timestamp()), 'metadata': metadata}]
+                        synthetic_state = [{'start_epoch': int(min_ts.timestamp()),
+                                            'end_epoch': min(int(max_ts.timestamp()), vm_last_epoch.get(vm, int(max_ts.timestamp()))),
+                                            'metadata': metadata}]
                         data_by_serial[authoritative_serial]['states'][vm] = synthetic_state
                 elif vms_with_missing_config:
                     print(f"WARNING: Found {len(vms_with_missing_config)} VMs with performance data but no configuration. These will be skipped as they cannot be reliably assigned to a multi-system target.", file=sys.stderr)
@@ -3404,7 +3448,10 @@ def main():
                     try:
                         with open(published_states_path, 'r') as f:
                             existing_states = json.load(f)
-                        states_to_write = _merge_config_states(existing_states, data['states'])
+                        # A VM without a sample in this run says nothing new about itself: its states stay as
+                        # they were, so that an anchor value does not extend a VM that has left (D-025).
+                        states_to_write = _merge_config_states(
+                            existing_states, {vm: st for vm, st in data['states'].items() if vm in vm_last_epoch})
                         state_action = 'merged'
                     except (json.JSONDecodeError, OSError) as e:
                         print(f"    WARNING: Could not read existing states for merge ({e}). "
