@@ -1444,6 +1444,14 @@ if (scalar @csv_visible_profiles < scalar @profiles) {
 # load the VM configuration: TIERs; PowerHA clusters, roles and VIOS (v10 stage 3.1b)
 my $vms_config = parse_vms_config("$script_dir/etc/nfit.vms.cfg");
 _report_vms_config($vms_config);
+if (@{ $vms_config->{errors} // [] })
+{
+    # A PowerHA policy setting that cannot be read is never replaced by a default.
+    print STDERR "  [ERROR] nfit.vms.cfg $_\n" foreach (@{ $vms_config->{errors} });
+    print STDERR "  [ERROR] nfit.vms.cfg: correct the setting(s) above; no analysis was made\n";
+    exit 2;
+}
+my $CURRENT_MGSYS;      # the managed system being analysed, as named under the staged data ([MGSYS:<name>] defaults)
 my %vm_tier_overrides = %{ $vms_config->{tiers} };
 
 # --- Generate CSV header columns ---
@@ -1872,6 +1880,7 @@ foreach my $system_serial (@target_systems_to_process)
 
     # First, determine the full path to the cache we are processing in this iteration.
     my $current_cache_path = defined($system_serial) ? File::Spec->catfile($base_cache_dir, $system_serial) : $nmon_dir;
+    $CURRENT_MGSYS = basename(abs_path($current_cache_path) // $current_cache_path);
 
     # Ensure the canonical history location exists and migrate legacy partitions if needed.
     _migrate_history_to_canonical($current_cache_path);
@@ -2448,6 +2457,9 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     ownership; an unclear case is unresolved. ha_sizing = standby_share\n";
         print {$LOG_FH} "                     gives a standby a share of its primary's target as a floor under its\n";
         print {$LOG_FH} "                     own workload; after a handover the new active node's reductions are held.\n";
+        print {$LOG_FH} "                     The policy is that of the node that is standby: its own setting, then\n";
+        print {$LOG_FH} "                     its managed system's defaults ([MGSYS:<name>] in nfit.vms.cfg), then\n";
+        print {$LOG_FH} "                     [GLOBAL]. The active node's settings do not size the standby.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
@@ -4594,7 +4606,7 @@ sub log_profile_rationale
     {
         my @sf_partners = @{ $sf_vios->{Partners} };
         my $sf_vm = $vm_map_ref->{Configuration}{vm_name} // '';
-        my $sf_policy = _vios_group_policy([ sort ($sf_vm, @sf_partners) ], \&_vms_config_settings, _vms_config_global(),
+        my $sf_policy = _vios_group_policy([ sort ($sf_vm, @sf_partners) ], \&_vms_config_settings, _vms_config_defaults($CURRENT_MGSYS),
             $sf_vios->{Source});
         $sf_glance->('VIOS pair', ($sf_policy->{Mode} eq 'independent')
             ? 'not grouped: three or more VIOS on this system without vios_peer; sized on its own workload (see VIOS Pairs)'
@@ -13122,6 +13134,42 @@ sub _vms_config_global
     return (defined $vms_config && ref($vms_config) eq 'HASH' && ref($vms_config->{global}) eq 'HASH') ? $vms_config->{global} : {};
 }
 
+# The settings of one managed system's [MGSYS:<name>] stanza (empty when there is none).
+sub _vms_config_mgsys
+{
+    my ($mgsys) = @_;
+    my $settings = (defined $vms_config && ref($vms_config) eq 'HASH' && ref($vms_config->{mgsys}) eq 'HASH' && defined $mgsys)
+        ? $vms_config->{mgsys}{$mgsys} : undef;
+    return (ref($settings) eq 'HASH') ? $settings : {};
+}
+
+# The defaults that apply on one managed system: [GLOBAL], with each setting its
+# [MGSYS:<name>] stanza names taking its place.
+sub _vms_config_defaults
+{
+    my ($mgsys) = @_;
+    return { %{ _vms_config_global() }, %{ _vms_config_mgsys($mgsys) } };
+}
+
+# ==============================================================================
+# SUBROUTINE: _policy_setting
+# PURPOSE:    One policy setting of one LPAR, resolved on its own: the LPAR's
+#             stanza, then the stanza of its managed system, then [GLOBAL].
+#             The built-in default is the caller's.
+# ARGUMENTS:  1. LPAR name  2. managed system (undef when not established: its
+#                stanza is then not consulted)  3. setting
+# RETURNS:    (value or undef, source: lpar | mgsys | global | built-in)
+# ==============================================================================
+sub _policy_setting
+{
+    my ($vm_name, $mgsys, $key) = @_;
+    foreach my $level ([ lpar => _vms_config_settings($vm_name) ], [ mgsys => _vms_config_mgsys($mgsys) ], [ global => _vms_config_global() ])
+    {
+        return ($level->[1]{$key}, $level->[0]) if (defined $level->[1]{$key});
+    }
+    return (undef, 'built-in');
+}
+
 # ==============================================================================
 # SUBROUTINE: _vios_groups_for_system
 # PURPOSE:    _vios_groups for the LPARs of the system being analysed, from
@@ -13441,7 +13489,7 @@ sub _apply_vios_alignment
                                                step_vp => $cell->($row, "${profile}_rVCPU_Tactical") };
             }
         }
-        my $policy = _vios_group_policy(\@names, \&_vms_config_settings, _vms_config_global(),
+        my $policy = _vios_group_policy(\@names, \&_vms_config_settings, _vms_config_defaults($CURRENT_MGSYS),
             $groups->{$vm_name}{Source});
         printf STDERR "    [WARN] VIOS group %s: members set different vios_sizing or margins; %s with margin %.2f applies\n",
             join(', ', @names), $policy->{Mode}, $policy->{Margin} if ($policy->{Conflict});
@@ -14161,12 +14209,22 @@ sub _ha_role_evidence
         my $rev = _proposal_revision($dir);
         $revision{ basename($dir) } = $rev->{data} // 'absent';
     }
-    my %minutes;
+    my (%minutes, %last_on);
     my %by_dir;
     foreach my $vm (keys %dirs_of) { $by_dir{$_}{$vm} = 1 for @{ $dirs_of{$vm} }; }
     foreach my $dir (sort keys %by_dir)
     {
-        _ha_read_minutes(File::Spec->catfile($dir, '.nfit.cache.data'), $by_dir{$dir}, $from, $to, \%minutes);
+        # Read per frame, so that each member's last sample on each frame is known; then merged.
+        my $read = _ha_read_minutes(File::Spec->catfile($dir, '.nfit.cache.data'), $by_dir{$dir}, $from, $to, {});
+        foreach my $vm (keys %$read)
+        {
+            $last_on{$vm}{ basename($dir) } = max(keys %{ $read->{$vm} });
+            foreach my $minute (keys %{ $read->{$vm} })
+            {
+                my $slot = $minutes{$vm}{$minute} //= [0, 0, 0, 0];
+                $slot->[$_] += $read->{$vm}{$minute}[$_] for (0 .. 3);
+            }
+        }
     }
 
     # Profile hours of each member: its planning profile here, else the one its
@@ -14189,6 +14247,7 @@ sub _ha_role_evidence
                  Caches => { map { my $vm = $_; map { (basename($_) => $revision{ basename($_) }) } @{ $dirs_of{$vm} // [] } } @$members },
                  Reason => '');
         $c{DirsOf}   = { map { $_ => ($dirs_of{$_} // []) } @$members };
+        $c{FrameOf}  = { map { $_ => _ha_member_frame($dirs_of{$_}, $last_on{$_}) } @$members };
         $c{StatesOf} = { map { $_ => ($states_of{$_} // []) } @$members };
         my @missing = grep { !$minutes{$_} } @$members;
         if (@$members > 2)
@@ -14229,31 +14288,59 @@ sub _ha_role_evidence
 }
 
 # ==============================================================================
-# SUBROUTINE: _ha_cluster_policy
-# PURPOSE:    How one PowerHA cluster is sized (v10 stage 3.1b step 6d):
-#             ha_sizing and standby_share from the members' sections, then
-#             [GLOBAL], then the built-in defaults (independent, 0.25). Members
-#             that disagree get the more protective value: standby_share (the
-#             share is only ever a floor under a standby's own workload) and
-#             the larger share; the conflict is reported.
-# ARGUMENTS:  1. member names (arrayref)  2. code ref: name -> settings hashref
-#             3. [GLOBAL] settings (hashref)
-# RETURNS:    hashref { Sizing, Share, Conflict (0/1) }
+# SUBROUTINE: _ha_member_frame
+# PURPOSE:    The managed system that holds a cluster member at the end of the
+#             period: the only frame whose staged data names it, or the frame
+#             that sampled it last. Not established (undef) when two frames
+#             sampled it within a day of each other at the end, or none did.
+#             The same answer whichever frame is being analysed. Pure.
+# ARGUMENTS:  1. cache directories that name the member (arrayref)
+#             2. { frame name => last sampled minute (epoch) }
+# RETURNS:    frame name or undef
 # ==============================================================================
-sub _ha_cluster_policy
+sub _ha_member_frame
 {
-    my ($names_aref, $settings_of, $global_href) = @_;
-    $global_href = {} unless (ref($global_href) eq 'HASH');
-    my (%sizing, %shares);
-    foreach my $name (@{ $names_aref // [] })
-    {
-        my $settings = (ref($settings_of) eq 'CODE') ? ($settings_of->($name) // {}) : {};
-        $sizing{ $settings->{ha_sizing} } = 1 if (defined $settings->{ha_sizing});
-        $shares{ $settings->{standby_share} } = 1 if (defined $settings->{standby_share});
-    }
-    my $mode = %sizing ? ($sizing{standby_share} ? 'standby_share' : 'independent') : ($global_href->{ha_sizing} // 'independent');
-    my $share = %shares ? (sort { $b <=> $a } keys %shares)[0] : ($global_href->{standby_share} // 0.25);
-    return { Sizing => $mode, Share => $share + 0, Conflict => (((keys %sizing) > 1 || (keys %shares) > 1) ? 1 : 0) };
+    my ($dirs_aref, $last_href) = @_;
+    my @frames = map { basename($_) } @{ $dirs_aref // [] };
+    return $frames[0] if (@frames == 1);
+    $last_href = {} unless (ref($last_href) eq 'HASH');
+    my @seen = sort { $last_href->{$b} <=> $last_href->{$a} || $a cmp $b } grep { defined $last_href->{$_} } @frames;
+    return undef unless (@seen);
+    return undef if (@seen > 1 && $last_href->{ $seen[0] } - $last_href->{ $seen[1] } < 86400);
+    return $seen[0];
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_standby_policy
+# PURPOSE:    How the standby of one PowerHA pair is sized: the effective
+#             policy of the node resolved as standby, each setting resolved on
+#             its own (the node's stanza, its managed system's, [GLOBAL], then
+#             independent and 0.25). The active node's settings do not enter,
+#             so a role reversal changes whose policy applies. Without exactly
+#             one active and one standby node there is no standby to size and
+#             no policy is resolved. Pure.
+# ARGUMENTS:  1. cluster (hashref: Members, Roles, FrameOf)
+#             2. code ref: (LPAR, managed system, setting) -> (value, source)
+# RETURNS:    hashref { Sizing, Share, Node (the standby, or undef), Frame (its
+#             managed system, undef when not established), Source { setting =>
+#             lpar | mgsys | global | built-in } }
+# ==============================================================================
+sub _ha_standby_policy
+{
+    my ($cluster, $setting_of) = @_;
+    my %policy = (Sizing => 'independent', Share => 0.25, Node => undef, Frame => undef, Source => {});
+    return \%policy unless (ref($cluster) eq 'HASH' && ref($cluster->{Members}) eq 'ARRAY' && @{ $cluster->{Members} } == 2
+                            && ref($setting_of) eq 'CODE');
+    my $roles = (ref($cluster->{Roles}) eq 'HASH') ? $cluster->{Roles} : {};
+    my @active  = grep { ($roles->{$_}{Effective} // '') eq 'active' } @{ $cluster->{Members} };
+    my @standby = grep { ($roles->{$_}{Effective} // '') eq 'standby' } @{ $cluster->{Members} };
+    return \%policy unless (@active == 1 && @standby == 1);
+    my $node = $standby[0];
+    my $frame = (ref($cluster->{FrameOf}) eq 'HASH') ? $cluster->{FrameOf}{$node} : undef;
+    my ($mode, $mode_source)   = $setting_of->($node, $frame, 'ha_sizing');
+    my ($share, $share_source) = $setting_of->($node, $frame, 'standby_share');
+    return { Sizing => $mode // 'independent', Share => ($share // 0.25) + 0, Node => $node, Frame => $frame,
+             Source => { ha_sizing => $mode_source // 'built-in', standby_share => $share_source // 'built-in' } };
 }
 
 # ==============================================================================
@@ -14532,9 +14619,7 @@ sub _apply_ha_sizing
     my $changed = 0;
     foreach my $cluster (@$evidence_aref)
     {
-        my $policy = _ha_cluster_policy($cluster->{Members}, \&_vms_config_settings, _vms_config_global());
-        printf STDERR "    [WARN] PowerHA cluster %s: members set different ha_sizing or standby_share; %s with share %.2f applies\n",
-            join(', ', @{ $cluster->{Members} }), $policy->{Sizing}, $policy->{Share} if ($policy->{Conflict});
+        my $policy = _ha_standby_policy($cluster, \&_policy_setting);
         my $plan = _ha_sizing_plan($cluster, $policy);
         $cluster->{Policy} = $policy;
         $cluster->{Plan} = $plan;
@@ -14815,12 +14900,19 @@ sub _log_powerha_roles
             }
         }
         push @out, _ha_probe_levels($cluster, $detection->{Metric}) if ($ENV{NFIT_HA_PROBE} && ref($detection) eq 'HASH');
-        my $policy = $cluster->{Policy} // _ha_cluster_policy(\@members, \&_vms_config_settings, _vms_config_global());
+        my $policy = $cluster->{Policy} // _ha_standby_policy($cluster, \&_policy_setting);
         my $plan = $cluster->{Plan} // {};
-        push @out, ($policy->{Sizing} eq 'standby_share')
-            ? sprintf('      Sizing: standby_share at %d%% of the primary\'s target, as a floor under own workload.',
-                int(100 * $policy->{Share} + 0.5))
-            : '      Sizing: independent (each node on its own workload).';
+        my $policy_from = { lpar => "its own settings", mgsys => "its managed system's defaults", global => '[GLOBAL]',
+                            'built-in' => 'the built-in default' }->{ $policy->{Source}{ha_sizing} // '' };
+        push @out, !defined $policy->{Node}
+            ? '      Sizing: no node is resolved as the standby of an active node; each node is sized on its own workload.'
+            : ($policy->{Sizing} eq 'standby_share')
+            ? sprintf('      Sizing: standby_share at %d%% of the primary\'s target, as a floor under own workload (policy of the standby %s, from %s).',
+                int(100 * $policy->{Share} + 0.5), $policy->{Node}, $policy_from)
+            : sprintf('      Sizing: independent, each node on its own workload (policy of the standby %s, from %s).', $policy->{Node}, $policy_from);
+        push @out, sprintf('      The managed system of %s is not established (sampled on two frames at the end of the period, or on none): '
+            . 'managed-system defaults were not applied to it.', $policy->{Node})
+            if (defined $policy->{Node} && !defined $policy->{Frame});
         foreach my $name (@members)
         {
             my $r = $cluster->{Roles}{$name} or next;
@@ -14865,7 +14957,8 @@ sub _log_powerha_roles
                     role => { configured => $r->{Configured}, hint => $r->{Hint}, inferred => $r->{Inferred},
                               effective => $r->{Effective}, source => $r->{Source}, note => $r->{Note} },
                     sizing => { policy => $policy->{Sizing}, share => $policy->{Share},
-                                treatment => ($entry ? $entry->{Treatment} : 'none') },
+                                treatment => ($entry ? $entry->{Treatment} : 'none'),
+                                node => $policy->{Node}, managedSystem => $policy->{Frame}, source => $policy->{Source} },
                     reason => $cluster->{Reason},
                     # Each member as installed when this run read it (its latest configuration state).
                     configuration => { map {
@@ -31601,17 +31694,25 @@ sub _build_adaptive_thresholds_hash {
 #             (comma or space separated); an ha_peer entry links two LPARs in
 #             whichever section it appears. A peer name that matches another
 #             section only by letter case is read as that section's name.
+#             [MGSYS:<name>] holds the same defaults for one managed system,
+#             named as its directory under the staged data; each setting is
+#             resolved on its own (LPAR, managed system, [GLOBAL]).
 #             Invalid values, unknown keys (once per key) and lines that are
-#             not settings are warned and ignored. Nothing is printed here.
+#             not settings are warned and ignored. Not so the PowerHA policy
+#             (ha_role, ha_sizing, standby_share) and the [MGSYS:] stanzas:
+#             what cannot be read there is an error, because ignoring it would
+#             let another level's policy apply unasked. Nothing is printed here.
 # ARGUMENTS:  1. file path
 # RETURNS:    hashref: path, exists, tiers ({LPAR => TIER}), vms ({LPAR =>
-#             {key => value}}), global ({key => value}), warnings (arrayref),
-#             clusters (arrayref from _ha_clusters)
+#             {key => value}}), global ({key => value}), mgsys ({name =>
+#             {key => value}}), warnings (arrayref), errors (arrayref; the
+#             caller stops on any), clusters (arrayref from _ha_clusters)
 # ==============================================================================
 sub parse_vms_config
 {
     my ($filepath) = @_;
-    my %config = (path => $filepath, exists => 0, tiers => {}, vms => {}, global => {}, warnings => [], clusters => []);
+    my %config = (path => $filepath, exists => 0, tiers => {}, vms => {}, global => {}, mgsys => {}, warnings => [], errors => [],
+                  clusters => []);
     return \%config unless (defined $filepath && -f $filepath);
     $config{exists} = 1;
 
@@ -31628,7 +31729,10 @@ sub parse_vms_config
         return \%config;
     }
     my ($section, $tier_seen, %unknown_warned) = ('', 0);
+    my $mgsys;          # the managed system of the [MGSYS:<name>] stanza being read; undef in a stanza that is refused
+    my %ha_policy_keys = map { $_ => 1 } qw(ha_role ha_sizing standby_share);
     my $warn = sub { push @{ $config{warnings} }, sprintf('line %d: %s', $., $_[0]); };
+    my $error = sub { push @{ $config{errors} }, sprintf('line %d, [%s]: %s', $., $section, $_[0]); };
     while (my $line = <$fh>)
     {
         chomp $line;
@@ -31640,6 +31744,26 @@ sub parse_vms_config
         {
             $section   = (uc($1) eq 'GLOBAL') ? 'GLOBAL' : $1;
             $tier_seen = 0;
+            $mgsys     = undef;
+            if ($section =~ /^MGSYS\s*:\s*(.*)$/i)
+            {
+                my $name = $1;
+                $section = "MGSYS:$name";
+                if ($name eq '')
+                {
+                    $error->('a managed-system stanza needs the managed system\'s name, as [MGSYS:<name>]');
+                }
+                elsif (exists $config{mgsys}{$name})
+                {
+                    $error->('this managed system has a stanza already; its defaults belong in one stanza');
+                }
+                else
+                {
+                    $mgsys = $name;
+                    $config{mgsys}{$name} = {};
+                }
+                next;
+            }
             # A [DEFAULT] section is an easy slip for [GLOBAL]: it would apply
             # only to an LPAR of that name.
             $warn->("[$section] is read as the section of an LPAR of that name; defaults belong in [GLOBAL]")
@@ -31657,10 +31781,16 @@ sub parse_vms_config
             $warn->("'$key' appears before any [section]; ignored");
             next;
         }
-        my $is_global = ($section eq 'GLOBAL') ? 1 : 0;
+        my $is_mgsys = ($section =~ /^MGSYS:/) ? 1 : 0;
+        next if ($is_mgsys && !defined $mgsys);       # a refused stanza: its error is recorded once
+        my $is_global = ($section eq 'GLOBAL' || $is_mgsys) ? 1 : 0;
         if (!($is_global ? $global_keys{$key} : $vm_keys{$key}))
         {
-            if ($is_global && $vm_keys{$key} && !$global_keys{$key})
+            if ($is_mgsys && $vm_keys{$key} && !$global_keys{$key})
+            {
+                $error->("'$key' is an LPAR setting; a managed-system stanza takes defaults only (" . join(', ', sort keys %global_keys) . ')');
+            }
+            elsif ($is_global && $vm_keys{$key} && !$global_keys{$key})
             {
                 $warn->("'$key' is an LPAR setting, not valid in [GLOBAL] (reserved for defaults); ignored");
             }
@@ -31672,10 +31802,11 @@ sub parse_vms_config
         }
         if ($value eq '')
         {
-            $warn->("'$key' has no value; ignored");
+            if ($ha_policy_keys{$key}) { $error->("'$key' has no value"); }
+            else                       { $warn->("'$key' has no value; ignored"); }
             next;
         }
-        my $store = $is_global ? $config{global} : ($config{vms}{$section} //= {});
+        my $store = $is_mgsys ? $config{mgsys}{$mgsys} : $is_global ? $config{global} : ($config{vms}{$section} //= {});
 
         if ($key eq 'tier')
         {
@@ -31704,7 +31835,7 @@ sub parse_vms_config
             }
             else
             {
-                $warn->("standby_share must be a fraction above 0 and at most 1 (for example 0.25); '$value' ignored");
+                $error->("standby_share must be a fraction above 0 and at most 1 (for example 0.25); '$value' is not");
             }
         }
         elsif ($key eq 'vios_takeover_margin')
@@ -31724,6 +31855,10 @@ sub parse_vms_config
             if (grep { $_ eq $choice } @{ $choices{$key} })
             {
                 $store->{$key} = $choice;
+            }
+            elsif ($ha_policy_keys{$key})
+            {
+                $error->(sprintf("%s must be one of %s; '%s' is not", $key, join(', ', @{ $choices{$key} }), $value));
             }
             else
             {
@@ -31815,6 +31950,8 @@ sub _report_vms_config
     print STDERR "  ↳  VM-specific tier override configuration file: $config->{path}\n";
     print STDERR "    [WARN] nfit.vms.cfg $_\n" foreach (@{ $config->{warnings} });
     print STDERR "    ✓ Loaded " . scalar(keys %{ $config->{tiers} }) . " VM-specific tier overrides\n";
+    printf STDERR "    ✓ Managed systems with their own defaults ([MGSYS:]): %d\n", scalar(keys %{ $config->{mgsys} })
+        if (ref($config->{mgsys}) eq 'HASH' && %{ $config->{mgsys} });
     my @clusters = @{ $config->{clusters} };
     if (@clusters)
     {

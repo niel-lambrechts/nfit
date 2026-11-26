@@ -19,12 +19,12 @@ my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
 for my $name (qw(_ha_role_rules _ha_median_mad _ha_percentile _ha_blocks _ha_detect_pair _ha_resolve_roles
-                 _ha_cluster_policy _ha_standby_target _ha_sizing_plan _safe_dig _option_differences _ha_peer_plan_mismatch))
+                 _ha_member_frame _ha_standby_policy _ha_standby_target _ha_sizing_plan _safe_dig _option_differences _ha_peer_plan_mismatch))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
 }
-eval "package UUT;\nuse Scalar::Util qw(looks_like_number);\n$code\n1;" or die "harness eval failed: $@\n";
+eval "package UUT;\nuse Scalar::Util qw(looks_like_number);\nuse File::Basename qw(basename);\n$code\n1;" or die "harness eval failed: $@\n";
 
 my $T0 = 1788220800;                          # 2026-09-01 00:00 UTC
 my $DAY = 86400;
@@ -209,13 +209,59 @@ is_deeply([ @{ $roles->{nodeA} }{qw(Effective Note)} ], ['unknown', 'no samples 
 # --- Sizing (step 6d) --------------------------------------------------------------------
 my %set6 = (n1 => { ha_sizing => 'standby_share' }, n2 => { standby_share => 0.30 }, n3 => { ha_sizing => 'independent' });
 my $so6 = sub { $set6{ $_[0] } // {} };
-my $pol = UUT::_ha_cluster_policy([qw(x y)], $so6, {});
-is_deeply([ @$pol{qw(Sizing Share Conflict)} ], ['independent', 0.25, 0], 'policy: independent and 0.25 by default');
-$pol = UUT::_ha_cluster_policy([qw(n1 n2)], $so6, {});
-is_deeply([ @$pol{qw(Sizing Share)} ], ['standby_share', 0.30], 'policy: set on either node, for the cluster');
-$pol = UUT::_ha_cluster_policy([qw(n1 n3)], $so6, {});
-is_deeply([ @$pol{qw(Sizing Conflict)} ], ['standby_share', 1], 'policy: disagreement - standby_share (a floor), reported');
-is(UUT::_ha_cluster_policy([qw(x y)], $so6, { ha_sizing => 'standby_share', standby_share => 0.2 })->{Share}, 0.2, 'policy: [GLOBAL]');
+# The policy of a pair is that of the node resolved as standby: its own stanza, its managed system's
+# defaults, [GLOBAL], then the built-in values. The active node's settings do not enter.
+my %mg6 = (FRAME_B => { ha_sizing => 'standby_share', standby_share => 0.40 });
+my %gl6 = ();
+my $of6 = sub
+{
+    my ($vm, $frame, $key) = @_;
+    return ($set6{$vm}{$key}, 'lpar') if (defined(($set6{$vm} // {})->{$key}));
+    return ($mg6{$frame}{$key}, 'mgsys') if (defined $frame && defined(($mg6{$frame} // {})->{$key}));
+    return ($gl6{$key}, 'global') if (defined $gl6{$key});
+    return (undef, 'built-in');
+};
+my $pair6 = sub
+{
+    my ($active, $standby, $frame_of) = @_;
+    return { Members => [ sort ($active, $standby) ], FrameOf => $frame_of // {},
+             Roles => { $active => { Effective => 'active' }, $standby => { Effective => 'standby' } } };
+};
+my $pol = UUT::_ha_standby_policy($pair6->('x', 'y'), $of6);
+is_deeply([ @$pol{qw(Sizing Share Node)} ], ['independent', 0.25, 'y'], 'policy: independent and 0.25 by default');
+is_deeply($pol->{Source}, { ha_sizing => 'built-in', standby_share => 'built-in' }, 'policy: the source of each setting is recorded');
+$pol = UUT::_ha_standby_policy($pair6->('n2', 'n1'), $of6);
+is_deeply([ @$pol{qw(Sizing Share)} ], ['standby_share', 0.25], 'policy: the standby\'s own mode; the active node\'s share does not enter');
+$pol = UUT::_ha_standby_policy($pair6->('n1', 'n2'), $of6);
+is_deeply([ @$pol{qw(Sizing Share)} ], ['independent', 0.30], 'policy: roles reversed, the other node\'s policy applies');
+$pol = UUT::_ha_standby_policy($pair6->('n1', 'n3'), $of6);
+is($pol->{Sizing}, 'independent', 'policy: stanzas that disagree - the standby\'s applies, not the more protective');
+$pol = UUT::_ha_standby_policy($pair6->('x', 'y', { y => 'FRAME_B' }), $of6);
+is_deeply([ @$pol{qw(Sizing Share Frame)} ], ['standby_share', 0.40, 'FRAME_B'], 'policy: the standby inherits its managed system\'s defaults');
+is_deeply($pol->{Source}, { ha_sizing => 'mgsys', standby_share => 'mgsys' }, 'policy: inherited settings are marked');
+$pol = UUT::_ha_standby_policy($pair6->('y', 'x', { y => 'FRAME_B', x => 'FRAME_A' }), $of6);
+is($pol->{Sizing}, 'independent', 'policy: the active node\'s managed system does not set the standby\'s policy');
+$pol = UUT::_ha_standby_policy($pair6->('x', 'n2', { n2 => 'FRAME_B' }), $of6);
+is_deeply([ @$pol{qw(Sizing Share)} ], ['standby_share', 0.30], 'policy: each setting on its own - mode inherited, share from the LPAR');
+is_deeply($pol->{Source}, { ha_sizing => 'mgsys', standby_share => 'lpar' }, 'policy: mixed sources');
+%gl6 = (ha_sizing => 'standby_share', standby_share => 0.2);
+is(UUT::_ha_standby_policy($pair6->('x', 'y'), $of6)->{Share}, 0.2, 'policy: [GLOBAL]');
+is(UUT::_ha_standby_policy($pair6->('x', 'y', { y => 'FRAME_B' }), $of6)->{Share}, 0.40, 'policy: the managed system before [GLOBAL]');
+$pol = UUT::_ha_standby_policy({ Members => [qw(x y)], Roles => { x => { Effective => 'unknown' }, y => { Effective => 'unknown' } } }, $of6);
+is_deeply([ @$pol{qw(Sizing Node)} ], ['independent', undef], 'policy: roles unresolved - no standby, no policy resolved');
+$pol = UUT::_ha_standby_policy({ Members => [qw(x y)], Roles => { x => { Effective => 'active' }, y => { Effective => 'active' } } }, $of6);
+is($pol->{Node}, undef, 'policy: two active nodes - no standby');
+$pol = UUT::_ha_standby_policy({ Members => [qw(x y z)], Roles => { x => { Effective => 'active' }, y => { Effective => 'standby' } } }, $of6);
+is($pol->{Node}, undef, 'policy: three nodes - none');
+%gl6 = ();
+
+# The managed system that holds a member at the end of the period.
+is(UUT::_ha_member_frame(['/s/FRAME_A'], {}), 'FRAME_A', 'member frame: the only frame that names it');
+is(UUT::_ha_member_frame(['/s/FRAME_A', '/s/FRAME_B'], { FRAME_A => $T0, FRAME_B => $T0 + 5 * $DAY }), 'FRAME_B', 'member frame: moved - the frame that sampled it last');
+is(UUT::_ha_member_frame(['/s/FRAME_B', '/s/FRAME_A'], { FRAME_A => $T0, FRAME_B => $T0 + 5 * $DAY }), 'FRAME_B', 'member frame: the same in either order');
+is(UUT::_ha_member_frame(['/s/FRAME_A', '/s/FRAME_B'], { FRAME_A => $T0 + 3600, FRAME_B => $T0 }), undef, 'member frame: sampled on two frames at the end - not established');
+is(UUT::_ha_member_frame(['/s/FRAME_A', '/s/FRAME_B'], {}), undef, 'member frame: named on two frames, sampled on none - not established');
+is(UUT::_ha_member_frame(['/s/FRAME_A', '/s/FRAME_B'], { FRAME_B => $T0 }), 'FRAME_B', 'member frame: sampled on one of two');
 
 my $st = UUT::_ha_standby_target(0.12, 1, 2.40, 0.25);
 is_deeply([ @$st{qw(Floor TargetEnt TargetVP FloorBinds)} ], [0.60, 0.60, 1, 1], 'standby: 25% of 2.40 is the floor above own 0.12');
