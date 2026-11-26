@@ -108,9 +108,11 @@ like($why, qr/^it is above the size of its pool \(2\)$/, 'and the pool named as 
 is($pair->{Ent}, undef, 'no installed pair: nothing is resolved');
 
 # --- The staging guard of ordinary sizing is kept; the exception is the fixed figure only ----
-# Ordinary sizing is two-stage: VPs are reduced first and the entitlement is reassessed after the
-# narrower LPAR has been observed. While a VP reduction is on its way, a cut of the entitlement
-# stops at what the more permissive of today's VP:ENT ratio and 2.00 carries on this cycle's VPs.
+# Ordinary sizing is coordinated: entitlement and VPs may both come down in one cycle. The staging
+# guard is one of its safeguards and is not entitlement preservation: while a VP reduction is still
+# on its way, the entitlement cut of that cycle stops at what the more permissive of today's
+# VP:ENT ratio and 2.00 carries on the cycle's VPs. (The coordinated change itself is traced end
+# to end in stage1_reduction_test.py.)
 my $ordinary = UUT::_resolve_current_cycle_pair({ target_ent => 0.10, target_vp => 1, step_vp => 3, current_ent => 3.00, current_vp => 4 });
 is_deeply([ $ordinary->{Ent}, $ordinary->{VP}, $ordinary->{Status} ], [1.01, 3, 'STAGED'],
           'ordinary staged reduction 4 -> 3 VPs towards 1: the entitlement cut stops at 1.01 (ratio 2.00, the more permissive of 1.33 and 2.00)');
