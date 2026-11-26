@@ -85,7 +85,7 @@ $c = cfg("[GLOBAL]\nvios_sizing = combined\nvios_takeover_margin = 0.10\nha_sizi
 is_deeply($c->{global}, { vios_sizing => 'combined', vios_takeover_margin => 0.10, ha_sizing => 'independent' }, '[GLOBAL]: the policy defaults');
 is_deeply($c->{vms}{v1}, { lpar_type => 'vios', vios_sizing => 'match_larger' }, 'vios_sizing read; an invalid margin ignored');
 ok((grep { /vios_takeover_margin must be a fraction from 0 to 1/ } @{ $c->{warnings} }), 'an invalid margin is warned');
-ok((grep { /\[n1\]: ha_sizing must be one of independent, standby_share; 'bogus' is not/ } @{ $c->{errors} }), 'an invalid ha_sizing is an error');
+ok((grep { /\[n1\]: ha_sizing must be one of independent, standby_share, standby_fixed; 'bogus' is not/ } @{ $c->{errors} }), 'an invalid ha_sizing is an error');
 ok(!(grep { /vios_takeover_margin/ } @{ $c->{errors} }), 'an invalid setting that is not PowerHA policy stays a warning');
 is($c->{vms}{n1}{ha_sizing}, 'standby_share', 'ha_sizing read');
 
@@ -146,6 +146,28 @@ ok((grep { /\[MGSYS:FRAME_D\]: 'standby_share' has no value/ } @{ $c->{errors} }
 is_deeply($c->{mgsys}, { FRAME_B => {}, FRAME_D => {} }, 'nothing is taken from a refused stanza or setting');
 is(scalar(grep { /unknown setting 'foo'/ } @{ $c->{warnings} }), 1, 'an unknown setting stays a warning');
 is(scalar(@{ $c->{errors} }), 7, 'every error is listed');
+
+# --- Fixed standby entitlement (B13) -----------------------------------------------
+$c = cfg("[GLOBAL]\nha_sizing = standby_share\n[MGSYS:FRAME_B]\nha_sizing = standby_fixed\nstandby_entitlement = 0.10\n"
+       . "[n1]\nstandby_entitlement = .2\n[n2]\nha_sizing = Standby_Fixed\n[n3]\nha_sizing = standby_fixed\nstandby_entitlement = 1\n");
+is_deeply($c->{errors}, [], 'standby_fixed with its entitlement reads without errors');
+is_deeply($c->{mgsys}{FRAME_B}, { ha_sizing => 'standby_fixed', standby_entitlement => 0.10 }, 'a managed system\'s fixed policy');
+is_deeply([ $c->{vms}{n1}{standby_entitlement}, $c->{vms}{n2}{ha_sizing}, $c->{vms}{n3}{standby_entitlement} ], [ 0.2, 'standby_fixed', 1 ],
+          'LPAR values; an LPAR may take the entitlement of a managed system');
+$c = cfg("[n1]\nstandby_entitlement = 0.04\n[n2]\nstandby_entitlement = 0.125\n[n3]\nstandby_entitlement = lots\n[n4]\nstandby_entitlement = 0.05\n"
+       . "[MGSYS:FRAME_B]\nstandby_entitlement = -1\n");
+is(scalar(grep { /standby_entitlement must be a number of processors of at least 0\.05, with two decimals at most/ } @{ $c->{errors} }), 4,
+   'below 0.05, three decimals, not a number, negative: each an error');
+is($c->{vms}{n4}{standby_entitlement}, 0.05, 'the platform minimum of one VP is accepted');
+ok(!exists $c->{vms}{n1}{standby_entitlement}, 'a refused value is not taken');
+$c = cfg("[GLOBAL]\nha_sizing = standby_fixed\n");
+ok((grep { /^line 2, \[GLOBAL\]: ha_sizing = standby_fixed needs standby_entitlement, in this stanza or a more general one/ } @{ $c->{errors} }),
+   '[GLOBAL] standby_fixed without an entitlement is an error');
+$c = cfg("[MGSYS:FRAME_A]\nstandby_entitlement = 0.2\n[MGSYS:FRAME_B]\nha_sizing = standby_fixed\n[n1]\nha_sizing = standby_fixed\n");
+is_deeply($c->{errors}, [ 'line 4, [MGSYS:FRAME_B]: ha_sizing = standby_fixed needs standby_entitlement, in this stanza or a more general one' ],
+          'another managed system\'s entitlement does not serve a managed system; for an LPAR it may (its frame is not known from the file)');
+$c = cfg("[GLOBAL]\nstandby_entitlement = 0.15\n[MGSYS:FRAME_B]\nha_sizing = standby_fixed\n[n1]\nha_sizing = standby_fixed\nha_sizing = independent\n");
+is_deeply($c->{errors}, [], '[GLOBAL] supplies the entitlement; a stanza whose last ha_sizing is not standby_fixed needs none');
 
 # --- One resolver: LPAR, managed system, [GLOBAL]; each setting on its own ---------
 $UUT::vms_config = cfg("[GLOBAL]\nha_sizing = standby_share\nstandby_share = 0.25\nvios_sizing = combined\n"

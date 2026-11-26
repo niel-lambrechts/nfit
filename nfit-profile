@@ -2461,6 +2461,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     its managed system's defaults ([MGSYS:<name>] in nfit.vms.cfg), then\n";
         print {$LOG_FH} "                     [GLOBAL]. The active node's settings do not size the standby.\n";
         print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Fixed standby      ha_sizing = standby_fixed: the customer's entitlement for a node while it is\n";
+        print {$LOG_FH} "  entitlement        standby (standby_entitlement), for sites that add capacity at takeover.\n";
+        print {$LOG_FH} "                     Not a floor: it replaces the entitlement the node's own workload asks\n";
+        print {$LOG_FH} "                     for, which is still shown. VPs follow the usual VP rules. Where the\n";
+        print {$LOG_FH} "                     entitlement cannot carry this cycle's VPs (0.05 per VP) nothing is changed:\n";
+        print {$LOG_FH} "                     [STANDBY_FIXED_CONFLICT]. nFit does not arrange or verify takeover capacity.\n";
+        print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
         print {$LOG_FH} "                     vios_takeover_margin, a planning scenario; match_larger: aligned with the\n";
@@ -14323,7 +14330,9 @@ sub _ha_member_frame
 #             2. code ref: (LPAR, managed system, setting) -> (value, source)
 # RETURNS:    hashref { Sizing, Share, Node (the standby, or undef), Frame (its
 #             managed system, undef when not established), Source { setting =>
-#             lpar | mgsys | global | built-in } }
+#             lpar | mgsys | global | built-in }, and under standby_fixed:
+#             Fixed (the entitlement), or Error where none is configured for
+#             this node }
 # ==============================================================================
 sub _ha_standby_policy
 {
@@ -14339,8 +14348,91 @@ sub _ha_standby_policy
     my $frame = (ref($cluster->{FrameOf}) eq 'HASH') ? $cluster->{FrameOf}{$node} : undef;
     my ($mode, $mode_source)   = $setting_of->($node, $frame, 'ha_sizing');
     my ($share, $share_source) = $setting_of->($node, $frame, 'standby_share');
-    return { Sizing => $mode // 'independent', Share => ($share // 0.25) + 0, Node => $node, Frame => $frame,
-             Source => { ha_sizing => $mode_source // 'built-in', standby_share => $share_source // 'built-in' } };
+    my %resolved = (Sizing => $mode // 'independent', Share => ($share // 0.25) + 0, Node => $node, Frame => $frame,
+                    Source => { ha_sizing => $mode_source // 'built-in', standby_share => $share_source // 'built-in' });
+    if ($resolved{Sizing} eq 'standby_fixed')
+    {
+        # Only this mode's parameter is read; there is no built-in fixed entitlement.
+        my ($fixed, $fixed_source) = $setting_of->($node, $frame, 'standby_entitlement');
+        if (defined $fixed)
+        {
+            $resolved{Fixed} = $fixed + 0;
+            $resolved{Source}{standby_entitlement} = $fixed_source;
+        }
+        else
+        {
+            $resolved{Error} = sprintf('ha_sizing = standby_fixed applies to the standby %s%s and no standby_entitlement is set for it '
+                . '(its own stanza, its managed system\'s, or [GLOBAL])', $node,
+                (defined $frame ? " on managed system $frame" : ', whose managed system is not established'));
+        }
+    }
+    return \%resolved;
+}
+
+# Where a policy setting came from, as the planner reads it.
+sub _policy_source_text
+{
+    my ($source) = @_;
+    return { lpar => 'its own setting in nfit.vms.cfg', mgsys => "its managed system's default", global => 'the [GLOBAL] default',
+             'built-in' => 'the built-in default' }->{ $source // '' } // 'nfit.vms.cfg';
+}
+
+# ==============================================================================
+# SUBROUTINE: _ha_fixed_standby_pair
+# PURPOSE:    The pair of a standby with a fixed standby entitlement (v10 B13).
+#             The entitlement is the customer's figure, in one step. The VPs
+#             are not part of the override: the VP count of this cycle is the
+#             step the existing VP rules give for the LPAR's own workload.
+#             Where the fixed entitlement and that VP count are not a pair
+#             PowerVM accepts (0.05 processors per VP; the pool's size), the
+#             installed pair is kept and the reason returned: the fixed figure
+#             is never changed and no VP reduction is invented. Pure.
+# ARGUMENTS:  hashref { fixed, step_vp, current_ent, current_vp, pool_size }
+# RETURNS:    (pair hashref as _resolve_current_cycle_pair gives it, conflict
+#             text or undef). A pair without Ent: nothing could be resolved.
+# ==============================================================================
+sub _ha_fixed_standby_pair
+{
+    my ($t) = @_;
+    # The VP count of this cycle is the step the VP rules give (the installed count without one).
+    # It is passed as the VP destination too, so that the resolver does not raise the entitlement to
+    # keep its ENT:VP ratio during a staged VP reduction: that guard sizes an entitlement nFit
+    # chose, and this one is the customer's. What PowerVM itself requires (0.05 per VP, the
+    # pool's size, VPs wide enough to carry the entitlement) still decides.
+    my $cycle_vp = (defined $t->{step_vp} && $t->{step_vp} >= 1) ? $t->{step_vp} : $t->{current_vp};
+    my $pair = _resolve_current_cycle_pair({ target_ent => $t->{fixed}, target_vp => $cycle_vp, step_vp => $cycle_vp,
+        current_ent => $t->{current_ent}, current_vp => $t->{current_vp}, pool_size => $t->{pool_size} });
+    return ($pair, undef) unless (defined $pair->{Ent});
+    return ($pair, undef) if (abs($pair->{Ent} - $t->{fixed}) < 0.005);
+    my %bound = map { $_ => 1 } @{ $pair->{Binding} // [] };
+    my $vp = $pair->{VP} // $t->{current_vp};
+    my $carries = int($t->{fixed} / $MIN_ENT_PER_VP + 1e-6);
+    my $why = $bound{POOL_SIZE}    ? sprintf('it is above the size of its pool (%s)', $t->{pool_size})
+            : ($vp > $carries)     ? sprintf('%.2f carries at most %d VP%s (0.05 processors per VP) and the VP count of this cycle is %d, which needs at least %.2f',
+                                             $t->{fixed}, $carries, ($carries == 1 ? '' : 's'), $vp, $MIN_ENT_PER_VP * $vp)
+            :                        sprintf('with %d VP%s the entitlement would have to be %.2f', $vp, ($vp == 1 ? '' : 's'), $pair->{Ent});
+    return ({ %$pair, Ent => $t->{current_ent}, VP => $t->{current_vp}, Status => 'HOLD', Order => 'NONE', ReviewVP => undef,
+              CycleVP => $vp }, $why);
+}
+
+# The planning action of a standby with a fixed standby entitlement, as sentences. Pure.
+sub _ha_fixed_standby_action
+{
+    my ($a) = @_;
+    my $own = looks_like_number($a->{ownEnt} // '')
+        ? sprintf('Its own workload needs %.2f%s.', $a->{ownEnt}, ($a->{ownEnt} > $a->{fixed} + 0.005 ? ', above the standby allocation' : ''))
+        : '';
+    my $head = sprintf('PowerHA standby for %s (%s): fixed standby entitlement %.2f (%s)', $a->{primary}, $a->{roleSource}, $a->{fixed},
+                       _policy_source_text($a->{fixedSource}));
+    my $takeover = defined $a->{primaryEnt}
+        ? sprintf('At failover it needs up to %.2f entitlement; capacity at takeover is arranged outside nFit and is not verified.', $a->{primaryEnt})
+        : 'Capacity at takeover is arranged outside nFit and is not verified.';
+    if (defined $a->{conflict})
+    {
+        return (sprintf('%s cannot be set this cycle: %s. The installed %.2f on %d VP%s is kept; no change.', $head, $a->{conflict},
+                        $a->{currentEnt}, $a->{currentVP}, ($a->{currentVP} == 1 ? '' : 's')), $own, $takeover);
+    }
+    return ("$head.", $own, _current_cycle_action_text($a->{pair}, $a->{currentEnt}, $a->{currentVP}, $a->{poolId}), $takeover);
 }
 
 # ==============================================================================
@@ -14389,7 +14481,7 @@ sub _ha_standby_target
 #             Clusters of three or more nodes and unresolved roles without a
 #             handover are sized independently. Pure.
 # ARGUMENTS:  1. cluster (hashref from _ha_role_evidence)  2. policy
-# RETURNS:    hashref { name => { Treatment (standby_floor | hold_reductions),
+# RETURNS:    hashref { name => { Treatment (standby_floor | standby_fixed | hold_reductions),
 #             Primary, Since, Reason } }
 # ==============================================================================
 sub _ha_sizing_plan
@@ -14407,6 +14499,10 @@ sub _ha_sizing_plan
     {
         $plan{ $standby[0] } = { Treatment => 'standby_floor', Primary => $active[0] }
             if (($policy->{Sizing} // '') eq 'standby_share');
+        # A fixed standby entitlement acts on the resolved standby only; the hold of an active
+        # node after a handover, below, is as without it.
+        $plan{ $standby[0] } = { Treatment => 'standby_fixed', Primary => $active[0] }
+            if (($policy->{Sizing} // '') eq 'standby_fixed');
         $plan{ $active[0] } = { Treatment => 'hold_reductions', Since => $last->{From}, Reason => 'took_over' }
             if ($last && $last->{Rises} eq $active[0]);
     }
@@ -14620,13 +14716,19 @@ sub _apply_ha_sizing
     foreach my $cluster (@$evidence_aref)
     {
         my $policy = _ha_standby_policy($cluster, \&_policy_setting);
+        if (defined $policy->{Error})
+        {
+            print STDERR "  [ERROR] nfit.vms.cfg: $policy->{Error}\n";
+            print STDERR "  [ERROR] nfit.vms.cfg: set standby_entitlement, or another ha_sizing; the analysis was stopped\n";
+            exit 2;
+        }
         my $plan = _ha_sizing_plan($cluster, $policy);
         $cluster->{Policy} = $policy;
         $cluster->{Plan} = $plan;
         # Holds before standby floors: a standby takes the held pair of a
         # primary that took over as its reference, so that primary must be
         # resolved first, whatever the names' sort order.
-        my $is_floor = sub { return (($plan->{ $_[0] }{Treatment} // '') eq 'standby_floor') ? 1 : 0; };
+        my $is_floor = sub { return (($plan->{ $_[0] }{Treatment} // '') =~ /^standby_/) ? 1 : 0; };
         foreach my $vm (sort { $is_floor->($a) <=> $is_floor->($b) || $a cmp $b } keys %$plan)
         {
             next unless (exists $row_of{$vm});
@@ -14693,6 +14795,43 @@ sub _apply_ha_sizing
                            PrimarySnapshot => $target->{Snapshot}, PrimaryReason => $target->{Reason}, Pending => $target->{Pending},
                            PrimaryFrames => [ map { basename($_) } @{ $cluster->{DirsOf}{$primary} // [] } ], Pair => $pair);
             }
+            elsif ($entry->{Treatment} eq 'standby_fixed')
+            {
+                my $primary = $entry->{Primary};
+                # The processor mode is known only where the collector reports it.
+                my ($state) = sort { ($b->{start_epoch} // 0) <=> ($a->{start_epoch} // 0) } grep { ref($_) eq 'HASH' } @{ $cluster->{StatesOf}{$vm} // [] };
+                my $shared = _safe_dig($state, 'metadata', 'shared_enabled');
+                if (defined $shared && looks_like_number($shared) && !$shared)
+                {
+                    $entry->{Note} = 'the fixed standby entitlement is not applied: its configuration reports that it is not a '
+                        . 'shared-processor LPAR; sized on its own workload';
+                    next;
+                }
+                my ($conflict);
+                ($pair, $conflict) = _ha_fixed_standby_pair({ fixed => $policy->{Fixed}, step_vp => $step,
+                    current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
+                if (!defined $pair->{Ent})
+                {
+                    $entry->{Note} = 'the fixed standby entitlement is not applied (' . ($pair->{Reason} // 'no installed pair') . '): sized on its own workload';
+                    next;
+                }
+                # The primary's target, where this run analysed it: the failover figure only. The fixed
+                # allocation does not depend on it.
+                my $primary_ent;
+                if (exists $row_of{$primary})
+                {
+                    my ($prow, $pcells) = @{ $row_of{$primary} }[1, 2];
+                    $primary_ent = $cell->($prow, $pcells->{'Planning Profile'}) if (defined $pcells->{'Planning Profile'});
+                }
+                push @action, _ha_fixed_standby_action({ primary => $primary, roleSource => $cluster->{Roles}{$vm}{Source},
+                    fixed => $policy->{Fixed}, fixedSource => $policy->{Source}{standby_entitlement}, ownEnt => $own_ent,
+                    conflict => $conflict, pair => $pair, currentEnt => $current_ent, currentVP => $current_vp,
+                    poolId => $cfg->{pool_id}, primaryEnt => $primary_ent });
+                %result = (Source => 'HA_STANDBY_FIXED', Profile => $profile, TargetEnt => $policy->{Fixed}, TargetVP => $own_vp,
+                           OwnTargetEnt => $own_ent, OwnTargetVP => $own_vp, Fixed => $policy->{Fixed},
+                           FixedSource => $policy->{Source}{standby_entitlement}, Frame => $policy->{Frame}, Primary => $primary,
+                           PrimaryTargetEnt => $primary_ent, Conflict => $conflict, ModeKnown => (defined $shared ? 1 : 0), Pair => $pair);
+            }
             else
             {
                 my $resolved = (ref($core->{Profile_CurrentCycle}) eq 'HASH') ? $core->{Profile_CurrentCycle}{$profile} : undef;
@@ -14729,7 +14868,8 @@ sub _apply_ha_sizing
             if (defined $proposals && ref($proposals->{$vm}) eq 'HASH')
             {
                 $proposals->{$vm}{role} = {
-                    type => ($result{Source} eq 'HA_STANDBY' ? 'haStandby' : 'haHold'), profile => $profile,
+                    type => ($result{Source} eq 'HA_STANDBY' ? 'haStandby' : $result{Source} eq 'HA_STANDBY_FIXED' ? 'haStandbyFixed' : 'haHold'),
+                    profile => $profile,
                     targetEntitlement => $result{TargetEnt}, targetVPs => $result{TargetVP}, entitlement => $pair->{Ent},
                     VPs => $pair->{VP}, status => $pair->{Status},
                     ($result{Source} eq 'HA_STANDBY'
@@ -14738,6 +14878,14 @@ sub _apply_ha_sizing
                                               source => $result{PrimarySource}, windowEnd => $result{PrimaryWindowEnd},
                                               snapshot => $result{PrimarySnapshot},
                                               (defined $result{PrimaryReason} ? (reason => $result{PrimaryReason}) : ()) })
+                        : $result{Source} eq 'HA_STANDBY_FIXED'
+                        # A customer's allocation for the node while it is standby. The requirement of its
+                        # own workload is kept beside it: overridden, not disproved.
+                        ? (primary => $result{Primary}, fixedEntitlement => $result{Fixed}, source => $result{FixedSource},
+                           managedSystem => $result{Frame},
+                           ownRequirement => { entitlement => $result{OwnTargetEnt}, VPs => $result{OwnTargetVP} },
+                           processorModeKnown => ($result{ModeKnown} ? JSON::true : JSON::false),
+                           (defined $result{Conflict} ? (conflict => $result{Conflict}) : ()))
                         : (since => $result{Since})),
                     (($result{PrimarySource} // '') eq 'installed' ? (unresolved => $result{PrimaryReason}) : ()),
                 };
@@ -14906,6 +15054,10 @@ sub _log_powerha_roles
                             'built-in' => 'the built-in default' }->{ $policy->{Source}{ha_sizing} // '' };
         push @out, !defined $policy->{Node}
             ? '      Sizing: no node is resolved as the standby of an active node; each node is sized on its own workload.'
+            : ($policy->{Sizing} eq 'standby_fixed')
+            ? sprintf('      Sizing: fixed standby entitlement %.2f (%s), set by the customer for the node while it is standby (policy of the standby %s, from %s). '
+                . 'Not a floor: it applies above or below the node\'s own workload requirement, which is still shown.',
+                $policy->{Fixed} // 0, _policy_source_text($policy->{Source}{standby_entitlement}), $policy->{Node}, $policy_from)
             : ($policy->{Sizing} eq 'standby_share')
             ? sprintf('      Sizing: standby_share at %d%% of the primary\'s target, as a floor under own workload (policy of the standby %s, from %s).',
                 int(100 * $policy->{Share} + 0.5), $policy->{Node}, $policy_from)
@@ -14936,6 +15088,19 @@ sub _log_powerha_roles
                     . 'sized to %.2f, current cycle %.2f on %s VPs. At failover it needs up to %.2f; takeover capacity not verified.',
                     $name, $rr->{Floor}, int(100 * $rr->{Share} + 0.5), $rr->{PrimaryTargetEnt}, ($rr->{OwnTargetEnt} // 0),
                     $rr->{TargetEnt}, ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'), $rr->{PrimaryTargetEnt}), '        ', '          ');
+            }
+            elsif (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_STANDBY_FIXED')
+            {
+                push @out, _rationale_wrap(sprintf('%s: fixed standby entitlement %.2f; own workload requirement %.2f on %s VP%s%s; %s. '
+                    . 'VPs follow the usual VP rules and are not part of the fixed allocation. Capacity at takeover is arranged outside nFit '
+                    . 'and is not verified here.%s',
+                    $name, $rr->{Fixed}, ($rr->{OwnTargetEnt} // 0), ($rr->{OwnTargetVP} // '?'), ((($rr->{OwnTargetVP} // 0) == 1) ? '' : 's'),
+                    ((($rr->{OwnTargetEnt} // 0) > $rr->{Fixed} + 0.005) ? ', above the standby allocation' : ''),
+                    (defined $rr->{Conflict}
+                        ? sprintf('not set this cycle: %s; the installed %.2f on %s VPs is kept', $rr->{Conflict}, ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'))
+                        : sprintf('current cycle %.2f on %s VPs', ($rr->{Pair}{Ent} // 0), ($rr->{Pair}{VP} // '?'))),
+                    ($rr->{ModeKnown} ? '' : ' The collector does not report whether this LPAR uses shared or dedicated processors: the setting '
+                        . 'is applied as configured.')), '        ', '          ');
             }
             elsif (ref($rr) eq 'HASH' && ($rr->{Source} // '') eq 'HA_HOLD')
             {
@@ -15021,7 +15186,7 @@ sub _collect_structural_findings
         my $proposed = (defined $planning && exists $values->{$planning}) ? $values->{$planning} : undef;
         my $role_result = (ref($core->{RoleResult}) eq 'HASH') ? $core->{RoleResult} : undef;
         $proposed = $role_result->{TargetEnt}                  # a VIOS sized with its group
-            if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_HOLD)$/);
+            if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_STANDBY_FIXED|HA_HOLD)$/);
         $proposed = undef unless (defined $proposed && looks_like_number($proposed) && $proposed > 0);
 
         # The pool plan (v10 stage 3.4, plan 8.2 part 1) counts what can be
@@ -15030,7 +15195,7 @@ sub _collect_structural_findings
         my $planning_cycle = (defined $planning && ref($core->{Profile_CurrentCycle}) eq 'HASH')
             ? $core->{Profile_CurrentCycle}{$planning} : undef;
         $planning_cycle = $role_result->{Pair}
-            if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_HOLD)$/ && ref($role_result->{Pair}) eq 'HASH');
+            if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_STANDBY_FIXED|HA_HOLD)$/ && ref($role_result->{Pair}) eq 'HASH');
         my $cycle_ent = (ref($planning_cycle) eq 'HASH' && looks_like_number($planning_cycle->{Ent} // '')) ? $planning_cycle->{Ent} + 0 : undef;
         if (defined $proposed && ref($planning_cycle) eq 'HASH' && looks_like_number($planning_cycle->{TargetVP} // ''))
         {
@@ -15217,7 +15382,7 @@ sub _entitlement_totals
                 my $cycle = (ref($core->{Profile_CurrentCycle}) eq 'HASH') ? $core->{Profile_CurrentCycle}{$planning} : undef;
                 $cycle_ent = $number->($cycle->{Ent}) if (defined $cycle && ref($cycle) eq 'HASH');
                 my $role_result = (ref($core->{RoleResult}) eq 'HASH') ? $core->{RoleResult} : undef;
-                if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_HOLD)$/)
+                if (defined $role_result && ($role_result->{Source} // '') =~ /^(?:VIOS_PAIR|HA_STANDBY|HA_STANDBY_FIXED|HA_HOLD)$/)
                 {                                            # a VIOS or PowerHA node sized with its group
                     $target    = $number->($role_result->{TargetEnt});
                     $cycle_ent = (ref($role_result->{Pair}) eq 'HASH') ? $number->($role_result->{Pair}{Ent}) : undef;
@@ -17778,6 +17943,10 @@ sub _write_standard_csv_report {
         # An LPAR no longer sampled on this frame: its row is a record, marked as such (B15).
         my $presence = _safe_dig($assimilation_map_ref, $row_vm, 'Presence');
         my $analysed_action = (ref($planner_cells) eq 'HASH') ? $planner_cells->{'NFIT - Action'} : undef;
+        # A standby on a fixed standby entitlement (B13): marked, and marked apart where it could not be set.
+        my $role_of_row = _safe_dig($assimilation_map_ref, $row_vm, 'CoreResults', 'RoleResult');
+        unshift @{ $structural_tags->{$row_vm} }, (defined $role_of_row->{Conflict} ? '[STANDBY_FIXED_CONFLICT]' : '[STANDBY_FIXED]')
+            if (ref($role_of_row) eq 'HASH' && ($role_of_row->{Source} // '') eq 'HA_STANDBY_FIXED');
         if (ref($presence) eq 'HASH' && $presence->{left})
         {
             $planner_cells->{'NFIT - Action'} = _historic_action($presence, $planner_cells->{'NFIT - Action'}) if (ref($planner_cells) eq 'HASH');
@@ -28563,6 +28732,16 @@ sub _capacity_plan_build
             $row_of{$vm}{roleLimitation} = 'PowerHA roles are not assessed for events: confirm this node can take over the event allocation of '
                 . join(', ', @peers);
             push @{ $row_of{$vm}{unresolved} }, 'PowerHA role';
+            # A node with a fixed standby entitlement (B13): the event increase is its own-workload
+            # forecast. It stays in the plan and is marked for confirmation against that policy.
+            my $fixed = (ref($ctx->{standbyPolicy}) eq 'HASH') ? $ctx->{standbyPolicy}{$vm} : undef;
+            if (defined $fixed && ($row_of{$vm}{action} // '') eq 'increase')
+            {
+                $row_of{$vm}{roleLimitation} .= sprintf('. [STANDBY_POLICY_CONFIRM] A fixed standby entitlement of %.2f is configured for this node '
+                    . 'while it is the standby. The increase is the forecast of its own workload and does not by itself replace that '
+                    . 'policy: confirm which applies for the event', $fixed);
+                push @{ $row_of{$vm}{unresolved} }, 'standby policy';
+            }
         }
     }
 
@@ -28892,6 +29071,13 @@ sub _capacity_plan_for_run
         $ctx{combined}{$vm} = [ @$combined ] if (ref($combined) eq 'ARRAY' && @$combined);
         # A run-queue evidence concern on the planning profile: the run's own anomaly flags (XRQ, DBW).
         my $flag = defined $p ? (_safe_dig($map_ref, $vm, 'CoreResults', 'ProfileDebugInfo', $p, 'RunQ_Potential') // '') : '';
+        # A fixed standby entitlement configured for this node (resolved as for a standby on this managed system).
+        if (grep { my $c = $_; @$c == 2 && grep { $_ eq $vm } @$c } @{ $ctx{clusters} // [] })
+        {
+            my ($mode) = _policy_setting($vm, $CURRENT_MGSYS, 'ha_sizing');
+            my ($fixed) = _policy_setting($vm, $CURRENT_MGSYS, 'standby_entitlement');
+            $ctx{standbyPolicy}{$vm} = $fixed if (($mode // '') eq 'standby_fixed' && defined $fixed);
+        }
         $ctx{evidence}{$vm} = 'the run queue is implausibly high (XRQ); find its cause' if ($flag =~ /ANOMALY\s*\(XRQ\)/i);
         $ctx{evidence}{$vm} = 'a high run queue with low CPU use (DBW); investigate the blocking' if ($flag =~ /ANOMALY\s*\(DBW\)/i);
     }
@@ -31685,6 +31871,7 @@ sub _build_adaptive_thresholds_hash {
 # PURPOSE:    Reads etc/nfit.vms.cfg (v10 stage 3.1b): one [section] per LPAR,
 #             and a reserved [GLOBAL] section for VM-policy defaults.
 #               LPAR keys:  tier, ha_peer, ha_role, ha_sizing, standby_share,
+#                           standby_entitlement,
 #                           lpar_type, vios_peer, vios_sizing,
 #                           vios_takeover_margin
 #               [GLOBAL]:   ha_sizing, standby_share, vios_sizing,
@@ -31699,7 +31886,8 @@ sub _build_adaptive_thresholds_hash {
 #             resolved on its own (LPAR, managed system, [GLOBAL]).
 #             Invalid values, unknown keys (once per key) and lines that are
 #             not settings are warned and ignored. Not so the PowerHA policy
-#             (ha_role, ha_sizing, standby_share) and the [MGSYS:] stanzas:
+#             (ha_role, ha_sizing, standby_share, standby_entitlement) and the
+#             [MGSYS:] stanzas:
 #             what cannot be read there is an error, because ignoring it would
 #             let another level's policy apply unasked. Nothing is printed here.
 # ARGUMENTS:  1. file path
@@ -31716,11 +31904,11 @@ sub parse_vms_config
     return \%config unless (defined $filepath && -f $filepath);
     $config{exists} = 1;
 
-    my %vm_keys     = map { $_ => 1 } qw(tier ha_peer ha_role ha_sizing standby_share lpar_type vios_peer
+    my %vm_keys     = map { $_ => 1 } qw(tier ha_peer ha_role ha_sizing standby_share standby_entitlement lpar_type vios_peer
                                          vios_sizing vios_takeover_margin);
-    my %global_keys = map { $_ => 1 } qw(ha_sizing standby_share vios_sizing vios_takeover_margin);
+    my %global_keys = map { $_ => 1 } qw(ha_sizing standby_share standby_entitlement vios_sizing vios_takeover_margin);
     my %choices     = (ha_role => [qw(auto active standby)], lpar_type => [qw(lpar vios)],
-                       ha_sizing => [qw(independent standby_share)], vios_sizing => [qw(combined match_larger)]);
+                       ha_sizing => [qw(independent standby_share standby_fixed)], vios_sizing => [qw(combined match_larger)]);
 
     my $fh;
     if (!open($fh, '<:encoding(utf8)', $filepath))
@@ -31730,7 +31918,8 @@ sub parse_vms_config
     }
     my ($section, $tier_seen, %unknown_warned) = ('', 0);
     my $mgsys;          # the managed system of the [MGSYS:<name>] stanza being read; undef in a stanza that is refused
-    my %ha_policy_keys = map { $_ => 1 } qw(ha_role ha_sizing standby_share);
+    my %ha_policy_keys = map { $_ => 1 } qw(ha_role ha_sizing standby_share standby_entitlement);
+    my %fixed_at;       # stanza => line of its ha_sizing = standby_fixed
     my $warn = sub { push @{ $config{warnings} }, sprintf('line %d: %s', $., $_[0]); };
     my $error = sub { push @{ $config{errors} }, sprintf('line %d, [%s]: %s', $., $section, $_[0]); };
     while (my $line = <$fh>)
@@ -31838,6 +32027,18 @@ sub parse_vms_config
                 $error->("standby_share must be a fraction above 0 and at most 1 (for example 0.25); '$value' is not");
             }
         }
+        elsif ($key eq 'standby_entitlement')
+        {
+            # Processors, as the HMC takes them: two decimals at most, and no less than one VP's minimum.
+            if ($value =~ /^(?:\d+(?:\.\d{1,2})?|\.\d{1,2})$/ && $value >= 0.05 - 1e-9)
+            {
+                $store->{standby_entitlement} = $value + 0;
+            }
+            else
+            {
+                $error->("standby_entitlement must be a number of processors of at least 0.05, with two decimals at most (for example 0.10); '$value' is not");
+            }
+        }
         elsif ($key eq 'vios_takeover_margin')
         {
             if ($value =~ /^(?:\d+(?:\.\d*)?|\.\d+)$/ && $value <= 1)
@@ -31855,6 +32056,8 @@ sub parse_vms_config
             if (grep { $_ eq $choice } @{ $choices{$key} })
             {
                 $store->{$key} = $choice;
+                $fixed_at{$section} = $. if ($key eq 'ha_sizing');
+                delete $fixed_at{$section} if ($key eq 'ha_sizing' && $choice ne 'standby_fixed');
             }
             elsif ($ha_policy_keys{$key})
             {
@@ -31867,6 +32070,18 @@ sub parse_vms_config
         }
     }
     close $fh;
+
+    # A fixed standby policy needs its entitlement: in the same stanza or a more general one. For
+    # an LPAR the managed system is not known here, so any managed system's value counts; what
+    # that still lets through is reported when the policy is resolved for a standby.
+    foreach my $stanza (sort { $fixed_at{$a} <=> $fixed_at{$b} } keys %fixed_at)
+    {
+        my $own = ($stanza eq 'GLOBAL') ? $config{global} : ($stanza =~ /^MGSYS:(.*)$/) ? ($config{mgsys}{$1} // {}) : ($config{vms}{$stanza} // {});
+        next if (defined $own->{standby_entitlement} || defined $config{global}{standby_entitlement});
+        next if ($stanza ne 'GLOBAL' && $stanza !~ /^MGSYS:/ && grep { defined $_->{standby_entitlement} } values %{ $config{mgsys} });
+        push @{ $config{errors} }, sprintf('line %d, [%s]: ha_sizing = standby_fixed needs standby_entitlement, in this stanza or a more general one',
+            $fixed_at{$stanza}, $stanza);
+    }
 
     # A peer that matches another section only by letter case is read as it.
     my %by_lower;

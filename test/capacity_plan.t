@@ -145,7 +145,8 @@ my %ctx = (event => 'month-end-adaptive', start => '2026-11-24', end => '2026-11
                          Alternatives => [ 'month-end-predictive' ] },
            references => { 'black-friday' => $bf }, normal => $normal, normalModel => 'hybrid-state-decay',
            clusters => [ [ 'DB01', 'DBHA' ] ], combined => {}, windowPlan => { Members => {} }, roleBinding => {},
-           evidence => { DB01 => 'the run queue is implausibly high (XRQ); find its cause', WEB03 => 'x' });
+           evidence => { DB01 => 'the run queue is implausibly high (XRQ); find its cause', WEB03 => 'x' },
+           standbyPolicy => { DB01 => 0.10, DBHA => 0.10 });
 my $plan = UUT::_capacity_plan_build(\%members, \%ctx);
 my %row = map { ($_->{vm} => $_) } @{ $plan->{Rows} };
 
@@ -174,6 +175,13 @@ is_deeply([ map { [ $row{$_}{pair}{Ent}, $row{$_}{pair}{AddEnt}, $row{$_}{role} 
 like($row{DBHA}{roleLimitation}, qr/^PowerHA roles are not assessed for events: confirm this node can take over the event allocation of DB01 \(2\.60 \/ 4\)$/,
      'DBHA: PowerHA role not assessed, the peer\'s event allocation named');
 is_deeply([ @{ $row{DBHA}{pair} }{qw(Ent VP)} ], [ 0.5, 2 ], 'nothing of a PowerHA node is lowered');
+# A fixed standby entitlement is configured for both nodes (B13): the node with an event increase is marked for
+# confirmation against that policy, its figure unchanged; the node without an increase is not marked.
+like($row{DB01}{roleLimitation}, qr/\[STANDBY_POLICY_CONFIRM\] A fixed standby entitlement of 0\.10 is configured for this node while it is the standby\. The increase is the forecast of its own workload and does not by itself replace that policy: confirm which applies for the event$/,
+     'DB01: a seasonal increase on a fixed-policy node is flagged for confirmation');
+ok((grep { $_ eq 'standby policy' } @{ $row{DB01}{unresolved} }), 'and listed as unresolved');
+is_deeply([ $row{DB01}{pair}{Ent}, $row{DB01}{pair}{AddEnt} ], [ 2.6, 0.6 ], 'its seasonal figure is unchanged');
+unlike($row{DBHA}{roleLimitation}, qr/STANDBY_POLICY_CONFIRM/, 'DBHA: no increase, no flag');
 my %pool = map { ($_->{PoolId} => $_) } @{ $plan->{Pools} };
 is_deeply([ @{ $pool{7} }{qw(Planned RequiredMax)}, @{ $pool{9} }{qw(Planned RequiredMax)} ], [ 7.4, 8, 3.1, 4 ],
           'pools on the retained and increased allocations: 7.40 -> 8, 3.10 -> 4');
