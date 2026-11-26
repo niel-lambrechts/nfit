@@ -14,6 +14,9 @@
 #            - a cycle is reusable: finalised with the primary's frame missing
 #              (standby unresolved, cycle INCOMPLETE, exit 0), then again once
 #              that frame has joined, with the complete result;
+#            - the allocation footprint (B11) is written with the summary: frame
+#              figures equal the sums of the final CSV, the shared capacity and
+#              its check are stated, hybrid-state-decay leads, no fit wording;
 #            - each model is finalised on its own;
 #            - an analysis begun and not completed is not used; an expected
 #              frame that is missing is listed;
@@ -26,6 +29,7 @@ import csv
 import gzip
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -65,6 +69,10 @@ def hashes(root, serial, model='state-based'):
 def summary(root):
     with open(os.path.join(root, 'cycle', 'cycle-summary.csv')) as fh:
         return list(csv.DictReader(fh))
+
+
+def summary_row(root, frame):
+    return next(r for r in summary(root) if r['Frame'] == frame)
 
 
 def status(root):
@@ -159,6 +167,47 @@ class CycleFinaliseTests(unittest.TestCase):
         self.assertIn('No list of expected frames was given: this is not stated to be the whole estate.', text)
         self.assertIn('state-based: 2 frames final; standbys across frames: 1 set, 0 unresolved', text)
         self.assertIn(text.splitlines()[0], self.done['standby_first'].stderr)
+
+    def test_the_allocation_footprint(self):
+        root = self.roots['standby_first']
+        cycle = os.path.join(root, 'cycle')
+        text = P.text(os.path.join(cycle, 'cycle-footprint.txt'))
+        self.assertRegex(text, r'^Planning cycle \S+: finalised\n')
+        self.assertIn('No list of expected frames was given: this is not stated to be the whole estate.', text)
+        self.assertRegex(text, r'Model: hybrid-state-decay \(primary view\)\n-+\n  Not analysed in this cycle\.')
+        self.assertLess(text.index('Model: hybrid-state-decay'), text.index('Model: state-based'))
+        self.assertIn('Shared capacity 32 (agreed by 2 LPARs)', text)
+        self.assertIn('Assessment: the entitlements of the LPARs analysed are within the shared capacity reported.', text)
+        self.assertNotRegex(text, r'(?i)\bfits\b|procure|consolidat|spare')
+        with open(os.path.join(cycle, 'cycle-footprint.csv')) as fh:
+            frames = {r['Frame']: r for r in csv.DictReader(fh)}
+        self.assertEqual(set(frames), {'SYSHA1', 'SYSHA2'})
+        row = frames['SYSHA1']
+        with open(outputs(root, 'SYSHA1')['csv']) as fh:
+            published = list(csv.DictReader(fh))
+        # The frame figures are the sums of what the final CSV shows; the standby is counted once, at its final figure.
+        self.assertAlmostEqual(float(row['Installed_ENT']), sum(float(r['Current - ENT']) for r in published), places=2)
+        self.assertAlmostEqual(float(row['CurrentCycle_ENT']), sum(float(r['NFIT - ENT']) for r in published), places=2)
+        self.assertEqual((row['Installed_VP'], row['CurrentCycle_VP']),
+                         (str(sum(int(r['Current - VCPU']) for r in published)), str(sum(int(r['NFIT - VCPU']) for r in published))))
+        self.assertEqual(row['Standby_CurrentCycle_ENT'], P.standby_row(root)['NFIT - ENT'])
+        self.assertEqual((row['Shared_Capacity'], row['Shared_Capacity_Check'], row['State']), ('32', 'agreed by 2 LPARs', 'final'))
+        self.assertAlmostEqual(float(row['CurrentCycle_ENT_Uncommitted']), 32 - float(row['CurrentCycle_ENT']), places=2)
+        self.assertEqual(row['Full_ENT'], summary_row(root, 'SYSHA1')['Target_ENT'])                 # one figure in both cycle files
+        with open(os.path.join(cycle, 'cycle-pools.csv')) as fh:
+            pools = list(csv.DictReader(fh))
+        self.assertEqual([(p['Frame'], p['Pool'], p['Maximum']) for p in pools], [('SYSHA1', '0 (default)', '32'), ('SYSHA2', '0 (default)', '32')])
+        self.assertEqual(pools[0]['Full_ENT'], row['Full_ENT'])                                      # D-024: totals and pool sums agree
+        plan = P.load(outputs(root, 'SYSHA1')['plan'])
+        self.assertEqual(plan['frame']['sharedProcessors']['status'], 'agreed')
+        # Order of analysis does not change it, and a repeat writes the same bytes.
+        other = os.path.join(self.roots['primary_first'], 'cycle')
+        strip = lambda t: re.sub(r'\d{8}T\d{6}-[0-9a-f]{6}', 'CYCLE', t)
+        for name in ('cycle-footprint.csv', 'cycle-pools.csv'):
+            self.assertEqual(strip(P.text(os.path.join(cycle, name))), strip(P.text(os.path.join(other, name))), name)
+        before = {name: P.text(os.path.join(cycle, name), 'rb') for name in ('cycle-footprint.txt', 'cycle-footprint.csv', 'cycle-pools.csv')}
+        self.assertEqual(finalise(root).returncode, 0)
+        self.assertEqual({name: P.text(os.path.join(cycle, name), 'rb') for name in before}, before)
 
     def test_a_second_finalisation_changes_nothing(self):
         root = self.roots['primary_first']

@@ -16,7 +16,11 @@
 #              was analysed on is an integrity error;
 #            - the provisional plan is not changed, and finalising twice gives
 #              the same result;
-#            - a CSV row is replaced cell by cell; every other byte stays.
+#            - a CSV row is replaced cell by cell; every other byte stays;
+#            - the allocation footprint (B11): the shared capacity of a frame is
+#              what its default-pool LPARs agree on; entitlements are compared
+#              with it per frame, pool maxima are listed and never added up, and
+#              a missing or conflicting capacity is "not assessed".
 # USAGE:     perl test/cycle_finalise.t   (or through dev/run-tests)
 # ==============================================================================
 use strict;
@@ -32,7 +36,8 @@ foreach my $name (qw(_safe_dig _cycle_canonical _option_differences _ha_peer_pla
                      _ha_standby_action _resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text _coarse_note_text
                      _coarse_review_text _coarse_review_advisories _coarse_review_action _assess_pool_entitlement_feasibility
                      _structural_shown_value _pool_units_text _pool_prerequisites _structural_csv_tags _rationale_wrap quote_csv
-                     _cycle_finalise_frame _cycle_finalise_lines _cycle_rewrite_csv))
+                     _cycle_finalise_frame _cycle_finalise_lines _cycle_rewrite_csv
+                     _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n";
@@ -169,5 +174,64 @@ is(UUT::_cycle_rewrite_csv($out, { sa => { entitlement => '3.00', VPs => 4, acti
    'rewriting with the same cells changes nothing');
 is(UUT::_cycle_rewrite_csv($csv, { zz => { entitlement => '1.00' } }), undef, 'a row that is not there: the file is left alone');
 is(UUT::_cycle_rewrite_csv("no header\n", { sa => { entitlement => '1.00' } }), undef, 'not a CSV of the analysis: left alone');
+
+# -- The allocation footprint --
+my $map = { a => { Configuration => { pool_id => 0, pool_cpu => 40 } }, b => { Configuration => { pool_id => 0, pool_cpu => 40 } },
+            c => { Configuration => { pool_id => 5, pool_cpu => 4 } }, d => { Configuration => { pool_id => 0, pool_cpu => 0 } } };
+my $capacity = UUT::_frame_shared_capacity($map, [qw(a b c d)]);
+is_deeply([ @{$capacity}{qw(status processors reporters)} ], [ 'agreed', 40, 2 ], 'shared capacity: what the default-pool LPARs agree on; a user pool and a zero are no reporters');
+$map->{b}{Configuration}{pool_cpu} = 38;
+$capacity = UUT::_frame_shared_capacity($map, [qw(a b c d)]);
+is_deeply([ $capacity->{status}, $capacity->{processors}, $capacity->{values} ], [ 'conflict', undef, { 38 => 1, 40 => 1 } ], 'shared capacity: reporters that disagree are a conflict, with no figure');
+is(UUT::_frame_shared_capacity($map, [qw(c)])->{status}, 'absent', 'shared capacity: no default-pool reporter');
+
+my $frame = sub
+{
+    my ($capacity_block, %ent) = @_;
+    return { frame => ($capacity_block ? { sharedProcessors => $capacity_block } : undef), members => {
+        v1 => { installedVPs => 2, planningProfile => 'P', profiles => { P => { recommendedVPs => 3 } }, role => { type => 'viosPair', targetVPs => 4 },
+                published => { VPs => 3 }, poolMember => { pool_id => 0, pool_cpu => 8, current_ent => 1, proposed_ent => ($ent{v1} // 2), cycle_ent => 1.5 } },
+        s1 => { installedVPs => 4, planningProfile => 'P', profiles => { P => { recommendedVPs => 1 } }, published => { VPs => '' },
+                poolMember => { pool_id => 5, pool_cpu => 4, current_ent => 2, proposed_ent => ($ent{s1} // 3), cycle_ent => 2.5 } },
+        x1 => { installedVPs => 2, planningProfile => 'P', profiles => { P => { recommendedVPs => 2 } }, published => { VPs => 2 },
+                poolMember => { pool_id => 5, pool_cpu => 4, current_ent => 1.5, proposed_ent => undef, cycle_ent => undef } },
+        n1 => { installedVPs => 1, planningProfile => 'P', profiles => { P => {} }, poolMember => { pool_id => undef, current_ent => 0.5 } } } };
+};
+my $fp = UUT::_cycle_footprint_frame($frame->({ status => 'agreed', processors => 8, reporters => 1, values => { 8 => 1 } }));
+is_deeply([ $fp->{lpars}, $fp->{noPool}, $fp->{vps} ], [ 4, 1, { Installed => 9, Full => 8, CurrentCycle => 10 } ],
+          'VPs: installed, the full requirement (a role figure before the profile\'s) and this cycle (installed where the row states none)');
+is_deeply($fp->{shared}, { Count => 3, Installed => 4.5, Full => 6.5, CurrentCycle => 5.5 }, 'entitlements of the LPARs with a pool, each once; an LPAR without a result keeps what it has');
+is_deeply($fp->{uncommitted}, { Installed => 3.5, Full => 1.5, CurrentCycle => 2.5 }, 'against the shared capacity: what is not committed as entitlement');
+is($fp->{assessment}, 'the entitlements of the LPARs analysed are within the shared capacity reported', 'within: stated of the LPARs analysed, no frame verdict');
+is_deeply([ map { [ @{$_}{qw(Pool Default Maximum Installed Full CurrentCycle MinFull MinCurrentCycle Status)} ] } @{ $fp->{pools} } ],
+          [ [ 0, 1, 8, 1, 2, 1.5, undef, undef, 'the default pool: its limit is the shared capacity of the frame' ],
+            [ 5, 0, 4, 3.5, 4.5, 4, 5, 4, 'below the full requirement' ] ],
+          'pools: the default pool against the shared capacity; a user pool with its maximum and the maximum each basis needs');
+$fp = UUT::_cycle_footprint_frame($frame->({ status => 'agreed', processors => 6, reporters => 1, values => { 6 => 1 } }, v1 => 3));
+is($fp->{assessment}, 'the full requirement exceeds it by 1.50', 'an excess is named with its size, per basis');
+$fp = UUT::_cycle_footprint_frame($frame->({ status => 'conflict', reporters => 2, values => { 6 => 1, 8 => 1 } }));
+is_deeply([ $fp->{assessment}, $fp->{uncommitted} ], [ 'not assessed: the default-pool LPARs report different shared capacities (6 by 1, 8 by 1)', undef ], 'a conflict is not assessed');
+$fp = UUT::_cycle_footprint_frame($frame->(undef));
+like($fp->{assessment}, qr/^not assessed: no LPAR of the default pool reports the shared capacity of the frame$/, 'no capacity in the saved plan: not assessed');
+
+my $good = UUT::_cycle_footprint_frame($frame->({ status => 'agreed', processors => 8, reporters => 1, values => { 8 => 1 } }));
+my %groups = (All => { Count => 4, Installed => 5, CurrentCycle => 6, Target => 7 }, Vios => { Count => 1, Installed => 1, CurrentCycle => 1.5, Target => 2 },
+              Standby => { Count => 0, Installed => 0, CurrentCycle => 0, Target => 0 });
+my ($frames, $pools, $text) = UUT::_cycle_footprint_lines('C1', [
+    { model => 'state-based', frame => 'FA', state => 'final', lpars => 4, totals => \%groups, resolved => 0, unresolved => 0, footprint => $good },
+    { model => 'state-based', frame => 'FB', state => 'standbys unresolved', lpars => 4, totals => \%groups, resolved => 1, unresolved => 2, footprint => $good },
+    { model => 'state-based', frame => 'FC', state => 'not analysed' } ], [ 'Planning cycle C1: INCOMPLETE' ]);
+my $all = join("\n", @$text);
+is($text->[0], 'Planning cycle C1: INCOMPLETE', 'the footprint opens with the completeness of the cycle');
+like($all, qr/Model: hybrid-state-decay \(primary view\)\n-+\n  Not analysed in this cycle\.\n.*Model: state-based\n/s, 'hybrid-state-decay comes first, and says so when it was not analysed');
+like($all, qr/^  FA\s+4\s+5\.00\s+7\.00\s+6\.00\s+9\/8\/10\s+final$/m, 'a frame: installed, full and cycle apart');
+like($all, qr/of which VIOS\s+1\s+1\.00\s+2\.00\s+1\.50/, 'VIOS shown as part of the frame, not added to it');
+like($all, qr/Standbys across frames: 1 set, 2 UNRESOLVED/, 'unresolved standbys are stated on their frame');
+like($all, qr/^  FC\s+not analysed$/m, 'an expected frame that was not analysed is listed without figures');
+like($all, qr/Frames analysed\s+10\.00\s+14\.00\s+12\.00\s+\(2 frames analysed; a sum of entitlements, not a capacity statement\)/, 'the sum over frames is labelled as no capacity statement');
+unlike($all, qr/\bfits\b|procure|consolidat|spare/i, 'no fit, procurement, consolidation or spare-capacity wording');
+is(scalar(@$frames), 4, 'frame file: a header and one row per frame of the model');
+is(scalar(@$pools), 5, 'pool file: each pool of each analysed frame on its own row');
+like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement"$/, 'a pool row: maximum, the three entitlement sums and the maximum each needs');
 
 done_testing();

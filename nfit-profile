@@ -980,6 +980,7 @@ GetOptions(@option_spec) or die usage_wrapper();
 my %RESOLVED_OPTIONS = %{ _resolved_options(\@option_spec, \%CYCLE_OPTIONS_LEFT_OUT) };
 # This process's part in a planning cycle: { dir, id, runs => { system => {...} } }. Empty outside one.
 my %CYCLE;
+my $FRAME_SHARED_CAPACITY;     # of the frame being published (a standard run), for its saved plan
 
 print STDERR "nfit-profile version $VERSION\n" if (!defined $show_version);
 
@@ -3332,11 +3333,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             printf STDERR "  [INFO] Recommended actions: %d (see rationale)\n", $action_count;
             # The snapshot is also filed with the planner outputs: the store lives beside the staged
             # data and goes when that is restaged; the recommendations of a run should not.
+            $FRAME_SHARED_CAPACITY = _frame_shared_capacity($assimilation_map_ref, \@vm_order);
             my $proposal_copy = _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
                 $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals,
                 File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.proposal.%s.json',
                     (map { s/[^a-zA-Z0-9_.-]//gr } ($system_identifier || 'standard', $report_type_for_filename)), $unique_date_suffix)));
             push @generated_files, $proposal_copy if defined $proposal_copy;
+            $FRAME_SHARED_CAPACITY = undef;
             # Planning cycle: what this analysis registers once its outputs are complete.
             if (%CYCLE && ref($CYCLE{runs}{$system_identifier}) eq 'HASH')
             {
@@ -18297,6 +18300,215 @@ sub _cycle_finalise_lines
     return @lines;
 }
 
+# ------------------------------------------------------------------------------
+# Allocation footprint of a planning cycle (v10 B11): what is allocated now, what
+# nFit recommends in full and for this cycle, and which known capacity limits
+# those allocations would exceed. Made at finalisation from the saved plans only.
+# Entitlement totals, pool maxima and the frame's shared-processor capacity are
+# three different things and are kept apart; pool maxima are never added up.
+# ------------------------------------------------------------------------------
+
+# The shared-processor capacity of a frame as its default-pool LPARs report it: pool_cpu of
+# pool 0, each LPAR in its current configuration state. It is not the frame's activated
+# processors: dedicated processors are outside it. Pure.
+# Returns { status (agreed | conflict | absent), processors (agreed only), reporters,
+#           values { value => LPARs }, source }.
+sub _frame_shared_capacity
+{
+    my ($map_ref, $vm_order_aref) = @_;
+    my (%values, $reporters);
+    foreach my $vm (@{ $vm_order_aref // [] })
+    {
+        my $cfg = (ref($map_ref) eq 'HASH' && ref($map_ref->{$vm}) eq 'HASH') ? $map_ref->{$vm}{Configuration} : undef;
+        next unless (ref($cfg) eq 'HASH' && looks_like_number($cfg->{pool_id} // '') && $cfg->{pool_id} == 0
+                     && looks_like_number($cfg->{pool_cpu} // '') && $cfg->{pool_cpu} > 0);
+        $values{ $cfg->{pool_cpu} + 0 }++;
+        $reporters++;
+    }
+    my %out = (source => 'pool_cpu of the default-pool LPARs, each in its current configuration state',
+               reporters => ($reporters // 0), values => \%values);
+    $out{status} = !$reporters ? 'absent' : (keys %values == 1) ? 'agreed' : 'conflict';
+    $out{processors} = (keys %values)[0] + 0 if ($out{status} eq 'agreed');
+    return \%out;
+}
+
+# The footprint of one frame and model from its saved plan (final where the frame had a standby
+# to set). Each LPAR is counted once, at the figures the pool check counted: a VIOS at its pair
+# figure, a standby at its role figure. Pure.
+# Returns { lpars, vps {Installed, Full, CurrentCycle}, shared {Count, Installed, Full,
+#   CurrentCycle}, noPool (LPARs with no pool reported), capacity (as saved, or status absent),
+#   uncommitted {Installed, Full, CurrentCycle} (capacity agreed only), assessment,
+#   pools [ { Pool, Default (0/1), Maximum, Count, Installed, Full, CurrentCycle, MinFull,
+#             MinCurrentCycle, Status } ] }.
+sub _cycle_footprint_frame
+{
+    my ($doc) = @_;
+    my $members = (ref($doc) eq 'HASH' && ref($doc->{members}) eq 'HASH') ? $doc->{members} : {};
+    my $number = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? $v + 0 : undef; };
+    my (%vp, %shared, %default, @pool_members);
+    my ($lpars, $no_pool) = (0, 0);
+    foreach my $vm (sort keys %$members)
+    {
+        my $m = $members->{$vm};
+        next unless (ref($m) eq 'HASH');
+        $lpars++;
+        my $installed_vp = $number->($m->{installedVPs});
+        my $role = (ref($m->{role}) eq 'HASH') ? $m->{role} : {};
+        my $own = _safe_dig($m, 'profiles', $m->{planningProfile} // '') // {};
+        my %vps = (Installed => $installed_vp, Full => ($number->($role->{targetVPs}) // $number->($own->{recommendedVPs}) // $installed_vp),
+                   CurrentCycle => ($number->(_safe_dig($m, 'published', 'VPs')) // $installed_vp));
+        $vp{$_} += $vps{$_} // 0 foreach (keys %vps);
+        my $pm = $m->{poolMember};
+        unless (ref($pm) eq 'HASH' && looks_like_number($pm->{pool_id} // ''))
+        {
+            $no_pool++;
+            next;
+        }
+        my $current = _structural_shown_value($pm->{current_ent});
+        my %ent = (Installed => $current, Full => (_structural_shown_value($pm->{proposed_ent}) // $current),
+                   CurrentCycle => (_structural_shown_value($pm->{cycle_ent}) // $current));
+        $shared{Count}++;
+        $shared{$_} += $ent{$_} // 0 foreach (keys %ent);
+        if ($pm->{pool_id} == 0)
+        {
+            $default{Count}++;
+            $default{$_} += $ent{$_} // 0 foreach (keys %ent);
+        }
+        push @pool_members, { %$pm, vm => $vm };
+    }
+    my @bases = qw(Installed Full CurrentCycle);
+    my $capacity = (ref($doc) eq 'HASH' && ref(_safe_dig($doc, 'frame', 'sharedProcessors')) eq 'HASH')
+        ? $doc->{frame}{sharedProcessors} : { status => 'absent', reporters => 0, values => {} };
+    my %out = (lpars => $lpars, vps => { map { ($_ => ($vp{$_} // 0)) } @bases }, noPool => $no_pool, capacity => $capacity,
+               shared => { Count => ($shared{Count} // 0), map { ($_ => 0 + sprintf('%.2f', $shared{$_} // 0)) } @bases });
+
+    my @pools;
+    if ($default{Count})
+    {
+        push @pools, { Pool => 0, Default => 1, Maximum => (($capacity->{status} // '') eq 'agreed' ? $capacity->{processors} : undef),
+                       Count => $default{Count}, (map { ($_ => 0 + sprintf('%.2f', $default{$_} // 0)) } @bases),
+                       Status => 'the default pool: its limit is the shared capacity of the frame' };
+    }
+    foreach my $pool (@{ _assess_pool_entitlement_feasibility(\@pool_members) })
+    {
+        my $status = !defined $pool->{Ceiling} ? 'maximum not reported consistently'
+                   : ($pool->{CycleShortfall} > 0 && $pool->{Status} eq 'SHORTFALL') ? 'below this cycle and the full requirement'
+                   : ($pool->{CycleShortfall} > 0) ? 'below this cycle'
+                   : ($pool->{Status} eq 'SHORTFALL') ? 'below the full requirement' : 'holds this cycle and the full requirement';
+        push @pools, { Pool => $pool->{PoolId}, Default => 0, Maximum => $pool->{Ceiling}, Count => scalar(@{ $pool->{Members} // [] }),
+                       Installed => 0 + sprintf('%.2f', $pool->{InstalledSum}), Full => 0 + sprintf('%.2f', $pool->{ProposedSum}),
+                       CurrentCycle => 0 + sprintf('%.2f', $pool->{CycleSum}), MinFull => $pool->{RequiredMax},
+                       MinCurrentCycle => $pool->{RequiredMaxCycle}, Status => $status };
+    }
+    $out{pools} = \@pools;
+
+    # Guaranteed allocations against the shared capacity reported. An excess is a finding; staying
+    # within it is no statement about the whole frame (LPARs outside the analysis, dedicated
+    # processors and pool reserves are not counted) and none about measured spare CPU.
+    if (($capacity->{status} // '') eq 'agreed')
+    {
+        my $n = $capacity->{processors};
+        $out{uncommitted} = { map { ($_ => 0 + sprintf('%.2f', $n - $out{shared}{$_})) } @bases };
+        my @over = map { sprintf('%s exceeds it by %.2f', ($_ eq 'Full' ? 'the full requirement' : $_ eq 'CurrentCycle' ? 'this cycle' : 'the installed entitlement'),
+                                 -$out{uncommitted}{$_}) } grep { $out{uncommitted}{$_} < -$STRUCTURAL_ENT_TOLERANCE } @bases;
+        $out{assessment} = @over ? join('; ', @over)
+                                 : 'the entitlements of the LPARs analysed are within the shared capacity reported';
+    }
+    elsif (($capacity->{status} // '') eq 'conflict')
+    {
+        $out{assessment} = 'not assessed: the default-pool LPARs report different shared capacities ('
+            . join(', ', map { sprintf('%s by %d', $_, $capacity->{values}{$_}) } sort { $a <=> $b } keys %{ $capacity->{values} // {} }) . ')';
+    }
+    else
+    {
+        $out{assessment} = 'not assessed: no LPAR of the default pool reports the shared capacity of the frame';
+    }
+    return \%out;
+}
+
+# The footprint files of a cycle: (frame CSV lines, pool CSV lines, text lines). Each model on its
+# own, hybrid-state-decay first; capacity is judged per frame only.
+#   $rows  [ { model, frame, state, lpars, totals (groups), resolved, unresolved, footprint } ],
+#          footprint undef for a frame that was not analysed or not completed
+sub _cycle_footprint_lines
+{
+    my ($cycle_id, $rows, $headline) = @_;
+    my @bases = qw(Installed Full CurrentCycle);
+    my %base_key = (Installed => 'Installed', Full => 'Target', CurrentCycle => 'CurrentCycle');
+    my $limits = 'LPARs analysed only; dedicated processors and pool reserves not counted; concurrent demand not assessed';
+    my $two = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? sprintf('%.2f', $v) : ''; };
+    my @frame_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame State LPARs Installed_ENT Full_ENT CurrentCycle_ENT
+        VIOS_Installed_ENT VIOS_Full_ENT VIOS_CurrentCycle_ENT Standby_Installed_ENT Standby_Full_ENT Standby_CurrentCycle_ENT
+        Installed_VP Full_VP CurrentCycle_VP Standbys_Unresolved Shared_Capacity Shared_Capacity_Check
+        Installed_ENT_Uncommitted Full_ENT_Uncommitted CurrentCycle_ENT_Uncommitted Assessment Not_Counted)));
+    my @pool_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame Pool LPARs Maximum Installed_ENT Full_ENT CurrentCycle_ENT
+        Minimum_Maximum_Full Minimum_Maximum_CurrentCycle Status)));
+    my @text = (@{ $headline // [] }, '',
+        'Allocation footprint: entitlement in processing units, each LPAR counted once (a VIOS at its pair figure, a PowerHA',
+        'standby at its finalised figure). Installed = allocated now; full = the full recommendation; cycle = recommended for',
+        'this cycle. Each model stands alone. A pool maximum is a ceiling on shared use, not processors: maxima are not added',
+        'up. Shared capacity is what the default-pool LPARs report for the frame; it is not the activated processor count.',
+        "Not counted: $limits.", 'Capacity is judged per frame: room on one frame does not offset an excess on another.');
+    my %models = map { ($_->{model} => 1) } @$rows;
+    my @order = sort { (($b eq 'hybrid-state-decay') <=> ($a eq 'hybrid-state-decay')) || $a cmp $b } keys %models;
+    unshift @order, 'hybrid-state-decay' unless ($models{'hybrid-state-decay'});
+    foreach my $model (@order)
+    {
+        push @text, '', ('-' x 100), "Model: $model" . ($model eq 'hybrid-state-decay' ? ' (primary view)' : ''), ('-' x 100);
+        my @of = sort { $a->{frame} cmp $b->{frame} } grep { $_->{model} eq $model } @$rows;
+        unless (@of)
+        {
+            push @text, '  Not analysed in this cycle.';
+            next;
+        }
+        my (%sum, $counted);
+        push @text, sprintf('  %-14s %5s %10s %10s %10s   %-13s %s', 'Frame', 'LPARs', 'Installed', 'Full', 'Cycle', 'VPs (I/F/C)', 'State');
+        foreach my $r (@of)
+        {
+            my ($f, $groups) = ($r->{footprint}, (ref($r->{totals}) eq 'HASH' ? $r->{totals} : {}));
+            my $cell = sub { my ($group, $base) = @_; return $two->(_safe_dig($groups, $group, $base_key{$base})); };
+            my $capacity = $f ? $f->{capacity} : {};
+            my $check = !$f ? '' : ($capacity->{status} // '') eq 'agreed' ? sprintf('agreed by %d LPAR%s', $capacity->{reporters}, ($capacity->{reporters} == 1 ? '' : 's'))
+                      : ($capacity->{status} // '') eq 'conflict' ? 'conflict' : 'not reported';
+            push @frame_csv, join(',', map { quote_csv($_) } $cycle_id, $model, $r->{frame}, $r->{state}, ($r->{lpars} // ''),
+                (map { $cell->('All', $_) } @bases), (map { $cell->('Vios', $_) } @bases), (map { $cell->('Standby', $_) } @bases),
+                (map { $f ? $f->{vps}{$_} : '' } @bases), ($r->{unresolved} // ''),
+                ($f && defined $capacity->{processors} ? $capacity->{processors} : ''), $check,
+                (map { ($f && $f->{uncommitted}) ? $two->($f->{uncommitted}{$_}) : '' } @bases), ($f ? $f->{assessment} : ''), ($f ? $limits : ''));
+            push @text, sprintf('  %-14s %5s %10s %10s %10s   %-13s %s', $r->{frame}, ($r->{lpars} // ''), (map { $cell->('All', $_) } @bases),
+                                ($f ? join('/', map { $f->{vps}{$_} } @bases) : ''), $r->{state});
+            next unless ($f);
+            $counted++;
+            $sum{$_} += _safe_dig($groups, 'All', $base_key{$_}) // 0 foreach (@bases);
+            foreach my $group ([ Vios => 'VIOS' ], [ Standby => 'PowerHA standbys' ])
+            {
+                next unless (_safe_dig($groups, $group->[0], 'Count'));
+                push @text, sprintf('    of which %-17s %5d %10s %10s %10s', $group->[1], $groups->{ $group->[0] }{Count}, map { $cell->($group->[0], $_) } @bases);
+            }
+            push @text, sprintf('    Standbys across frames: %d set, %d UNRESOLVED (counted as analysed; see the cycle summary)', $r->{resolved} // 0, $r->{unresolved})
+                if ($r->{unresolved});
+            push @text, (($capacity->{status} // '') eq 'agreed')
+                ? sprintf('    Shared capacity %s (%s): entitlements %s installed, %s full, %s cycle; not committed as entitlement %s / %s / %s.',
+                          $capacity->{processors}, $check, (map { $two->($f->{shared}{$_}) } @bases), (map { $two->($f->{uncommitted}{$_}) } @bases))
+                : sprintf('    Shared capacity: %s.', ($check eq 'conflict' ? 'reported differently by the default-pool LPARs' : 'not reported'));
+            push @text, _rationale_wrap("Assessment: $f->{assessment}.", '    ', '      ');
+            push @text, sprintf('    %d LPAR%s with no pool reported: left out of the comparison.', $f->{noPool}, ($f->{noPool} == 1 ? '' : 's')) if ($f->{noPool});
+            foreach my $pool (@{ $f->{pools} })
+            {
+                push @pool_csv, join(',', map { quote_csv($_) } $cycle_id, $model, $r->{frame}, ($pool->{Default} ? '0 (default)' : $pool->{Pool}),
+                    $pool->{Count}, ($pool->{Maximum} // ''), (map { $two->($pool->{$_}) } @bases), ($pool->{MinFull} // ''), ($pool->{MinCurrentCycle} // ''),
+                    $pool->{Status});
+                next if ($pool->{Default});
+                push @text, sprintf('    Pool %-4s maximum %-5s entitlements %7s / %7s / %7s; maximum needed %s full, %s cycle: %s', $pool->{Pool},
+                    ($pool->{Maximum} // '?'), (map { $two->($pool->{$_}) } @bases), $pool->{MinFull}, $pool->{MinCurrentCycle}, $pool->{Status});
+            }
+        }
+        push @text, sprintf('  %-14s %5s %10s %10s %10s   (%d frame%s analysed; a sum of entitlements, not a capacity statement)', 'Frames analysed', '',
+                            (map { $two->($sum{$_}) } @bases), $counted, ($counted == 1 ? '' : 's')) if ($counted && $counted > 1);
+    }
+    return (\@frame_csv, \@pool_csv, \@text);
+}
+
 # The rows of a CSV with the NFIT cells of the given LPARs set; every other byte as it was.
 # Bytes in, bytes out: a cell is written as the analysis writes it.
 sub _cycle_rewrite_csv
@@ -18544,7 +18756,7 @@ sub _cycle_finalise
     my %analysed = map { ($reg{$_}{system} => 1) } keys %reg;
     my @summary = (join(',', map { quote_csv($_) } qw(Cycle Frame Model State LPARs Installed_ENT CurrentCycle_ENT Target_ENT
                                                        Standbys_Resolved Standbys_Unresolved Analysis_Start Analysis_End Capture_Check)));
-    my (@status, $problems);
+    my (@status, $problems, @footprint_rows);
     foreach my $model (sort keys %models)
     {
         my %count;
@@ -18554,12 +18766,16 @@ sub _cycle_finalise
             my ($r, $s) = ($reg{$key}, $state{$key} // { state => 'analysis not completed' });
             $count{ $s->{state} }++;
             my $all = _safe_dig($s, 'totals', 'All') // {};
+            push @footprint_rows, { model => $model, frame => ($r ? $r->{system} : ($key =~ s/\.\Q$model\E$//r)), state => $s->{state},
+                lpars => ($r ? $r->{lpars} : undef), totals => $s->{totals}, resolved => $s->{resolved}, unresolved => $s->{unresolved},
+                footprint => ($r ? _cycle_footprint_frame($job{$key} ? $job{$key}{doc} : $plan_of->($r->{plan})) : undef) };
             push @summary, join(',', map { quote_csv($_) } $cycle->{id}, ($r ? $r->{system} : ($key =~ s/\.\Q$model\E$//r)), $model, $s->{state},
                 ($r ? $r->{lpars} : ''), (map { defined $all->{$_} ? sprintf('%.2f', $all->{$_}) : '' } qw(Installed CurrentCycle Target)),
                 ($s->{resolved} // ''), ($s->{unresolved} // ''), ($r ? ($r->{coverage}{start}, $r->{coverage}{end}) : ('', '')),
                 ($r ? $r->{capture}{kind} : ''));
         }
         push @summary, join(',', map { quote_csv($_) } $cycle->{id}, $_, $model, 'not analysed', ('') x 9) foreach (@missing);
+        push @footprint_rows, map { { model => $model, frame => $_, state => 'not analysed' } } @missing;
         my $resolved = sum0(map { $state{$_}{resolved} // 0 } keys %{ $models{$model} });
         my $unresolved = sum0(map { $state{$_}{unresolved} // 0 } keys %{ $models{$model} });
         $problems += scalar(grep { $_ ne 'final' } keys %count) + scalar(@missing);
@@ -18576,6 +18792,11 @@ sub _cycle_finalise
                 sprintf('  Analysis end %s; nFit %s.', $cycle->{context}{analysisEnd} // '?', $VERSION));
     _cycle_replace(File::Spec->catfile($dir, 'cycle-summary.csv'), join("\n", @summary) . "\n");
     _cycle_replace(File::Spec->catfile($dir, 'cycle-status.txt'), join("\n", @head, @status, sprintf('  Finalised in %.2f s.', $elapsed)) . "\n");
+    # The allocation footprint, from the same saved plans (no time of day: a repeat writes the same bytes).
+    my ($frame_csv, $pool_csv, $footprint_text) = _cycle_footprint_lines($cycle->{id}, \@footprint_rows, [ @head, @status ]);
+    _cycle_replace(File::Spec->catfile($dir, 'cycle-footprint.csv'), join("\n", @$frame_csv) . "\n");
+    _cycle_replace(File::Spec->catfile($dir, 'cycle-pools.csv'), join("\n", @$pool_csv) . "\n");
+    _cycle_replace(File::Spec->catfile($dir, 'cycle-footprint.txt'), join("\n", @$footprint_text) . "\n");
     # The completion marker, last: exactly which registrations this finalisation covered and what it wrote.
     _cycle_write_json(File::Spec->catfile($dir, 'finalised.json'), {
         cycle => $cycle->{id}, complete => ($complete ? JSON::true : JSON::false),
@@ -18599,6 +18820,8 @@ sub _publish_tactical_proposals
             guaranteePolicy => $guarantee_policy,
             contestedLevel => (_contested_level_on() ? $CONTESTED_LEVEL_RULE : 'off') },
         members => $members,
+        # The frame as this run read it: the shared-processor capacity its default-pool LPARs report.
+        ((ref($FRAME_SHARED_CAPACITY) eq 'HASH') ? (frame => { sharedProcessors => $FRAME_SHARED_CAPACITY }) : ()),
         # Optional run context (an adaptive run: the selection used, the checks not made).
         ((ref($context) eq 'HASH') ? (context => $context) : ()),
         # A plan made in a planning cycle is provisional until the cycle is finalised.
@@ -32472,7 +32695,10 @@ Model behaviour depends on the event configuration:
   --finalise-cycle <dir>                    : Finalise the planning cycle in <dir>, after its analyses: sets each PowerHA
                                               standby whose primary is on another frame from that frame's analysis and
                                               corrects its CSV row, rationale and saved plan. Runs no analysis; may be
-                                              repeated as frames are added. Writes cycle-summary.csv and cycle-status.txt.
+                                              repeated as frames are added. Writes cycle-summary.csv and cycle-status.txt,
+                                              and the allocation footprint (cycle-footprint.txt, cycle-footprint.csv,
+                                              cycle-pools.csv): installed, full and current-cycle allocations per frame
+                                              and model against the pool maxima and the shared capacity reported.
 
   --seasonal                                : Execute all configured seasonal models applicable to the analysis period.
 
