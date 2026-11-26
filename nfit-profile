@@ -981,6 +981,7 @@ my %RESOLVED_OPTIONS = %{ _resolved_options(\@option_spec, \%CYCLE_OPTIONS_LEFT_
 # This process's part in a planning cycle: { dir, id, runs => { system => {...} } }. Empty outside one.
 my %CYCLE;
 my $FRAME_SHARED_CAPACITY;     # of the frame being published (a standard run), for its saved plan
+my $PRESENCE_GRACE_DAYS = 2;    # an LPAR last sampled longer before the analysis end is taken to have left the frame (provisional)
 
 print STDERR "nfit-profile version $VERSION\n" if (!defined $show_version);
 
@@ -3333,7 +3334,18 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             printf STDERR "  [INFO] Recommended actions: %d (see rationale)\n", $action_count;
             # The snapshot is also filed with the planner outputs: the store lives beside the staged
             # data and goes when that is restaged; the recommendations of a run should not.
-            $FRAME_SHARED_CAPACITY = _frame_shared_capacity($assimilation_map_ref, \@vm_order);
+            # Each LPAR's last sampled day (from the engine's sample store manifest: no data is read again) and
+            # its role in the totals go into the saved plan, so that a planning cycle's footprint counts the
+            # LPARs that were on the frame at the analysis end.
+            my $last_sampled = _last_sampled_days($current_cache_path);
+            foreach my $vm (keys %proposals)
+            {
+                next unless (ref($proposals{$vm}) eq 'HASH');
+                $proposals{$vm}{lastSampled} = $last_sampled->{$vm} if ($last_sampled && defined $last_sampled->{$vm});
+                $proposals{$vm}{estateRole}  = $lpar_roles{$vm} if (defined $lpar_roles{$vm} && $lpar_roles{$vm} ne '');
+            }
+            $FRAME_SHARED_CAPACITY = _frame_shared_capacity($assimilation_map_ref,
+                [ grep { _lpar_present(($last_sampled ? $last_sampled->{$_} : undef), $run_end_date_obj->ymd) } @vm_order ]);
             my $proposal_copy = _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
                 $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals,
                 File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.proposal.%s.json',
@@ -18332,11 +18344,53 @@ sub _frame_shared_capacity
     return \%out;
 }
 
+# The last day each LPAR has samples on, from the manifest of the engine's sample store (a small file;
+# the staged data is not read). undef when there is no store, or it is older than the staged data.
+# Workaround for D-025: a migrated LPAR's configuration state runs to the end of the capture.
+sub _last_sampled_days
+{
+    my ($cache) = @_;
+    my $manifest = File::Spec->catfile($cache, '.nfit.store', 'samples', 'store.json');
+    my @store = stat($manifest) or return undef;
+    my @data = stat(File::Spec->catfile($cache, '.nfit.cache.data'));
+    return undef if (@data && $store[9] < $data[9]);
+    my $store = _cycle_read_json($manifest);
+    return undef unless (ref($store) eq 'HASH' && !$store->{unusable} && ref($store->{vms}) eq 'HASH');
+    my %last;
+    foreach my $vm (keys %{ $store->{vms} })
+    {
+        my ($day) = reverse sort grep { /^\d{4}-\d{2}-\d{2}$/ } keys %{ (ref($store->{vms}{$vm}) eq 'HASH' ? $store->{vms}{$vm}{days} : undef) // {} };
+        $last{$vm} = $day if (defined $day);
+    }
+    return \%last;
+}
+
+# Days between an LPAR's last sampled day and the analysis end; undef when either is not known. Pure.
+sub _days_before_end
+{
+    my ($last, $end) = @_;
+    return undef unless (defined $last && defined $end && $last =~ /^\d{4}-\d{2}-\d{2}$/ && $end =~ /^\d{4}-\d{2}-\d{2}$/);
+    my $days = eval { (Time::Piece->strptime($end, '%Y-%m-%d') - Time::Piece->strptime($last, '%Y-%m-%d')) / 86400 };
+    return defined $days ? int($days + ($days < 0 ? -0.5 : 0.5)) : undef;
+}
+
+# Whether an LPAR counts as on the frame at the analysis end: sampled within the last days of the
+# period, or its last sampled day is not known. Pure.
+sub _lpar_present
+{
+    my ($last, $end) = @_;
+    my $days = _days_before_end($last, $end);
+    return (!defined $days || $days <= $PRESENCE_GRACE_DAYS) ? 1 : 0;
+}
+
 # The footprint of one frame and model from its saved plan (final where the frame had a standby
 # to set). Each LPAR is counted once, at the figures the pool check counted: a VIOS at its pair
 # figure, a standby at its role figure. Pure.
-# Returns { lpars, vps {Installed, Full, CurrentCycle}, shared {Count, Installed, Full,
-#   CurrentCycle}, noPool (LPARs with no pool reported), capacity (as saved, or status absent),
+# Only LPARs on the frame at the analysis end are counted (_lpar_present); the others are returned
+# apart. Without a recorded last sampled day every LPAR counts, and presenceKnown is 0.
+# Returns { lpars (counted), groups { All | Vios | Standby => {Count, Installed, Full, CurrentCycle} },
+#   left {Count, Installed, days [..]}, presenceKnown, vps {Installed, Full, CurrentCycle}, shared {Count,
+#   Installed, Full, CurrentCycle}, noPool (LPARs with no pool reported), capacity (as saved, or status absent),
 #   uncommitted {Installed, Full, CurrentCycle} (capacity agreed only), assessment,
 #   pools [ { Pool, Default (0/1), Maximum, Count, Installed, Full, CurrentCycle, MinFull,
 #             MinCurrentCycle, Status } ] }.
@@ -18345,12 +18399,22 @@ sub _cycle_footprint_frame
     my ($doc) = @_;
     my $members = (ref($doc) eq 'HASH' && ref($doc->{members}) eq 'HASH') ? $doc->{members} : {};
     my $number = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? $v + 0 : undef; };
-    my (%vp, %shared, %default, @pool_members);
-    my ($lpars, $no_pool) = (0, 0);
+    my (%vp, %shared, %default, @pool_members, %groups, @left_days);
+    my ($lpars, $no_pool, $known) = (0, 0, 0);
+    my %left = (Count => 0, Installed => 0);
+    my $end = (ref($doc) eq 'HASH') ? _safe_dig($doc, 'window', 'end') : undef;
     foreach my $vm (sort keys %$members)
     {
         my $m = $members->{$vm};
         next unless (ref($m) eq 'HASH');
+        $known++ if (defined $m->{lastSampled});
+        unless (_lpar_present($m->{lastSampled}, $end))
+        {
+            $left{Count}++;
+            $left{Installed} += _structural_shown_value(_safe_dig($m, 'poolMember', 'current_ent')) // $number->($m->{installedEntitlement}) // 0;
+            push @left_days, _days_before_end($m->{lastSampled}, $end);
+            next;
+        }
         $lpars++;
         my $installed_vp = $number->($m->{installedVPs});
         my $role = (ref($m->{role}) eq 'HASH') ? $m->{role} : {};
@@ -18358,15 +18422,23 @@ sub _cycle_footprint_frame
         my %vps = (Installed => $installed_vp, Full => ($number->($role->{targetVPs}) // $number->($own->{recommendedVPs}) // $installed_vp),
                    CurrentCycle => ($number->(_safe_dig($m, 'published', 'VPs')) // $installed_vp));
         $vp{$_} += $vps{$_} // 0 foreach (keys %vps);
-        my $pm = $m->{poolMember};
-        unless (ref($pm) eq 'HASH' && looks_like_number($pm->{pool_id} // ''))
+        my $pm = (ref($m->{poolMember}) eq 'HASH') ? $m->{poolMember} : {};
+        my $current = _structural_shown_value($pm->{current_ent});
+        my %ent = (Installed => $current, Full => (_structural_shown_value($pm->{proposed_ent}) // $current),
+                   CurrentCycle => (_structural_shown_value($pm->{cycle_ent}) // $current));
+        if (defined $current)
+        {
+            foreach my $group ('All', (($m->{estateRole} // '') eq 'vios' ? 'Vios' : ()), (($m->{estateRole} // '') eq 'standby' ? 'Standby' : ()))
+            {
+                $groups{$group}{Count}++;
+                $groups{$group}{$_} += $ent{$_} // 0 foreach (keys %ent);
+            }
+        }
+        unless (looks_like_number($pm->{pool_id} // ''))
         {
             $no_pool++;
             next;
         }
-        my $current = _structural_shown_value($pm->{current_ent});
-        my %ent = (Installed => $current, Full => (_structural_shown_value($pm->{proposed_ent}) // $current),
-                   CurrentCycle => (_structural_shown_value($pm->{cycle_ent}) // $current));
         $shared{Count}++;
         $shared{$_} += $ent{$_} // 0 foreach (keys %ent);
         if ($pm->{pool_id} == 0)
@@ -18380,6 +18452,10 @@ sub _cycle_footprint_frame
     my $capacity = (ref($doc) eq 'HASH' && ref(_safe_dig($doc, 'frame', 'sharedProcessors')) eq 'HASH')
         ? $doc->{frame}{sharedProcessors} : { status => 'absent', reporters => 0, values => {} };
     my %out = (lpars => $lpars, vps => { map { ($_ => ($vp{$_} // 0)) } @bases }, noPool => $no_pool, capacity => $capacity,
+               presenceKnown => $known, left => { Count => $left{Count}, Installed => 0 + sprintf('%.2f', $left{Installed}),
+                                                  days => [ sort { $a <=> $b } grep { defined } @left_days ] },
+               groups => { map { my $g = $_; ($g => { Count => ($groups{$g}{Count} // 0), map { ($_ => 0 + sprintf('%.2f', $groups{$g}{$_} // 0)) } @bases }) }
+                           qw(All Vios Standby) },
                shared => { Count => ($shared{Count} // 0), map { ($_ => 0 + sprintf('%.2f', $shared{$_} // 0)) } @bases });
 
     my @pools;
@@ -18434,19 +18510,19 @@ sub _cycle_footprint_lines
 {
     my ($cycle_id, $rows, $headline) = @_;
     my @bases = qw(Installed Full CurrentCycle);
-    my %base_key = (Installed => 'Installed', Full => 'Target', CurrentCycle => 'CurrentCycle');
     my $limits = 'LPARs analysed only; dedicated processors and pool reserves not counted; concurrent demand not assessed';
     my $two = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? sprintf('%.2f', $v) : ''; };
     my @frame_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame State LPARs Installed_ENT Full_ENT CurrentCycle_ENT
         VIOS_Installed_ENT VIOS_Full_ENT VIOS_CurrentCycle_ENT Standby_Installed_ENT Standby_Full_ENT Standby_CurrentCycle_ENT
-        Installed_VP Full_VP CurrentCycle_VP Standbys_Unresolved Shared_Capacity Shared_Capacity_Check
+        Installed_VP Full_VP CurrentCycle_VP LPARs_Left Left_Installed_ENT Standbys_Unresolved Shared_Capacity Shared_Capacity_Check
         Installed_ENT_Uncommitted Full_ENT_Uncommitted CurrentCycle_ENT_Uncommitted Assessment Not_Counted)));
     my @pool_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame Pool LPARs Maximum Installed_ENT Full_ENT CurrentCycle_ENT
         Minimum_Maximum_Full Minimum_Maximum_CurrentCycle Status)));
     my @text = (@{ $headline // [] }, '',
         'Allocation footprint: entitlement in processing units, each LPAR counted once (a VIOS at its pair figure, a PowerHA',
         'standby at its finalised figure). Installed = allocated now; full = the full recommendation; cycle = recommended for',
-        'this cycle. Each model stands alone. A pool maximum is a ceiling on shared use, not processors: maxima are not added',
+        'this cycle. Only LPARs sampled up to the analysis end are counted; LPARs that left the frame earlier are stated apart.',
+        'Each model stands alone. A pool maximum is a ceiling on shared use, not processors: maxima are not added',
         'up. Shared capacity is what the default-pool LPARs report for the frame; it is not the activated processor count.',
         "Not counted: $limits.", 'Capacity is judged per frame: room on one frame does not offset an excess on another.');
     my %models = map { ($_->{model} => 1) } @$rows;
@@ -18465,21 +18541,27 @@ sub _cycle_footprint_lines
         push @text, sprintf('  %-14s %5s %10s %10s %10s   %-13s %s', 'Frame', 'LPARs', 'Installed', 'Full', 'Cycle', 'VPs (I/F/C)', 'State');
         foreach my $r (@of)
         {
-            my ($f, $groups) = ($r->{footprint}, (ref($r->{totals}) eq 'HASH' ? $r->{totals} : {}));
-            my $cell = sub { my ($group, $base) = @_; return $two->(_safe_dig($groups, $group, $base_key{$base})); };
+            my $f = $r->{footprint};
+            my $groups = $f ? $f->{groups} : {};
+            my $cell = sub { my ($group, $base) = @_; return $f ? $two->(_safe_dig($groups, $group, $base)) : ''; };
             my $capacity = $f ? $f->{capacity} : {};
             my $check = !$f ? '' : ($capacity->{status} // '') eq 'agreed' ? sprintf('agreed by %d LPAR%s', $capacity->{reporters}, ($capacity->{reporters} == 1 ? '' : 's'))
                       : ($capacity->{status} // '') eq 'conflict' ? 'conflict' : 'not reported';
-            push @frame_csv, join(',', map { quote_csv($_) } $cycle_id, $model, $r->{frame}, $r->{state}, ($r->{lpars} // ''),
+            push @frame_csv, join(',', map { quote_csv($_) } $cycle_id, $model, $r->{frame}, $r->{state}, ($f ? $f->{lpars} : ''),
                 (map { $cell->('All', $_) } @bases), (map { $cell->('Vios', $_) } @bases), (map { $cell->('Standby', $_) } @bases),
-                (map { $f ? $f->{vps}{$_} : '' } @bases), ($r->{unresolved} // ''),
+                (map { $f ? $f->{vps}{$_} : '' } @bases), ($f ? ($f->{left}{Count}, $two->($f->{left}{Installed})) : ('', '')), ($r->{unresolved} // ''),
                 ($f && defined $capacity->{processors} ? $capacity->{processors} : ''), $check,
                 (map { ($f && $f->{uncommitted}) ? $two->($f->{uncommitted}{$_}) : '' } @bases), ($f ? $f->{assessment} : ''), ($f ? $limits : ''));
-            push @text, sprintf('  %-14s %5s %10s %10s %10s   %-13s %s', $r->{frame}, ($r->{lpars} // ''), (map { $cell->('All', $_) } @bases),
+            push @text, sprintf('  %-14s %5s %10s %10s %10s   %-13s %s', $r->{frame}, ($f ? $f->{lpars} : ''), (map { $cell->('All', $_) } @bases),
                                 ($f ? join('/', map { $f->{vps}{$_} } @bases) : ''), $r->{state});
             next unless ($f);
             $counted++;
-            $sum{$_} += _safe_dig($groups, 'All', $base_key{$_}) // 0 foreach (@bases);
+            $sum{$_} += _safe_dig($groups, 'All', $_) // 0 foreach (@bases);
+            push @text, _rationale_wrap(sprintf('Not counted: %d LPAR%s last sampled before the analysis end (%s days earlier), installed entitlement %s. '
+                . '%s to have left the frame; %s recommendation in the CSV is not an action for this frame.', $f->{left}{Count},
+                ($f->{left}{Count} == 1 ? '' : 's'), join(', ', @{ $f->{left}{days} }), $two->($f->{left}{Installed}),
+                ($f->{left}{Count} == 1 ? 'It appears' : 'They appear'), ($f->{left}{Count} == 1 ? 'its' : 'their')), '    ', '      ') if ($f->{left}{Count});
+            push @text, '    Last sampled day not recorded for this frame: every LPAR analysed is counted.' unless ($f->{presenceKnown});
             foreach my $group ([ Vios => 'VIOS' ], [ Standby => 'PowerHA standbys' ])
             {
                 next unless (_safe_dig($groups, $group->[0], 'Count'));

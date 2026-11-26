@@ -37,16 +37,17 @@ foreach my $name (qw(_safe_dig _cycle_canonical _option_differences _ha_peer_pla
                      _coarse_review_text _coarse_review_advisories _coarse_review_action _assess_pool_entitlement_feasibility
                      _structural_shown_value _pool_units_text _pool_prerequisites _structural_csv_tags _rationale_wrap quote_csv
                      _cycle_finalise_frame _cycle_finalise_lines _cycle_rewrite_csv
-                     _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines))
+                     _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines _days_before_end _lpar_present))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n";
 }
 my %constant = map { my ($v) = $src =~ /^my \$$_\s*=\s*([0-9.e-]+);/m or die "$_ not found\n"; ($_ => $v) }
                qw(MIN_ENT_PER_VP STRUCTURAL_ENT_TOLERANCE FLOAT_EPSILON VCPU_RATIO_MAX);
+my ($grace) = $src =~ /^my \$PRESENCE_GRACE_DAYS\s*=\s*(\d+);/m or die "PRESENCE_GRACE_DAYS not found\n";
 my ($interval) = $src =~ /^my %EVIDENCE_INTERVAL\s*=\s*(\(.*?\));/m or die "EVIDENCE_INTERVAL not found\n";
 eval "package UUT; use JSON; use POSIX qw(ceil floor); use List::Util qw(sum sum0 min max uniq); use Scalar::Util qw(looks_like_number);\n"
-   . join('', map { "our \$$_ = $constant{$_};\n" } sort keys %constant) . "our %EVIDENCE_INTERVAL = $interval;\n$code 1;"
+   . join('', map { "our \$$_ = $constant{$_};\n" } sort keys %constant) . "use Time::Piece; our \$PRESENCE_GRACE_DAYS = $grace; our %EVIDENCE_INTERVAL = $interval;\n$code 1;"
    or die "harness eval failed: $@\n";
 
 # -- Two frames: standby sa (with x1, in pool 5 of 4.00) on FA; its primary pb on FB --
@@ -188,8 +189,10 @@ is(UUT::_frame_shared_capacity($map, [qw(c)])->{status}, 'absent', 'shared capac
 my $frame = sub
 {
     my ($capacity_block, %ent) = @_;
-    return { frame => ($capacity_block ? { sharedProcessors => $capacity_block } : undef), members => {
-        v1 => { installedVPs => 2, planningProfile => 'P', profiles => { P => { recommendedVPs => 3 } }, role => { type => 'viosPair', targetVPs => 4 },
+    return { window => { end => '2026-10-31' }, frame => ($capacity_block ? { sharedProcessors => $capacity_block } : undef), members => {
+        g1 => { installedVPs => 6, lastSampled => ($ent{g1} // '2026-09-13'), planningProfile => 'P', profiles => { P => { recommendedVPs => 1 } }, published => { VPs => 1 },
+                poolMember => { pool_id => 5, pool_cpu => 4, current_ent => 19, proposed_ent => 0.5, cycle_ent => 9 } },
+        v1 => { installedVPs => 2, estateRole => 'vios', lastSampled => '2026-10-30', planningProfile => 'P', profiles => { P => { recommendedVPs => 3 } }, role => { type => 'viosPair', targetVPs => 4 },
                 published => { VPs => 3 }, poolMember => { pool_id => 0, pool_cpu => 8, current_ent => 1, proposed_ent => ($ent{v1} // 2), cycle_ent => 1.5 } },
         s1 => { installedVPs => 4, planningProfile => 'P', profiles => { P => { recommendedVPs => 1 } }, published => { VPs => '' },
                 poolMember => { pool_id => 5, pool_cpu => 4, current_ent => 2, proposed_ent => ($ent{s1} // 3), cycle_ent => 2.5 } },
@@ -198,6 +201,12 @@ my $frame = sub
         n1 => { installedVPs => 1, planningProfile => 'P', profiles => { P => {} }, poolMember => { pool_id => undef, current_ent => 0.5 } } } };
 };
 my $fp = UUT::_cycle_footprint_frame($frame->({ status => 'agreed', processors => 8, reporters => 1, values => { 8 => 1 } }));
+is_deeply($fp->{left}, { Count => 1, Installed => 19, days => [48] }, 'an LPAR last sampled 48 days before the analysis end is stated apart, with its entitlement');
+is_deeply($fp->{groups}{All}, { Count => 4, Installed => 5, Full => 7, CurrentCycle => 6 }, 'the frame totals count the LPARs still there; one sampled the day before the end is there');
+is_deeply($fp->{groups}{Vios}, { Count => 1, Installed => 1, Full => 2, CurrentCycle => 1.5 }, 'VIOS subtotal from the role the analysis recorded');
+is(UUT::_cycle_footprint_frame($frame->(undef, g1 => '2026-10-29'))->{left}{Count}, 0, 'two days without samples at the end is not a departure');
+is_deeply([ UUT::_lpar_present(undef, '2026-10-31'), UUT::_lpar_present('2026-10-28', '2026-10-31'), UUT::_days_before_end('2026-09-13', '2026-10-31') ], [ 1, 0, 48 ],
+          'presence: unknown counts as present; three days earlier does not');
 is_deeply([ $fp->{lpars}, $fp->{noPool}, $fp->{vps} ], [ 4, 1, { Installed => 9, Full => 8, CurrentCycle => 10 } ],
           'VPs: installed, the full requirement (a role figure before the profile\'s) and this cycle (installed where the row states none)');
 is_deeply($fp->{shared}, { Count => 3, Installed => 4.5, Full => 6.5, CurrentCycle => 5.5 }, 'entitlements of the LPARs with a pool, each once; an LPAR without a result keeps what it has');
@@ -215,8 +224,7 @@ $fp = UUT::_cycle_footprint_frame($frame->(undef));
 like($fp->{assessment}, qr/^not assessed: no LPAR of the default pool reports the shared capacity of the frame$/, 'no capacity in the saved plan: not assessed');
 
 my $good = UUT::_cycle_footprint_frame($frame->({ status => 'agreed', processors => 8, reporters => 1, values => { 8 => 1 } }));
-my %groups = (All => { Count => 4, Installed => 5, CurrentCycle => 6, Target => 7 }, Vios => { Count => 1, Installed => 1, CurrentCycle => 1.5, Target => 2 },
-              Standby => { Count => 0, Installed => 0, CurrentCycle => 0, Target => 0 });
+my %groups;
 my ($frames, $pools, $text) = UUT::_cycle_footprint_lines('C1', [
     { model => 'state-based', frame => 'FA', state => 'final', lpars => 4, totals => \%groups, resolved => 0, unresolved => 0, footprint => $good },
     { model => 'state-based', frame => 'FB', state => 'standbys unresolved', lpars => 4, totals => \%groups, resolved => 1, unresolved => 2, footprint => $good },
@@ -227,11 +235,13 @@ like($all, qr/Model: hybrid-state-decay \(primary view\)\n-+\n  Not analysed in 
 like($all, qr/^  FA\s+4\s+5\.00\s+7\.00\s+6\.00\s+9\/8\/10\s+final$/m, 'a frame: installed, full and cycle apart');
 like($all, qr/of which VIOS\s+1\s+1\.00\s+2\.00\s+1\.50/, 'VIOS shown as part of the frame, not added to it');
 like($all, qr/Standbys across frames: 1 set, 2 UNRESOLVED/, 'unresolved standbys are stated on their frame');
+like(join(' ', map { s/^\s+//r } @$text), qr/Not counted: 1 LPAR last sampled before the analysis end \(48 days earlier\), installed entitlement 19\.00\. It appears to have left the frame; its recommendation in the CSV is not an action for this frame\./, 'the LPAR that left is named as not counted');
+like($frames->[1], qr/,"9","8","10","1","19\.00",/, 'frame file: LPARs that left and their installed entitlement');
 like($all, qr/^  FC\s+not analysed$/m, 'an expected frame that was not analysed is listed without figures');
 like($all, qr/Frames analysed\s+10\.00\s+14\.00\s+12\.00\s+\(2 frames analysed; a sum of entitlements, not a capacity statement\)/, 'the sum over frames is labelled as no capacity statement');
 unlike($all, qr/\bfits\b|procure|consolidat|spare/i, 'no fit, procurement, consolidation or spare-capacity wording');
 is(scalar(@$frames), 4, 'frame file: a header and one row per frame of the model');
 is(scalar(@$pools), 5, 'pool file: each pool of each analysed frame on its own row');
-like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement"$/, 'a pool row: maximum, the three entitlement sums and the maximum each needs');
+like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement"$/, 'a pool row counts the LPARs still there: maximum, the three sums and the maximum each needs');
 
 done_testing();

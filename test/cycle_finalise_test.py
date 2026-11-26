@@ -194,6 +194,10 @@ class CycleFinaliseTests(unittest.TestCase):
         self.assertEqual((row['Shared_Capacity'], row['Shared_Capacity_Check'], row['State']), ('32', 'agreed by 2 LPARs', 'final'))
         self.assertAlmostEqual(float(row['CurrentCycle_ENT_Uncommitted']), 32 - float(row['CurrentCycle_ENT']), places=2)
         self.assertEqual(row['Full_ENT'], summary_row(root, 'SYSHA1')['Target_ENT'])                 # one figure in both cycle files
+        self.assertEqual((row['LPARs'], row['LPARs_Left'], row['Left_Installed_ENT']), ('2', '0', '0.00'))
+        members = P.load(outputs(root, 'SYSHA1')['plan'])['members']
+        self.assertEqual({m.get('lastSampled') for m in members.values()}, {self.last})          # from the engine's sample store
+        self.assertEqual(members['hanodeA'].get('estateRole'), 'standby')
         with open(os.path.join(cycle, 'cycle-pools.csv')) as fh:
             pools = list(csv.DictReader(fh))
         self.assertEqual([(p['Frame'], p['Pool'], p['Maximum']) for p in pools], [('SYSHA1', '0 (default)', '32'), ('SYSHA2', '0 (default)', '32')])
