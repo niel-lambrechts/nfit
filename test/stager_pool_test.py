@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import pathlib
 import shutil
 import sys
 import tempfile
@@ -213,7 +214,7 @@ class PoolCaptureTests(unittest.TestCase):
         self.assertIn('max_capacity_cores=120', m['pool_nonempty'])
         self.assertIn('max_capacity=unresolved (legacy integer)', m['pool_units'])
         self.assertEqual(m['pool_revision'], 'sha256:' + hashlib.sha256(
-            open(self.path('S1', self.st.POOL_OBSERVATIONS_FILE), 'rb').read()).hexdigest())
+            pathlib.Path(self.path('S1', self.st.POOL_OBSERVATIONS_FILE)).read_bytes()).hexdigest())
         self.assertEqual(m['pool_slices'], 'total=24; failed=0')
         self.assertIn('S1: pool capture complete, 360 observations from 3 reporter(s)', out)
 

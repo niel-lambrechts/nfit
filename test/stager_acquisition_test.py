@@ -11,6 +11,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import pathlib
 import shutil
 import subprocess
 import sys
@@ -353,7 +354,7 @@ class AcquisitionTests(unittest.TestCase):
             master, vms, mn, mx = self.new.stream_performance_data_optimized(
                 client, 'nmon', "(\"serial_no\" = 'S9')", slices, self.tmp,
                 types.SimpleNamespace(verbose=False, chunk_size=10))
-            body = open(master).read().splitlines()
+            body = pathlib.Path(master).read_text().splitlines()
             self.assertIn('2026-10-01 02:00:00,vmN,2.0,2.0', body)    # .999999999 floored
             self.assertEqual(mx.strftime('%H:%M:%S'), '02:00:00')
             self.assertEqual(mn.strftime('%H:%M:%S'), '01:00:00')    # .123456789 floored
@@ -378,7 +379,7 @@ class AcquisitionTests(unittest.TestCase):
             master = self.new.stream_performance_data_optimized(
                 client, 'nmon', "(\"serial_no\" = 'S8')", slices, self.tmp,
                 types.SimpleNamespace(verbose=False, chunk_size=10))[0]
-            body = open(master).read().splitlines()
+            body = pathlib.Path(master).read_text().splitlines()
             self.assertEqual(body, ['Timestamp,VMName,PhysC,RunQ',
                                     '2026-10-01 01:00:00,vmK,1.0,1.0',
                                     '2026-10-01 02:00:00,vmK,2.0,2.0'])
@@ -405,7 +406,7 @@ class AcquisitionTests(unittest.TestCase):
             master = self.new.stream_performance_data_optimized(
                 client, 'nmon', "(\"serial_no\" = 'S7')", slices, self.tmp,
                 types.SimpleNamespace(verbose=False, chunk_size=10))[0]
-            self.assertEqual(open(master).read().splitlines(),
+            self.assertEqual(pathlib.Path(master).read_text().splitlines(),
                              ['Timestamp,VMName,PhysC,RunQ',
                               '2026-10-01 00:01:00,vmA,0.5,',
                               '2026-10-01 00:02:00,vmA,0.75,3.0'])
@@ -442,7 +443,7 @@ class AcquisitionTests(unittest.TestCase):
             master = self.new.stream_performance_data_optimized(
                 client, 'nmon', "(\"serial_no\" = 'S6')", slices, self.tmp,
                 types.SimpleNamespace(verbose=False, chunk_size=10))[0]
-            rows = open(master).read().splitlines()[1:]
+            rows = pathlib.Path(master).read_text().splitlines()[1:]
         finally:
             if saved is None:
                 os.environ.pop('LC_ALL', None)
