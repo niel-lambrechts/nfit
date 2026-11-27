@@ -155,7 +155,7 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.05')
         self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
         self.assertRegex(run.stdout, r'\[ok\] frame %s: standbys under the fixed standby entitlement 0\.05 asked for this run: 1 \(applied to 0, not applied to 1\)' % self.standby)
-        self.assertIn("Sizing decision: idle-standby allocation not applied (width); the recommendation follows this node's workload", run.stdout)
+        self.assertIn("Sizing decision: fixed standby entitlement not applied (width); the recommendation follows this node's workload", run.stdout)
         self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: fixed figure not applied \(width: its own workload needs 2 VPs and 0\.05 carries at most 1 '
                                      r'\(0\.05 processors per VP\)\); the recommendation \S+ on \d VPs? follows its workload \(installed 1\.50 / 4\)')
         self.assertIn('Result: all checks passed', run.stdout)

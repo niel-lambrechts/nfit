@@ -251,12 +251,16 @@ $w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(40, 8, 0.20), 
 my $said = UUT::_ha_workload_text($w);
 is($said, 'PhysC at 0.20 cores or more (15-minute medians) for 2 hours or longer without a break on 2 days; 2 needed; longest run 3 hours; '
    . 'its profile hours (online), its current role period from 01 Jan 1970; PhysB by the same test: 1 day', 'the evidence names metric, level, duration, days, hours and period');
-is(UUT::_ha_workload_veto_text(0.10, 'mgsys', $w, 1),
-   'Sustained workload observed: idle-standby allocation not applied. Recommendation follows this node\'s workload. '
-   . 'Not applied: fixed standby entitlement 0.10 (its managed system\'s default). Evidence: ' . $said . '. '
-   . 'Sustained workload is observed on both nodes of this cluster in this period: neither is sized as an idle standby. '
-   . 'Which node owns the resource groups is not verified.',
-   'the row of an inferred standby with sustained workload: sizing eligibility, no claim about resource-group ownership');
-unlike(UUT::_ha_workload_veto_text(0.10, 'mgsys', $w, 0), qr/both nodes/, 'one node only: no statement about the pair');
+is(UUT::_ha_workload_veto_text('fixed standby entitlement 0.10 (its managed system\'s default)', $w, 1),
+   'Workload-bearing node; idle-standby sizing not applied. Recommendation follows this node\'s workload. '
+   . 'Not applied: fixed standby entitlement 0.10 (its managed system\'s default). '
+   . 'The comparison of the two nodes reads this node as the standby: kept as a diagnostic, not used for its sizing. Evidence: ' . $said . '. '
+   . 'Sustained workload is observed on both nodes of this cluster in this period. Which node owns the resource groups is '
+   . 'not verified, and no takeover requirement is stated.',
+   'the row of an inferred standby with sustained workload: the sizing decision, the role reading as a diagnostic, no claim about resource groups');
+my $one = UUT::_ha_workload_veto_text('standby share (25% of the target of dbnode1, the [GLOBAL] default)', $w, 0);
+unlike($one, qr/both nodes/, 'one node only: no statement about the pair');
+like($one, qr/Not applied: standby share \(25% of the target of dbnode1, the \[GLOBAL\] default\)\./, 'the same sentence names a share that is not laid under the node');
+unlike($one, qr/failover|takeover/i, 'and states no takeover requirement');
 
 done_testing();

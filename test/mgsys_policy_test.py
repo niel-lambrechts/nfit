@@ -174,12 +174,13 @@ class ManagedSystemPolicyTests(unittest.TestCase):
         self.assertGreater(float(row['NFIT - ENT']), 1.0)
         self.assertTrue(row['NFIT - Action'].startswith(ordinary['NFIT - Action']), row['NFIT - Action'])
         said = row['NFIT - Action'][len(ordinary['NFIT - Action']):].strip()
-        self.assertTrue(said.startswith("Sustained workload observed: idle-standby allocation not applied. Recommendation follows this node's workload. "
+        self.assertTrue(said.startswith("Workload-bearing node; idle-standby sizing not applied. Recommendation follows this node's workload. "
                                         "Not applied: fixed standby entitlement 0.10 (its managed system's default). "
+                                        'The comparison of the two nodes reads this node as the standby: kept as a diagnostic, not used for its sizing. '
                                         'Evidence: PhysC at 0.20 cores or more (15-minute medians) for 2 hours or longer without a break on '), said)
         self.assertRegex(said, r'on \d+ days; 2 needed; longest run [\d.]+ hours; all hours, its current role period from 13 Sep 2026; PhysB not collected\. '
-                               r'Sustained workload is observed on both nodes of this cluster in this period: neither is sized as an idle standby\. '
-                               r'Which node owns the resource groups is not verified\.$')
+                               r'Sustained workload is observed on both nodes of this cluster in this period\. '
+                               r'Which node owns the resource groups is not verified, and no takeover requirement is stated\.$')
         self.assertIn('[STANDBY_FIXED_NOT_APPLIED]', row['VM_Comments'])
         self.assertNotIn('[STANDBY_FIXED]', row['VM_Comments'])
         member = P.load(F.outputs(fixed[0], 'SYSHA1')['plan'])['members']['hanodeA']
@@ -190,7 +191,8 @@ class ManagedSystemPolicyTests(unittest.TestCase):
         self.assertEqual((work['metric'], work['cores'], work['hours'], work['daysNeeded'], work['observed'], work['assessed'], work['bothNodes'],
                           work['physB'], work['profileHours'], work['period']), ('PhysC', 0.2, 2, 2, True, True, True, None, 'none', 'role'))
         self.assertGreaterEqual(work['days'], 7)
-        self.assertIn('sustained workload observed', ' '.join(rationale(fixed[0], 'SYSHA1').split()))
+        self.assertIn('workload-bearing node', ' '.join(rationale(fixed[0], 'SYSHA1').split()))
+        self.assertEqual((member['roleEvidence']['sizing']['treatment'], member['roleEvidence']['sizing']['withheld']), ('none', 'workload'))
         # Every node's record carries its own finding; the inferred role is left as it is (sizing eligibility only).
         proof = member['roleEvidence']
         self.assertEqual((proof['role']['inferred'], proof['role']['effective'], proof['ownWorkload']['observed'], proof['ownWorkload']['bothNodes']),
@@ -213,9 +215,79 @@ class ManagedSystemPolicyTests(unittest.TestCase):
         finally:
             H.level = saved
         row = P.standby_row(root)
-        self.assertIn('Sustained workload observed: idle-standby allocation not applied.', row['NFIT - Action'])
+        self.assertIn('Workload-bearing node; idle-standby sizing not applied.', row['NFIT - Action'])
         self.assertIn('[STANDBY_FIXED_NOT_APPLIED]', row['VM_Comments'])
         self.assertGreater(float(row['NFIT - ENT']), 0.25)                           # its own workload, not 0.10
+
+    def test_a_share_floor_is_not_laid_under_a_workload_bearing_inferred_standby(self):
+        # hanodeA runs at 0.30 beside hanodeB at 3.9, with no handover: the comparison reads it as the standby, and a
+        # quarter of its partner's target (about 1.0) would be laid under it. Sustained workload is observed
+        # on it, so no idle-standby sizing applies: it is sized as without the policy, in the analysis and after the
+        # finalisation of the cycle, in either order.
+        def working(vm, t):
+            if vm == 'app1':
+                return 0.8
+            return 0.30 if vm == 'hanodeA' else 3.9
+        saved = H.level
+        H.level = working
+        try:
+            cycles = [cycle(P.SHARE, order) for order in (('SYSHA1', 'SYSHA2'), ('SYSHA2', 'SYSHA1'))]
+            plain, _, _ = cycle('[GLOBAL]\nha_sizing = independent\n', ('SYSHA1', 'SYSHA2'))
+        finally:
+            H.level = saved
+        for root, _, _ in cycles:
+            self.addCleanup(shutil.rmtree, root, True)
+        self.addCleanup(shutil.rmtree, plain, True)
+        ordinary = P.standby_row(plain)
+        rows = []
+        for root, runs, done in cycles:
+            self.assertEqual([r.returncode for r in runs] + [done.returncode], [0, 0, 0], done.stderr[-600:])
+            row = P.standby_row(root)                                                # after the finalisation
+            rows.append((row['NFIT - ENT'], row['NFIT - VCPU'], row['NFIT - Action']))
+            self.assertEqual((row['NFIT - ENT'], row['NFIT - VCPU']), (ordinary['NFIT - ENT'], ordinary['NFIT - VCPU']))
+            self.assertLess(float(row['NFIT - ENT']), 0.85)                          # its own workload (0.76 this cycle); the floor is about 1.0
+            self.assertTrue(row['NFIT - Action'].startswith(ordinary['NFIT - Action']), row['NFIT - Action'])
+            self.assertIn("Workload-bearing node; idle-standby sizing not applied. Recommendation follows this node's workload. "
+                          'Not applied: standby share (25% of the target of hanodeB, the built-in default). '
+                          'The comparison of the two nodes reads this node as the standby: kept as a diagnostic, not used for its sizing.', row['NFIT - Action'])
+            self.assertNotIn('failover', row['NFIT - Action'])
+            self.assertIn('[STANDBY_SHARE_NOT_APPLIED]', row['VM_Comments'])
+            member = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']
+            self.assertNotIn('pendingRole', member)
+            self.assertNotEqual((member.get('role') or {}).get('type'), 'haStandby')
+            proof = member['roleEvidence']
+            self.assertEqual((proof['role']['inferred'], proof['role']['effective'], proof['sizing']['treatment'], proof['sizing']['withheld'],
+                              proof['sizing']['policyWithheld']), ('standby', 'standby', 'none', 'workload', 'standby_floor'))
+            policy = member['standbyPolicy']
+            self.assertEqual((policy['type'], policy['applied'], policy['notApplied']['kind'], policy['roleSource'], policy['sustainedWorkload']['observed']),
+                             ('share', False, 'workload', 'inferred', True))
+            self.assertEqual(P.registration(root, 'SYSHA1').get('pending') or [], [])   # nothing for the finalisation to set
+        self.assertEqual(rows[0], rows[1])
+
+    def test_a_configured_standby_keeps_its_share_floor_whatever_it_runs(self):
+        # The same workload with ha_role = standby: the customer's statement. The share of the partner's target is laid
+        # under the node as before.
+        def working(vm, t):
+            if vm == 'app1':
+                return 0.8
+            return 0.30 if vm == 'hanodeA' else 3.9
+        saved = H.level
+        H.level = working
+        try:
+            root, runs, done = cycle('[hanodeA]\nha_role = standby\n' + P.SHARE, ('SYSHA2', 'SYSHA1'))
+        finally:
+            H.level = saved
+        self.addCleanup(shutil.rmtree, root, True)
+        self.assertEqual([r.returncode for r in runs] + [done.returncode], [0, 0, 0], done.stderr[-600:])
+        row = P.standby_row(root)
+        member = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']
+        self.assertEqual((member['role']['type'], member['roleEvidence']['role']['source'], member['roleEvidence']['sizing']['treatment']),
+                         ('haStandby', 'configured', 'standby_floor'))
+        self.assertGreater(float(row['NFIT - ENT']), 0.90)                           # the floor: a quarter of about 4
+        self.assertTrue(row['NFIT - Action'].startswith('PowerHA standby for hanodeB (configured): 25% of its '), row['NFIT - Action'])
+        self.assertNotIn('Workload-bearing', row['NFIT - Action'])
+        self.assertNotIn('NOT_APPLIED', row['VM_Comments'])
+        self.assertNotIn('standbyPolicy', member)
 
     def test_the_finding_does_not_need_the_partners_data(self):
         # The partner's frame is not staged here: no role can be inferred, and the node's own finding is still made.

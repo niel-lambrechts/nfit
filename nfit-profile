@@ -2475,10 +2475,13 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "  observed           two hours or longer without a break, on at least two days: 15-minute medians,\n";
         print {$LOG_FH} "                     in the node's planning-profile hours, in its current role period. Each node\n";
         print {$LOG_FH} "                     is judged on its own, not against its partner. A node whose standby role is\n";
-        print {$LOG_FH} "                     inferred is then not given an idle-standby allocation (the fixed standby\n";
-        print {$LOG_FH} "                     entitlement) and keeps its ordinary recommendation. For a node configured\n";
-        print {$LOG_FH} "                     as standby the setting is applied and the mismatch reported:\n";
-        print {$LOG_FH} "                     [STANDBY_WORKLOAD_MISMATCH]. This is about sizing, not a verified HA role.\n";
+        print {$LOG_FH} "                     inferred is then a workload-bearing node: no idle-standby sizing is applied\n";
+        print {$LOG_FH} "                     to it (neither the fixed standby entitlement, [STANDBY_FIXED_NOT_APPLIED],\n";
+        print {$LOG_FH} "                     nor the share of its partner's target, [STANDBY_SHARE_NOT_APPLIED]) and it\n";
+        print {$LOG_FH} "                     keeps its ordinary recommendation. The role reading stays as a diagnostic.\n";
+        print {$LOG_FH} "                     For a node configured as standby the setting is applied; with a fixed\n";
+        print {$LOG_FH} "                     entitlement the mismatch is reported: [STANDBY_WORKLOAD_MISMATCH]. This is\n";
+        print {$LOG_FH} "                     about sizing, not a verified HA role or resource-group ownership.\n";
         print {$LOG_FH} "                     The values are provisional settings (standby_work_cores, standby_work_hours,\n";
         print {$LOG_FH} "                     standby_work_days), not platform limits. Not observed does not mean idle.\n";
         print {$LOG_FH} "\n";
@@ -4864,8 +4867,9 @@ sub log_profile_rationale
             ($re->{ReductionPoolAvailabilityStatus} // $na);
         printf {$fh} "    Downward action depends on unmeasured pool         : %s\n",
             ($re->{ReductionDependsOnUnmeasuredPool} ? 'Yes - CAUTION required' : 'No');
+        # An exempt check is said to be exempt, with its reason: not the N/A of a check that could not be evaluated.
         printf {$fh} "    Strategic capacity check                           : %s\n",
-            ($re->{StrategicInvariantStatus} // $na);
+            ((($re->{StrategicInvariantExempt} // '') ne '') ? "Exempt - $re->{StrategicInvariantExempt}" : ($re->{StrategicInvariantStatus} // $na));
         if (defined $re->{ReductionPeakReachRatio} && looks_like_number($re->{ReductionPeakReachRatio})) {
             printf {$fh} "    Credible peak / current reachable                  : %.1f%%\n",
                 $re->{ReductionPeakReachRatio} * 100;
@@ -6943,6 +6947,7 @@ sub _compute_entbounded_and_tactical
         reduction_depends_on_unmeasured_pool =>
             ($is_downward_candidate && $reduction_safety->{depends_on_unmeasured_pool}) ? 1 : 0,
         strategic_invariant_status          => $reduction_safety->{strategic_invariant_status} // 'N/A',
+        strategic_invariant_exempt          => $reduction_safety->{strategic_invariant_exempt} // '',
         immediate_candidate                 => $immediate_candidate,
         immediate_invariant_holds           => $immediate_ok,
         immediate_invariant                 => $immediate_msg,
@@ -10202,6 +10207,7 @@ sub calculate_runq_modified_physc
             ReductionCurrentReachabilityBasis => $rvcpu_ebt->{reduction_current_reachability_basis},
             ReductionDependsOnUnmeasuredPool => $rvcpu_ebt->{reduction_depends_on_unmeasured_pool},
             StrategicInvariantStatus      => $rvcpu_ebt->{strategic_invariant_status},
+            StrategicInvariantExempt      => $rvcpu_ebt->{strategic_invariant_exempt},
             ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
             ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
             ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
@@ -14788,14 +14794,17 @@ sub _ha_fixed_standby_action
 }
 
 # What is added to the ordinary action of a node whose standby role is inferred and on which sustained
-# workload is observed. Eligibility for an idle-standby allocation, not a statement of its HA role. Pure.
+# workload is observed: no idle-standby sizing (fixed allocation or share of the partner's target). The
+# role reading is kept as a diagnostic and said to be that; nothing is claimed about resource-group
+# ownership and no takeover requirement is stated. Pure.
 sub _ha_workload_veto_text
 {
-    my ($fixed, $source, $work, $both) = @_;
-    return sprintf('Sustained workload observed: idle-standby allocation not applied. Recommendation follows this node\'s workload. '
-        . 'Not applied: fixed standby entitlement %.2f (%s). Evidence: %s.%s', $fixed, _policy_source_text($source), _ha_workload_text($work),
-        ($both ? ' Sustained workload is observed on both nodes of this cluster in this period: neither is sized as an idle standby. '
-                 . 'Which node owns the resource groups is not verified.' : ''));
+    my ($what, $work, $both) = @_;
+    return sprintf('Workload-bearing node; idle-standby sizing not applied. Recommendation follows this node\'s workload. Not applied: %s. '
+        . 'The comparison of the two nodes reads this node as the standby: kept as a diagnostic, not used for its sizing. Evidence: %s.%s',
+        $what, _ha_workload_text($work),
+        ($both ? ' Sustained workload is observed on both nodes of this cluster in this period. Which node owns the resource groups is '
+                 . 'not verified, and no takeover requirement is stated.' : ''));
 }
 
 # What is added to a node's ordinary action where its fixed standby entitlement is not applied. Pure.
@@ -15117,6 +15126,34 @@ sub _apply_ha_sizing
             if ($entry->{Treatment} eq 'standby_floor')
             {
                 my $primary = $entry->{Primary};
+                # A node whose standby role is inferred and on which sustained workload is observed is
+                # not sized as an idle standby: no share of its partner's target is laid under it, and
+                # it keeps its ordinary own-workload recommendation. Nothing is pending for it, so the
+                # finalisation of a planning cycle has no floor to set. A configured standby keeps the
+                # customer's policy.
+                my $work = _safe_dig($cluster, 'Workload', $vm);
+                if (($cluster->{Roles}{$vm}{Source} // '') ne 'configured' && ref($work) eq 'HASH' && $work->{Observed})
+                {
+                    my $both = _safe_dig($cluster, 'Workload', $primary, 'Observed') ? 1 : 0;
+                    my $what = sprintf('standby share (%d%% of the target of %s, %s)', int(100 * ($policy->{Share} // 0) + 0.5), $primary,
+                                       _policy_source_text($policy->{Source}{standby_share}));
+                    $entry->{Withheld} = 'workload';
+                    $entry->{Note} = 'workload-bearing node; idle-standby sizing not applied: ' . _ha_workload_text($work)
+                        . '; the recommendation follows this node\'s workload';
+                    $core->{StandbyShareNotApplied} = 'workload';
+                    $cells->{'NFIT - Action'} = join(' ', grep { defined $_ && $_ ne '' } $cells->{'NFIT - Action'},
+                        _ha_workload_veto_text($what, $work, $both));
+                    $proposals->{$vm}{standbyPolicy} = {
+                        type => 'share', share => $policy->{Share}, source => $policy->{Source}{standby_share}, managedSystem => $policy->{Frame},
+                        primary => $primary, roleSource => $cluster->{Roles}{$vm}{Source}, applied => JSON::false,
+                        ownRequirement => { entitlement => (looks_like_number($own_ent // '') ? $own_ent + 0 : undef),
+                                            VPs => (looks_like_number($own_vp // '') ? $own_vp + 0 : undef) },
+                        sustainedWorkload => _ha_workload_record($work, $both),
+                        notApplied => { kind => 'workload', cause => 'workload-bearing node: ' . _ha_workload_text($work) },
+                    } if (defined $proposals && ref($proposals->{$vm}) eq 'HASH');
+                    $changed++;
+                    next;
+                }
                 my $target;
                 if (exists $row_of{$primary})
                 {
@@ -15193,7 +15230,7 @@ sub _apply_ha_sizing
                 my $configured = (($cluster->{Roles}{$vm}{Source} // '') eq 'configured') ? 1 : 0;
                 my $resolved = ($bearing && !$configured)
                     ? { Applied => 0, Kind => 'workload', Carries => int($policy->{Fixed} / $MIN_ENT_PER_VP + 1e-6),
-                        Cause => 'sustained workload observed: ' . _ha_workload_text($work) }
+                        Cause => 'workload-bearing node: ' . _ha_workload_text($work) }
                     : _ha_fixed_standby_resolve({ fixed => $policy->{Fixed}, own_vp => $own_vp, step_vp => $step,
                         safety_state => $known->($di->{'rVCPU_ReductionSafetyState'}), safety_reasons => $known->($di->{'rVCPU_ReductionSafetyReasons'}),
                         current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
@@ -15234,9 +15271,11 @@ sub _apply_ha_sizing
                     $entry->{Note} = sprintf('fixed standby entitlement %.2f not applied: %s; the recommendation follows this node\'s workload',
                         $policy->{Fixed}, $resolved->{Cause});
                     $core->{StandbyFixedNotApplied} = $resolved->{Cause};
+                    $entry->{Withheld} = 'workload' if ($resolved->{Kind} eq 'workload');
                     $cells->{'NFIT - Action'} = join(' ', grep { defined $_ && $_ ne '' } $cells->{'NFIT - Action'},
                         (($resolved->{Kind} eq 'workload')
-                            ? _ha_workload_veto_text($policy->{Fixed}, $policy->{Source}{standby_entitlement}, $work, $both)
+                            ? _ha_workload_veto_text(sprintf('fixed standby entitlement %.2f (%s)', $policy->{Fixed},
+                                  _policy_source_text($policy->{Source}{standby_entitlement})), $work, $both)
                             : _ha_fixed_not_applied_text($policy->{Fixed}, $policy->{Source}{standby_entitlement}, $resolved->{Cause})));
                     $changed++;
                     next;
@@ -15562,7 +15601,9 @@ sub _log_powerha_roles
                                                     leadFirst => $w->{LeadA}, leadSecond => $w->{LeadB} }) }
                                      keys %{ $detection->{Segments}[-1]{Windows} // {} } } }) : ()),
                     sizing => { policy => $policy->{Sizing}, share => $policy->{Share},
-                                treatment => ($entry ? $entry->{Treatment} : 'none'),
+                                # Withheld on the node's own workload: no standby treatment was applied; the role above stays as read.
+                                treatment => (($entry && !$entry->{Withheld}) ? $entry->{Treatment} : 'none'),
+                                ($entry && $entry->{Withheld} ? (withheld => $entry->{Withheld}, policyWithheld => $entry->{Treatment}) : ()),
                                 node => $policy->{Node}, managedSystem => $policy->{Frame}, source => $policy->{Source} },
                     reason => $cluster->{Reason},
                     # Each member as installed when this run read it (its latest configuration state).
@@ -17750,6 +17791,7 @@ sub _write_standard_csv_report {
                         ReductionCurrentReachabilityBasis => $rvcpu_ebt->{reduction_current_reachability_basis},
                         ReductionDependsOnUnmeasuredPool => $rvcpu_ebt->{reduction_depends_on_unmeasured_pool},
                         StrategicInvariantStatus      => $rvcpu_ebt->{strategic_invariant_status},
+            StrategicInvariantExempt      => $rvcpu_ebt->{strategic_invariant_exempt},
                         ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
                         ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
                         ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},
@@ -18391,6 +18433,8 @@ sub _write_standard_csv_report {
             if (ref($role_of_row) eq 'HASH' && ($role_of_row->{Source} // '') eq 'HA_STANDBY_FIXED' && ($role_of_row->{Mismatch} // '') ne '');
         unshift @{ $structural_tags->{$row_vm} }, '[STANDBY_FIXED_NOT_APPLIED]'
             if (defined _safe_dig($assimilation_map_ref, $row_vm, 'CoreResults', 'StandbyFixedNotApplied'));
+        unshift @{ $structural_tags->{$row_vm} }, '[STANDBY_SHARE_NOT_APPLIED]'
+            if (defined _safe_dig($assimilation_map_ref, $row_vm, 'CoreResults', 'StandbyShareNotApplied'));
         if (ref($presence) eq 'HASH' && $presence->{left})
         {
             $planner_cells->{'NFIT - Action'} = _historic_action($presence, $planner_cells->{'NFIT - Action'}) if (ref($planner_cells) eq 'HASH');
@@ -36975,6 +37019,7 @@ sub _execute_multiplicative_seasonal {
                 ReductionCurrentReachabilityBasis => $rvcpu_ebt->{reduction_current_reachability_basis},
                 ReductionDependsOnUnmeasuredPool => $rvcpu_ebt->{reduction_depends_on_unmeasured_pool},
                 StrategicInvariantStatus      => $rvcpu_ebt->{strategic_invariant_status},
+            StrategicInvariantExempt      => $rvcpu_ebt->{strategic_invariant_exempt},
                 ImmediateCandidate            => $rvcpu_ebt->{immediate_candidate},
                 ImmediateInvariantHolds       => $rvcpu_ebt->{immediate_invariant_holds},
                 ImmediateInvariant            => $rvcpu_ebt->{immediate_invariant},

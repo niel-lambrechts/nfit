@@ -195,6 +195,8 @@ class CutProtectionTest(unittest.TestCase):
         self.assertIn('guarantee check of the strategic pair exempt: the pool-borrowing budget is the only condition not met, and it is not '
                       'applied because no competition for the pool was observed', ' '.join(log.split()))
         self.assertNotIn('not positively proven (N/A)', log)
+        # In the rationale the check reads as exempt with its reason, not as the N/A of a check that could not be evaluated.
+        self.assertRegex(' '.join(log.split()), r'Strategic capacity check : Exempt - the pool-borrowing budget is the only condition not met')
         # Genuine safety evidence still limits the step: served bursts make it CAUTION, one VP only (the tier's rate is 3).
         self.assertIn('CAUTION: limited to 1 VP this cycle (material served-burst evidence', ' '.join(log.split()))
         # And still blocks where it should: the P profile's candidate fails the check of the pair it would leave.
@@ -210,6 +212,8 @@ class CutProtectionTest(unittest.TestCase):
         self.assertEqual((held['G3-95W15_rVCPU_Tactical'], held['NFIT - VCPU']), ('6', '6'))
         self.assertIn('strategic guarantee invariant not positively proven (N/A)', held_log)
         self.assertNotIn('guarantee check of the strategic pair exempt', held_log)
+        self.assertNotIn('Strategic capacity check : Exempt', ' '.join(held_log.split()))
+        self.assertIn('Strategic capacity check : N/A', ' '.join(held_log.split()))
         # With VPs now coming down, the entitlement of this cycle is staged by the existing staging guard (1.01 on the
         # way to 0.52); with the VPs held it went to 0.52 at once. The target is the same.
         self.assertEqual((row['G3-95W15'], held['G3-95W15']), ('0.52', '0.52'))
