@@ -452,6 +452,9 @@ def evidence_methods():
         self.say('  VP width evidence (saved plans; diagnostic, counts only):')
         for serial, reg in sorted(regs.items()):
             self.width_lines(serial, reg, plans[serial])
+        self.say('  Joint check of entitlement reductions (saved plans, final; cycle-pools.csv):')
+        for serial, reg in sorted(regs.items()):
+            self.joint_lines(cycle, serial, reg, plans[serial])
         if getattr(self.args, 'compare', None):
             self.say('  Figures against the earlier run (%s):' % 'CSV rows of both work trees; counts only')
             self.compare_lines(regs, Path(self.args.compare).expanduser())
@@ -680,6 +683,92 @@ def evidence_methods():
                                pool, (row or {}).get('Reduction_Verdict', 'no row'), (row or {}).get('Reduction_Candidate') or '-'))
 
     Acceptance.reduction_lines = reduction_lines
+
+    def joint_lines(self, cycle, serial, reg, plan):
+        """The joint check as the final plan holds it: per pool the replay at both levels, the evidence apart, the protected-level outcomes, and what it costs to keep."""
+        self.say('    Frame %s:' % serial)
+        block = plan.get('jointCheck')
+        if not isinstance(block, dict):
+            self.say('      No joint check in the saved plan (no reading after sizing, or the plan predates it).')
+            return
+        results, evidence, levels = block.get('results') or {}, block.get('evidence') or {}, block.get('protectedLevel') or {}
+        if block.get('unavailable'):
+            self.say('      Evidence not gathered: %s.' % block['unavailable'])
+        listed = {}
+        pools_file = Path(cycle) / 'cycle-pools.csv'
+        if pools_file.is_file():
+            with open(pools_file, newline='') as fh:
+                listed = {r['Pool'].split(' ')[0]: r for r in csv.DictReader(fh) if r.get('Frame') == serial and r.get('Model') == self.args.model}
+        consistent, agree = True, True
+        for pool in sorted(results, key=lambda k: float(k)):
+            r, e = results[pool], evidence.get(pool) or {}
+            c = r.get('completeness') or {}
+            self.say('      Pool %s: %s; %d LPAR(s) with a reduction, %d assessed; evidence %s; readings kept %s of %s%s.' % (
+                pool, r.get('state'), c.get('members') or 0, c.get('assessed') or 0, c.get('state'),
+                len(e.get('readings') or []), e.get('readingCount', '?'), ' (limit reached)' if e.get('truncated') else ''))
+            support = e.get('support') or {}
+            assessed = [vm for vm in (r.get('levels') or {}) if vm not in (c.get('notAssessed') or {})]
+            self.say('        Contested LPAR-minutes observed for the LPARs assessed (all hours): %d' % sum((support.get(vm) or {}).get('contested') or 0 for vm in assessed))
+            for vm, why in sorted((c.get('notAssessed') or {}).items()):
+                self.say('        Not assessed: %s (%s)' % (vm, why))
+            if r.get('state') != 'replayed':
+                self.say('        %s%s' % (r.get('reason') or '', '; an earlier result is kept as superseded' if r.get('superseded') else ''))
+            for level, name in (('cycle', 'this cycle'), ('target', 'full targets')):
+                scopes = r.get(level)
+                if not isinstance(scopes, dict):
+                    continue
+                parts = []
+                for scope, text in (('profileHours', 'in profile hours'), ('otherHours', 'outside profile hours')):
+                    sc = scopes.get(scope) or {}
+                    consistent = consistent and (sc.get('poolMinutes') or 0) <= (sc.get('lparMinutes') or 0) and (sc.get('longestEpisode') or 0) <= (sc.get('poolMinutes') or 0)
+                    parts.append('%s %s pool-minutes, %s LPAR-minutes, %.2f core-minutes, at most %s together, longest episode %s, %s LPARs' % (
+                        text, sc.get('poolMinutes') or 0, sc.get('lparMinutes') or 0, float(sc.get('shortfall') or 0), sc.get('mostTogether') or 0,
+                        sc.get('longestEpisode') or 0, len(sc.get('members') or {})) if sc.get('poolMinutes') else '%s none' % text)
+                both = scopes.get('allHours') or {}
+                consistent = consistent and (both.get('poolMinutes') or 0) <= sum((scopes.get(k) or {}).get('poolMinutes') or 0 for k in ('profileHours', 'otherHours'))
+                self.say('        %s: %s' % (name, '; '.join(parts)))
+            row = listed.get(str(pool)) or listed.get(str(int(float(pool))))
+            if row is not None and 'Joint_Check' in row:
+                expect = {'notAssessed': 'not assessed', 'notReassessed': 'not reassessed'}.get(r.get('state')) or (
+                    'exposed' if ((r.get('cycle') or {}).get('allHours') or {}).get('poolMinutes') else 'no exposure observed')
+                agree = agree and row['Joint_Check'] == expect
+        if not results:
+            self.say('      No pool has an LPAR with an entitlement reduction that was followed.')
+        self.check(consistent, 'pool-minutes never exceed LPAR-minutes, an episode never exceeds its pool-minutes, and all hours never exceed the two parts')
+        self.check(agree, 'cycle-pools.csv gives the same joint verdict for every pool')
+        stale = [p for p, r in results.items() if r.get('state') == 'notReassessed']
+        truncated = [p for p, e in evidence.items() if e.get('truncated')]
+        self.say('      Saved evidence limit: reached on %d pool%s%s; not reassessed after finalisation: %d.' % (
+            len(truncated), '' if len(truncated) == 1 else 's', (' (%s)' % ', '.join(sorted(truncated))) if truncated else '', len(stale)))
+        # Protected level, on the final figures.
+        count = {}
+        for vm, o in levels.items():
+            for level in ('cycle', 'target'):
+                if level in o:
+                    count.setdefault((level, o[level].get('outcome')), []).append(vm)
+        for level, name in (('cycle', 'this cycle'), ('target', 'full targets')):
+            self.say('      Protected level, %s: %s' % (name, ', '.join('%s %d' % (k[1], len(v)) for k, v in sorted(count.items()) if k[0] == level) or 'no reduction'))
+        for (level, outcome), names in sorted(count.items()):
+            if outcome in ('belowByPolicy', 'heldPrerequisite', 'heldUnexplained'):
+                for vm in sorted(names):
+                    o = levels[vm][level]
+                    self.say('        %s, %s: %s; protected level %s, short by %s%s' % (vm, level, outcome, o.get('required'), o.get('shortBy'),
+                             ('; ' + (o.get('policy') or o.get('prerequisite'))) if (o.get('policy') or o.get('prerequisite')) else ''))
+        with open(self.outputs(reg)['csv'], newline='') as fh:
+            rows = list(csv.DictReader(fh))
+        tagged = sorted(r['VM'] for r in rows if '[PROTECTED_LEVEL_HELD]' in (r.get('VM_Comments') or ''))
+        held = sorted(vm for vm, o in levels.items() if (o.get('cycle') or {}).get('outcome', '').startswith('held'))
+        self.say('      Reductions held for the protected level this cycle: %d%s; rows tagged [BELOW_PROTECTED_LEVEL]: %d.' % (
+            len(held), (' (%s)' % ', '.join(held)) if held else '', sum(1 for r in rows if '[BELOW_PROTECTED_LEVEL]' in (r.get('VM_Comments') or ''))))
+        self.check(tagged == held, 'every reduction held for its protected level carries [PROTECTED_LEVEL_HELD] in the CSV, and no other row does (%d)' % len(held))
+        installed = {r['VM']: (r.get('Current - ENT'), r.get('Current - VCPU'), r.get('NFIT - ENT'), r.get('NFIT - VCPU')) for r in rows}
+        self.check(all(installed[vm][2] in ('', None) or (float(installed[vm][2]) == float(installed[vm][0]) and str(installed[vm][3]) == str(installed[vm][1])) for vm in held if vm in installed),
+                   'a held row shows the installed entitlement on the installed VPs, or no pair')
+        size = lambda value: len(json.dumps(value, separators=(',', ':'), sort_keys=True))
+        self.say('      Kept with the plan: joint check %d bytes of %d (%.1f%%); readings %d' % (
+            size(block), size(plan), 100.0 * size(block) / max(1, size(plan)), sum(len(e.get('readings') or []) for e in evidence.values())))
+
+    Acceptance.joint_lines = joint_lines
 
     def width_lines(self, serial, reg, plan):
         """The width evidence kept with the plan: how many LPARs carry each label beside a VP statement, and what it costs to keep."""

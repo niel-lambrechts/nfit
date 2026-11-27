@@ -39,7 +39,9 @@ foreach my $name (qw(_safe_dig _cycle_canonical _option_differences _ha_peer_pla
                      _cycle_finalise_frame _cycle_finalise_lines _cycle_rewrite_csv
                      _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines _days_before_end _lpar_present
                      _plain_day _historic_action _cycle_membership
-                     _pool_whole_units _exposure_tolerance _pool_reduction_members _pool_reduction_candidate _pool_reduction_text))
+                     _pool_whole_units _exposure_tolerance _pool_reduction_members _pool_reduction_candidate _pool_reduction_text
+                     _joint_members _joint_check_record _joint_replay _joint_completeness _joint_evidence_for_plan _joint_check_lines _joint_csv_cells
+                     _protected_level_outcome _protected_level_held_pair _protected_level_hold))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n";
@@ -50,7 +52,7 @@ my ($grace) = $src =~ /^my \$PRESENCE_GRACE_DAYS\s*=\s*(\d+);/m or die "PRESENCE
 my ($interval) = $src =~ /^my %EVIDENCE_INTERVAL\s*=\s*(\(.*?\));/m or die "EVIDENCE_INTERVAL not found\n";
 eval "package UUT; use JSON; use POSIX qw(ceil floor); use List::Util qw(sum sum0 min max uniq); use Scalar::Util qw(looks_like_number);\n"
    . join('', map { "our \$$_ = $constant{$_};\n" } sort keys %constant) . "use Time::Piece; our \$PRESENCE_GRACE_DAYS = $grace; our %EVIDENCE_INTERVAL = $interval;\n"
-   . "our %MEMBER_EXPOSURE_RULES = (localScarceAbsCores => 0.10, localScarceRel => 0.02); our %POOL_REDUCTION_RULE = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90);\n$code 1;"
+   . "our %MEMBER_EXPOSURE_RULES = (localScarceAbsCores => 0.10, localScarceRel => 0.02); our %POOL_REDUCTION_RULE = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90); our %JOINT_CHECK_RULE = (version => 'joint-check-1', maxReadings => 5000);\n$code 1;"
    or die "harness eval failed: $@\n";
 
 # -- Two frames: standby sa (with x1, in pool 5 of 4.00) on FA; its primary pb on FB --
@@ -245,7 +247,7 @@ like($all, qr/Frames analysed\s+10\.00\s+14\.00\s+12\.00\s+\(2 frames analysed; 
 unlike($all, qr/\bfits\b|procure|consolidat|spare/i, 'no fit, procurement, consolidation or spare-capacity wording');
 is(scalar(@$frames), 4, 'frame file: a header and one row per frame of the model');
 is(scalar(@$pools), 5, 'pool file: each pool of each analysed frame on its own row');
-like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement","","","","","",""$/, 'a pool row counts the LPARs still there: maximum, the three sums and the maximum each needs');
+like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement","","","","","","","","","","",""$/, 'a pool row counts the LPARs still there: maximum, the three sums and the maximum each needs');
 
 # -- Where an LPAR is at the analysis end, across the frames of a cycle (B15) --
 my $t = sub { my ($ymd, $hms) = @_; return Time::Piece->strptime("$ymd " . ($hms // '00:00:00'), '%Y-%m-%d %H:%M:%S')->epoch; };
@@ -324,7 +326,7 @@ is_deeply([ @{ $after_pool->{Reduction} }{qw(verdict candidate setBy)}, $after_p
 is_deeply([ map { $_->{code} } @{ $after_pool->{Reduction}{prerequisites} } ], [qw(memberReductions reserve futureEvents licensing)],
           'with its dependencies: the members total 7.00 installed, so they are reduced first');
 my (undef, $pool_csv, $fp_text) = UUT::_cycle_footprint_lines('c1', [ { model => 'state-based', frame => 'FA', state => 'final', lpars => 2, totals => \%groups, resolved => 1, unresolved => 0, footprint => $after_fp } ], [ 'h' ]);
-like($pool_csv->[0], qr/"Status","Reduction_Verdict","Reduction_Candidate","Takeover_Provision","Measured_Use_Needs","Reduction_Reasons","Reduction_Prerequisites"$/, 'cycle-pools.csv: verdict, candidate, reasons and prerequisites in columns of their own');
+like($pool_csv->[0], qr/"Status","Reduction_Verdict","Reduction_Candidate","Takeover_Provision","Measured_Use_Needs","Reduction_Reasons","Reduction_Prerequisites","Joint_Check","Joint_Evidence","Joint_Pool_Minutes","Joint_Core_Minutes","Outside_Hours_Pool_Minutes"$/, 'cycle-pools.csv: verdict, candidate, reasons and prerequisites in columns of their own');
 my ($pool_row) = grep { /,"FA","7",/ } @$pool_csv;
 like($pool_row, qr/,"candidate","4","4","2","","reduce the members' entitlements first: installed they total 7\.00, so the maximum cannot go below 7 until then; confirm the pool reserve/,
      'the row keeps eligibility (no reason) apart from the prerequisites');
@@ -332,5 +334,89 @@ like(join(' ', map { s/^\s+//r } @$fp_text), qr/Pool 7: reduction candidate, max
 # A plan without pool evidence: the footprint is as before.
 my $plain_fp = UUT::_cycle_footprint_frame({ window => { end => '2026-10-31' }, members => $pool_doc->({ poolMember => { pool_id => 7, pool_cpu => 12, current_ent => 3 } })->{members} });
 ok(!exists((grep { $_->{Pool} == 7 } @{ $plain_fp->{pools} })[0]{Reduction}), 'no pool evidence in the plan: no candidate, the pool line as it was');
+
+# -- The joint check of entitlement reductions at finalisation (v10 B7) --
+# The primary's target is 1.00, so the standby's share is 0.50 and its own 0.80 stands: a reduction from 2.00,
+# decided here and not in the analysis. x1 is reduced from 1.50 to 1.00 by the analysis. The evidence saved with
+# the plan is replayed on the finalised figures; a member that does not change stays in the replay.
+{
+    my $T = 1_790_000_040;
+    my $with_joint = sub
+    {
+        my (%over) = @_;
+        my $doc = $standby_doc->();
+        $doc->{members}{sa}{profiles}{'P-95'}{cutProtection} = $over{protection} if ($over{protection});
+        my $x1 = $doc->{members}{x1};
+        $x1->{profiles}{'P-95'}{entitlement} = 1;
+        @{ $x1->{poolMember} }{qw(proposed_ent cycle_ent)} = (1, 1);
+        $x1->{published}{entitlement} = '1.00';
+        my $evidence = { members => [qw(sa x1)], cadence => 1, notAssessed => {},
+                         support => { sa => { paired => 1000, classified => 1000, contested => 3 }, x1 => { paired => 1000, classified => 1000, contested => 3 } },
+                         readings => [ [ $T, 0, 1.2, 1 ], [ $T, 1, 1.4, 1 ], [ $T + 60, 0, 1.2, 1 ], [ $T + 600, 0, 0.6, 0 ] ] };
+        # The record of the analysis: only x1 is a reduction then (the standby's role is pending).
+        my $record = UUT::_joint_check_record({ 5 => $evidence }, UUT::_joint_members($doc->{members}));
+        if ($over{truncated})
+        {
+            $record->{evidence}{5} = UUT::_joint_evidence_for_plan($evidence, 3);
+            $record->{results}{5}{completeness}{state} = 'limitReached';
+        }
+        $doc->{jointCheck} = $record;
+        return $doc;
+    };
+    local $plan{planB} = $primary_doc->(member => { profiles => { 'P-99' => { entitlement => 1, recommendedVPs => 2 } } });
+
+    local $plan{planA} = $with_joint->();
+    is_deeply([ sort keys %{ $plan{planA}{jointCheck}{results}{5}{levels} } ], ['x1'], 'in the analysis the pending standby is followed in the evidence, and is not yet a reduction');
+    is($plan{planA}{jointCheck}{results}{5}{target}{allHours}{lparMinutes}, 1, 'the analysis: x1 exposed in one minute');
+    my $kept_before = UUT::_cycle_canonical($plan{planA}{jointCheck});
+
+    # Replayed again on the finalised figures.
+    my $j = UUT::_cycle_finalise_frame($plan{planA}, $reg_a, { FA => $reg_a, FB => $reg_b }, {}, $plan_of, 'C1');
+    my $res = $j->{doc}{jointCheck}{results}{5};
+    my ($cycle_ent, $target_ent) = @{ $res->{levels}{sa} };
+    is($target_ent, 0.8, 'the standby is resolved to its own 0.80: a reduction made at finalisation');
+    is($res->{state}, 'replayed', 'the saved evidence is replayed on the finalised figures');
+    is_deeply([ @{ $res->{target}{profileHours} }{qw(poolMinutes lparMinutes mostTogether longestEpisode)}, $res->{target}{otherHours}{poolMinutes} ], [ 2, 3, 2, 2, 0 ],
+        'at the full targets: the standby and the unchanged x1 together in one minute; the 0.60 outside its hours is not exposed');
+    is($res->{target}{profileHours}{shortfall}, 1.2, 'shortfall 2 x (1.20 - 0.80) + (1.40 - 1.00)');
+    is($res->{cycle}{allHours}{members}{sa}{minutes} // 0, ($cycle_ent < 1.2 - 0.005 ? 2 : 0), "this cycle's figure ($cycle_ent) is assessed apart from the target");
+    is(ref($j->{joint}), 'HASH', 'the changed result is handed to the rationale block');
+    like(join("\n", UUT::_cycle_finalise_lines('C1', $j, undef)), qr/Joint Check of Entitlement Reductions.*Made again on the finalised figures of the planning cycle.*Pool 5: 2 LPARs with an entitlement reduction\./s,
+        'and the Cycle Finalisation block carries the section, said to be made again');
+    is($j->{doc}{jointCheck}{protectedLevel}{sa}{target}{outcome}, 'notKnown', 'no protected level was recorded for it: not known');
+    is(UUT::_cycle_canonical($plan{planA}{jointCheck}), $kept_before, 'the provisional record is not changed');
+    is_deeply([ (UUT::_joint_csv_cells($res))[0, 1] ], [ 'exposed', 'complete' ], 'cycle-pools.csv: the check and the evidence, apart');
+
+    # A protected level above the resolved figure, with no policy behind the figure: held at the installed pair.
+    $plan{planA} = $with_joint->(protection => { status => 'bound', bound => { busy => 1.2, ladder => 1.3, consumed => 1.5 } });
+    my $h = UUT::_cycle_finalise_frame($plan{planA}, $reg_a, { FA => $reg_a, FB => $reg_b }, {}, $plan_of, 'C1');
+    is_deeply([ @{ $h->{rows}{sa} }{qw(entitlement VPs)} ], [ '2.00', 4 ], 'below its protected level of 1.30: held at the installed entitlement and VPs');
+    like($h->{rows}{sa}{comments}, qr/^\[PROTECTED_LEVEL_HELD\]/, 'the row is tagged');
+    like($h->{rows}{sa}{action}, qr/would leave the entitlement below its protected level of 1\.30/, 'and its action says why');
+    is($h->{doc}{members}{sa}{role}{protectedLevelHold}{required}, 1.3, 'the plan records the hold and its level');
+    is($h->{doc}{members}{sa}{role}{targetEntitlement}, 0.8, 'the full requirement stays visible as the target');
+    is($h->{doc}{members}{sa}{poolMember}{cycle_ent}, 2, 'the pool check counts the held figure');
+    is($h->{doc}{jointCheck}{protectedLevel}{sa}{cycle}{outcome}, 'heldUnexplained', 'the outcome of this cycle is the hold');
+    is($h->{doc}{jointCheck}{protectedLevel}{sa}{target}{outcome}, 'heldUnexplained', 'and the full target is marked as below the level too');
+    ok(!exists $h->{doc}{jointCheck}{results}{5}{cycle}{allHours}{members}{sa}, 'the joint result is made after the hold: the standby is not exposed this cycle');
+
+    # Truncated evidence and a changed figure: not reassessed; the earlier result only as superseded.
+    $plan{planA} = $with_joint->(truncated => 1);
+    my $t = UUT::_cycle_finalise_frame($plan{planA}, $reg_a, { FA => $reg_a, FB => $reg_b }, {}, $plan_of, 'C1');
+    my $tr = $t->{doc}{jointCheck}{results}{5};
+    is_deeply([ @{$tr}{qw(state reason)} ], [ 'notReassessed', 'saved evidence limit reached' ], 'truncated evidence and a changed figure: not reassessed');
+    ok(!exists $tr->{cycle} && !exists $tr->{target}, 'the earlier result is not carried forward as the verdict');
+    is(UUT::_cycle_canonical($tr->{superseded}{levels}), '{"x1":[1,1]}', 'it is kept only as superseded, with the figures it was made on');
+    is_deeply([ UUT::_joint_csv_cells($tr) ], [ 'not reassessed', 'limit reached', '', '', '' ], 'cycle-pools.csv says so, with no figures');
+    like(join("\n", UUT::_joint_check_lines($t->{doc}{jointCheck}, 1)), qr/Not reassessed: saved evidence limit reached\..*limited to 5,000 readings.*Superseded \(made on the figures before the change/s,
+        'the rationale says why, and labels the earlier result as superseded');
+    is($t->{doc}{jointCheck}{protectedLevel}{sa}{target}{outcome}, 'notKnown', 'the protected-level check still runs: it needs no readings');
+
+    # Truncated evidence and no change of figures (the primary's frame is not analysed): the analysis result stands.
+    my $same = UUT::_cycle_finalise_frame($plan{planA}, $reg_a, { FA => $reg_a }, {}, $plan_of, 'C1');
+    is($same->{doc}{jointCheck}{results}{5}{state}, 'replayed', 'unchanged figures: the complete result of the analysis stands');
+    is($same->{doc}{jointCheck}{results}{5}{target}{allHours}{lparMinutes}, 1, 'with its figures');
+    is($same->{joint}, undef, 'and nothing is added to the rationale');
+}
 
 done_testing();

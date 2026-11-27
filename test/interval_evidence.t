@@ -29,6 +29,9 @@ for my $name (qw(_exposure_process_day _exposure_population_admits _exposure_tol
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n\n";
 }
+# The CSV's two-decimal tolerance, read from the source (the joint-check capture in _exposure_process_day uses it).
+$src =~ /^(my \$STRUCTURAL_ENT_TOLERANCE\s*=\s*[0-9.]+;)/m or die "could not extract STRUCTURAL_ENT_TOLERANCE\n";
+$code = "$1\n$code";
 eval "package UUT;\nuse List::Util qw(max min);\nuse Scalar::Util qw(looks_like_number);\n"
    . "my \$CUT_PROTECTION_TOP_READINGS = 32; my \$research_contested_level; my \%PRESSURE_KIND_CODE;\n$code\n1;" or die "harness eval failed: $@\n";
 
