@@ -207,10 +207,25 @@ class WidthEvidenceTest(unittest.TestCase):
         self.assertEqual(row['near']['pool'], {'room': 0, 'others': 0, 'alone': 0, 'unobserved': 120})       # the pool state is unknown, and said to be
         self.assertNotIn('poolReduction', self.bare)
 
-    def test_too_short_a_current_configuration_is_not_assessed(self):
+    def test_too_short_a_current_configuration_is_limited_history(self):
         ev = self.evidence('moved')
-        self.assertEqual((ev['status'], ev['reason']), ('notAssessed', '20 days in the current configuration, 28 needed'))
-        self.assertNotIn('widths', ev)
+        self.assertEqual((ev['status'], ev['reason'], ev['stateDays']), ('limitedHistory', '20 days in the current configuration, 28 needed', 20))
+        self.assertTrue(ev['widths'])
+        for row in ev['widths']:
+            self.assertNotIn('comparison', row)                                           # no verdict from 20 days
+        self.assertGreater(ev['coverage'], 0.9)
+        self.assertNotIn('cap', ev)
+        # Reporting only: the review sentence is not drawn from it, and no figure moves for it.
+        self.assertNotIn('The width evidence corroborates', self.rows['moved']['NFIT - Action'])
+        self.assertNotIn('does not corroborate', self.rows['moved']['NFIT - Action'])
+        at = self.section.find('moved (')
+        self.assertGreaterEqual(at, 0)
+        block = self.section[at:at + 700]
+        self.assertRegex(block, r'^moved \(4 VPs, [^)]*\)[^.]*\. Limited history: 20 days in the current configuration, 28 needed for a comparison; '
+                                r'PhysC and PhysB both present in \d+% of the profile minutes\. The minutes observed are shown; no verdict is drawn from them\.')
+        block = block[:block.find(' rose (')] if ' rose (' in block else block          # up to the next LPAR's lines
+        for word in ('busy share and queue', 'did not rise', 'disagree', 'sufficient minutes', 'not approached'):
+            self.assertNotIn(word, block)
 
     def test_the_boundaries_are_stated_once_and_as_provisional(self):
         self.assertIn('Near a width: consumed at 90% of it or more. Reference: consumed between 0.25 cores and 70% of it. A comparison needs 30 minutes on 2 days', self.section)
@@ -230,7 +245,7 @@ class WidthEvidenceTest(unittest.TestCase):
             sized = m['profiles'][m['planningProfile']]
             for value in (m['installedVPs'], sized['currentCycle']['VPs'], sized['recommendedVPs']):
                 self.assertIsInstance(value, (int, float), vm)
-        self.assertRegex(self.section, r'LPARs by the evidence near their installed width: none observed \d+, limited \d+, sufficient \d+, not assessed 1\.')
+        self.assertRegex(self.section, r'LPARs by the evidence near their installed width: none observed \d+, limited \d+, sufficient \d+, limited history 1, not assessed 0\.')
 
 
 if __name__ == '__main__':

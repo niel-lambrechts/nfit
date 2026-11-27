@@ -17,7 +17,7 @@ open my $fh, '<', $SRC or die "cannot open $SRC: $!";
 my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
-for my $name (qw(_width_add_minute _width_figures _width_compare _width_row _width_assessable _width_evidence _width_label
+for my $name (qw(_width_add_minute _width_figures _width_compare _width_row _width_assessable _width_limited_history _width_evidence _width_label
                  _width_review_phrase _width_review_verdict _width_lines _exposure_totals _exposure_population_label _rationale_wrap))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
@@ -115,8 +115,22 @@ is((UUT::_width_assessable($tracker->(to => 20 * 86400)))[1], '20 days in the cu
 is((UUT::_width_assessable($tracker->(daily => { 1 => { expected => 43200, paired => 30000 } })))[1],
    'PhysC and PhysB are both present in 69% of the profile minutes, 90% needed', 'PhysB missing in too many minutes');
 is((UUT::_width_assessable($tracker->(daily => { 1 => { expected => 43200, paired => 0 } })))[1], 'no minute with both PhysC and PhysB in the profile hours', 'no PhysB at all');
-my $short = UUT::_width_evidence($tracker->(to => 20 * 86400), {});
-is_deeply([ $short->{status}, exists $short->{widths} ? 1 : 0 ], [ 'notAssessed', 0 ], 'not assessed: a reason, and no figures');
+# Too short a history with observations: limited history, its figures shown and no verdict drawn (B10 follow-up).
+my $short = UUT::_width_evidence({ %$t, to => 20 * 86400 }, { target => 2 });
+is_deeply([ $short->{status}, $short->{stateDays}, $short->{reason}, scalar @{ $short->{widths} } ], [ 'limitedHistory', 20, '20 days in the current configuration, 28 needed', 2 ],
+    'a short history with observations: limited history, with its days, and both widths');
+ok(!grep({ exists $_->{comparison} } @{ $short->{widths} }), 'no comparison verdict from it');
+is($short->{widths}[0]{support}, 'sufficient', 'the support is recorded as counted');
+is(UUT::_width_review_verdict({ %$t, to => 20 * 86400 }), 'insufficient', 'and the review of a VP increase is not corroborated from it');
+my $short_text = join(' ', map { s/^\s+//r } UUT::_width_lines('s', $short, ''));
+like($short_text, qr/^s \(4 VPs, all hours\)\. Limited history: 20 days in the current configuration, 28 needed for a comparison; PhysC and PhysB both present in \d+% of the profile minutes\. The minutes observed are shown; no verdict is drawn from them\. At the installed 4 VPs: \d+ minutes on \d+ days at 90% of it or more/,
+     'the lines: limited history, then what was observed');
+unlike($short_text, qr/rose|did not rise|disagree|sufficient minutes|reference minute/, 'with no wording of a verdict or a comparison');
+# No minute with both PhysC and PhysB: still not assessed, whatever the length.
+my $none = UUT::_width_evidence($tracker->(to => 20 * 86400, daily => { 1 => { expected => 43200, paired => 0 } }), {});
+is_deeply([ $none->{status}, exists $none->{widths} ? 1 : 0 ], [ 'notAssessed', 0 ], 'no observations: not assessed, a reason, and no figures');
+my $coarse = UUT::_width_evidence($tracker->(to => 20 * 86400, width => { bins => {}, dayMax => {}, coarse => 15 }), {});
+is($coarse->{status}, 'notAssessed', 'coarse data: not assessed, short or not');
 
 # --- The record: installed width always; proposed widths where they differ -----------
 my $record = UUT::_width_evidence($t, { cycle => 4, target => 2 });
