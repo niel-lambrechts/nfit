@@ -173,20 +173,121 @@ class ManagedSystemPolicyTests(unittest.TestCase):
         self.assertEqual((row['NFIT - ENT'], row['NFIT - VCPU']), (ordinary['NFIT - ENT'], ordinary['NFIT - VCPU']))
         self.assertGreater(float(row['NFIT - ENT']), 1.0)
         self.assertTrue(row['NFIT - Action'].startswith(ordinary['NFIT - Action']), row['NFIT - Action'])
-        self.assertIn('Substantial ongoing workload conflicts with an idle-standby assumption (at least 1.00 cores consumed for a full hour on ',
-                      row['NFIT - Action'])
-        self.assertIn('(PhysC: busy time is not collected for both nodes, a weaker basis)). Fixed standby allocation 0.10 '
-                      "(its managed system's default) not applied; recommendation follows this node's workload. "
-                      'Both nodes of this cluster carry sustained workload; which node owns the resource groups is not verified.', row['NFIT - Action'])
+        said = row['NFIT - Action'][len(ordinary['NFIT - Action']):].strip()
+        self.assertTrue(said.startswith("Sustained workload observed: idle-standby allocation not applied. Recommendation follows this node's workload. "
+                                        "Not applied: fixed standby entitlement 0.10 (its managed system's default). "
+                                        'Evidence: PhysC at 0.20 cores or more (15-minute medians) for 2 hours or longer without a break on '), said)
+        self.assertRegex(said, r'on \d+ days; 2 needed; longest run [\d.]+ hours; all hours, its current role period from 13 Sep 2026; PhysB not collected\. '
+                               r'Sustained workload is observed on both nodes of this cluster in this period: neither is sized as an idle standby\. '
+                               r'Which node owns the resource groups is not verified\.$')
         self.assertIn('[STANDBY_FIXED_NOT_APPLIED]', row['VM_Comments'])
         self.assertNotIn('[STANDBY_FIXED]', row['VM_Comments'])
         member = P.load(F.outputs(fixed[0], 'SYSHA1')['plan'])['members']['hanodeA']
         self.assertNotEqual((member.get('role') or {}).get('type'), 'haStandbyFixed')
         policy = member['standbyPolicy']
         self.assertEqual((policy['applied'], policy['notApplied']['kind'], policy['roleSource']), (False, 'workload', 'inferred'))
-        self.assertEqual((policy['sustainedWorkload']['found'], policy['sustainedWorkload']['bothNodes'], policy['sustainedWorkload']['basis']),
-                         (True, True, 'PhysC'))
-        self.assertIn('substantial ongoing workload', ' '.join(rationale(fixed[0], 'SYSHA1').split()))
+        work = policy['sustainedWorkload']
+        self.assertEqual((work['metric'], work['cores'], work['hours'], work['daysNeeded'], work['observed'], work['assessed'], work['bothNodes'],
+                          work['physB'], work['profileHours'], work['period']), ('PhysC', 0.2, 2, 2, True, True, True, None, 'none', 'role'))
+        self.assertGreaterEqual(work['days'], 7)
+        self.assertIn('sustained workload observed', ' '.join(rationale(fixed[0], 'SYSHA1').split()))
+        # Every node's record carries its own finding; the inferred role is left as it is (sizing eligibility only).
+        proof = member['roleEvidence']
+        self.assertEqual((proof['role']['inferred'], proof['role']['effective'], proof['ownWorkload']['observed'], proof['ownWorkload']['bothNodes']),
+                         ('standby', 'standby', True, True))
+        self.assertNotIn('busyShare', proof['ownWorkload'])
+        self.assertNotIn('candidate', proof['latestPeriod'])
+        partner = P.load(F.outputs(fixed[0], 'SYSHA2')['plan'])['members']['hanodeB']['roleEvidence']
+        self.assertEqual((partner['role']['effective'], partner['ownWorkload']['observed']), ('active', True))
+
+    def test_a_small_node_beside_a_large_one_is_judged_on_its_own_workload(self):
+        # 0.30 cores all day beside 3.0: a tenth of the pair's consumption, and sustained workload all the same.
+        def working(vm, t):
+            if vm == 'app1':
+                return 0.8
+            return 3.0 if ((t < H.SWITCH) == (vm == 'hanodeA')) else 0.30
+        saved = H.level
+        H.level = working
+        try:
+            root = self.run_cycle(FIXED % '0.10', ('SYSHA2', 'SYSHA1'))
+        finally:
+            H.level = saved
+        row = P.standby_row(root)
+        self.assertIn('Sustained workload observed: idle-standby allocation not applied.', row['NFIT - Action'])
+        self.assertIn('[STANDBY_FIXED_NOT_APPLIED]', row['VM_Comments'])
+        self.assertGreater(float(row['NFIT - ENT']), 0.25)                           # its own workload, not 0.10
+
+    def test_the_finding_does_not_need_the_partners_data(self):
+        # The partner's frame is not staged here: no role can be inferred, and the node's own finding is still made.
+        def working(vm, t):
+            return 0.8 if vm == 'app1' else 1.3
+        saved = H.level
+        H.level = working
+        try:
+            root = tempfile.mkdtemp(prefix='nfit-mgsys-')
+            self.addCleanup(shutil.rmtree, root, True)
+            _, last = H.build(root, True, FIXED % '0.10')
+        finally:
+            H.level = saved
+        shutil.rmtree(os.path.join(root, 'stage', 'SYSHA2'))
+        run = P.analyse(root, 'SYSHA1', last)
+        self.assertEqual(run.returncode, 0, run.stderr[-800:])
+        member = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']
+        proof = member['roleEvidence']
+        self.assertEqual((proof['role']['effective'], proof['reason']), ('unknown', 'no samples for hanodeB in this period'))
+        self.assertEqual((proof['ownWorkload']['observed'], proof['ownWorkload']['period'], proof['ownWorkload']['bothNodes']), (True, 'whole', False))
+        self.assertNotIn('standbyPolicy', member)                                     # no standby role: no standby allocation
+        self.assertNotIn('STANDBY_FIXED', P.standby_row(root)['VM_Comments'])
+
+    def test_a_configured_standby_keeps_the_customers_policy_and_the_mismatch_is_reported(self):
+        # ha_role = standby is the customer's statement: the fixed figure is applied where it can be set, and the
+        # sustained workload on the node is reported as a mismatch. The settings of the test are set for the node.
+        def working(vm, t):
+            if vm == 'app1':
+                return 0.8
+            return 0.30 if vm == 'hanodeA' else 3.0                                 # no handover: the roles hold throughout
+        saved = H.level
+        H.level = working
+        try:
+            root = self.run_cycle('[hanodeA]\nha_role = standby\nstandby_work_cores = 0.25\nstandby_work_hours = 3\nstandby_work_days = 5\n' + FIXED % '0.10',
+                                  ('SYSHA2', 'SYSHA1'))
+        finally:
+            H.level = saved
+        row = P.standby_row(root)
+        member = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']
+        policy = member['standbyPolicy']
+        self.assertEqual((policy['roleSource'], policy['applied'], policy.get('workloadMismatch')), ('configured', True, True))
+        self.assertEqual((policy['sustainedWorkload']['cores'], policy['sustainedWorkload']['hours'], policy['sustainedWorkload']['daysNeeded'],
+                          policy['sustainedWorkload']['source']), (0.25, 3, 5, {'cores': 'lpar', 'hours': 'lpar', 'days': 'lpar'}))
+        self.assertEqual(row['NFIT - ENT'], '0.10')
+        self.assertIn('[STANDBY_FIXED]', row['VM_Comments'])
+        self.assertIn('[STANDBY_WORKLOAD_MISMATCH]', row['VM_Comments'])
+        self.assertIn('This node is configured as the standby and sustained workload is observed on it (PhysC at 0.25 cores or more (15-minute medians) '
+                      'for 3 hours or longer without a break on ', row['NFIT - Action'])
+        self.assertIn('the fixed standby entitlement is applied as configured; check the role.', row['NFIT - Action'])
+
+    def test_a_configured_active_node_that_works_is_not_called_quiet(self):
+        # Both nodes configured active; the comparison still reads the smaller one as the lesser of the two. The note
+        # says what the evidence shows (it works) and does not call it a quiet node.
+        def working(vm, t):
+            if vm == 'app1':
+                return 0.8
+            return 3.0 if ((t < H.SWITCH) == (vm == 'hanodeA')) else 1.3
+        saved = H.level
+        H.level = working
+        try:
+            root = self.run_cycle('ha_role = active\n[hanodeA]\nha_role = active\n' + FIXED % '0.10', ('SYSHA2', 'SYSHA1'))
+        finally:
+            H.level = saved
+        member = P.load(F.outputs(root, 'SYSHA1')['plan'])['members']['hanodeA']
+        role = member['roleEvidence']['role']
+        self.assertEqual((role['configured'], role['inferred'], role['effective'], role['source']), ('active', 'standby', 'active', 'configured'))
+        self.assertTrue(role['note'].startswith('its partner leads in the comparison of the two nodes, and sustained workload is observed on this node '
+                                                '(PhysC at 0.20 cores or more (15-minute medians) for 2 hours or longer without a break on '), role['note'])
+        self.assertTrue(role['note'].endswith('consistent with both nodes active'), role['note'])
+        self.assertNotIn('quiet', role['note'])
+        self.assertNotIn('standbyPolicy', member)                                     # an active node is not a standby: no fixed figure
+        self.assertNotIn('[STANDBY_FIXED', P.standby_row(root)['VM_Comments'])
 
     def test_a_fixed_policy_without_an_entitlement_for_the_standby_stops_the_run(self):
         # The file check accepts another managed system's entitlement for an LPAR stanza; the standby's own frame has none.

@@ -19,7 +19,7 @@ close $fh;
 my $code = '';
 for my $name (qw(_resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text _policy_source_text
                  _ha_standby_policy _ha_sizing_plan _ha_fixed_standby_resolve _ha_fixed_standby_action _ha_fixed_not_applied_text
-    _ha_role_rules _ha_sustained_workload _ha_workload_text _ha_workload_veto_text))
+    _ha_role_rules _ha_sustained_workload _ha_day_text _ha_workload_text _ha_workload_veto_text))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
     $code .= "$1\n\n";
@@ -171,48 +171,92 @@ is(UUT::_ha_fixed_not_applied_text(0.10, 'mgsys', 'its own workload needs 3 VPs 
    'Fixed standby entitlement 0.10 (its managed system\'s default) not applied: its own workload needs 3 VPs and 0.10 carries at most 2 (0.05 processors per VP). '
    . 'The recommendation follows this node\'s workload.', 'not applied: said on the node\'s ordinary row, with the actual cause');
 
-# --- Sustained workload: positive evidence that a node is not an idle standby ----------
-# 15-minute blocks; a block counts at 80% coverage and a median of 1.00 cores or more; four in a row
-# are a sustained hour; the days on which one completes are counted; two days make the verdict.
-my $day = 96;
+# --- Sustained workload observed: each node on its own ---------------------------------
+# PhysC, 15-minute blocks (median of the minute values, 80% coverage), in the node's profile hours and
+# its current role period: 0.20 cores or more for two hours without a break, on two distinct days.
+my $day = 96;                                   # blocks in a day
 my $series = sub
 {
-    my ($n, %busy) = @_;          # block index => level; everything else quiet at 0.05
-    return [ map { { b_med => ($busy{$_} // 0.05), b_cov => 1, c_med => ($busy{$_} // 0.05) + 0.10, c_cov => 1 } } (0 .. $n - 1) ];
+    my ($n, $base, %busy) = @_;                 # block index => PhysC level; everything else at the base level
+    return [ map { my $c = $busy{$_} // $base; { c_med => $c, c_cov => 1, b_med => $c * 0.5, b_cov => 1 } } (0 .. $n - 1) ];
 };
-my $hour = sub { my ($start, $lvl) = @_; return map { ($start + $_ => $lvl) } (0 .. 3); };
-my $w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.00), $hour->(2 * $day + 40, 3.2)), 0, 0, 'PhysB');
-is_deeply([ @$w{qw(Basis Days Bearing)} ], ['PhysB', 2, 1], 'one busy core for a full hour on two days: sustained workload');
-$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.4)), 0, 0, 'PhysB');
-is_deeply([ @$w{qw(Days Bearing)} ], [1, 0], 'one day only: not enough');
-$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.4), $hour->(20, 1.4), $hour->(60, 1.4)), 0, 0, 'PhysB');
-is_deeply([ @$w{qw(Days Bearing)} ], [1, 0], 'several hours on the same day are one day');
-$w = UUT::_ha_sustained_workload($series->(5 * $day, (map { ($_ => 1.4) } 10 .. 12), (map { ($_ => 1.4) } $day + 10 .. $day + 12)), 0, 0, 'PhysB');
-is_deeply([ @$w{qw(Days Bearing)} ], [0, 0], 'three blocks are not a sustained hour');
-$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 0.95), $hour->($day + 10, 0.95)), 0, 0, 'PhysB');
-is($w->{Bearing}, 0, 'below one core: no verdict (use above entitlement is not the test)');
-my $gappy = $series->(5 * $day, $hour->(10, 1.4), $hour->($day + 10, 1.4));
-$gappy->[$day + 11]{b_cov} = 0.5;
-$w = UUT::_ha_sustained_workload($gappy, 0, 0, 'PhysB');
-is_deeply([ @$w{qw(Days Bearing)} ], [1, 0], 'a thinly sampled block ends a run: it is never taken as busy');
-# The node's current role period only: its time as the active node does not count against it.
-$w = UUT::_ha_sustained_workload($series->(5 * $day, (map { ($_ => 4.0) } 0 .. 2 * $day - 1)), 0, 2 * $day, 'PhysB');
-is_deeply([ @$w{qw(Days Bearing Since)} ], [0, 0, 2 * $day * 900], 'a node that was active and has been quiet since the handover: no sustained workload');
-$w = UUT::_ha_sustained_workload($series->(5 * $day, (map { ($_ => 4.0) } 0 .. 2 * $day - 1), $hour->(3 * $day, 1.2), $hour->(4 * $day, 1.2)), 0, 2 * $day, 'PhysB');
-is($w->{Bearing}, 1, 'and one that kept working after it: sustained workload');
-# Without PhysB the consumed cores are read, and the weaker basis is stated.
-$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 0.95), $hour->($day + 10, 0.95)), 0, 0, 'PhysC');
-is_deeply([ @$w{qw(Basis Bearing)} ], ['PhysC', 1], 'PhysC (0.95 busy shown as 1.05 consumed here): the verdict rests on consumed cores');
-is(UUT::_ha_workload_text($w), 'at least 1.00 cores consumed for a full hour on 2 days of its current role period (PhysC: busy time is not collected for both nodes, a weaker basis)',
-   'and says so');
-my $none = UUT::_ha_sustained_workload([ map { { c_med => undef, c_cov => 0, b_med => undef, b_cov => 0 } } 1 .. 200 ], 0, 0, 'PhysB');
-is_deeply([ @$none{qw(Days Bearing)} ], [0, 0], 'no samples: no verdict either way (never a finding of idleness)');
-$w = UUT::_ha_sustained_workload($series->(5 * $day, $hour->(10, 1.00), $hour->(2 * $day + 40, 3.2)), 0, 0, 'PhysB');
+my $run = sub { my ($start, $blocks, $lvl) = @_; return map { ($start + $_ => $lvl) } (0 .. $blocks - 1); };
+my $w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(40, 8, 0.20), $run->(2 * $day + 40, 8, 0.45)), 0, 0, undef, undef);
+is_deeply([ @$w{qw(Metric Cores Seconds DaysNeeded Days Assessed Observed)} ], ['PhysC', 0.20, 7200, 2, 2, 1, 1],
+          '0.20 cores for two hours on two days: sustained workload observed');
+is($w->{LongestSeconds}, 7200, 'the duration is elapsed time: eight 15-minute blocks are two hours');
+# Each node on its own: a small node beside a large one is judged by what it does, not by its share.
+my $small = UUT::_ha_sustained_workload($series->(5 * $day, 0.30), 0, 0, undef, undef);
+my $large = UUT::_ha_sustained_workload($series->(5 * $day, 3.00), 0, 0, undef, undef);
+is_deeply([ $small->{Observed}, $large->{Observed}, $small->{Days} ], [1, 1, 5], 'unequal nodes that both work: observed on each (0.30 beside 3.00)');
+# A quiet standby: housekeeping at 0.05, a monitoring spike every hour, and a daily job of an hour and three quarters.
+my %spikes = map { ($_ * 4 => 0.30) } (0 .. 5 * 24 - 1);
+my %jobs = map { $run->($_ * $day + 20, 7, 0.40) } (0 .. 4);
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, %spikes, %jobs), 0, 0, undef, undef);
+is_deeply([ @$w{qw(Days Observed Assessed)} ], [0, 0, 1], 'a quiet standby with hourly monitoring spikes and a daily job under two hours: not observed');
+is($w->{LongestSeconds}, 6300, 'its longest run is reported (an hour and three quarters)');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(40, 8, 0.25)), 0, 0, undef, undef);
+is_deeply([ @$w{qw(Days Observed)} ], [1, 0], 'one day only: not observed');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(10, 8, 0.25), $run->(30, 8, 0.25), $run->(60, 8, 0.25)), 0, 0, undef, undef);
+is_deeply([ @$w{qw(Days Observed)} ], [1, 0], 'several runs on the same day are one day');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(40, 8, 0.19), $run->($day + 40, 8, 0.19)), 0, 0, undef, undef);
+is($w->{Observed}, 0, 'just below the level: not observed');
+# Nothing is bridged: a thinly sampled block ends the run.
+my $gappy = $series->(5 * $day, 0.05, $run->(40, 8, 0.30), $run->($day + 40, 8, 0.30));
+$gappy->[$day + 43]{c_cov} = 0.5;
+$w = UUT::_ha_sustained_workload($gappy, 0, 0, undef, undef);
+is_deeply([ @$w{qw(Days Observed)} ], [1, 0], 'a block with too few samples ends a run: missing data is not made into activity');
+# Profile hours. The same two hours count in general (all hours) and in online hours (08:00 to 17:00);
+# hours outside the profile are not read, and a run is not carried across them.
+my $online = sub { my ($t) = @_; my $m = int(($t % 86400) / 60); return ($m >= 480 && $m < 1020) ? 1 : 0; };
+my $midday = $series->(5 * $day, 0.05, $run->(40, 8, 0.30), $run->($day + 40, 8, 0.30));            # 10:00 to 12:00
+is_deeply([ UUT::_ha_sustained_workload($midday, 0, 0, undef, undef)->{Observed}, UUT::_ha_sustained_workload($midday, 0, 0, $online, undef)->{Observed} ],
+          [1, 1], 'two hours at midday count under general and under online hours alike');
+my $night = $series->(5 * $day, 0.05, $run->(8, 8, 0.30), $run->($day + 8, 8, 0.30));                # 02:00 to 04:00
+is_deeply([ UUT::_ha_sustained_workload($night, 0, 0, undef, undef)->{Observed}, UUT::_ha_sustained_workload($night, 0, 0, $online, undef)->{Observed} ],
+          [1, 0], 'two hours at night count in general hours and are outside online hours');
+my $evening = $series->(5 * $day, 0.05, $run->(64, 8, 0.30), $run->($day + 64, 8, 0.30));            # 16:00 to 18:00
+$w = UUT::_ha_sustained_workload($evening, 0, 0, $online, undef);
+is_deeply([ $w->{Observed}, $w->{LongestSeconds} ], [0, 3600], 'a run that leaves the online hours counts only as far as they go (one hour of two)');
+my $quiet_g = UUT::_ha_sustained_workload($midday, 0, 0, undef, undef);
+my $quiet_o = UUT::_ha_sustained_workload($midday, 0, 0, $online, undef);
+cmp_ok($quiet_g->{Blocks}, '>', $quiet_o->{Blocks}, 'general hours read more blocks than online hours');
+is($quiet_g->{Days}, $quiet_o->{Days}, 'and the extra quiet hours do not dilute the finding: the same two days');
+# The current role period only: a node that was active and has been quiet since the handover.
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(0, 2 * $day, 4.0)), 0, 2 * $day, undef, undef);
+is_deeply([ @$w{qw(Days Observed Since)} ], [0, 0, 2 * $day * 900], 'a failover followed by a quiet standby: its time as the active node does not count');
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(0, 2 * $day, 4.0), $run->(3 * $day, 8, 0.6), $run->(4 * $day, 8, 0.6)), 0, 2 * $day, undef, undef);
+is($w->{Observed}, 1, 'and one that kept working after the handover: observed');
+# Missing or coarse evidence: not assessed, which is not a finding either way.
+my $coarse = [ map { { c_med => 2.0, c_cov => 0.2, b_med => 1.0, b_cov => 0.2 } } 1 .. 3 * $day ];    # a sample every five minutes
+$w = UUT::_ha_sustained_workload($coarse, 0, 0, undef, undef);
+is_deeply([ @$w{qw(Assessed Observed Blocks)} ], [0, 0, 0], 'coarse sampling: no block reaches the coverage, the node is not assessed');
+like(UUT::_ha_workload_text({ %$w, Hours => 'none' }), qr/^not assessed: no 15-minute block of all hours since 01 Jan 1970 holds enough samples/, 'and the text says so');
+$w = UUT::_ha_sustained_workload([], 0, 0, undef, undef);
+is_deeply([ @$w{qw(Assessed Observed)} ], [0, 0], 'no samples: not assessed');
+# PhysB is put through the same test and reported beside it; PhysC decides.
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(40, 8, 0.30), $run->($day + 40, 8, 0.30)), 0, 0, undef, undef);
+is_deeply([ $w->{Observed}, $w->{PhysB}{Days}, $w->{PhysB}{Observed} ], [1, 0, 0], 'PhysC 0.30 with PhysB 0.15: observed on PhysC; the PhysB result is shown apart');
+my $no_b = [ map { { c_med => 0.30, c_cov => 1, b_med => undef, b_cov => 0 } } 1 .. 3 * $day ];
+$w = UUT::_ha_sustained_workload($no_b, 0, 0, undef, undef);
+is_deeply([ $w->{Observed}, $w->{PhysB} ], [1, undef], 'without PhysB the finding stands on PhysC, and PhysB is stated as not collected');
+# The settings are policy values and can be set.
+$w = UUT::_ha_sustained_workload($series->(6 * $day, 0.05, map { $run->($_ * $day + 40, 4, 0.60) } (0 .. 3)), 0, 0, undef, { Cores => 0.50, Seconds => 3600, Days => 4 });
+is_deeply([ @$w{qw(Cores Seconds DaysNeeded Days Observed)} ], [0.50, 3600, 4, 4, 1], 'other settings: 0.50 cores for one hour on four days');
+$w = UUT::_ha_sustained_workload($series->(6 * $day, 0.05, map { $run->($_ * $day + 40, 4, 0.60) } (0 .. 2)), 0, 0, undef, { Cores => 0.50, Seconds => 3600, Days => 4 });
+is($w->{Observed}, 0, 'and three days are then not enough');
+# Wording.
+$w = UUT::_ha_sustained_workload($series->(5 * $day, 0.05, $run->(40, 8, 0.20), $run->(2 * $day + 40, 12, 0.45)), 0, 0, undef, undef);
+@$w{qw(Hours Period)} = ('online', 'role');
+my $said = UUT::_ha_workload_text($w);
+is($said, 'PhysC at 0.20 cores or more (15-minute medians) for 2 hours or longer without a break on 2 days; 2 needed; longest run 3 hours; '
+   . 'its profile hours (online), its current role period from 01 Jan 1970; PhysB by the same test: 1 day', 'the evidence names metric, level, duration, days, hours and period');
 is(UUT::_ha_workload_veto_text(0.10, 'mgsys', $w, 1),
-   'Substantial ongoing workload conflicts with an idle-standby assumption (at least 1.00 busy cores for a full hour on 2 days of its current role period (PhysB)). '
-   . 'Fixed standby allocation 0.10 (its managed system\'s default) not applied; recommendation follows this node\'s workload. '
-   . 'Both nodes of this cluster carry sustained workload; which node owns the resource groups is not verified.',
-   'the row of an inferred standby that carries work, both nodes working: no claim about resource-group ownership');
-unlike(UUT::_ha_workload_veto_text(0.10, 'mgsys', $w, 0), qr/Both nodes/, 'one node only: no statement about the pair');
+   'Sustained workload observed: idle-standby allocation not applied. Recommendation follows this node\'s workload. '
+   . 'Not applied: fixed standby entitlement 0.10 (its managed system\'s default). Evidence: ' . $said . '. '
+   . 'Sustained workload is observed on both nodes of this cluster in this period: neither is sized as an idle standby. '
+   . 'Which node owns the resource groups is not verified.',
+   'the row of an inferred standby with sustained workload: sizing eligibility, no claim about resource-group ownership');
+unlike(UUT::_ha_workload_veto_text(0.10, 'mgsys', $w, 0), qr/both nodes/, 'one node only: no statement about the pair');
 
 done_testing();

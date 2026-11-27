@@ -2471,14 +2471,16 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     keeps its ordinary recommendation: [STANDBY_FIXED_NOT_APPLIED]. nFit does\n";
         print {$LOG_FH} "                     not arrange or verify takeover capacity.\n";
         print {$LOG_FH} "\n";
-        print {$LOG_FH} "  Sustained workload A node that ran at one busy core or more for a full hour on at least two days\n";
-        print {$LOG_FH} "  (PowerHA node)     of its current role period (15-minute medians; PhysB, or PhysC consumed where\n";
-        print {$LOG_FH} "                     PhysB is not collected for both nodes, a weaker basis). A node the role\n";
-        print {$LOG_FH} "                     evidence reads as standby that does so is not sized as an idle standby:\n";
-        print {$LOG_FH} "                     the fixed standby entitlement is not applied to it. For a node configured\n";
+        print {$LOG_FH} "  Sustained workload Observed on a PowerHA node when its PhysC stays at 0.20 cores or more for\n";
+        print {$LOG_FH} "  observed           two hours or longer without a break, on at least two days: 15-minute medians,\n";
+        print {$LOG_FH} "                     in the node's planning-profile hours, in its current role period. Each node\n";
+        print {$LOG_FH} "                     is judged on its own, not against its partner. A node whose standby role is\n";
+        print {$LOG_FH} "                     inferred is then not given an idle-standby allocation (the fixed standby\n";
+        print {$LOG_FH} "                     entitlement) and keeps its ordinary recommendation. For a node configured\n";
         print {$LOG_FH} "                     as standby the setting is applied and the mismatch reported:\n";
-        print {$LOG_FH} "                     [STANDBY_WORKLOAD_MISMATCH]. Provisional; its absence does not show that\n";
-        print {$LOG_FH} "                     a node is idle.\n";
+        print {$LOG_FH} "                     [STANDBY_WORKLOAD_MISMATCH]. This is about sizing, not a verified HA role.\n";
+        print {$LOG_FH} "                     The values are provisional settings (standby_work_cores, standby_work_hours,\n";
+        print {$LOG_FH} "                     standby_work_days), not platform limits. Not observed does not mean idle.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
@@ -13694,9 +13696,11 @@ sub _ha_role_rules
         minLeadBlocks    => 4,       # ... the rising node leads during (shares of separated blocks)
         relativeDrop     => 0.50,    # the falling node drops to at most half its usual level
         minSegmentBlocks => 96,      # supported blocks in profile hours for a segment verdict
-        workCores        => 1.00,    # sustained workload: at least one busy core ...
-        workBlocks       => 4,       # ... in each of four consecutive blocks (one hour) ...
-        workDays         => 2,       # ... on at least two days of the node's current role period (provisional)
+        # Sustained workload of one node (provisional policy values, not platform limits; each can be
+        # set in nfit.vms.cfg: standby_work_cores, standby_work_hours, standby_work_days).
+        workCores        => 0.20,    # PhysC, median of a block's minute values, at or above this ...
+        workSeconds      => 7200,    # ... without a break for at least two hours of elapsed time ...
+        workDays         => 2,       # ... on at least two distinct days
     };
 }
 
@@ -14074,49 +14078,123 @@ sub _ha_detect_pair
 }
 
 # ==============================================================================
+# SUBROUTINE: _ha_workload_policy
+# PURPOSE:    The sustained-workload settings of one node: the built-in
+#             provisional values, or standby_work_cores, standby_work_hours and
+#             standby_work_days of nfit.vms.cfg (LPAR, managed system, [GLOBAL]).
+# ARGUMENTS:  1. LPAR  2. its managed system (may be undef)
+# RETURNS:    hashref { Cores, Seconds, Days, Source { cores, hours, days } }
+# ==============================================================================
+sub _ha_workload_policy
+{
+    my ($vm, $frame) = @_;
+    my $rules = _ha_role_rules();
+    my %p = (Cores => $rules->{workCores}, Seconds => $rules->{workSeconds}, Days => $rules->{workDays},
+             Source => { cores => 'built-in', hours => 'built-in', days => 'built-in' });
+    my ($cores, $cores_from) = _policy_setting($vm, $frame, 'standby_work_cores');
+    my ($hours, $hours_from) = _policy_setting($vm, $frame, 'standby_work_hours');
+    my ($days, $days_from)   = _policy_setting($vm, $frame, 'standby_work_days');
+    if (defined $cores)
+    {
+        ($p{Cores}, $p{Source}{cores}) = ($cores, $cores_from);
+    }
+    if (defined $hours)
+    {
+        ($p{Seconds}, $p{Source}{hours}) = ($hours * 3600, $hours_from);
+    }
+    if (defined $days)
+    {
+        ($p{Days}, $p{Source}{days}) = ($days, $days_from);
+    }
+    return \%p;
+}
+
+# ==============================================================================
 # SUBROUTINE: _ha_sustained_workload
-# PURPOSE:    Positive evidence that a node carries substantial ongoing work
-#             (v10 B13): a full hour at one busy physical core or more, on at
-#             least two days. Measured on the detector's 15-minute blocks, all
-#             hours: a block counts when at least 80% of its minutes hold a
-#             sample and the median of its minute values is 1.00 cores or
-#             more; four consecutive such blocks are a sustained hour; the
-#             days (UTC) on which a sustained hour completes are counted. The
-#             metric is the detector's: PhysB (busy time), or PhysC (consumed)
-#             where PhysB is not collected for both nodes, a weaker basis.
-#             A missing or thin block ends a run: it is never taken as busy,
-#             and never as idle. The settings are provisional. The verdict
-#             only ever withholds an automatic standby allocation; its absence
-#             does not show that a node is inactive. Pure.
+# PURPOSE:    Whether sustained workload is observed on one node (v10 B13). The
+#             node is judged on its own: its partner's level, and its share of
+#             the pair's consumption, play no part, so the finding stands when
+#             the partner's data is not available.
+#             What is tested: PhysC (processors consumed). The node's minute
+#             samples are grouped in 15-minute blocks; a block is supported
+#             when at least 80% of its minutes hold a sample and it starts in
+#             the node's planning-profile hours; its value is the median of
+#             its minute values. A run is a sequence of consecutive supported
+#             blocks at or above the level; its duration is elapsed time (the
+#             number of blocks times 15 minutes), not a count of samples. A
+#             block that is missing, thinly sampled, outside the profile hours
+#             or below the level ends the run: nothing is bridged. Sustained
+#             workload is observed when a run reaches the required duration on
+#             at least the required number of distinct days (UTC; the day on
+#             which the run reaches the duration). Only the node's current
+#             role period is read, so an earlier time as the active node does
+#             not count. The same duration applies to every profile: an hour
+#             of work counts the same in general and in online hours, and
+#             quiet hours do not dilute it.
+#             PhysB (busy time) is put through the same test and reported
+#             beside it; it decides nothing.
+#             At a sampling interval coarser than a minute no block reaches
+#             the coverage: the node is then not assessed. Not observed, and
+#             not assessed, are never a finding that the node is idle. Pure.
 # ARGUMENTS:  1. blocks of the node (from _ha_blocks)  2. window start (epoch)
-#             3. first block to read (the start of the node's current role
-#                period)  4. metric (PhysB | PhysC)
-# RETURNS:    hashref { Basis, Cores, Days, Since (epoch), Bearing (1/0) }
+#             3. first block of the current role period
+#             4. code ref (block start epoch) -> 1 in the node's profile hours
+#                (undef: all hours)
+#             5. settings { Cores, Seconds, Days } (undef: the built-in values)
+# RETURNS:    hashref { Metric 'PhysC', Cores, Seconds, DaysNeeded, Blocks
+#             (supported, in the profile hours), Days, LongestSeconds, Since
+#             (epoch), Assessed (1/0), Observed (1/0), PhysB { Blocks, Days,
+#             LongestSeconds, Observed } or undef where PhysB is not collected }
 # ==============================================================================
 sub _ha_sustained_workload
 {
-    my ($blocks, $from, $first, $metric) = @_;
+    my ($blocks, $from, $first, $admit, $policy) = @_;
     my $rules = _ha_role_rules();
-    my ($med, $cov) = (($metric // '') eq 'PhysB') ? qw(b_med b_cov) : qw(c_med c_cov);
+    my $step = $rules->{blockSeconds};
+    $policy = { Cores => $rules->{workCores}, Seconds => $rules->{workSeconds}, Days => $rules->{workDays} } unless (ref($policy) eq 'HASH');
     $first = 0 unless (defined $first && $first > 0);
-    my (%days, $run);
-    $run = 0;
-    foreach my $k ($first .. $#{ $blocks // [] })
+    my $need = int($policy->{Seconds} / $step);
+    $need++ if ($need * $step < $policy->{Seconds});
+    $need = 1 if ($need < 1);
+    my $scan = sub
     {
-        my $blk = $blocks->[$k];
-        if (defined $blk && ($blk->{$cov} // 0) >= $rules->{minCoverage} && defined $blk->{$med} && $blk->{$med} >= $rules->{workCores} - $FLOAT_EPSILON)
+        my ($med, $cov) = @_;
+        my %days;
+        my ($run, $longest, $supported) = (0, 0, 0);
+        foreach my $k ($first .. $#{ $blocks // [] })
         {
-            $run++;
-            $days{ int(($from + $k * $rules->{blockSeconds}) / 86400) } = 1 if ($run >= $rules->{workBlocks});
+            my $blk = $blocks->[$k];
+            my $t = $from + $k * $step;
+            my $ok = ((!defined $admit || $admit->($t)) && defined $blk && ($blk->{$cov} // 0) >= $rules->{minCoverage} && defined $blk->{$med}) ? 1 : 0;
+            $supported++ if ($ok);
+            if ($ok && $blk->{$med} >= $policy->{Cores} - $FLOAT_EPSILON)
+            {
+                $run++;
+                $longest = $run if ($run > $longest);
+                $days{ int($t / 86400) } = 1 if ($run >= $need);
+            }
+            else
+            {
+                $run = 0;
+            }
         }
-        else
-        {
-            $run = 0;
-        }
-    }
-    my $n = scalar(keys %days);
-    return { Basis => ((($metric // '') eq 'PhysB') ? 'PhysB' : 'PhysC'), Cores => $rules->{workCores}, Days => $n,
-             Since => $from + $first * $rules->{blockSeconds}, Bearing => ($n >= $rules->{workDays} ? 1 : 0) };
+        my $n = scalar(keys %days);
+        return { Blocks => $supported, Days => $n, LongestSeconds => $longest * $step,
+                 Observed => (($supported > 0 && $n >= $policy->{Days}) ? 1 : 0) };
+    };
+    my ($c, $b) = ($scan->('c_med', 'c_cov'), $scan->('b_med', 'b_cov'));
+    return { Metric => 'PhysC', Cores => $policy->{Cores}, Seconds => $policy->{Seconds}, DaysNeeded => $policy->{Days},
+             Blocks => $c->{Blocks}, Days => $c->{Days}, LongestSeconds => $c->{LongestSeconds}, Since => $from + $first * $step,
+             Assessed => ($c->{Blocks} > 0 ? 1 : 0), Observed => $c->{Observed}, PhysB => ($b->{Blocks} > 0 ? $b : undef) };
+}
+
+# A day as the planner reads it (UTC).
+sub _ha_day_text
+{
+    my ($epoch) = @_;
+    return '?' unless (defined $epoch && looks_like_number($epoch));
+    my @t = gmtime($epoch);
+    return sprintf('%02d %s %d', $t[3], (qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec))[ $t[4] ], $t[5] + 1900);
 }
 
 # The sustained-workload evidence of a node, as the planner reads it. Pure.
@@ -14124,9 +14202,32 @@ sub _ha_workload_text
 {
     my ($w) = @_;
     return '' unless (ref($w) eq 'HASH');
-    return sprintf('at least %.2f %s for a full hour on %d day%s of its current role period (%s)', $w->{Cores},
-        ($w->{Basis} eq 'PhysB' ? 'busy cores' : 'cores consumed'), $w->{Days}, ($w->{Days} == 1 ? '' : 's'),
-        ($w->{Basis} eq 'PhysB' ? 'PhysB' : 'PhysC: busy time is not collected for both nodes, a weaker basis'));
+    my $hours = sub { my ($s) = @_; my $h = $s / 3600; return sprintf('%s hour%s', (($h == int($h)) ? int($h) : sprintf('%.2f', $h)), ($h == 1 ? '' : 's')); };
+    my $where = (!defined $w->{Hours} || $w->{Hours} eq 'none') ? 'all hours' : "its profile hours ($w->{Hours})";
+    my $period = (($w->{Period} // 'role') eq 'whole') ? 'the evidence period' : 'its current role period';
+    return sprintf('not assessed: no 15-minute block of %s since %s holds enough samples (a sampling interval coarser than a minute, or no data)',
+                   $where, _ha_day_text($w->{Since})) unless ($w->{Assessed});
+    my $physb = (ref($w->{PhysB}) eq 'HASH')
+        ? sprintf('PhysB by the same test: %d day%s', $w->{PhysB}{Days}, ($w->{PhysB}{Days} == 1 ? '' : 's'))
+        : 'PhysB not collected';
+    return sprintf('PhysC at %.2f cores or more (15-minute medians) for %s or longer without a break on %d day%s; %d needed; longest run %s; '
+        . '%s, %s from %s; %s', $w->{Cores}, $hours->($w->{Seconds}), $w->{Days}, ($w->{Days} == 1 ? '' : 's'), $w->{DaysNeeded},
+        $hours->($w->{LongestSeconds}), $where, $period, _ha_day_text($w->{Since}), $physb);
+}
+
+# The same evidence for a saved plan.
+sub _ha_workload_record
+{
+    my ($w, $both) = @_;
+    return undef unless (ref($w) eq 'HASH');
+    return { metric => $w->{Metric}, statistic => 'median of the minute values of a 15-minute block', cores => $w->{Cores} + 0,
+             hours => $w->{Seconds} / 3600, daysNeeded => $w->{DaysNeeded} + 0, days => $w->{Days} + 0,
+             longestRunHours => $w->{LongestSeconds} / 3600, blocks => $w->{Blocks} + 0, since => $w->{Since},
+             profileHours => $w->{Hours}, period => $w->{Period}, source => $w->{Source},
+             assessed => ($w->{Assessed} ? JSON::true : JSON::false), observed => ($w->{Observed} ? JSON::true : JSON::false),
+             physB => (ref($w->{PhysB}) eq 'HASH' ? { days => $w->{PhysB}{Days} + 0, longestRunHours => $w->{PhysB}{LongestSeconds} / 3600,
+                                                       blocks => $w->{PhysB}{Blocks} + 0, observed => ($w->{PhysB}{Observed} ? JSON::true : JSON::false) } : undef),
+             (defined $both ? (bothNodes => ($both ? JSON::true : JSON::false)) : ()) };
 }
 
 # ==============================================================================
@@ -14347,6 +14448,7 @@ sub _ha_role_evidence
     my @result;
     foreach my $members (@clusters)
     {
+        my %blocks_of;
         my %c = (Members => [ @$members ], Here => [ grep { $here{$_} } @$members ], Window => [ $from, $to ],
                  Caches => { map { my $vm = $_; map { (basename($_) => $revision{ basename($_) }) } @{ $dirs_of{$vm} // [] } } @$members },
                  Reason => '');
@@ -14391,18 +14493,43 @@ sub _ha_role_evidence
             $c{Detection} = _ha_detect_pair($node_a, $node_b, @blocks, $from, \%windows);
             $c{Blocks} = \@blocks;                    # for the calibration detail only
             $c{Metric} = $c{Detection}{Metric};
-            # Sustained workload of each node in its current role period: from the latest sustained
-            # handover, so that a node's time as the active one does not count against it as a standby.
-            my $latest = (ref($c{Detection}{Segments}) eq 'ARRAY' && @{ $c{Detection}{Segments} }) ? $c{Detection}{Segments}[-1] : undef;
-            my $first = defined $latest ? int(($latest->{From} - $from) / $rules->{blockSeconds}) : 0;
-            $c{Workload} = { $node_a => _ha_sustained_workload($blocks[0], $from, $first, $c{Metric}),
-                             $node_b => _ha_sustained_workload($blocks[1], $from, $first, $c{Metric}) };
+            @blocks_of{ $node_a, $node_b } = @blocks;
+        }
+        # Sustained workload of each node, judged on the node alone and so also where its partner has no
+        # data here. Read from the latest sustained handover where one is known, so that a node's time as
+        # the active one does not count against it as a standby; otherwise over the whole evidence period.
+        my $latest = (ref($c{Detection}) eq 'HASH' && ref($c{Detection}{Segments}) eq 'ARRAY' && @{ $c{Detection}{Segments} })
+            ? $c{Detection}{Segments}[-1] : undef;
+        my $first = defined $latest ? int(($latest->{From} - $from) / $rules->{blockSeconds}) : 0;
+        foreach my $vm (@$members)
+        {
+            next unless ($minutes{$vm});
+            $blocks_of{$vm} //= _ha_blocks($minutes{$vm}, $from, $to, $states_of{$vm});
+            my $key = $window_of->($vm);
+            my $policy = _ha_workload_policy($vm, $c{FrameOf}{$vm});
+            my $work = _ha_sustained_workload($blocks_of{$vm}, $from, $first, sub
+            {
+                my ($t) = @_;
+                return _exposure_population_admits($key, (int($t / 86400) + 4) % 7, int(($t % 86400) / 60));
+            }, $policy);
+            @$work{qw(Hours Period Source)} = ($key, (($first > 0) ? 'role' : 'whole'), $policy->{Source});
+            $c{Workload}{$vm} = $work;
         }
         $c{Roles} = _ha_resolve_roles($members, $c{Detection}, $c{Reason}, \&_vms_config_settings, sub
         {
             my ($vm) = @_;
             return (exists $vm_config_data{$vm} && ref($vm_config_data{$vm}) eq 'HASH') ? $vm_config_data{$vm}{systemtype} : undef;
         });
+        # A node configured active that the comparison reads as the lesser of the two is not thereby
+        # quiet: where it carries sustained workload, the note says what the evidence does show.
+        foreach my $name (@$members)
+        {
+            my $r = $c{Roles}{$name};
+            next unless (ref($r) eq 'HASH' && $r->{Configured} eq 'active' && $r->{Inferred} eq 'standby'
+                         && ref($c{Workload}) eq 'HASH' && ref($c{Workload}{$name}) eq 'HASH' && $c{Workload}{$name}{Observed});
+            $r->{Note} = sprintf('its partner leads in the comparison of the two nodes, and sustained workload is observed on this node (%s): '
+                . 'consistent with both nodes active', _ha_workload_text($c{Workload}{$name}));
+        }
         push @result, \%c;
     }
     return \@result;
@@ -14658,13 +14785,15 @@ sub _ha_fixed_standby_action
             _current_cycle_action_text($resolved->{Pair}, $a->{currentEnt}, $a->{currentVP}, $a->{poolId}), $takeover);
 }
 
-# What is added to the ordinary action of an inferred standby that carries substantial ongoing work. Pure.
+# What is added to the ordinary action of a node whose standby role is inferred and on which sustained
+# workload is observed. Eligibility for an idle-standby allocation, not a statement of its HA role. Pure.
 sub _ha_workload_veto_text
 {
     my ($fixed, $source, $work, $both) = @_;
-    return sprintf('Substantial ongoing workload conflicts with an idle-standby assumption (%s). Fixed standby allocation %.2f (%s) not applied; '
-        . 'recommendation follows this node\'s workload.%s', _ha_workload_text($work), $fixed, _policy_source_text($source),
-        ($both ? ' Both nodes of this cluster carry sustained workload; which node owns the resource groups is not verified.' : ''));
+    return sprintf('Sustained workload observed: idle-standby allocation not applied. Recommendation follows this node\'s workload. '
+        . 'Not applied: fixed standby entitlement %.2f (%s). Evidence: %s.%s', $fixed, _policy_source_text($source), _ha_workload_text($work),
+        ($both ? ' Sustained workload is observed on both nodes of this cluster in this period: neither is sized as an idle standby. '
+                 . 'Which node owns the resource groups is not verified.' : ''));
 }
 
 # What is added to a node's ordinary action where its fixed standby entitlement is not applied. Pure.
@@ -15052,23 +15181,23 @@ sub _apply_ha_sizing
                 my $known = sub { my ($v) = @_; return (defined $v && $v ne '' && $v ne 'N/A') ? $v : undef; };
                 # Figures are written as numbers, whatever form the VP path kept them in.
                 my $count = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? $v + 0 : undef; };
-                # A node that carries substantial ongoing work is not an idle standby, whatever the
-                # detector's relative reading of the pair says. For an inferred role that withholds the
-                # fixed allocation; a configured role is the customer's policy and is applied, with the
-                # mismatch reported.
+                # Eligibility, apart from the HA role: a node on which sustained workload is observed is not
+                # given an idle-standby allocation, whatever the comparison of the two nodes says. For an
+                # inferred role that withholds the fixed allocation; a configured role is the customer's
+                # policy and is applied, with the mismatch reported.
                 my $work = _safe_dig($cluster, 'Workload', $vm);
-                my $bearing = (ref($work) eq 'HASH' && $work->{Bearing}) ? 1 : 0;
-                my $both = ($bearing && _safe_dig($cluster, 'Workload', $primary, 'Bearing')) ? 1 : 0;
+                my $bearing = (ref($work) eq 'HASH' && $work->{Observed}) ? 1 : 0;
+                my $both = ($bearing && _safe_dig($cluster, 'Workload', $primary, 'Observed')) ? 1 : 0;
                 my $configured = (($cluster->{Roles}{$vm}{Source} // '') eq 'configured') ? 1 : 0;
                 my $resolved = ($bearing && !$configured)
                     ? { Applied => 0, Kind => 'workload', Carries => int($policy->{Fixed} / $MIN_ENT_PER_VP + 1e-6),
-                        Cause => 'substantial ongoing workload conflicts with an idle-standby assumption: ' . _ha_workload_text($work) }
+                        Cause => 'sustained workload observed: ' . _ha_workload_text($work) }
                     : _ha_fixed_standby_resolve({ fixed => $policy->{Fixed}, own_vp => $own_vp, step_vp => $step,
                         safety_state => $known->($di->{'rVCPU_ReductionSafetyState'}), safety_reasons => $known->($di->{'rVCPU_ReductionSafetyReasons'}),
                         current_ent => $current_ent, current_vp => $current_vp, pool_size => $pool_size });
                 my $mismatch = ($bearing && $configured && $resolved->{Applied})
-                    ? sprintf('This node is configured as the standby and carries sustained workload (%s): the fixed standby entitlement is applied as configured; check the role.',
-                              _ha_workload_text($work))
+                    ? sprintf('This node is configured as the standby and sustained workload is observed on it (%s): the fixed standby entitlement is applied '
+                              . 'as configured; check the role.', _ha_workload_text($work))
                     : '';
                 # What the decision rested on, kept with the plan: the width evidence, the VP path of
                 # ordinary sizing, the safety verdict, and what the fixed figure can carry.
@@ -15078,8 +15207,7 @@ sub _apply_ha_sizing
                     ownRequirement => { entitlement => $count->($own_ent), VPs => $count->($own_vp) },
                     processorModeKnown => (defined $shared ? JSON::true : JSON::false),
                     roleSource => $cluster->{Roles}{$vm}{Source},
-                    (ref($work) eq 'HASH' ? (sustainedWorkload => { basis => $work->{Basis}, cores => $work->{Cores}, days => $work->{Days},
-                        since => $work->{Since}, found => ($bearing ? JSON::true : JSON::false), bothNodes => ($both ? JSON::true : JSON::false) }) : ()),
+                    (ref($work) eq 'HASH' ? (sustainedWorkload => _ha_workload_record($work, $both)) : ()),
                     ($mismatch ne '' ? (workloadMismatch => JSON::true) : ()),
                     trace => {
                         carriesVPs => $resolved->{Carries}, widthVPs => $resolved->{Width},
@@ -15418,6 +15546,18 @@ sub _log_powerha_roles
                                      @{ (ref($detection) eq 'HASH') ? $detection->{Transitions} : [] } ],
                     role => { configured => $r->{Configured}, hint => $r->{Hint}, inferred => $r->{Inferred},
                               effective => $r->{Effective}, source => $r->{Source}, note => $r->{Note} },
+                    # What is known of every node: whether sustained workload is observed on it (judged on
+                    # the node alone), and the comparison of the two nodes the role reading rests on.
+                    (ref($cluster->{Workload}) eq 'HASH' && ref($cluster->{Workload}{$name}) eq 'HASH' ? (ownWorkload =>
+                        _ha_workload_record($cluster->{Workload}{$name},
+                            ((grep { !_safe_dig($cluster, 'Workload', $_, 'Observed') } @members) ? 0 : 1))) : ()),
+                    (ref($detection) eq 'HASH' && ref($detection->{Segments}) eq 'ARRAY' && @{ $detection->{Segments} } ? (latestPeriod => {
+                        outcome => $detection->{Segments}[-1]{Outcome}, active => $detection->{Segments}[-1]{Active},
+                        reason => $detection->{Segments}[-1]{Reason}, nodes => [ @members[0, 1] ],
+                        windows => { map { my $w = $detection->{Segments}[-1]{Windows}{$_};
+                                           ($_ => { outcome => $w->{Outcome}, blocks => $w->{Blocks}, separated => $w->{Separated},
+                                                    leadFirst => $w->{LeadA}, leadSecond => $w->{LeadB} }) }
+                                     keys %{ $detection->{Segments}[-1]{Windows} // {} } } }) : ()),
                     sizing => { policy => $policy->{Sizing}, share => $policy->{Share},
                                 treatment => ($entry ? $entry->{Treatment} : 'none'),
                                 node => $policy->{Node}, managedSystem => $policy->{Frame}, source => $policy->{Source} },
@@ -32206,8 +32346,9 @@ sub parse_vms_config
     $config{exists} = 1;
 
     my %vm_keys     = map { $_ => 1 } qw(tier ha_peer ha_role ha_sizing standby_share standby_entitlement lpar_type vios_peer
-                                         vios_sizing vios_takeover_margin);
-    my %global_keys = map { $_ => 1 } qw(ha_sizing standby_share standby_entitlement vios_sizing vios_takeover_margin);
+                                         vios_sizing vios_takeover_margin standby_work_cores standby_work_hours standby_work_days);
+    my %global_keys = map { $_ => 1 } qw(ha_sizing standby_share standby_entitlement vios_sizing vios_takeover_margin
+                                         standby_work_cores standby_work_hours standby_work_days);
     my %choices     = (ha_role => [qw(auto active standby)], lpar_type => [qw(lpar vios)],
                        ha_sizing => [qw(independent standby_share standby_fixed)], vios_sizing => [qw(combined match_larger)]);
 
@@ -32219,7 +32360,7 @@ sub parse_vms_config
     }
     my ($section, $tier_seen, %unknown_warned) = ('', 0);
     my $mgsys;          # the managed system of the [MGSYS:<name>] stanza being read; undef in a stanza that is refused
-    my %ha_policy_keys = map { $_ => 1 } qw(ha_role ha_sizing standby_share standby_entitlement);
+    my %ha_policy_keys = map { $_ => 1 } qw(ha_role ha_sizing standby_share standby_entitlement standby_work_cores standby_work_hours standby_work_days);
     my %fixed_at;       # stanza => line of its ha_sizing = standby_fixed
     my $warn = sub { push @{ $config{warnings} }, sprintf('line %d: %s', $., $_[0]); };
     my $error = sub { push @{ $config{errors} }, sprintf('line %d, [%s]: %s', $., $section, $_[0]); };
@@ -32338,6 +32479,41 @@ sub parse_vms_config
             else
             {
                 $error->("standby_entitlement must be a number of processors of at least 0.05, with two decimals at most (for example 0.10); '$value' is not");
+            }
+        }
+        elsif ($key eq 'standby_work_cores')
+        {
+            # The level of the sustained-workload test, in processors consumed.
+            if ($value =~ /^(?:\d+(?:\.\d{1,2})?|\.\d{1,2})$/ && $value >= 0.05 - 1e-9)
+            {
+                $store->{standby_work_cores} = $value + 0;
+            }
+            else
+            {
+                $error->("standby_work_cores must be a number of processors of at least 0.05, with two decimals at most (for example 0.20); '$value' is not");
+            }
+        }
+        elsif ($key eq 'standby_work_hours')
+        {
+            # Whole quarter hours: the test reads 15-minute blocks.
+            if ($value =~ /^(?:\d+(?:\.(?:0|00|25|5|50|75))?)$/ && $value >= 0.25 && $value <= 24)
+            {
+                $store->{standby_work_hours} = $value + 0;
+            }
+            else
+            {
+                $error->("standby_work_hours must be between 0.25 and 24 in quarter hours (for example 2 or 1.5); '$value' is not");
+            }
+        }
+        elsif ($key eq 'standby_work_days')
+        {
+            if ($value =~ /^\d+$/ && $value >= 1 && $value <= 366)
+            {
+                $store->{standby_work_days} = $value + 0;
+            }
+            else
+            {
+                $error->("standby_work_days must be a whole number of days of at least 1 (for example 2); '$value' is not");
             }
         }
         elsif ($key eq 'vios_takeover_margin')

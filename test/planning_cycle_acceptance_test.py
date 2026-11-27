@@ -117,7 +117,11 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         self.assertRegex(report, r'VP requirements: strategic 2 \(run-queue width \S+, peak-throughput floor \S+, configured-burst floor \S+\); VPs that preserve the installed entitlement 2 ')
         self.assertRegex(report, r'reduction safety CLEAR \(.*\); 0\.15 carries at most 3 VPs')
         self.assertRegex(report, r'Guarantee check of the strategic pair: Yes \(.+\)')
-        self.assertRegex(report, r'Sustained workload \(at least 1\.00 cores for a full hour, PhysC, since \d\d \w+ 2026\): 0 day\(s\); not found')
+        self.assertRegex(report, r'Sustained workload of vm_[0-9a-f]{6}: OBSERVED: PhysC at 0\.20 cores or more .* on \d+ day\(s\), 2 needed')      # the active node
+        self.assertRegex(report, r'Comparison of the two nodes \(\S+ hours\): ACTIVE:vm_[0-9a-f]{6}; \d+ of \d+ blocks separated')
+        self.assertRegex(report, r'Sustained workload: not observed: PhysC at 0\.20 cores or more \(median of the minute values of a 15-minute block\) for 2 hours or longer '
+                                 r'on 0 day\(s\), 2 needed; longest run 0 hours; all hours, the current role period from \d\d \w+ 2026; PhysB not collected')
+        self.assertIn('Sizing decision: fixed standby entitlement applied', report)
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: set to the fixed 0\.15 on 2 VPs \(installed 1\.50 / 4\)')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: the VPs are no fewer than its workload needs \(2\) and no more than the fixed figure carries')
         self.assertRegex(report, r'\[ok\] vm_[0-9a-f]{6}: final at analysis, not pending in the cycle')
@@ -151,6 +155,7 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.05')
         self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
         self.assertRegex(run.stdout, r'\[ok\] frame %s: standbys under the fixed standby entitlement 0\.05 asked for this run: 1 \(applied to 0, not applied to 1\)' % self.standby)
+        self.assertIn("Sizing decision: idle-standby allocation not applied (width); the recommendation follows this node's workload", run.stdout)
         self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: fixed figure not applied \(width: its own workload needs 2 VPs and 0\.05 carries at most 1 '
                                      r'\(0\.05 processors per VP\)\); the recommendation \S+ on \d VPs? follows its workload \(installed 1\.50 / 4\)')
         self.assertIn('Result: all checks passed', run.stdout)

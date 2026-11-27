@@ -183,4 +183,19 @@ is_deeply(UUT::_vms_config_defaults('FRAME_B'), { ha_sizing => 'independent', st
 is_deeply(UUT::_vms_config_defaults('FRAME_A'), $UUT::vms_config->{global}, 'and [GLOBAL] alone elsewhere');
 is_deeply(UUT::_vms_config_defaults(undef), $UUT::vms_config->{global}, 'or where the managed system is not known');
 
+# --- The sustained-workload settings: policy values, at every level ---------------------
+$c = cfg("[GLOBAL]\nstandby_work_cores = 0.25\n[MGSYS:FRAME_A]\nstandby_work_hours = 1.5\nstandby_work_days = 4\n[n1]\nstandby_work_cores = .3\n");
+is_deeply([ $c->{global}{standby_work_cores}, $c->{mgsys}{FRAME_A}, $c->{vms}{n1}{standby_work_cores} ],
+          [ 0.25, { standby_work_hours => 1.5, standby_work_days => 4 }, 0.3 ], 'standby_work_cores, _hours and _days are read in [GLOBAL], [MGSYS:] and an LPAR stanza');
+is_deeply($c->{errors}, [], 'and valid values raise nothing');
+$c = cfg("[n1]\nstandby_work_cores = 0.01\nstandby_work_hours = 1.1\nstandby_work_days = 0\n[n2]\nstandby_work_hours = 30\nstandby_work_days = 2.5\nstandby_work_cores =\n");
+ok((grep { /^line 2, \[n1\]: standby_work_cores must be a number of processors of at least 0\.05, with two decimals at most \(for example 0\.20\); '0\.01' is not/ } @{ $c->{errors} }),
+   'a level below 0.05 is an error');
+ok((grep { /\[n1\]: standby_work_hours must be between 0\.25 and 24 in quarter hours \(for example 2 or 1\.5\); '1\.1' is not/ } @{ $c->{errors} }), 'a duration that is not in quarter hours is an error');
+ok((grep { /\[n2\]: standby_work_hours must be between 0\.25 and 24/ } @{ $c->{errors} }), 'and so is one above a day');
+ok((grep { /\[n1\]: standby_work_days must be a whole number of days of at least 1 \(for example 2\); '0' is not/ } @{ $c->{errors} }), 'no days is an error');
+ok((grep { /\[n2\]: standby_work_days must be a whole number/ } @{ $c->{errors} }), 'and a part of a day');
+ok((grep { /\[n2\]: 'standby_work_cores' has no value/ } @{ $c->{errors} }), 'a setting without a value is an error');
+is_deeply([ $c->{vms}{n1} // {}, $c->{vms}{n2} // {} ], [ {}, {} ], 'nothing is taken from a refused value');
+
 done_testing();
