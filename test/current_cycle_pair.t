@@ -342,4 +342,13 @@ is($lbad, 0, "limit sweep: $lsweeps pairs valid within every limit") or diag(joi
     is(scalar(keys %{ UUT::_coarse_review_advisories($rise, \%actions, 0) }), 0, 'no entitlement cut this cycle: no advisory');
 }
 
+# The review sentence carries the width evidence where there is any, and is unchanged where there is none.
+{
+    my $review = pair(target_ent => 1.00, target_vp => 4, step_vp => 2, current_ent => 2.00, current_vp => 2);
+    my $plain = UUT::_current_cycle_action_text($review, 2.00, 2, 0);
+    like($plain, qr/Review a VP increase to 4 \(run-queue or peak evidence\)\.$/, 'no width evidence: the review sentence as before');
+    $review->{ReviewEvidence} = 'The width evidence is insufficient to assess the review.';
+    is(UUT::_current_cycle_action_text($review, 2.00, 2, 0), "$plain The width evidence is insufficient to assess the review.", 'with width evidence: one sentence after it');
+}
+
 done_testing();
