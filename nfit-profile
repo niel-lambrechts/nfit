@@ -4751,6 +4751,11 @@ sub log_profile_rationale
     $sf_glance->('Reduction safety', ($sf_re->{ReductionSafetyState} // $na));
     $sf_glance->('Current cycle', (defined $sf_pair && defined $sf_pair->{Ent})
         ? $sf_pair_text->($sf_pair->{Ent}, $sf_pair->{VP}) : 'no recommendation');
+    if (defined $sf_pair && ref($sf_pair->{EntParts}) eq 'HASH' && defined $sf_pair->{Ent}
+        && grep { $_ eq 'PLATFORM_MINIMUM' || $_ eq 'RATIO_GUARD' } @{ $sf_pair->{Binding} // [] })
+    {
+        $sf_glance->('Entitlement this cycle', _cycle_entitlement_parts_text($sf_pair));
+    }
     $sf_glance->('Current-cycle action', defined $sf_pair
         ? _current_cycle_action_text($sf_pair, $sf_cur_ent, $sf_cur_n, $sf_cfg->{pool_id}) : $na);
     print {$fh} "\n";
@@ -7215,6 +7220,9 @@ sub _resolve_current_cycle_pair
         $blocked = 1;
     }
     my $minimum = $up->($MIN_ENT_PER_VP * $vp);
+    # Three quantities that are never merged (v10 B10): what the workload needs, what PowerVM needs for the
+    # VPs of this cycle, and what the staging guard keeps for this cycle only while VPs are still coming down.
+    $out{EntParts} = { Workload => $shown->($ent), PlatformMinimum => $shown->($minimum), StagingGuard => undef };
     if ($ent < $minimum - $FLOAT_EPSILON)
     {
         $ent = $minimum;
@@ -7232,6 +7240,7 @@ sub _resolve_current_cycle_pair
         {
             $ent = $guard;
             push @binding, 'RATIO_GUARD';
+            $out{EntParts}{StagingGuard} = $shown->($guard);
         }
     }
     my $tier_floor = (ref($terms->{tier_floor}) eq 'CODE') ? $terms->{tier_floor}->($vp) : undef;
@@ -7560,6 +7569,20 @@ sub _planner_csv_header
 # ARGUMENTS:  1. VM map entry (hashref)  2. profile name
 # RETURNS:    pair hashref from _resolve_current_cycle_pair, or undef
 # ==============================================================================
+# The current-cycle entitlement in its parts, where the PowerVM minimum or the staging guard shaped it:
+# the workload requirement is not raised by either, and the guard's part is temporary.
+sub _cycle_entitlement_parts_text
+{
+    my ($pair) = @_;
+    my $parts = $pair->{EntParts} // {};
+    my @text = (sprintf('the workload needs %.2f', $parts->{Workload} // 0));
+    push @text, sprintf('PowerVM needs %.2f for %d VP%s (%.2f a VP)', $parts->{PlatformMinimum}, $pair->{VP}, ($pair->{VP} == 1 ? '' : 's'), $MIN_ENT_PER_VP)
+        if (grep { $_ eq 'PLATFORM_MINIMUM' } @{ $pair->{Binding} // [] });
+    push @text, sprintf('the staging guard keeps %.2f for this cycle only, while VPs are still being reduced', $parts->{StagingGuard})
+        if (defined $parts->{StagingGuard});
+    return sprintf('%.2f: %s. The workload requirement is not raised to fit a VP:entitlement ratio.', $pair->{Ent}, join('; ', @text));
+}
+
 sub _current_cycle_pair_from_results
 {
     my ($vm_map_ref, $profile_name) = @_;
@@ -10206,7 +10229,7 @@ sub calculate_runq_modified_physc
         # decision trace never reconstructs which protection won. Uses the same
         # floors that produced rVCPU; ties break by operational priority
         # (dispatch > peak > burst > entitlement).
-        my $strategic_governor;
+        my ($strategic_governor, $width_above_range);
         {
             my @gv = (
                 [ $rvcpu_raw,                   'run-queue dispatch width'   ],
@@ -10228,6 +10251,34 @@ sub calculate_runq_modified_physc
                 && defined $rvcpu_final && looks_like_number($rvcpu_final)
                 && $rvcpu_final == $rvcpu_max) {
                 $strategic_governor = sprintf('normal VP range maximum (%s VPs)', $rvcpu_max);
+                # Recorded for review (v10 B10): the entitlement is not raised to admit the width, and the VP target
+                # stays at the range maximum, below the witness. The record states every witness with its source,
+                # the VPs the completed evidence supports (peak-throughput protection and configured burst; a
+                # run-queue width counts only as far as the existing rules already admitted it), and what bears
+                # on that width: the PowerVM minimum, the pool, capped mode, the pool-borrowing rule.
+                my @witnesses = map { { source => $_->[1], VPs => $_->[0] + 0 } } grep { defined $_->[0] && looks_like_number($_->[0]) } @gv;
+                my $supported = max($rvcpu_final, map { $_ + 0 } grep { defined $_ && looks_like_number($_) } ($p99w1_floor_vcpu, $configured_burst_floor_vcpu));
+                my $workload_ent = (defined $rENT_P_for_envelope && looks_like_number($rENT_P_for_envelope)) ? 0 + sprintf('%.2f', $rENT_P_for_envelope) : undef;
+                my $pool_size = (!$is_capped_lpar && defined $pool_cpu_for_lpar_numeric && looks_like_number($pool_cpu_for_lpar_numeric)
+                                 && $pool_cpu_for_lpar_numeric > 0) ? $pool_cpu_for_lpar_numeric + 0 : undef;
+                $width_above_range = {
+                    rangeMaximum => $rvcpu_max + 0, target => $rvcpu_final + 0, witnesses => \@witnesses, supportedVPs => 0 + $supported,      # as numbers
+                    workloadEntitlement => $workload_ent,
+                    baseDemand => (looks_like_number($debug_info{'BasePlanningDemand'} // '') ? 0 + $debug_info{'BasePlanningDemand'} : undef),
+                    guaranteeDemand => (looks_like_number($debug_info{'GuaranteeDemand'} // '') ? 0 + sprintf('%.2f', $debug_info{'GuaranteeDemand'}) : undef),
+                    platformMinimum => 0 + sprintf('%.2f', $MIN_ENT_PER_VP * $supported),
+                    meetsPlatformMinimum => ((defined $workload_ent && $workload_ent >= $MIN_ENT_PER_VP * $supported - $FLOAT_EPSILON) ? JSON::true : JSON::false),
+                    capped => ($is_capped_lpar ? JSON::true : JSON::false),
+                    poolSize => $pool_size, poolBelowWidth => ((defined $pool_size && $supported > $pool_size) ? JSON::true : JSON::false),
+                    poolBorrowingRule => $debug_info{'PeakUpliftGate'},
+                    # What the tier's pool-borrowing rule asks of the guarantee at the supported width (one evaluation, for the inventory).
+                    tierFloorAtSupportedWidth => do {
+                        my ($floor) = eval { _tier_guarantee_floor($debug_info{'GuaranteeDemand'}, ((defined $pool_size && $pool_size < $supported) ? $pool_size : $supported),
+                                                                   $is_capped_lpar, $debug_info{'DispatchBudgetFraction'}, $final_tier) };
+                        (defined $floor && looks_like_number($floor)) ? 0 + sprintf('%.2f', $floor) : undef;
+                    },
+                    pressure => ((($debug_info{'IsRunQPressure'} // '') eq 'True' || ($debug_info{'IsWorkloadPressure'} // '') eq 'True') ? JSON::true : JSON::false),
+                };
             }
             $strategic_governor //= 'entitlement delivery floor';
         }
@@ -10238,6 +10289,7 @@ sub calculate_runq_modified_physc
             Max            => $rvcpu_max,
             EntitlementMinimumVP => $rvcpu_min,
             StrategicGovernor    => $strategic_governor,
+            (defined $width_above_range ? (WidthAboveRange => $width_above_range) : ()),
             EntCores       => (defined $rENT_P ? sprintf("%.2f", $rENT_P) : undef),
             EntCoresPlanning => (defined $rENT_P_for_envelope ? sprintf("%.2f", $rENT_P_for_envelope) : undef),
             EnvelopeExceedsOperational => ($envelope_exceeds_operational ? 1 : 0),
@@ -19285,7 +19337,16 @@ sub _write_standard_csv_report {
                         binding     => [ sort @{ $pair->{Binding} } ],
                         reviewVPs   => $pair->{ReviewVP},
                         reason      => $pair->{Reason},
+                        # Where the PowerVM minimum or the staging guard shaped the entitlement: its parts, kept apart.
+                        ((ref($pair->{EntParts}) eq 'HASH' && grep { $_ eq 'PLATFORM_MINIMUM' || $_ eq 'RATIO_GUARD' } @{ $pair->{Binding} })
+                            ? (entitlementParts => { workload => $pair->{EntParts}{Workload}, platformMinimum => $pair->{EntParts}{PlatformMinimum},
+                                                     stagingGuard => $pair->{EntParts}{StagingGuard} }) : ()),
                     },
+                    # Where the strategic VP target is held at the normal VP range maximum below a width witness (recorded, not changed).
+                    ((ref(($core->{Profile_rVCPU_Explain}{$name} // {})->{WidthAboveRange}) eq 'HASH')
+                        ? (widthAboveRange => { %{ $core->{Profile_rVCPU_Explain}{$name}{WidthAboveRange} },
+                               reductionSafety => $core->{Profile_rVCPU_Explain}{$name}{ReductionSafetyState},
+                               reductionSafetyReasons => $core->{Profile_rVCPU_Explain}{$name}{ReductionSafetyReasons} }) : ()),
                     ($cycle_by_policy{$name} ? (cycleByPolicy => $cycle_by_policy{$name}) : ()),
                     ((defined $pair->{BorrowingCadence}) ? (borrowingByResolution => $pair->{BorrowingCadence}) : ()),
                     ((ref(($core->{ProfileDebugInfo}{$name} // {})->{'ContestedLevelFloor'}) eq 'HASH')

@@ -19,7 +19,7 @@ my $src = do { local $/; <$fh> };
 close $fh;
 
 my $code = '';
-for my $name (qw(_resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text _coarse_note_text _coarse_review_text
+for my $name (qw(_resolve_current_cycle_pair _ceil_ratio _current_cycle_action_text _cycle_entitlement_parts_text _coarse_note_text _coarse_review_text
                  _coarse_review_advisories _coarse_review_action))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
@@ -342,6 +342,65 @@ is($lbad, 0, "limit sweep: $lsweeps pairs valid within every limit") or diag(joi
     is(scalar(keys %{ UUT::_coarse_review_advisories($rise, \%actions, 0) }), 0, 'no entitlement cut this cycle: no advisory');
 }
 
+# -- The entitlement of this cycle in its three parts (v10 B10): never merged, never raised for a ratio --
+{
+    # A deep cut on a very wide LPAR: the workload needs 0.10; PowerVM needs 0.70 for the 14 VPs of this cycle;
+    # the staging guard keeps 3.47 for this cycle only. The guard is below what is installed: it limits a cut.
+    my $deep = pair(target_ent => 0.10, target_vp => 2, step_vp => 14, current_ent => 4.00, current_vp => 15);
+    is_deeply($deep->{EntParts}, { Workload => 0.10, PlatformMinimum => 0.70, StagingGuard => 3.47 }, 'deep cut: workload 0.10, PowerVM minimum 0.70, staging guard 3.47, kept apart');
+    ok($deep->{EntParts}{StagingGuard} < 4.00, 'the guard retains part of the installed entitlement; it does not raise it');
+    is($deep->{TargetEnt}, 0.10, 'and the target stays the workload requirement');
+    is(UUT::_cycle_entitlement_parts_text($deep),
+       '3.47: the workload needs 0.10; PowerVM needs 0.70 for 14 VPs (0.05 a VP); the staging guard keeps 3.47 for this cycle only, while VPs are still being reduced. '
+       . 'The workload requirement is not raised to fit a VP:entitlement ratio.', 'the rationale names each part');
+    # The VPs reach their destination in this cycle: no guard, the workload figure stands.
+    my $done = pair(target_ent => 0.10, target_vp => 1, step_vp => 1, current_ent => 3.00, current_vp => 4);
+    is_deeply([ $done->{Ent}, $done->{VP}, $done->{EntParts}{StagingGuard}, scalar(@{ $done->{Binding} }) ], [ 0.10, 1, undef, 0 ], 'destination reached this cycle: no guard, 0.10 on 1 VP');
+    # A credible width requirement with a small entitlement, VPs not reduced: the entitlement is the workload's.
+    # 0.61 on 8 VPs is 13 VPs per core; nothing raises it towards 2:1.
+    my $wide = pair(target_ent => 0.61, target_vp => 5, step_vp => 8, current_ent => 4.00, current_vp => 8);
+    is_deeply([ $wide->{Ent}, $wide->{VP}, $wide->{EntParts}{StagingGuard}, scalar(@{ $wide->{Binding} }) ], [ 0.61, 8, undef, 0 ],
+              'width kept for the peak, entitlement 0.61: not inflated to fit a ratio');
+    # A width increase asked for by evidence on a small entitlement: a review, and the entitlement stays the workload's.
+    my $review = pair(target_ent => 0.61, target_vp => 5, step_vp => 2, current_ent => 0.61, current_vp => 2);
+    is_deeply([ $review->{Ent}, $review->{VP}, $review->{ReviewVP}, scalar(@{ $review->{Binding} }) ], [ 0.61, 2, 5, 0 ], 'a width requirement above 2:1 is a review of the VPs; the entitlement is untouched');
+    # Only the platform can raise it for the VPs kept: 0.05 a VP, named as such.
+    my $thin = pair(target_ent => 0.20, target_vp => 6, step_vp => 8, current_ent => 2.00, current_vp => 8);
+    is_deeply([ $thin->{Ent}, $thin->{Binding}, $thin->{EntParts} ], [ 0.40, ['PLATFORM_MINIMUM'], { Workload => 0.20, PlatformMinimum => 0.40, StagingGuard => undef } ],
+              'the PowerVM minimum for 8 VPs is the only raise, and it is not the ratio guard');
+    # Over a grid of pairs: the entitlement is never above the largest of its three parts; the guard exists only
+    # while a VP reduction is staged, and always below the installed entitlement.
+    my ($cases, $above, $guard_out, $guard_high) = (0, 0, 0, 0);
+    foreach my $cur_vp (1, 2, 4, 8, 15)
+    {
+        foreach my $cur_ent (0.10, 0.50, 1.00, 2.00, 4.00)
+        {
+            next if ($cur_ent > $cur_vp || $cur_ent < 0.05 * $cur_vp);
+            foreach my $t_ent (0.05, 0.10, 0.61, 1.20, 3.00)
+            {
+                foreach my $t_vp (1, 2, 5, 9)
+                {
+                    foreach my $step (grep { $_ >= 1 } ($cur_vp, $cur_vp - 1, int($cur_vp / 2), $t_vp))
+                    {
+                        my $p = pair(target_ent => $t_ent, target_vp => $t_vp, step_vp => $step, current_ent => $cur_ent, current_vp => $cur_vp);
+                        next unless (defined $p->{Ent} && ref($p->{EntParts}) eq 'HASH' && $p->{Status} ne 'BLOCKED');
+                        $cases++;
+                        my $parts = $p->{EntParts};
+                        my $largest = (sort { $b <=> $a } grep { defined } @{$parts}{qw(Workload PlatformMinimum StagingGuard)})[0];
+                        $above++ if ($p->{Ent} > $largest + 0.011);
+                        next unless (defined $parts->{StagingGuard});
+                        $guard_out++  unless ($p->{VP} < $cur_vp && $p->{VP} > $t_vp);
+                        $guard_high++ unless ($parts->{StagingGuard} < $cur_ent + 1e-9);
+                    }
+                }
+            }
+        }
+    }
+    ok($cases > 500, "grid: $cases pairs resolved");
+    is($above, 0, 'grid: the entitlement is never above the largest of workload, PowerVM minimum and staging guard');
+    is($guard_out, 0, 'grid: the staging guard appears only while a VP reduction is still staged');
+    is($guard_high, 0, 'grid: the staging guard never exceeds the installed entitlement');
+}
 # The review sentence carries the width evidence where there is any, and is unchanged where there is none.
 {
     my $review = pair(target_ent => 1.00, target_vp => 4, step_vp => 2, current_ent => 2.00, current_vp => 2);
