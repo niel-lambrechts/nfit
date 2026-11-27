@@ -412,6 +412,27 @@ ok(!exists((grep { $_->{Pool} == 7 } @{ $plain_fp->{pools} })[0]{Reduction}), 'n
         'the rationale says why, and labels the earlier result as superseded');
     is($t->{doc}{jointCheck}{protectedLevel}{sa}{target}{outcome}, 'notKnown', 'the protected-level check still runs: it needs no readings');
 
+    # A member without PhysB beside them: after finalisation it is still not assessed, and the exposure measured on
+    # the others still stands (missing evidence is neither zero nor a reason to hide what was measured).
+    {
+        my $doc = $with_joint->();
+        $doc->{members}{x2} = { planningProfile => 'P-95', installedEntitlement => 1.0, installedVPs => 2, poolId => 5, poolSize => 4,
+                                profiles => { 'P-95' => { entitlement => 0.4, recommendedVPs => 1, tacticalVPs => 1 } },
+                                poolMember => { pool_id => 5, pool_cpu => 4, current_ent => 1.0, proposed_ent => 0.4, cycle_ent => 0.4, lowest_ent => 0.4,
+                                                planning_profile => 'P-95', tier_source => 'configured' },
+                                published => { entitlement => '0.40', VPs => 1, action => 'Reduce.', ownAction => 'Reduce.', comments => '', ownComments => '', alerts => [] } };
+        $doc->{jointCheck}{evidence}{5}{notAssessed} = { x2 => 'no PhysB measurement in the period' };
+        $doc->{jointCheck} = UUT::_joint_check_record($doc->{jointCheck}{evidence}, UUT::_joint_members($doc->{members}));
+        local $plan{planA} = $doc;
+        my $m = UUT::_cycle_finalise_frame($plan{planA}, $reg_a, { FA => $reg_a, FB => $reg_b }, {}, $plan_of, 'C1');
+        my $mr = $m->{doc}{jointCheck}{results}{5};
+        is_deeply([ $mr->{state}, $mr->{completeness}{state}, $mr->{completeness}{notAssessed} ], [ 'replayed', 'incomplete', { x2 => 'no PhysB measurement in the period' } ],
+            'after finalisation: the member without PhysB is still not assessed');
+        ok(!exists $mr->{target}{allHours}{members}{x2} && $mr->{target}{allHours}{poolMinutes} == 2, 'it is not counted as zero, and the exposure of the others stands');
+        is_deeply([ UUT::_joint_csv_cells($mr) ], [ 'exposed', 'incomplete: 2 of 3 LPARs', $mr->{cycle}{allHours}{poolMinutes}, sprintf('%.2f', $mr->{cycle}{allHours}{shortfall}), 0 ],
+            'cycle-pools.csv: exposed, and the evidence incomplete (this cycle\'s figures)');
+    }
+
     # Truncated evidence and no change of figures (the primary's frame is not analysed): the analysis result stands.
     my $same = UUT::_cycle_finalise_frame($plan{planA}, $reg_a, { FA => $reg_a }, {}, $plan_of, 'C1');
     is($same->{doc}{jointCheck}{results}{5}{state}, 'replayed', 'unchanged figures: the complete result of the analysis stands');
