@@ -9,16 +9,19 @@
 #            the credible peak asks for 5 VPs: more than the normal VP range
 #            of that entitlement admits (2).
 #
-#            What is asserted:
-#              - the profile's entitlement stays the workload figure; it is
-#                not raised until the VP range admits the width;
-#              - the rationale says so, and names the width as the open point;
-#              - the saved plan records the width witness above the range
-#                (widthAboveRange), for review;
+#            What is asserted (after the correction of 27 November):
+#              - the VP target is the width the credible peak asks for; the
+#                usual range of the entitlement does not hold it at 2;
+#              - the workload figure of the profile is unchanged by that;
+#              - this cache has no pool observations, so the tier's
+#                pool-borrowing rule applies as it does to every profile: the
+#                guarantee it asks for at 5 VPs is a raise named as the tier
+#                rule, kept apart from the workload figure. (With the rule
+#                withheld on pool evidence the entitlement stays the
+#                workload's: test/vp_target_test.py.)
 #              - on the planning profile, the entitlement of this cycle is not
 #                above the largest of its three parts (workload, PowerVM
 #                minimum, staging guard), and the parts are kept apart.
-#            The VP target of such a profile is recorded here, not judged.
 # USAGE    : python3 test/ratio_policy_test.py
 # ==============================================================================
 import csv
@@ -84,30 +87,34 @@ class RatioPolicyTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.root, ignore_errors=True)
 
-    def test_the_entitlement_is_the_workload_figure_not_one_that_admits_the_width(self):
-        ent = float(self.row[PROFILE])
-        record = self.member['profiles'][PROFILE]['widthAboveRange']
-        witnesses = {w['source']: w['VPs'] for w in record['witnesses']}
-        self.assertEqual(witnesses['peak-throughput protection'], 5)
-        self.assertEqual((record['supportedVPs'], record['target']), (5, 2))                     # what the evidence supports; what the range left
-        # What bears on the supported width, each stated apart: the PowerVM minimum is met, no pool or cap stands in the way.
-        self.assertEqual((record['platformMinimum'], record['meetsPlatformMinimum'], record['capped'], record['poolBelowWidth']), (0.25, True, False, False))
-        self.assertEqual(record['workloadEntitlement'], ent)
-        self.assertEqual(record['reductionSafety'], 'BLOCK')
-        self.assertIn('strategic guarantee invariant failed', record['reductionSafetyReasons'])
-        # 5 VPs fit the normal range only from 2.01 entitlement: the profile was not raised towards it.
-        self.assertLessEqual(ent, 1.0)
-        self.assertEqual(record['rangeMaximum'], 2)
-        self.assertEqual(self.member['profiles'][PROFILE]['entitlement'], ent)
+    def test_the_width_witness_is_the_vp_target(self):
+        sized = self.member['profiles'][PROFILE]
+        self.assertEqual(sized['recommendedVPs'], 5)                  # peak-throughput protection; formerly held at 2 (twice the entitlement)
+        self.assertIn('Peak-throughput protection: credible peak 5.04 cores', self.rationale)
 
-    def test_the_rationale_says_the_entitlement_was_not_raised_for_the_width(self):
-        self.assertRegex(self.rationale, r'INFEASIBLE WIDTH: applicable demand 4\.\d\d cores exceeds proposed reachable capacity 2\.00; entitlement was not '
-                                         r'raised because the uncapped proposal requires more reachable width')
-        self.assertIn('no entitlement raise applied; the uncapped proposal requires additional reachable width', self.rationale)
+    def test_the_workload_figure_is_unchanged_and_the_tier_raise_is_named(self):
+        sized = self.member['profiles'][PROFILE]
+        floor = sized['tierFloor']
+        self.assertLessEqual(floor['own'], 1.0)                       # the workload figure: the same as before the width stood
+        self.assertTrue(floor['gate'].startswith('applied (legacy: no pool evidence'))
+        self.assertFalse(floor['withheld'])
+        # The guarantee the tier's pool-borrowing rule asks for at 5 VPs: the published entitlement is that figure, rounded up.
+        self.assertGreater(floor['floor'], floor['own'])
+        self.assertTrue(floor['floor'] <= sized['entitlement'] < floor['floor'] + 0.051)
+        self.assertRegex(self.rationale, r"tier 'G3' budget 60%: applicable demand 4\.\d\d cores, reachable 5\.00\. Guarantee must be >= 3\.\d\d")
+        self.assertIn('guarantee raised the planning entitlement', self.rationale)
+        # 0.05 a VP is met with room: the raise is not the PowerVM minimum, and no ratio is named as its cause.
+        self.assertGreaterEqual(floor['own'], 0.05 * 5)
 
-    def test_a_profile_without_such_a_witness_carries_no_record(self):
-        clean = [name for name, p in self.member['profiles'].items() if 'widthAboveRange' not in p]
-        self.assertTrue(clean, 'the record is kept only where the range maximum holds the target below a witness')
+    def test_no_target_is_left_below_a_completed_witness(self):
+        held = [name for name, p in self.member['profiles'].items()
+                if (p.get('widthAboveRange') or {}).get('state') not in (None, 'targetAboveUsualRange', 'runQueueWidthNotAdmitted')]
+        self.assertEqual(held, [])
+        for name, p in self.member['profiles'].items():
+            record = p.get('widthAboveRange')
+            if record and record['state'] == 'targetAboveUsualRange':
+                self.assertGreater(record['target'], record['rangeMaximum'], name)
+                self.assertTrue(record['meetsPlatformMinimum'], name)
 
     def test_this_cycles_entitlement_is_within_its_three_parts(self):
         planning = self.member['planningProfile']
