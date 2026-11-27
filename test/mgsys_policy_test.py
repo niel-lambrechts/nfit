@@ -262,6 +262,16 @@ class ManagedSystemPolicyTests(unittest.TestCase):
             self.assertEqual((policy['type'], policy['applied'], policy['notApplied']['kind'], policy['roleSource'], policy['sustainedWorkload']['observed']),
                              ('share', False, 'workload', 'inferred', True))
             self.assertEqual(P.registration(root, 'SYSHA1').get('pending') or [], [])   # nothing for the finalisation to set
+            # It is counted with the ordinary LPARs of its frame, in the totals and in the footprint, not among the standbys.
+            self.assertNotIn('estateRole', member)
+            totals = P.registration(root, 'SYSHA1')['totals']
+            self.assertEqual((totals['All']['Count'], (totals.get('Standby') or {}).get('Count', 0), totals['ExclStandby']['Count']), (2, 0, 2))
+            with open(F.outputs(root, 'SYSHA1')['csv']) as fh:
+                total = sum(float(r['NFIT - ENT']) for r in csv.DictReader(fh) if r['NFIT - ENT'])
+            self.assertAlmostEqual(float(F.summary_row(root, 'SYSHA1')['CurrentCycle_ENT']), total, places=2)
+            footprint = P.text(os.path.join(root, 'cycle', 'cycle-footprint.txt'))
+            self.assertRegex(footprint, r'SYSHA1\s+2\s')                              # both LPARs of the frame are counted
+            self.assertNotRegex(footprint.split('SYSHA2')[0].split('SYSHA1')[-1], r'of which PowerHA standbys')
         self.assertEqual(rows[0], rows[1])
 
     def test_a_configured_standby_keeps_its_share_floor_whatever_it_runs(self):
@@ -288,6 +298,7 @@ class ManagedSystemPolicyTests(unittest.TestCase):
         self.assertNotIn('Workload-bearing', row['NFIT - Action'])
         self.assertNotIn('NOT_APPLIED', row['VM_Comments'])
         self.assertNotIn('standbyPolicy', member)
+        self.assertEqual(member.get('estateRole'), 'standby')                         # a configured standby is counted as one
 
     def test_the_finding_does_not_need_the_partners_data(self):
         # The partner's frame is not staged here: no role can be inferred, and the node's own finding is still made.
