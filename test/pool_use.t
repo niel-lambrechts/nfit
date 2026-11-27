@@ -124,7 +124,7 @@ close $log;
 like($buffer, qr/^Pool Use$/m, 'section heading');
 like($buffer, qr/^\s+7\s+4\s+2\.00\s+3\.50\s+4\.00\s+4\.00\s+40 minutes on 3 days \(longest 25\)$/m, 'pool row: maximum, median, P95, P99, peak, fullness');
 like($buffer, qr/^\s+12\s+8\s+2\.00\s+2\.00\s+2\.00\s+2\.00\s+never$/m, 'an open pool row');
-like($buffer, qr/No pool reduction is derived here\./, 'no reduction is derived');
+like($buffer, qr/Reduction candidates are in the section that follows\./, 'reductions are left to their own section');
 like(join(' ', split(' ', $buffer)), qr/Pressure on capped LPARs is not evaluated by this check \(which is not a finding that there is none\)/, 'capped LPARs: not evaluated, not absent');
 
 # A coarse cadence: counts are intervals, no longest run is given, and the resolution is stated.

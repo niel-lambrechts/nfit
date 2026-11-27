@@ -38,7 +38,8 @@ foreach my $name (qw(_safe_dig _cycle_canonical _option_differences _ha_peer_pla
                      _structural_shown_value _pool_units_text _pool_prerequisites _structural_csv_tags _rationale_wrap quote_csv
                      _cycle_finalise_frame _cycle_finalise_lines _cycle_rewrite_csv
                      _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines _days_before_end _lpar_present
-                     _plain_day _historic_action _cycle_membership))
+                     _plain_day _historic_action _cycle_membership
+                     _pool_whole_units _exposure_tolerance _pool_reduction_members _pool_reduction_candidate _pool_reduction_text))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
     $code .= "$1\n";
@@ -48,7 +49,8 @@ my %constant = map { my ($v) = $src =~ /^my \$$_\s*=\s*([0-9.e-]+);/m or die "$_
 my ($grace) = $src =~ /^my \$PRESENCE_GRACE_DAYS\s*=\s*(\d+);/m or die "PRESENCE_GRACE_DAYS not found\n";
 my ($interval) = $src =~ /^my %EVIDENCE_INTERVAL\s*=\s*(\(.*?\));/m or die "EVIDENCE_INTERVAL not found\n";
 eval "package UUT; use JSON; use POSIX qw(ceil floor); use List::Util qw(sum sum0 min max uniq); use Scalar::Util qw(looks_like_number);\n"
-   . join('', map { "our \$$_ = $constant{$_};\n" } sort keys %constant) . "use Time::Piece; our \$PRESENCE_GRACE_DAYS = $grace; our %EVIDENCE_INTERVAL = $interval;\n$code 1;"
+   . join('', map { "our \$$_ = $constant{$_};\n" } sort keys %constant) . "use Time::Piece; our \$PRESENCE_GRACE_DAYS = $grace; our %EVIDENCE_INTERVAL = $interval;\n"
+   . "our %MEMBER_EXPOSURE_RULES = (localScarceAbsCores => 0.10, localScarceRel => 0.02); our %POOL_REDUCTION_RULE = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90);\n$code 1;"
    or die "harness eval failed: $@\n";
 
 # -- Two frames: standby sa (with x1, in pool 5 of 4.00) on FA; its primary pb on FB --
@@ -243,7 +245,7 @@ like($all, qr/Frames analysed\s+10\.00\s+14\.00\s+12\.00\s+\(2 frames analysed; 
 unlike($all, qr/\bfits\b|procure|consolidat|spare/i, 'no fit, procurement, consolidation or spare-capacity wording');
 is(scalar(@$frames), 4, 'frame file: a header and one row per frame of the model');
 is(scalar(@$pools), 5, 'pool file: each pool of each analysed frame on its own row');
-like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement"$/, 'a pool row counts the LPARs still there: maximum, the three sums and the maximum each needs');
+like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement","","","","","",""$/, 'a pool row counts the LPARs still there: maximum, the three sums and the maximum each needs');
 
 # -- Where an LPAR is at the analysis end, across the frames of a cycle (B15) --
 my $t = sub { my ($ymd, $hms) = @_; return Time::Piece->strptime("$ymd " . ($hms // '00:00:00'), '%Y-%m-%d %H:%M:%S')->epoch; };
@@ -291,5 +293,44 @@ like($cf->{rows}{x1}{comments}, qr/\[ON_TWO_FRAMES\]/, 'and tagged');
 ok(!$cf->{delta}{ExclStandby}, 'it stays counted: nothing is dropped silently');
 my $cfp = UUT::_cycle_footprint_frame({ %{ $cf->{doc} }, frame => { sharedProcessors => { status => 'agreed', processors => 8, reporters => 1, values => { 8 => 1 } } } });
 like($cfp->{assessment}, qr/^not assessed: 1 LPAR is sampled on this frame and on another over the same time; which frame holds it is unresolved$/, 'and the frame\'s capacity is not assessed while it is unresolved');
+
+# -- Pool reduction candidate in the footprint (B6): worked out from the plan's figures, again after finalisation --
+my $reduction_evidence = { 7 => { pool => 7, maximum => 12, cadenceMinutes => 1, days => 30, daysObserved => 30, coverage => 1, worstDayCoverage => 1, peak => 1.20,
+    peakDay => '2026-09-12T00:00:00Z', secondDayPeak => 1.10, daysNearPeak => 2, routineDayPeak => 1.00, atMaximum => { minutes => 0, days => 0 }, changes => [],
+    contestedMembers => [], frame => { assessed => 1, observations => 43200, withoutSpareCores => 0 }, events => [] } };
+my $pool_doc = sub
+{
+    my ($standby) = @_;
+    return { window => { end => '2026-10-31' }, poolReduction => { evidence => $reduction_evidence }, members => {
+        act => { installedVPs => 4, lastSampled => '2026-10-31', planningProfile => 'P', profiles => { P => { currentCycle => { VPs => 4 } } }, published => { VPs => 4 },
+                 poolMember => { pool_id => 7, pool_cpu => 12, current_ent => 4, proposed_ent => 1, cycle_ent => 1 } },
+        sb  => { installedVPs => 4, lastSampled => '2026-10-31', estateRole => 'standby', planningProfile => 'P', profiles => { P => { currentCycle => { VPs => 4 } } },
+                 published => { VPs => 4 }, %$standby } } };
+};
+# Before finalisation: the standby is pending, on its primary's installed figure. Its takeover need is not known.
+my $before_fp = UUT::_cycle_footprint_frame($pool_doc->({ pendingRole => { type => 'haStandby', primary => 'pb' },
+    role => { type => 'haStandby', primaryTarget => { entitlement => 4, source => 'installed' } },
+    poolMember => { pool_id => 7, pool_cpu => 12, current_ent => 3, proposed_ent => 1, cycle_ent => 1 } }));
+my ($before_pool) = grep { $_->{Pool} == 7 } @{ $before_fp->{pools} };
+is_deeply([ @{ $before_pool->{Reduction} }{qw(verdict candidate normalOperation)}, $before_pool->{Reduction}{takeover}{state} ], ['withheld', 2, 2, 'unknown'],
+          'footprint before finalisation: the standby\'s takeover need is not known, the reduction is withheld; the normal-operation figure is shown');
+# After finalisation: the role is set from the primary's plan (target 2.40) and the standby's own figures changed (0.60).
+my $after_fp = UUT::_cycle_footprint_frame($pool_doc->({ role => { type => 'haStandby', primaryTarget => { entitlement => 2.4, source => 'cycle' } },
+    poolMember => { pool_id => 7, pool_cpu => 12, current_ent => 3, proposed_ent => 0.6, cycle_ent => 0.6 } }));
+my ($after_pool) = grep { $_->{Pool} == 7 } @{ $after_fp->{pools} };
+is_deeply([ @{ $after_pool->{Reduction} }{qw(verdict candidate setBy)}, $after_pool->{Reduction}{takeover}{full}, $after_pool->{Reduction}{structural}{full} ],
+          ['candidate', 4, 'takeover', 4, 2],
+          'after finalisation: candidate, verdict and reasons are worked out again from the finalised figures on the same evidence (1.00 + 2.40 at takeover = 4)');
+is_deeply([ map { $_->{code} } @{ $after_pool->{Reduction}{prerequisites} } ], [qw(memberReductions reserve futureEvents licensing)],
+          'with its dependencies: the members total 7.00 installed, so they are reduced first');
+my (undef, $pool_csv, $fp_text) = UUT::_cycle_footprint_lines('c1', [ { model => 'state-based', frame => 'FA', state => 'final', lpars => 2, totals => \%groups, resolved => 1, unresolved => 0, footprint => $after_fp } ], [ 'h' ]);
+like($pool_csv->[0], qr/"Status","Reduction_Verdict","Reduction_Candidate","Takeover_Provision","Measured_Use_Needs","Reduction_Reasons","Reduction_Prerequisites"$/, 'cycle-pools.csv: verdict, candidate, reasons and prerequisites in columns of their own');
+my ($pool_row) = grep { /,"FA","7",/ } @$pool_csv;
+like($pool_row, qr/,"candidate","4","4","2","","reduce the members' entitlements first: installed they total 7\.00, so the maximum cannot go below 7 until then; confirm the pool reserve/,
+     'the row keeps eligibility (no reason) apart from the prerequisites');
+like(join(' ', map { s/^\s+//r } @$fp_text), qr/Pool 7: reduction candidate, maximum 12 to 4 processing units\. For planner review, not an instruction/, 'cycle-footprint.txt carries the candidate as a review item');
+# A plan without pool evidence: the footprint is as before.
+my $plain_fp = UUT::_cycle_footprint_frame({ window => { end => '2026-10-31' }, members => $pool_doc->({ poolMember => { pool_id => 7, pool_cpu => 12, current_ent => 3 } })->{members} });
+ok(!exists((grep { $_->{Pool} == 7 } @{ $plain_fp->{pools} })[0]{Reduction}), 'no pool evidence in the plan: no candidate, the pool line as it was');
 
 done_testing();

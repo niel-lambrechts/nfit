@@ -194,6 +194,8 @@ my $VCPU_MIN_ABS = 1;                                   # Never recommend below 
 # PowerVM accepts between a minimum and 1.00 processing units per virtual
 # processor. The minimum is 0.05 from firmware FW760 (0.10 on earlier levels).
 my $MIN_ENT_PER_VP = 0.05;                              # Minimum entitlement (cores) per VP
+# Pool reduction candidate (v10 B6; Stage 3.4 pool reduction policy, first version): the evidence a candidate needs.
+our %POOL_REDUCTION_RULE = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90);
 my $STRUCTURAL_ENT_TOLERANCE = 0.005;                   # Entitlements are compared as shown in the CSV (two decimals)
 my $FLOAT_EPSILON = 1e-9;
 my $VCPU_MIN_FOR_ENT_GE_0_5_LT_1 = 1;                    # For 0.5 <= rENT < 1.0, 1 VP is sufficient
@@ -830,6 +832,11 @@ my $EVENT_EVIDENCE_STATUS;     # seasonal runs: the outcome of the event-window 
 # { pool => { Maximum, Observed, Full, FullDays, Longest, P50, P95, P99, Peak,
 #             Pressured => [ { vm, minutes, days } ], Verdict } }
 my %POOL_USE;
+# What a pool reduction candidate rests on (v10 B6), per user-defined pool, gathered in the same
+# evidence pass and saved with the plan so that the candidate can be worked out again from the
+# finalised member figures of a planning cycle without reading the staged data again.
+my %POOL_REDUCTION_EVIDENCE;
+my %POOL_REDUCTION_RECORDS;          # pool => the candidate as this analysis worked it out (saved beside the evidence)
 # Interval-aware evidence (v10 stage 3.4). The evidence pass counts
 # observations as they were recorded: one LPAR sample and its pool's reading
 # of the same interval. At one-minute cadence that is the minute, as before.
@@ -2485,6 +2492,19 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     The values are provisional settings (standby_work_cores, standby_work_hours,\n";
         print {$LOG_FH} "                     standby_work_days), not platform limits. Not observed does not mean idle.\n";
         print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Pool reduction     A lower maximum for a user-defined pool, offered for the planner's review and\n";
+        print {$LOG_FH} "  candidate          never as an instruction. It is the largest of: what the members' entitlements\n";
+        print {$LOG_FH} "                     need (a pool maximum cannot be below their sum), a conservative takeover\n";
+        print {$LOG_FH} "                     provision for PowerHA standbys whose takeover requirement is known, and the\n";
+        print {$LOG_FH} "                     whole number of processing units that keeps the highest credible minute of\n";
+        print {$LOG_FH} "                     measured pool use outside the near-maximum tolerance. No margin is added.\n";
+        print {$LOG_FH} "                     It needs 28 days of one-minute pool observations; it is not offered where\n";
+        print {$LOG_FH} "                     the pool reached its maximum, the pool or its members changed, a planned\n";
+        print {$LOG_FH} "                     change can release held-back demand, the frame ran out of spare cores, or a\n";
+        print {$LOG_FH} "                     standby's takeover requirement is not known. \"No exceedance observed at the\n";
+        print {$LOG_FH} "                     recorded resolution\" describes the period measured, not the future. The pool\n";
+        print {$LOG_FH} "                     reserve is not collected: confirm it before reducing.\n";
+        print {$LOG_FH} "\n";
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
         print {$LOG_FH} "                     vios_takeover_margin, a planning scenario; match_larger: aligned with the\n";
@@ -2743,6 +2763,8 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
     # section is; seasonal model runs are left as they are (stage 3.6).
     %CUT_PROTECTION_EVIDENCE = ();
     %POOL_USE = ();
+    %POOL_REDUCTION_EVIDENCE = ();
+    %POOL_REDUCTION_RECORDS = ();
     $SYSTEM_CPU_CADENCE = _cpu_cache_cadence($current_cache_path);
     if (_cut_protection_wanted($current_cache_path) && $effective_start_date_obj && $effective_end_date_obj)
     {
@@ -3390,6 +3412,15 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             # Recommended Actions: what the checks above ask of the planner.
             my $pool_use_report = _pool_use_report($open_log_files{$system_identifier}, \%POOL_USE,
                 (ref($structural_summary->{Findings}) eq 'HASH' ? $structural_summary->{Findings}{Pools} : undef));
+            # Pool reduction candidates (v10 B6): for review, listed with the pool observations, never as an action.
+            %POOL_REDUCTION_RECORDS = ();
+            if (%POOL_REDUCTION_EVIDENCE && ref($structural_summary->{Findings}) eq 'HASH')
+            {
+                my $pool_reduction = _pool_reduction_report($open_log_files{$system_identifier}, $structural_summary->{Findings}{Pools},
+                    \%POOL_REDUCTION_EVIDENCE, _pool_reduction_members(\%proposals, \%lpar_roles));
+                %POOL_REDUCTION_RECORDS = %{ $pool_reduction->{Records} };
+                push @{ $pool_use_report->{Observed} }, @{ $pool_reduction->{Observed} };
+            }
             my $action_count = _log_recommended_actions($open_log_files{$system_identifier}, $structural_summary, $exposure_summary, $pool_use_report, \%COARSE_REVIEW);
             printf STDERR "  [INFO] Recommended actions: %d (see rationale)\n", $action_count;
             # The snapshot is also filed with the planner outputs: the store lives beside the staged
@@ -16306,7 +16337,7 @@ sub _pool_use_report
         '  A pool that was repeatedly at its maximum while its LPARs had busy work above their entitlement,',
         '  in the hours of their planning profiles, gets a trial increase of one processing unit, then',
         '  re-measurement: being full shows that demand was at least what was served, not how much more',
-        '  was wanted. No pool reduction is derived here.', '',
+        '  was wanted. Reduction candidates are in the section that follows.', '',
         sprintf('    %-6s %8s %8s %8s %8s %8s  %s', 'Pool', 'Maximum', 'Median', 'P95', 'P99', 'Peak', 'At its maximum'),
         sprintf('    %-6s %8s %8s %8s %8s %8s  %s', '-' x 6, ('-' x 8) x 5, '-' x 30));
     foreach my $pool (sort { $a <=> $b } keys %$pool_use)
@@ -16374,6 +16405,495 @@ sub _pool_use_report
         . 'peaks shorter than an interval are not seen; an LPAR\'s busy work and its pool\'s state are matched by interval, and that they '
         . 'coincided inside it is not shown. Pool reduction not assessed: %d-minute data can hide short peaks. Collect one-minute data.',
         $any_coarse, $any_coarse), '    ', '    '), '' if $any_coarse;
+    print {$log_fh} join("\n", @out), "\n" if (defined $log_fh && ref($log_fh));
+    return \%result;
+}
+
+# ==============================================================================
+# Pool reduction candidate (v10 B6). Policy: Stage 3.4 Pool Reduction Policy
+# (first version) with the decisions of 21 and 27 November: a conditional
+# candidate for the planner's review, never an instruction; no margin; not from
+# data coarser than one minute; coverage of at least 28 days, 99% of the minutes
+# credible overall and 90% on every day. The pool reserve is not collected and
+# is not counted: only the pool's maximum processing units are worked with.
+# ==============================================================================
+
+# A number of processors as whole processing units, rounded up.
+sub _pool_whole_units
+{
+    my ($value) = @_;
+    return undef unless (defined $value && looks_like_number($value));
+    my $units = int($value);
+    $units++ if ($value - $units > $FLOAT_EPSILON);
+    return $units;
+}
+
+# The configured events against the evidence period (the pool observations of one frame):
+# [ { event, state (observed | incomplete | notInPeriod), occurrences, complete } ]. An occurrence
+# counts as observed only when all its days lie in the period and each of them holds credible pool
+# readings for at least 90% of its minutes on every pool observed; falling within the dates is not enough.
+sub _pool_reduction_events
+{
+    my ($config, $from, $to, $pool_use) = @_;
+    my @out;
+    return \@out unless (ref($config) eq 'HASH' && %$config);
+    # Occurrences are listed past the end of the period too, so that one still running when the period ends
+    # is seen as incomplete rather than as absent.
+    my ($start, $end) = (scalar(gmtime($from)), scalar(gmtime($to + 366 * 86400)));
+    # Judged for one pool, on its own observations: another pool's missing days say nothing about this one.
+    my $day_ok = sub
+    {
+        my ($day) = @_;
+        return (ref($pool_use) eq 'HASH' && ((($pool_use->{dayCredible}{$day} // 0) / 1440) >= $POOL_REDUCTION_RULE{minDayCoverage})) ? 1 : 0;
+    };
+    foreach my $name (sort keys %$config)
+    {
+        my $cfg = $config->{$name};
+        next unless (ref($cfg) eq 'HASH');
+        next if ($name =~ /^(?:Global|Adaptive)$/i);
+        my $monthly = (($cfg->{period} // '') eq 'monthly' && !(defined $cfg->{dates} && length($cfg->{dates})));
+        # Only an event with a calendar of its own can be looked for in the period (one that follows another event has none).
+        next unless ((defined $cfg->{dates} && length($cfg->{dates})) || ($monthly && ($cfg->{day_of_period} // 0) == -1)
+            || ($cfg->{period} // '') =~ /^(?:weekly|daily)$/);
+        my $occurrences = eval { _enumerate_event_occurrences($cfg, $start, $end) };
+        next unless (ref($occurrences) eq 'ARRAY');           # a free-running or unreadable event has no calendar to check
+        my ($seen, $complete) = (0, 0);
+        foreach my $o (@$occurrences)
+        {
+            next unless (ref($o) eq 'HASH' && $o->{start} && $o->{end});
+            my ($first, $last) = (int($o->{start}->epoch / 86400), int($o->{end}->epoch / 86400));
+            # A monthly event is its last days up to the month end (as its forecast reads it), not the whole month.
+            $first = $last - (max(1, int($cfg->{duration_days} // 1)) - 1) if ($monthly);
+            next if ($last < int($from / 86400) || $first > int(($to - 1) / 86400));
+            $seen++;
+            next if ($first < int($from / 86400) || $last > int(($to - 1) / 86400));
+            $complete++ unless (grep { !$day_ok->($_) } ($first .. $last));
+        }
+        push @out, { event => $name, occurrences => $seen, complete => $complete,
+                     state => (!$seen ? 'notInPeriod' : $complete ? 'observed' : 'incomplete') };
+    }
+    return \@out;
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_reduction_evidence
+# PURPOSE:    The workload evidence of each user-defined pool for a reduction
+#             candidate, from the evidence pass: coverage, the highest credible
+#             minute and what supports it, whether the pool reached its
+#             maximum, changes of the pool or its members in the period, the
+#             members with busy work above entitlement in contested minutes,
+#             whether the frame was without spare cores anywhere in the period,
+#             and the configured events against the period. Plain data: it is
+#             saved with the plan.
+# ARGUMENTS:  1. counts of _exposure_evaluate_window  2. %POOL_USE
+#             3. pool segments (_pool_segments)  4. evidence trackers
+#             5. events (_pool_reduction_events)
+# RETURNS:    hashref { pool => evidence }
+# ==============================================================================
+# The saved seasonal plans that are compatible with this run (v10 B6): for each configured event, the newest
+# stored Seasonal Capacity Plan on the same data and profile definitions, and what it needs of each pool
+# (planned entitlements plus the pool use relied on, in whole processing units). No seasonal model is run.
+# Returns { pool => [ { event, snapshot, occurrence, requirement, units } ] }.
+sub _pool_reduction_seasonal
+{
+    my ($cache, $config) = @_;
+    my %out;
+    return \%out unless (defined $cache && ref($config) eq 'HASH');
+    foreach my $name (sort keys %$config)
+    {
+        next unless (ref($config->{$name}) eq 'HASH');
+        next if ($name =~ /^(?:Global|Adaptive)$/i);
+        my $reference = eval { _capacity_plan_reference($cache, $name) };
+        next unless (ref($reference) eq 'HASH' && ($reference->{Status} // '') eq 'matching');
+        my $plan = _safe_dig($reference->{Record}, 'context', 'capacityPlan');
+        next unless (ref($plan) eq 'HASH' && $plan->{produced} && ref($plan->{pools}) eq 'ARRAY');
+        foreach my $pool (@{ $plan->{pools} })
+        {
+            next unless (ref($pool) eq 'HASH' && looks_like_number($pool->{pool} // '') && looks_like_number($pool->{requirement} // ''));
+            push @{ $out{ $pool->{pool} + 0 } }, { event => $name, snapshot => $reference->{Snapshot},
+                occurrence => (ref($plan->{occurrence}) eq 'HASH' ? { %{ $plan->{occurrence} } } : undef),
+                requirement => $pool->{requirement} + 0, units => _pool_whole_units($pool->{requirement}) };
+        }
+    }
+    return \%out;
+}
+
+sub _pool_reduction_evidence
+{
+    my ($counts, $pool_use, $segments, $trackers, $event_config, $seasonal) = @_;
+    my %out;
+    my $raw = (ref($counts) eq 'HASH' && ref($counts->{poolUse}) eq 'HASH') ? $counts->{poolUse} : {};
+    my %contested;
+    foreach my $t (@{ $trackers // [] })
+    {
+        next unless (defined $t->{pool} && ref($t->{protection}) eq 'HASH' && ($t->{protection}{contested} // 0) > 0);
+        $contested{ $t->{pool} + 0 }{ $t->{vm} } = 1;
+    }
+    foreach my $pool (keys %{ $pool_use // {} })
+    {
+        my ($u, $use) = ($pool_use->{$pool}, $raw->{$pool});
+        next unless (ref($u) eq 'HASH' && ref($use) eq 'HASH' && ref($use->{window}) eq 'ARRAY');
+        my ($from, $to) = @{ $use->{window} };
+        my @days = (int($from / 86400) .. int(($to - 1) / 86400));
+        my $credible = sum0(values %{ $use->{dayCredible} });
+        my @peaks = sort { $use->{dayPeak}{$b} <=> $use->{dayPeak}{$a} || $a <=> $b } keys %{ $use->{dayPeak} };
+        my @levels = sort { $a <=> $b } values %{ $use->{dayPeak} };
+        my $peak = @peaks ? $use->{dayPeak}{ $peaks[0] } : undef;
+        my $near = defined $peak ? _exposure_tolerance($MEMBER_EXPOSURE_RULES{localScarceAbsCores}, $MEMBER_EXPOSURE_RULES{localScarceRel}, $peak) : 0;
+        my @changes = map { _pool_iso($_->{from}) } @{ $segments->{$pool} // [] };
+        shift @changes;                                         # the first segment starts the period: not a change
+        # What changed at each of them, in the planner's terms.
+        my @kinds;
+        my @list = @{ $segments->{$pool} // [] };
+        foreach my $i (1 .. $#list)
+        {
+            my ($was, $is) = map { my $seg = $_; +{ map { ($_->{vm} => $_) } @{ $seg->{members} // [] } } } @list[ $i - 1, $i ];
+            my %what;
+            $what{'members joined or left'} = 1 if (join(',', sort keys %$was) ne join(',', sort keys %$is));
+            foreach my $vm (grep { $was->{$_} } keys %$is)
+            {
+                $what{'entitlement'} = 1 if (($was->{$vm}{entitlement} // '') ne ($is->{$vm}{entitlement} // ''));
+                $what{'VPs'} = 1         if (($was->{$vm}{virtualProcessors} // '') ne ($is->{$vm}{virtualProcessors} // ''));
+                $what{'capped mode'} = 1 if (($was->{$vm}{capped} // '') ne ($is->{$vm}{capped} // ''));
+                $what{'SMT mode'} = 1    if (($was->{$vm}{smt} // '') ne ($is->{$vm}{smt} // ''));
+            }
+            $what{'pool maximum'} = 1 if (join(',', sort keys %{ $list[ $i - 1 ]{sizes} // {} }) ne join(',', sort keys %{ $list[$i]{sizes} // {} }));
+            push @kinds, [ sort keys %what ];
+        }
+        $out{ $pool + 0 } = {
+            pool => $pool + 0, maximum => (defined $u->{Maximum} ? $u->{Maximum} + 0 : undef), cadenceMinutes => ($u->{Cadence} // 1) + 0,
+            window => { start => _pool_iso($from), end => _pool_iso($to) }, days => scalar(@days),
+            daysObserved => scalar(keys %{ $use->{dayCredible} }), credibleMinutes => $credible + 0,
+            coverage => _pool_round($credible / (1440 * (scalar(@days) || 1))),
+            worstDayCoverage => _pool_round(min(map { ($use->{dayCredible}{$_} // 0) / 1440 } @days)),
+            aboveMaximumReadings => ($use->{aboveMaximum} // 0) + 0,
+            peak => (defined $peak ? _pool_round($peak) : undef), peakDay => (@peaks ? _pool_iso($peaks[0] * 86400) : undef),
+            secondDayPeak => (@peaks > 1 ? _pool_round($use->{dayPeak}{ $peaks[1] }) : undef),
+            daysNearPeak => (defined $peak ? scalar(grep { $peak - $_ <= $near + 1e-9 } @levels) : 0),
+            routineDayPeak => (@levels ? _pool_round(_pool_quantile(\@levels, 0.50)) : undef),
+            atMaximum => { minutes => ($u->{Full} // 0) + 0, days => ($u->{FullDays} // 0) + 0 },
+            maximumChanged => ($u->{MaximumChanged} ? [ map { $_ + 0 } @{ $u->{MaximumChanged} } ] : undef),
+            changes => \@changes, changeKinds => \@kinds,
+            contestedMembers => [ sort keys %{ $contested{ $pool + 0 } // {} } ],
+            frame => { assessed => (($counts->{physicalMinutes} // 0) > 0 ? JSON::true : JSON::false), observations => ($counts->{physicalMinutes} // 0) + 0,
+                       withoutSpareCores => ($counts->{frameLow} // 0) + 0 },
+            events => _pool_reduction_events($event_config, $from, $to, $use),
+            seasonalPlans => [ @{ (ref($seasonal) eq 'HASH' ? $seasonal->{ $pool + 0 } : undef) // [] } ],
+        };
+    }
+    return \%out;
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_reduction_members
+# PURPOSE:    What a reduction candidate needs to know of each member of a
+#             frame, read from the plan records (the same before and after the
+#             finalisation of a planning cycle): its role in the totals; for a
+#             PowerHA standby, the takeover requirement where a compatible one
+#             is known (the target of its primary, from a plan that was
+#             resolved, not its installed stand-in); its VP change.
+# ARGUMENTS:  1. members of a plan (hashref)  2. roles { LPAR => role } where the
+#                plan does not carry them yet (optional)
+# RETURNS:    hashref { LPAR => { Role, Takeover, InstalledVP, CycleVP, ReviewVP } }
+# ==============================================================================
+sub _pool_reduction_members
+{
+    my ($members, $roles) = @_;
+    my %out;
+    foreach my $vm (keys %{ $members // {} })
+    {
+        my $m = $members->{$vm};
+        next unless (ref($m) eq 'HASH');
+        my $role = (ref($roles) eq 'HASH' ? $roles->{$vm} : undef) // $m->{estateRole} // '';
+        my $r = (ref($m->{role}) eq 'HASH') ? $m->{role} : {};
+        my $takeover;
+        if ($role eq 'standby' && ($r->{type} // '') eq 'haStandby' && ref($m->{pendingRole}) ne 'HASH' && !defined $r->{unresolved})
+        {
+            my $pt = (ref($r->{primaryTarget}) eq 'HASH') ? $r->{primaryTarget} : {};
+            $takeover = $pt->{entitlement} + 0 if (looks_like_number($pt->{entitlement} // '') && ($pt->{source} // '') ne 'installed');
+        }
+        my $profile = (defined $m->{planningProfile} && ref($m->{profiles}) eq 'HASH') ? $m->{profiles}{ $m->{planningProfile} } : undef;
+        my $cc = (ref($profile) eq 'HASH' && ref($profile->{currentCycle}) eq 'HASH') ? $profile->{currentCycle} : {};
+        my $published = (ref($m->{published}) eq 'HASH') ? $m->{published} : {};
+        $out{$vm} = { Role => $role, Takeover => $takeover,
+                      InstalledVP => (looks_like_number($m->{installedVPs} // '') ? $m->{installedVPs} + 0 : undef),
+                      CycleVP => (looks_like_number($published->{VPs} // '') ? $published->{VPs} + 0 : looks_like_number($cc->{VPs} // '') ? $cc->{VPs} + 0 : undef),
+                      ReviewVP => (looks_like_number($cc->{reviewVPs} // '') ? $cc->{reviewVPs} + 0 : undef) };
+    }
+    return \%out;
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_reduction_candidate
+# PURPOSE:    The reduction candidate of one user-defined pool, its eligibility
+#             and what remains to be done before the maximum could be lowered.
+#             Three quantities, named apart:
+#             - the structural minimum: the members' entitlements, for the full
+#               targets and for this cycle (a pool maximum cannot be below the
+#               sum of its members' entitlements); the installed total beside
+#               them;
+#             - the takeover provision: the same sums with the known takeover
+#               requirement of each standby in place of its own entitlement
+#               where that is higher (the other members at their planned
+#               allocations; nothing counted twice). Conservative provision,
+#               not a verified failover scenario;
+#             - the workload part: the smallest whole number of processing
+#               units that keeps the highest credible minute outside the
+#               near-ceiling tolerance.
+#             The candidate is the largest of them. It is offered only where
+#             the evidence is complete and nothing in the plan can release
+#             demand the measurements did not see; where the takeover need of a
+#             standby is not known it is withheld, whatever the policy of that
+#             standby. Eligibility (why it is or is not offered) and
+#             prerequisites (what the planner must still do or confirm) are
+#             kept apart: a candidate with prerequisites is not an approved
+#             reduction. Pure.
+# ARGUMENTS:  1. evidence of the pool (from _pool_reduction_evidence; undef:
+#                none)  2. the pool of _assess_pool_entitlement_feasibility
+#             3. members (_pool_reduction_members)
+# RETURNS:    hashref (see the keys below; plain data for the saved plan)
+# ==============================================================================
+sub _pool_reduction_candidate
+{
+    my ($ev, $pool, $members) = @_;
+    my %rule = %POOL_REDUCTION_RULE;
+    my $maximum = $pool->{Ceiling};
+    my %r = (pool => $pool->{PoolId}, maximum => $maximum, verdict => 'notAssessed', eligible => JSON::false, candidate => undef,
+             installedEntitlement => 0 + sprintf('%.2f', $pool->{InstalledSum} // 0),
+             structural => { full => $pool->{RequiredMax}, cycle => $pool->{RequiredMaxCycle},
+                             fullEntitlement => 0 + sprintf('%.2f', $pool->{ProposedSum} // 0), cycleEntitlement => 0 + sprintf('%.2f', $pool->{CycleSum} // 0) },
+             reasons => [], prerequisites => []);
+    my $reason = sub { push @{ $r{reasons} }, { code => $_[0], text => $_[1] }; };
+    my $need   = sub { push @{ $r{prerequisites} }, { code => $_[0], text => $_[1] }; };
+    my $plural = sub { return ($_[0] == 1) ? '' : 's'; };
+    unless (defined $maximum && looks_like_number($maximum) && $maximum > 0)
+    {
+        $reason->('maximum', 'the pool maximum is not reported consistently by its members');
+        return \%r;
+    }
+    unless (ref($ev) eq 'HASH' && defined $ev->{peak})
+    {
+        $reason->('evidence', 'no pool observations for this pool in the period');
+        return \%r;
+    }
+    if (($ev->{cadenceMinutes} // 1) > 1)
+    {
+        $reason->('resolution', sprintf('%d-minute data can hide short peaks. Collect one-minute data', $ev->{cadenceMinutes}));
+        return \%r;
+    }
+
+    # The workload part: the highest credible minute outside the near-ceiling tolerance, in whole units. No margin.
+    my $workload = _pool_whole_units($ev->{peak}) || 1;
+    $workload++ while ($workload - $ev->{peak} <= _exposure_tolerance($MEMBER_EXPOSURE_RULES{localScarceAbsCores}, $MEMBER_EXPOSURE_RULES{localScarceRel}, $workload) + 1e-9);
+    $r{workload} = { units => $workload, peak => $ev->{peak}, peakDay => $ev->{peakDay}, secondDayPeak => $ev->{secondDayPeak},
+                     daysNearPeak => $ev->{daysNearPeak}, routineDayPeak => $ev->{routineDayPeak}, days => $ev->{days} };
+
+    # Takeover provision of the standbys in the pool.
+    my (@known, @unknown, $extra_full, $extra_cycle);
+    ($extra_full, $extra_cycle) = (0, 0);
+    foreach my $row (@{ $pool->{Members} // [] })
+    {
+        my $m = (defined $row->{Vm} && ref($members->{ $row->{Vm} }) eq 'HASH') ? $members->{ $row->{Vm} } : {};
+        next unless (($m->{Role} // '') eq 'standby');
+        if (!defined $m->{Takeover})
+        {
+            push @unknown, $row->{Vm};
+            next;
+        }
+        my ($full, $cycle) = (($row->{Proposed} // $row->{Current} // 0), ($row->{Cycle} // $row->{Current} // 0));
+        $extra_full  += $m->{Takeover} - $full  if ($m->{Takeover} > $full);
+        $extra_cycle += $m->{Takeover} - $cycle if ($m->{Takeover} > $cycle);
+        push @known, { lpar => $row->{Vm}, takeoverEntitlement => $m->{Takeover}, fullEntitlement => $full, cycleEntitlement => $cycle };
+    }
+    $r{takeover} = { state => (@unknown ? 'unknown' : @known ? 'known' : 'none'), unknown => [ sort @unknown ], known => \@known,
+                     (@known && !@unknown ? (full => _pool_whole_units(($pool->{ProposedSum} // 0) + $extra_full),
+                                             cycle => _pool_whole_units(($pool->{CycleSum} // 0) + $extra_cycle)) : ()) };
+
+    # A compatible saved seasonal plan: no candidate below what it needs of this pool.
+    my @plans = grep { ref($_) eq 'HASH' && looks_like_number($_->{units} // '') } @{ $ev->{seasonalPlans} // [] };
+    my $seasonal = @plans ? max(map { $_->{units} } @plans) : 0;
+    $r{seasonalPlan} = { units => $seasonal, events => [ map { { event => $_->{event}, units => $_->{units}, requirement => $_->{requirement} } } @plans ] } if (@plans);
+
+    my $normal = max($pool->{RequiredMax}, $pool->{RequiredMaxCycle}, $workload);
+    my $candidate = max($normal, ($r{takeover}{full} // 0), ($r{takeover}{cycle} // 0), $seasonal);
+    $r{normalOperation} = $normal;
+    $r{setBy} = ($candidate == $workload) ? 'workload' : ($candidate == max($pool->{RequiredMax}, $pool->{RequiredMaxCycle})) ? 'entitlements'
+              : ($candidate == max(($r{takeover}{full} // 0), ($r{takeover}{cycle} // 0))) ? 'takeover' : 'seasonalPlan';
+    if ($candidate >= $maximum - $FLOAT_EPSILON)
+    {
+        @r{qw(verdict candidate)} = ('none', undef);
+        $r{needed} = $candidate;
+        return \%r;
+    }
+
+    # Eligibility: is the evidence fit to rest a reduction on?
+    $reason->('takeover', sprintf('the takeover requirement of %s is not known to nFit: the maximum the pool needs at takeover cannot be stated',
+        join(', ', sort @unknown))) if (@unknown);
+    $reason->('atMaximum', sprintf('the pool reached its maximum (%d minute%s on %d day%s): its measured use is a lower bound', $ev->{atMaximum}{minutes},
+        $plural->($ev->{atMaximum}{minutes}), $ev->{atMaximum}{days}, $plural->($ev->{atMaximum}{days}))) if (($ev->{atMaximum}{minutes} // 0) > 0);
+    $reason->('days', sprintf('%d days observed, %d needed', $ev->{days}, $rule{minDays})) if (($ev->{days} // 0) < $rule{minDays});
+    $reason->('coverage', sprintf('%.1f%% of the minutes hold a credible reading, %.0f%% needed', 100 * ($ev->{coverage} // 0), 100 * $rule{minCoverage}))
+        if (($ev->{coverage} // 0) < $rule{minCoverage} - 1e-9);
+    $reason->('dayCoverage', sprintf('the least covered day holds %.1f%% of its minutes, %.0f%% needed on every day', 100 * ($ev->{worstDayCoverage} // 0),
+        100 * $rule{minDayCoverage})) if (($ev->{worstDayCoverage} // 0) < $rule{minDayCoverage} - 1e-9);
+    my @changed = map { my $kinds = (ref($ev->{changeKinds}) eq 'ARRAY') ? $ev->{changeKinds}[$_] : undef;
+                        substr($ev->{changes}[$_], 0, 10) . ((ref($kinds) eq 'ARRAY' && @$kinds) ? ': ' . join(', ', @$kinds) : '') } (0 .. $#{ $ev->{changes} // [] });
+    $reason->('changed', sprintf('the pool or its members changed in the period (%s): re-measure after the change',
+        join('; ', @changed[ 0 .. (@changed > 3 ? 2 : $#changed) ]) . (@changed > 3 ? '; ...' : '')))
+        if (@changed || $ev->{maximumChanged});
+    $reason->('frame', sprintf('the frame was without spare cores in %d minute%s of the period: use may have been held back', $ev->{frame}{withoutSpareCores},
+        $plural->($ev->{frame}{withoutSpareCores}))) if (($ev->{frame}{withoutSpareCores} // 0) > 0);
+    # Member changes that can release demand the measurements did not see.
+    my %contested = map { $_ => 1 } @{ $ev->{contestedMembers} // [] };
+    my @release;
+    foreach my $row (@{ $pool->{Members} // [] })
+    {
+        my $vm = $row->{Vm} // next;
+        my $m = (ref($members->{$vm}) eq 'HASH') ? $members->{$vm} : {};
+        my @why;
+        push @why, 'more VPs' if (defined $m->{CycleVP} && defined $m->{InstalledVP} && $m->{CycleVP} > $m->{InstalledVP});
+        push @why, 'a VP increase under review' if (defined $m->{ReviewVP} && defined $m->{InstalledVP} && $m->{ReviewVP} > $m->{InstalledVP});
+        my $rise = max(($row->{Proposed} // $row->{Current} // 0), ($row->{Cycle} // $row->{Current} // 0)) - ($row->{Current} // 0);
+        push @why, 'a higher entitlement where it competed for the pool' if ($rise > $STRUCTURAL_ENT_TOLERANCE && $contested{$vm});
+        push @release, sprintf('%s (%s)', $vm, join(', ', @why)) if (@why);
+    }
+    $reason->('memberChange', sprintf('planned changes can release demand that was held back: %s. Re-measure after them', join('; ', @release))) if (@release);
+
+    # Prerequisites: what the planner must still do or confirm. Never empty: the reserve is not collected.
+    my $installed_units = _pool_whole_units($pool->{InstalledSum} // 0);
+    if ($candidate < $installed_units)
+    {
+        $r{memberReductionsFirst} = { installedMinimum => $installed_units };
+        $need->('memberReductions', sprintf("reduce the members' entitlements first: installed they total %.2f, so the maximum cannot go below %d until then",
+            $pool->{InstalledSum}, $installed_units));
+    }
+    $need->('reserve', 'confirm the pool reserve: it is not collected and is not counted here');
+    $need->('frameNotAssessed', 'whether the frame held back use in the period is not assessed (no frame observations)') unless ($ev->{frame}{assessed});
+    my @missing = map { $_->{event} } grep { $_->{state} eq 'notInPeriod' } @{ $ev->{events} // [] };
+    my @partial = map { $_->{event} } grep { $_->{state} eq 'incomplete' } @{ $ev->{events} // [] };
+    $need->('eventsMissing', sprintf('the period does not contain %s', join(', ', @missing))) if (@missing);
+    $need->('eventsIncomplete', sprintf('incompletely observed in the period: %s', join(', ', @partial))) if (@partial);
+    # Future events: checked only against a compatible saved seasonal plan; anything else is said to be unchecked.
+    my %planned = map { ($_->{event} => 1) } @plans;
+    my @unplanned = grep { !$planned{$_} } map { $_->{event} } @{ $ev->{events} // [] };
+    if (!@plans)
+    {
+        $need->('futureEvents', 'future event capacity has not been checked');
+    }
+    elsif (@unplanned)
+    {
+        $need->('futureEvents', sprintf('future event capacity has been checked against the saved seasonal plan of %s only; not checked for %s',
+            join(', ', sort keys %planned), join(', ', @unplanned)));
+    }
+    $need->('licensing', 'check licensing');
+
+    $r{candidate} = $candidate;
+    $r{unitsRemoved} = $maximum - $candidate;
+    if (@{ $r{reasons} })
+    {
+        $r{verdict} = 'withheld';
+    }
+    else
+    {
+        @r{qw(verdict eligible)} = ('candidate', JSON::true);
+    }
+    return \%r;
+}
+
+# The candidate as the planner reads it: one sentence for the pool observations (undef where there
+# is nothing to say), and the short form for a footprint line. Pure.
+sub _pool_reduction_text
+{
+    my ($r, $short) = @_;
+    return undef unless (ref($r) eq 'HASH');
+    my $units = sub { return _pool_units_text($_[0]); };
+    my $s = $r->{structural} // {};
+    if ($r->{verdict} eq 'notAssessed')
+    {
+        my ($why) = map { $_->{text} } @{ $r->{reasons} };
+        return $short ? "reduction not assessed ($why)" : sprintf('Pool %s: reduction not assessed: %s.', $r->{pool}, $why);
+    }
+    if ($r->{verdict} eq 'none')
+    {
+        return $short ? sprintf('no reduction: %d needed', $r->{needed}) : undef;
+    }
+    my $w = $r->{workload};
+    my $parts = sprintf("members' entitlements need %d for the full targets and %d this cycle (installed they total %.2f)%s; measured use needs %d "
+        . '(highest credible minute %.2f on %s; no exceedance observed at the recorded resolution in %d days)',
+        $s->{full}, $s->{cycle}, $r->{installedEntitlement},
+        (($r->{takeover}{state} // '') eq 'known' ? sprintf('; conservative takeover provision %d full, %d this cycle (%s at the takeover requirement, the other members as planned; not a verified failover scenario)',
+            $r->{takeover}{full}, $r->{takeover}{cycle}, join(', ', map { $_->{lpar} } @{ $r->{takeover}{known} })) : ''),
+        $w->{units}, $w->{peak}, substr($w->{peakDay} // '?', 0, 10), $w->{days});
+    $parts .= sprintf('; the saved seasonal plan%s need%s %s', (@{ $r->{seasonalPlan}{events} } == 1 ? '' : 's'), (@{ $r->{seasonalPlan}{events} } == 1 ? 's' : ''),
+        join(', ', map { sprintf('%d (%s)', $_->{units}, $_->{event}) } @{ $r->{seasonalPlan}{events} })) if (ref($r->{seasonalPlan}) eq 'HASH');
+    my $before = join('; ', map { $_->{text} } @{ $r->{prerequisites} });
+    if ($r->{verdict} eq 'candidate')
+    {
+        return sprintf('reduction candidate %s to %s (conditional: %s)', $units->($r->{maximum}), $units->($r->{candidate}),
+            join(', ', map { $_->{code} } @{ $r->{prerequisites} })) if ($short);
+        return sprintf('Pool %s: reduction candidate, maximum %s to %s processing units. For planner review, not an instruction: the maximum is not to be '
+            . 'lowered before the points below are met. The %s: %s. Before reducing: %s.', $r->{pool}, $units->($r->{maximum}), $units->($r->{candidate}),
+            'candidate is the largest of these', $parts, $before);
+    }
+    my $why = join('; ', map { $_->{text} } @{ $r->{reasons} });
+    return sprintf('reduction not offered (%s)', join(', ', map { $_->{code} } @{ $r->{reasons} })) if ($short);
+    return sprintf('Pool %s: reduction not offered: %s. For information only, normal operation would need %s processing unit%s against a maximum of %s (%s); '
+        . 'that figure is not sufficient for a reduction decision.', $r->{pool}, $why, $units->($r->{normalOperation}), ($r->{normalOperation} == 1 ? '' : 's'),
+        $units->($r->{maximum}), $parts);
+}
+
+# ==============================================================================
+# SUBROUTINE: _pool_reduction_report
+# PURPOSE:    The reduction candidates of a system's user-defined pools: the
+#             "Pool Reduction Candidates" rationale section and the sentences
+#             for the pool observations. Nothing here is an action.
+# ARGUMENTS:  1. log handle (undef: no section)  2. structural pools
+#             3. evidence { pool => ... }  4. members (_pool_reduction_members)
+# RETURNS:    { Records => { pool => record }, Observed => [ sentences ] }
+# ==============================================================================
+sub _pool_reduction_report
+{
+    my ($log_fh, $structural_pools, $evidence, $members) = @_;
+    my %result = (Records => {}, Observed => []);
+    my @pools = grep { ref($_) eq 'HASH' && defined $_->{PoolId} && ref($evidence->{ $_->{PoolId} }) eq 'HASH' } @{ $structural_pools // [] };
+    return \%result unless (@pools);
+    my @out = ('', '=' x 70, 'Pool Reduction Candidates', '=' x 70,
+        '  For each user-defined pool with pool observations: what its maximum must hold, and whether a lower',
+        '  maximum is a candidate. A candidate is for the planner\'s review, not an instruction. All hours are',
+        '  read: a maximum is in force all day. No margin is added. The pool reserve is not collected and is',
+        '  not counted: confirm it before any reduction.', '',
+        sprintf('    %-6s %8s %10s %9s %9s %9s %9s %10s  %s', 'Pool', 'Maximum', 'Installed', 'Full', 'Cycle', 'Takeover', 'Measured', 'Candidate', 'Verdict'),
+        sprintf('    %-6s %8s %10s %9s %9s %9s %9s %10s  %s', '-' x 6, '-' x 8, '-' x 10, ('-' x 9) x 4, '-' x 10, '-' x 22));
+    foreach my $pool (sort { $a->{PoolId} <=> $b->{PoolId} } @pools)
+    {
+        my $r = _pool_reduction_candidate($evidence->{ $pool->{PoolId} }, $pool, $members);
+        $result{Records}{ $pool->{PoolId} } = $r;
+        my $takeover = (($r->{takeover}{state} // '') eq 'known') ? max($r->{takeover}{full}, $r->{takeover}{cycle})
+                     : (($r->{takeover}{state} // '') eq 'unknown') ? 'unknown' : '-';
+        my $whole = sub { return defined $_[0] ? sprintf('%d', $_[0]) : '-'; };      # formatted as numbers: the record is saved as it is
+        push @out, sprintf('    %-6s %8s %10.2f %9s %9s %9s %9s %10s  %s', $pool->{PoolId}, _pool_units_text($r->{maximum}), $r->{installedEntitlement},
+            $whole->($r->{structural}{full}), $whole->($r->{structural}{cycle}), $takeover, $whole->($r->{workload} ? $r->{workload}{units} : undef),
+            $whole->(($r->{verdict} eq 'candidate') ? $r->{candidate} : undef),
+            { candidate => 'candidate (conditional)', withheld => 'not offered', none => 'no reduction', notAssessed => 'not assessed' }->{ $r->{verdict} });
+        my $text = _pool_reduction_text($r, 0);
+        push @{ $result{Observed} }, $text if (defined $text && $r->{verdict} ne 'notAssessed');
+    }
+    push @out, '', '    Installed, Full, Cycle: what the members\' entitlements need, in whole processing units (Installed: their total).',
+        '    Takeover: the same with each standby at its known takeover requirement (conservative provision, not a',
+        '    verified failover scenario); unknown where nFit does not know it, and then no reduction is offered.',
+        '    Measured: the smallest whole number that keeps the highest credible minute outside the near-maximum',
+        sprintf('    tolerance. Evidence needed: %d days, %.0f%% of the minutes overall and %.0f%% on every day, at one-minute resolution.',
+            $POOL_REDUCTION_RULE{minDays}, 100 * $POOL_REDUCTION_RULE{minCoverage}, 100 * $POOL_REDUCTION_RULE{minDayCoverage}), '';
+    foreach my $id (sort { $a <=> $b } keys %{ $result{Records} })
+    {
+        my $r = $result{Records}{$id};
+        my $w = $r->{workload} or next;
+        next unless ($r->{verdict} eq 'candidate');
+        push @out, _rationale_wrap(sprintf('Pool %s, what supports the measured figure: highest credible minute %.2f cores on %s; second-highest day %s; %d day%s '
+            . 'within the tolerance of the peak; the median of the daily peaks is %s. A pool that runs close to its peak on many days leaves little room above '
+            . 'its routine level.', $id, $w->{peak}, substr($w->{peakDay} // '?', 0, 10), (defined $w->{secondDayPeak} ? sprintf('%.2f', $w->{secondDayPeak}) : 'none'),
+            $w->{daysNearPeak}, ($w->{daysNearPeak} == 1 ? '' : 's'), (defined $w->{routineDayPeak} ? sprintf('%.2f', $w->{routineDayPeak}) : '?')), '    ', '      ');
+    }
     print {$log_fh} join("\n", @out), "\n" if (defined $log_fh && ref($log_fh));
     return \%result;
 }
@@ -19144,6 +19664,14 @@ sub _cycle_finalise_frame
         @{$published}{qw(entitlement VPs action comments)} = @cells{qw(entitlement VPs action comments)};
         $rows{$vm} = \%cells;
     }
+    # Pool reduction candidates: worked out again from the finalised member figures, on the workload
+    # evidence the analysis saved (no staged data is read).
+    if (ref($final->{poolReduction}) eq 'HASH' && ref($final->{poolReduction}{evidence}) eq 'HASH')
+    {
+        my $reduction_members = _pool_reduction_members($final->{members});
+        $final->{poolReduction}{candidates} = { map { ($_->{PoolId} => _pool_reduction_candidate($final->{poolReduction}{evidence}{ $_->{PoolId} }, $_, $reduction_members)) }
+            grep { ref($final->{poolReduction}{evidence}{ $_->{PoolId} }) eq 'HASH' } @{ $findings->{Pools} } };
+    }
     $final->{cycle} = { id => $cycle_id, state => 'final', provisionalPlan => $reg->{plan} };
     return { doc => $final, rows => \%rows, standbys => \@standbys, delta => \%delta, moves => \@moves,
              pools => [ grep { $pool_touched{ $_->{PoolId} } } @{ $findings->{Pools} } ] };
@@ -19421,6 +19949,8 @@ sub _cycle_footprint_frame
                        Count => $default{Count}, (map { ($_ => 0 + sprintf('%.2f', $default{$_} // 0)) } @bases),
                        Status => 'the default pool: its limit is the shared capacity of the frame' };
     }
+    my $reduction_evidence = (ref($doc) eq 'HASH' && ref(_safe_dig($doc, 'poolReduction', 'evidence')) eq 'HASH') ? $doc->{poolReduction}{evidence} : {};
+    my $reduction_members = _pool_reduction_members($members);
     foreach my $pool (@{ _assess_pool_entitlement_feasibility(\@pool_members) })
     {
         my $status = !defined $pool->{Ceiling} ? 'maximum not reported consistently'
@@ -19430,7 +19960,10 @@ sub _cycle_footprint_frame
         push @pools, { Pool => $pool->{PoolId}, Default => 0, Maximum => $pool->{Ceiling}, Count => scalar(@{ $pool->{Members} // [] }),
                        Installed => 0 + sprintf('%.2f', $pool->{InstalledSum}), Full => 0 + sprintf('%.2f', $pool->{ProposedSum}),
                        CurrentCycle => 0 + sprintf('%.2f', $pool->{CycleSum}), MinFull => $pool->{RequiredMax},
-                       MinCurrentCycle => $pool->{RequiredMaxCycle}, Status => $status };
+                       MinCurrentCycle => $pool->{RequiredMaxCycle}, Status => $status,
+                       # The reduction candidate, from the figures of this plan (the finalised ones in a finalised cycle).
+                       (ref($reduction_evidence->{ $pool->{PoolId} }) eq 'HASH'
+                           ? (Reduction => _pool_reduction_candidate($reduction_evidence->{ $pool->{PoolId} }, $pool, $reduction_members)) : ()) };
     }
     $out{pools} = \@pools;
 
@@ -19478,7 +20011,8 @@ sub _cycle_footprint_lines
         Installed_VP Full_VP CurrentCycle_VP LPARs_Left LPARs_Left_Moved Left_Installed_ENT LPARs_On_Two_Frames Standbys_Unresolved Shared_Capacity Shared_Capacity_Check
         Installed_ENT_Uncommitted Full_ENT_Uncommitted CurrentCycle_ENT_Uncommitted Assessment Not_Counted)));
     my @pool_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame Pool LPARs Maximum Installed_ENT Full_ENT CurrentCycle_ENT
-        Minimum_Maximum_Full Minimum_Maximum_CurrentCycle Status)));
+        Minimum_Maximum_Full Minimum_Maximum_CurrentCycle Status Reduction_Verdict Reduction_Candidate Takeover_Provision Measured_Use_Needs
+        Reduction_Reasons Reduction_Prerequisites)));
     my @text = (@{ $headline // [] }, '',
         'Allocation footprint: entitlement in processing units, each LPAR counted once (a VIOS at its pair figure, a PowerHA',
         'standby at its finalised figure). Installed = allocated now; full = the full recommendation; cycle = recommended for',
@@ -19542,10 +20076,24 @@ sub _cycle_footprint_lines
             {
                 push @pool_csv, join(',', map { quote_csv($_) } $cycle_id, $model, $r->{frame}, ($pool->{Default} ? '0 (default)' : $pool->{Pool}),
                     $pool->{Count}, ($pool->{Maximum} // ''), (map { $two->($pool->{$_}) } @bases), ($pool->{MinFull} // ''), ($pool->{MinCurrentCycle} // ''),
-                    $pool->{Status});
+                    $pool->{Status},
+                    # Verdict, candidate, and the two lists kept apart: why it is or is not offered; what must still be done or confirmed.
+                    (ref($pool->{Reduction}) eq 'HASH'
+                        ? ($pool->{Reduction}{verdict}, ($pool->{Reduction}{candidate} // ''),
+                           ((($pool->{Reduction}{takeover}{state} // '') eq 'known') ? max($pool->{Reduction}{takeover}{full}, $pool->{Reduction}{takeover}{cycle})
+                               : (($pool->{Reduction}{takeover}{state} // '') eq 'unknown') ? 'unknown' : ''),
+                           ($pool->{Reduction}{workload} ? $pool->{Reduction}{workload}{units} : ''),
+                           join('; ', map { $_->{text} } @{ $pool->{Reduction}{reasons} // [] }),
+                           join('; ', map { $_->{text} } @{ $pool->{Reduction}{prerequisites} // [] }))
+                        : ('', '', '', '', '', '')));
                 next if ($pool->{Default});
                 push @text, sprintf('    Pool %-4s maximum %-5s entitlements %7s / %7s / %7s; maximum needed %s full, %s cycle: %s', $pool->{Pool},
                     ($pool->{Maximum} // '?'), (map { $two->($pool->{$_}) } @bases), $pool->{MinFull}, $pool->{MinCurrentCycle}, $pool->{Status});
+                if (ref($pool->{Reduction}) eq 'HASH' && $pool->{Reduction}{verdict} ne 'none')
+                {
+                    # For review, not an instruction: the full sentence carries the conditions.
+                    push @text, _rationale_wrap(_pool_reduction_text($pool->{Reduction}, 0), '      ', '        ', 104);
+                }
             }
         }
         push @text, sprintf('  %-14s %5s %10s %10s %10s   (%d frame%s analysed; a sum of entitlements, not a capacity statement)', 'Frames analysed', '',
@@ -19877,6 +20425,10 @@ sub _publish_tactical_proposals
         members => $members,
         # The frame as this run read it: the shared-processor capacity its default-pool LPARs report.
         ((ref($FRAME_SHARED_CAPACITY) eq 'HASH') ? (frame => { sharedProcessors => $FRAME_SHARED_CAPACITY }) : ()),
+        # Pool reduction candidates (B6): the workload evidence of each pool, and the candidate as this analysis
+        # worked it out. The finalisation of a planning cycle works the candidates out again from the evidence
+        # and the finalised member figures.
+        (%POOL_REDUCTION_EVIDENCE ? (poolReduction => { evidence => { %POOL_REDUCTION_EVIDENCE }, candidates => { %POOL_REDUCTION_RECORDS } }) : ()),
         # Optional run context (an adaptive run: the selection used, the checks not made).
         ((ref($context) eq 'HASH') ? (context => $context) : ()),
         # A plan made in a planning cycle is provisional until the cycle is finalised.
@@ -29866,7 +30418,9 @@ sub _exposure_evaluate_window
         foreach my $pool (keys %$minutes)
         {
             my $use = $pool_use{$pool} //= { observed => 0, full => 0, days => {}, longest => 0, run => 0, last => undef,
-                                             values => '', sizes => {}, size => undef };
+                                             values => '', sizes => {}, size => undef,
+                                             # For the reduction candidate (v10 B6): credible readings by day and their daily peaks.
+                                             window => [ $window_start, $window_end ], dayCredible => {}, dayPeak => {}, aboveMaximum => 0 };
             foreach my $minute (sort { $a <=> $b } keys %{ $minutes->{$pool} })
             {
                 my $record = $minutes->{$pool}{$minute};
@@ -29877,6 +30431,17 @@ sub _exposure_evaluate_window
                 $use->{values} .= pack('f<', $record->{value});
                 $use->{sizes}{ $record->{size} + 0 } = 1;
                 $use->{size} = $record->{size} + 0;                 # the latest reported maximum
+                # A reading above the maximum reported with it is not credible: counted, and left out of the peak a
+                # reduction candidate rests on (the use figures above are unchanged).
+                if ($record->{value} > $record->{size} + _exposure_tolerance($rule{localScarceAbsCores}, $rule{localScarceRel}, $record->{size}))
+                {
+                    $use->{aboveMaximum}++;
+                }
+                else
+                {
+                    $use->{dayCredible}{$day}++;
+                    $use->{dayPeak}{$day} = $record->{value} + 0 if (!defined $use->{dayPeak}{$day} || $record->{value} > $use->{dayPeak}{$day});
+                }
                 next unless ($record->{size} - $record->{value}
                     <= _exposure_tolerance($rule{localScarceAbsCores}, $rule{localScarceRel}, $record->{size}) + 1e-9);
                 $pool_full{$pool}++;
@@ -31498,6 +32063,9 @@ sub _protection_evidence_before_sizing
         $CUT_PROTECTION_EVIDENCE{ $t->{vm} }{$_} = $t for @{ $t->{profiles} };
     }
     %POOL_USE = %{ _pool_use_findings($window_counts->{poolUse}, $trackers) };
+    %POOL_REDUCTION_EVIDENCE = %{ _pool_reduction_evidence($window_counts, \%POOL_USE, _pool_segments(_exposure_load_states($cache_dir), $window_start, $window_end),
+        $trackers, $seasonality_config,
+        _pool_reduction_seasonal($cache_dir, $seasonality_config)) };
     _task(sprintf('Cut protection evidence gathered (%s)', format_duration(time() - $started)));
     return { Status => 'evaluated', Trackers => $trackers };
 }
