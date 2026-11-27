@@ -12,7 +12,7 @@ local $/; my $src = <$fh>; close $fh;
 
 my @names = qw(
     _assess_pool_reliance _resolve_pool_evidence _resolve_dispatch_budget
-    _classify_vcpu_reduction_safety
+    _classify_vcpu_reduction_safety _compute_entbounded_and_tactical _assert_budget_invariant
 );
 my $code = '';
 for my $name (@names) {
@@ -37,6 +37,9 @@ our $VCPU_REDUCTION_CAUTION_REACH_RATIO = 0.80;
 our $MIN_MEANINGFUL_ADJUSTMENT_CORES    = 0.10;
 our $VCPU_REDUCTION_CAUTION_PEAK_PAE    = 0.25;
 our $VCPU_REDUCTION_CAUTION_PEAK_AAE    = 0.25;
+our %VCPU_TIER_STAGE1_STEP_FRACTION   = (1 => 0.25, 2 => 0.35, 3 => 0.50, 4 => 0.50);
+our $VCPU_TIER_STAGE1_STEP_MIN_VP     = 1;
+our $VCPU_REDUCTION_CAUTION_MAX_STEP_VP = 1;
 } . $code . "\n1;\n";
 eval $harness or die "harness eval failed: $@\n";
 
@@ -90,6 +93,38 @@ my $cls2 = UUT::_classify_vcpu_reduction_safety({
     evidence=>{}, current_vp=>8, current_entitlement=>4.0, pool_cpu=>16,
     is_capped=>1, peak_physc=>3.0, guarantee_demand=>6.0});
 ok($cls2->{depends_on_unmeasured_pool} == 0, 'capped LPAR does not depend on unmeasured pool');
+
+# --- D-028: a guarantee check that fails only on the withheld pool-borrowing rule ----------
+# The uplift of the tier's pool-borrowing rule is withheld where the pool was never contested; the
+# check then reads N/A. A VP reduction needs the check positively proven, so without the exemption
+# mark every such LPAR kept all its VPs, with no pressure evidence at all.
+my %quiet = (current_vp => 7, current_entitlement => 6.00, pool_cpu => 32, is_capped => 0, peak_physc => 0.45, guarantee_demand => 0.45);
+my $why = 'the pool-borrowing budget is the only condition not met, and it is not applied because no competition for the pool was observed';
+my $held = UUT::_classify_vcpu_reduction_safety({ %quiet, evidence => { GuaranteeInvariantHolds => 'N/A' } });
+my $free = UUT::_classify_vcpu_reduction_safety({ %quiet, evidence => { GuaranteeInvariantHolds => 'N/A', GuaranteeInvariantExempt => $why } });
+ok($held->{state} eq 'CLEAR' && $held->{strategic_invariant_exempt} eq '', 'D-028: a check that did not run is not exempt');
+ok($free->{state} eq 'CLEAR' && $free->{strategic_invariant_exempt} eq $why, 'D-028: the withheld pool-borrowing allowance is carried as exempt, with its reason');
+my %step = (rvcpu_raw => 1, rvcpu_min => 1, rvcpu_max => 2, rvcpu_final => 1, p99w1_floor_vcpu => 1, rvcpu_tier_num => 1,
+            vp_current_ent_floor => 6, current_ent_stale => 0, current_vp_numeric => 7, current_entitlement => 6.00,
+            guarantee_demand => 0.45, is_capped => 0, pool_cpu => 32, dispatch_budget => 0.15, tier_label => 'G1');
+my $t_held = UUT::_compute_entbounded_and_tactical({ %step, reduction_safety => $held });
+my $t_free = UUT::_compute_entbounded_and_tactical({ %step, reduction_safety => $free });
+ok($t_held->{tactical} == 7 && $t_held->{reduction_safety_state} eq 'BLOCK', 'D-028: a check that did not run still holds the VPs (fail-closed)');
+ok($t_held->{reduction_safety_reasons} =~ /strategic guarantee invariant not positively proven \(N\/A\)/, 'D-028: and says why');
+ok($t_free->{entbounded} == 6 && $t_free->{tactical} == 6 && $t_free->{reduction_safety_state} eq 'CLEAR',
+   'D-028: the exempt check does not hold the VP step (7 to 6 at the tier rate)');
+ok($t_free->{reduction_safety_reasons} !~ /not positively proven/, 'D-028: no guarantee reason is given as a block');
+ok($t_free->{tactical_note} =~ /; guarantee check of the strategic pair exempt: \Q$why\E/, 'D-028: the reason for the exemption stays on the VP step');
+ok($t_held->{tactical_note} !~ /exempt/, 'D-028: and is absent where nothing is exempt');
+# The mark does not turn a failed check, or one that passed, into something else.
+my $failed = UUT::_classify_vcpu_reduction_safety({ %quiet, evidence => { GuaranteeInvariantHolds => 'No', GuaranteeInvariantExempt => $why } });
+ok($failed->{state} eq 'BLOCK' && $failed->{strategic_invariant_exempt} eq '', 'D-028: a check that failed outright blocks, whatever the mark');
+my $t_failed = UUT::_compute_entbounded_and_tactical({ %step, reduction_safety => $failed });
+ok($t_failed->{tactical} == 7, 'D-028: and the VPs stay');
+# Other safety evidence is untouched by the exemption: a credible peak at the reachable capacity still blocks.
+my $pressed = UUT::_classify_vcpu_reduction_safety({ %quiet, peak_physc => 6.9, evidence => { GuaranteeInvariantHolds => 'N/A', GuaranteeInvariantExempt => $why } });
+my $t_pressed = UUT::_compute_entbounded_and_tactical({ %step, reduction_safety => $pressed });
+ok($pressed->{state} eq 'BLOCK' && $t_pressed->{tactical} == 7, 'D-028: a peak at the reachable capacity blocks an exempt LPAR as any other');
 
 print "\n$tests tests, $fail failures\n";
 exit($fail ? 1 : 0);

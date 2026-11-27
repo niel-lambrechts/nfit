@@ -29,6 +29,9 @@ class CutProtectionTest(unittest.TestCase):
         self.root = Path(mx.MemberExposureTests.make_root())
         self.addCleanup(shutil.rmtree, self.root)
         self.cache = self.root / 'stage' / mx.SERIAL
+        self.setUpConfig()
+
+    def setUpConfig(self):
         self.cfg = self.root / 'vms.csv'
         with self.cfg.open('w') as f:
             w = csv.writer(f)
@@ -169,6 +172,49 @@ class CutProtectionTest(unittest.TestCase):
         for vm in rows:                                                          # every pair stays valid
             ent, vps = float(rows[vm]['NFIT - ENT']), int(rows[vm]['NFIT - VCPU'])
             self.assertTrue(0.05 * vps - 1e-9 <= ent <= vps + 1e-9, vm)
+
+    def test_a_withheld_borrowing_allowance_does_not_hold_the_vp_step(self):
+        # D-028, through ordinary sizing. vmS (tier 3) is given 6 VPs in a pool of 8 that was never contested: its
+        # workload needs 2. The tier's pool-borrowing allowance is withheld on the pool evidence, the guarantee check of
+        # the strategic pair then reads N/A, and that used to hold every VP ("not positively proven"). It is exempt now,
+        # with its reason; the other safety evidence still decides the step.
+        saved = mx.CONFIG['vmS']
+        mx.CONFIG['vmS'] = (1.5, 6, 9, 8.0)
+        self.addCleanup(mx.CONFIG.__setitem__, 'vmS', saved)
+        mx.MemberExposureTests.roots = []
+        self.root = Path(mx.MemberExposureTests.make_root())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.cache = self.root / 'stage' / mx.SERIAL
+        self.setUpConfig()
+        gates, rows, log = self.gates()
+        row = rows['vmS']
+        self.assertEqual(gates['vmS'], {'withheld (no contested minute)'})
+        self.assertEqual((row['Current - ENT'], row['Current - VCPU']), ('1.50', '6'))
+        # The false block is gone: the planning profile's VPs take a step, and the reason for the exemption is stated.
+        self.assertEqual((row['G3-95W15_rVCPU_Tactical'], row['NFIT - VCPU']), ('5', '5'))
+        self.assertIn('guarantee check of the strategic pair exempt: the pool-borrowing budget is the only condition not met, and it is not '
+                      'applied because no competition for the pool was observed', ' '.join(log.split()))
+        self.assertNotIn('not positively proven (N/A)', log)
+        # Genuine safety evidence still limits the step: served bursts make it CAUTION, one VP only (the tier's rate is 3).
+        self.assertIn('CAUTION: limited to 1 VP this cycle (material served-burst evidence', ' '.join(log.split()))
+        # And still blocks where it should: the P profile's candidate fails the check of the pair it would leave.
+        self.assertEqual(row['P-99W1_rVCPU_Tactical'], '6')
+        self.assertIn('BLOCK: candidate 5 VPs failed the immediate guarantee check; held at current 6 VPs', ' '.join(log.split()))
+        # D-028 does not touch the entitlement the workload asks for: the profile figures are those of a run in which
+        # nothing is exempt (the uplift withheld by switch, without pool evidence).
+        _, held_rows, held_log = self.gates('--research-no-peak-uplift')
+        held = held_rows['vmS']
+        for name in [k for k in row if k + '_rENT_Tactical' in row]:
+            self.assertEqual(row[name], held[name], name)
+        # That switch is not the supported exemption: its N/A still holds the VPs.
+        self.assertEqual((held['G3-95W15_rVCPU_Tactical'], held['NFIT - VCPU']), ('6', '6'))
+        self.assertIn('strategic guarantee invariant not positively proven (N/A)', held_log)
+        self.assertNotIn('guarantee check of the strategic pair exempt', held_log)
+        # With VPs now coming down, the entitlement of this cycle is staged by the existing staging guard (1.01 on the
+        # way to 0.52); with the VPs held it went to 0.52 at once. The target is the same.
+        self.assertEqual((row['G3-95W15'], held['G3-95W15']), ('0.52', '0.52'))
+        self.assertEqual((row['NFIT - ENT'], held['NFIT - ENT']), ('1.01', '0.52'))
+        self.assertIn('Target 0.52 entitlement on 2 VPs over later cycles.', row['NFIT - Action'])
 
     def test_replay_scores_the_recorded_levels(self):
         self.standard()
