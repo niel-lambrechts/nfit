@@ -1003,6 +1003,10 @@ my %RESOLVED_OPTIONS = %{ _resolved_options(\@option_spec, \%CYCLE_OPTIONS_LEFT_
 # This process's part in a planning cycle: { dir, id, runs => { system => {...} } }. Empty outside one.
 my %CYCLE;
 my $FRAME_SHARED_CAPACITY;     # of the frame being published (a standard run), for its saved plan
+# A frame-level reading of the shared total is taken as the whole number of processors it lies within this many
+# processing units of (the total is a count of physical processors; its minute readings vary in the third decimal).
+my %FRAME_USE_RULE = (wholeTolerance => 0.02);
+my %FRAME_USE;                 # measured use of the frame's shared processors (B8), from the evidence pass
 my $PRESENCE_GRACE_DAYS = 2;    # an LPAR last sampled longer before the analysis end is taken to have left the frame (provisional)
 
 print STDERR "nfit-profile version $VERSION\n" if (!defined $show_version);
@@ -2497,6 +2501,17 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "                     [PROTECTED_LEVEL_HELD]; a figure a stated policy sets below it (a fixed\n";
         print {$LOG_FH} "                     standby entitlement) is kept and marked [BELOW_PROTECTED_LEVEL].\n";
         print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Shared capacity    The shared processor capacity the frame reports (phys_cpus_pool of its\n";
+        print {$LOG_FH} "                     default-pool LPARs, used only when they agree). Not the frame's installed or\n";
+        print {$LOG_FH} "                     activated processors. The guarantees of the LPARs analysed are set against it;\n";
+        print {$LOG_FH} "                     pool reserves and LPARs not analysed are not counted.\n";
+        print {$LOG_FH} "\n";
+        print {$LOG_FH} "  Known single-      The largest known increase one PowerHA standby would need to take over its\n";
+        print {$LOG_FH} "  takeover check     primary's target entitlement, one takeover at a time, with every other\n";
+        print {$LOG_FH} "                     allocation kept, against the shared capacity remaining. Known only where the\n";
+        print {$LOG_FH} "                     primary's target comes from a resolved plan. Not a failover capacity verdict:\n";
+        print {$LOG_FH} "                     ROHA, capacity on demand and a whole-frame evacuation are not assessed.\n";
+        print {$LOG_FH} "\n";
         print {$LOG_FH} "  Joint check        The entitlement reductions of a pool's LPARs replayed together against the busy\n";
         print {$LOG_FH} "                     work and pool competition observed, for this cycle's entitlements and for the\n";
         print {$LOG_FH} "                     full targets, in profile hours and outside them. Pool-minute: a minute with at\n";
@@ -3510,6 +3525,9 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
             }
             $FRAME_SHARED_CAPACITY = _frame_shared_capacity($assimilation_map_ref,
                 [ grep { !_safe_dig($assimilation_map_ref, $_, 'Presence', 'left') } @vm_order ]);
+            # The default pool and the frame check (v10 B8): reporting only.
+            print {$open_log_files{$system_identifier}} join("\n", _frame_check_lines(_frame_check(\%proposals, $FRAME_SHARED_CAPACITY,
+                (%FRAME_USE ? \%FRAME_USE : undef), $run_end_date_obj->ymd), 'analysis')), "\n" if ($open_log_files{$system_identifier});
             my $proposal_copy = _publish_tactical_proposals($current_cache_path, $report_type_for_filename,
                 $effective_start_date_obj->ymd, $run_end_date_obj->ymd, \%proposals,
                 File::Spec->catfile($output_dir, sprintf('nfit-profile.%s.%s.proposal.%s.json',
@@ -20299,6 +20317,354 @@ sub _cycle_finalise_lines
 # three different things and are kept apart; pool maxima are never added up.
 # ------------------------------------------------------------------------------
 
+# ==============================================================================
+# The default pool and the frame check (v10 B8; design "Default Pool and Frame Check (B8)").
+# Reporting only: no LPAR figure is taken from it. Three things are kept apart:
+#   - the shared capacity the frame reports (phys_cpus_pool of its default-pool LPARs, with its
+#     provenance); it is not the frame's installed or activated processors;
+#   - the guaranteed entitlements of the LPARs analysed, each counted once, for the user pools
+#     and the default pool, and what remains of the shared capacity after them (a negative
+#     balance is a shortfall). Pool maxima are ceilings on shared use, never added up;
+#   - the measured use of the shared processors, from the frame-level observations only.
+# And one known single-takeover entitlement check per frame.
+# ==============================================================================
+
+# The measured use of the shared processors from the reading of the frame-level observations:
+# { sizes => { size => [ packed busy values, minutes without spare capacity ] }, observed, windowMinutes }.
+# One reading a minute (the reduction already takes one value a minute over its reporters), so a
+# frame observation reported by several LPARs is counted once. Returns { status (observed |
+# notObserved), windowMinutes, observedMinutes, coverage, sizes [ { size, minutes, highest, p99,
+# withoutSpare } ], sizeChanged, and, with one size, highest, p99, withoutSpare }.
+sub _frame_use_summary
+{
+    my ($raw) = @_;
+    return { status => 'notObserved', reason => 'no frame-level observation of the shared processors in the period' }
+        unless (ref($raw) eq 'HASH' && ref($raw->{sizes}) eq 'HASH' && %{ $raw->{sizes} });
+    # The shared total is a count of physical processors: a whole number. Each minute's reading of it is an
+    # interval statistic that varies in the third decimal (119.995, 120.004), so a reading within the named
+    # tolerance of a whole number is that number, and only a real change of the total separates the minutes
+    # (found on the acceptance frames, 28 November 2026). A reading further from any whole number is not
+    # rounded: its minutes are counted as inconsistent and left out of the figures.
+    my (%whole, $inconsistent);
+    $inconsistent = 0;
+    foreach my $size (keys %{ $raw->{sizes} })
+    {
+        my $key = int($size + 0.5);
+        if (abs($size - $key) > $FRAME_USE_RULE{wholeTolerance} + 1e-9 || $key < 1)
+        {
+            $inconsistent += length($raw->{sizes}{$size}[0] // '') / 4;
+            next;
+        }
+        $whole{$key}[0] .= $raw->{sizes}{$size}[0] // '';
+        $whole{$key}[1] += $raw->{sizes}{$size}[1] // 0;
+    }
+    my ($observed, @sizes) = (0);
+    foreach my $size (sort { $a <=> $b } keys %whole)
+    {
+        my ($packed, $without) = @{ $whole{$size} };
+        my @v = sort { $a <=> $b } unpack('f<*', $packed // '');
+        next unless (@v);
+        my $rank = int(0.99 * @v + 0.999999);
+        $rank = 1 if ($rank < 1);
+        push @sizes, { size => $size + 0, minutes => scalar @v, highest => 0 + sprintf('%.2f', $v[-1]), p99 => 0 + sprintf('%.2f', $v[ $rank - 1 ]),
+                       withoutSpare => $without + 0 };
+        $observed += @v;
+    }
+    return { status => 'notObserved', reason => ($inconsistent
+                 ? sprintf('%d frame-level reading%s of the shared total, none near a whole number of processors', $inconsistent, ($inconsistent == 1 ? '' : 's'))
+                 : 'no credible frame-level reading in the period') } unless (@sizes);
+    my %out = (status => 'observed', inconsistentMinutes => $inconsistent + 0, windowMinutes => ($raw->{windowMinutes} // 0) + 0, observedMinutes => $observed,
+               coverage => (($raw->{windowMinutes} // 0) ? 0 + sprintf('%.3f', $observed / $raw->{windowMinutes}) : undef),
+               sizes => \@sizes, sizeChanged => (@sizes > 1 ? JSON::true : JSON::false));
+    @out{qw(highest p99 withoutSpare)} = @{ $sizes[0] }{qw(highest p99 withoutSpare)} if (@sizes == 1);
+    $out{withoutSpare} = 0 + List::Util::sum(map { $_->{withoutSpare} } @sizes) if (@sizes > 1);
+    return \%out;
+}
+
+# SUBROUTINE: _frame_check
+# PURPOSE:    The frame check of one plan's members. Pure; used by the analysis and, on the finalised
+#             plans, by the planning cycle's footprint.
+# ARGUMENTS:  1. plan members  2. shared capacity record ({ status, processors, reporters, values, source })
+#             3. measured use (from _frame_use_summary)  4. analysis end (YYYY-MM-DD; LPARs not sampled
+#             up to it are not counted)
+# RETURNS:    { capacity, guarantees { userPools, defaultPool, all => { Count, Installed, Full, CurrentCycle } },
+#               poolMaxima [ { pool, maximum } ], remaining { basis => balance } (undef without a capacity),
+#               notCounted { noPool }, takeover { eligible, known, cases [...], unknown [...], largest { basis => case },
+#               after { basis => balance } }, measured }
+sub _frame_check
+{
+    my ($members, $capacity, $measured, $end, $lookup) = @_;
+    my @bases = qw(Installed Full CurrentCycle);
+    my $number = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? $v + 0 : undef; };
+    my (%g, %maxima, %pool_sum, $no_pool);
+    $no_pool = 0;
+    $g{$_} = { Count => 0, map { ($_ => 0) } @bases } for qw(userPools defaultPool all);
+    my %present;
+    foreach my $vm (sort keys %{ $members // {} })
+    {
+        my $m = $members->{$vm};
+        next unless (ref($m) eq 'HASH');
+        next unless (_lpar_present($m->{lastSampled}, $end) && (_safe_dig($m, 'membership', 'class') // '') ne 'moved');
+        $present{$vm} = 1;
+        my $pm = (ref($m->{poolMember}) eq 'HASH') ? $m->{poolMember} : {};
+        my $current = _structural_shown_value($pm->{current_ent});
+        unless (defined $current && looks_like_number($pm->{pool_id} // ''))
+        {
+            $no_pool++;
+            next;
+        }
+        my %ent = (Installed => $current, Full => (_structural_shown_value($pm->{proposed_ent}) // $current),
+                   CurrentCycle => (_structural_shown_value($pm->{cycle_ent}) // $current));
+        my $pool = $pm->{pool_id} + 0;
+        foreach my $group (($pool == 0 ? 'defaultPool' : 'userPools'), 'all')
+        {
+            $g{$group}{Count}++;
+            $g{$group}{$_} += $ent{$_} for @bases;
+        }
+        next if ($pool == 0);
+        $pool_sum{$pool}{$_} += $ent{$_} for @bases;
+        $maxima{$pool}{ $pm->{pool_cpu} + 0 } = 1 if (looks_like_number($pm->{pool_cpu} // '') && $pm->{pool_cpu} > 0);
+    }
+    foreach my $group (values %g)
+    {
+        $group->{$_} = 0 + sprintf('%.2f', $group->{$_}) for @bases;
+    }
+    my $shared = (ref($capacity) eq 'HASH' && ($capacity->{status} // '') eq 'agreed' && looks_like_number($capacity->{processors} // '')) ? $capacity->{processors} + 0 : undef;
+    my %out = (capacity => (ref($capacity) eq 'HASH' ? $capacity : { status => 'absent', reporters => 0, values => {} }), guarantees => \%g,
+               poolMaxima => [ map { { pool => $_, maximum => ((keys %{ $maxima{$_} }) == 1 ? (keys %{ $maxima{$_} })[0] + 0 : undef) } }
+                               sort { $a <=> $b } keys %pool_sum ],
+               notCounted => { noPool => $no_pool }, measured => ((ref($measured) eq 'HASH' && %$measured) ? $measured : { status => 'notObserved', reason => 'not gathered' }));
+    foreach my $p (@{ $out{poolMaxima} })
+    {
+        $p->{guarantees} = { map { ($_ => 0 + sprintf('%.2f', $pool_sum{ $p->{pool} }{$_} // 0)) } @bases };
+    }
+    $out{remaining} = defined $shared ? { map { ($_ => 0 + sprintf('%.2f', $shared - $g{all}{$_})) } @bases } : undef;
+
+    # Known single-takeover entitlement check: one takeover at a time; the other allocations stay as they are
+    # (the primary is not assumed to release its capacity). Only a standby sized as one, whose primary's
+    # target is known from a resolved plan, has a known requirement.
+    my (@cases, @unknown);
+    my $eligible = 0;
+    foreach my $vm (sort keys %present)
+    {
+        my $m = $members->{$vm};
+        my $role = (ref($m->{role}) eq 'HASH') ? $m->{role} : {};
+        my $type = $role->{type} // '';
+        next unless ($type eq 'haStandby' || $type eq 'haStandbyFixed');
+        $eligible++;
+        my $primary = $role->{primary};
+        my ($requirement, $source, $why);
+        if ($type eq 'haStandby')
+        {
+            my $pt = (ref($role->{primaryTarget}) eq 'HASH') ? $role->{primaryTarget} : {};
+            if (ref($m->{pendingRole}) eq 'HASH' || defined $role->{unresolved})
+            {
+                $why = 'its primary\'s plan is not resolved';
+            }
+            elsif (($pt->{source} // '') eq 'installed' || !looks_like_number($pt->{entitlement} // ''))
+            {
+                $why = 'only the primary\'s installed entitlement is known, not its requirement';
+            }
+            else
+            {
+                ($requirement, $source) = ($pt->{entitlement} + 0, 'the primary\'s target');
+            }
+        }
+        else
+        {
+            # A fixed standby entitlement: the requirement is known only where the primary's own plan is this one.
+            # Its sizing does not depend on it: this is a reporting dependency only.
+            my $p = (defined $primary) ? $members->{$primary} : undef;
+            my $pt = (ref($p) eq 'HASH' && $present{$primary}) ? _ha_target_of_member($p) : undef;
+            my $found = (ref($lookup) eq 'HASH') ? $lookup->{$vm} : undef;
+            if ($pt)
+            {
+                ($requirement, $source) = ($pt->{Ent}, 'the primary\'s target on this frame');
+            }
+            elsif (ref($found) eq 'HASH' && looks_like_number($found->{requirement} // ''))
+            {
+                ($requirement, $source) = ($found->{requirement} + 0, $found->{source});
+            }
+            else
+            {
+                $why = (ref($found) eq 'HASH' && defined $found->{reason}) ? $found->{reason}
+                     : 'its primary is not analysed on this frame; the finalisation of a planning cycle looks for its plan';
+            }
+        }
+        if (!defined $requirement)
+        {
+            push @unknown, { standby => $vm, primary => $primary, type => $type, reason => $why };
+            next;
+        }
+        my $pm = (ref($m->{poolMember}) eq 'HASH') ? $m->{poolMember} : {};
+        my %planned = (CurrentCycle => (_structural_shown_value($pm->{cycle_ent}) // $number->(_safe_dig($m, 'published', 'entitlement'))),
+                       Full => _structural_shown_value($pm->{proposed_ent}));
+        my %vps = (CurrentCycle => $number->(_safe_dig($m, 'published', 'VPs')) // $number->($role->{VPs}), Full => $number->($role->{targetVPs}));
+        my %case = (standby => $vm, primary => $primary, type => $type, requirement => 0 + sprintf('%.2f', $requirement), source => $source,
+                    pool => (looks_like_number($pm->{pool_id} // '') ? $pm->{pool_id} + 0 : undef));
+        foreach my $basis (qw(CurrentCycle Full))
+        {
+            next unless (defined $planned{$basis});
+            my $inc = $requirement - $planned{$basis};
+            $inc = 0 if ($inc < 0);
+            $case{planned}{$basis} = $planned{$basis};
+            $case{increment}{$basis} = 0 + sprintf('%.2f', $inc);
+            # Prerequisites beside the frame result: the standby's VPs, and its pool's maximum.
+            my @pre;
+            my $need = int($requirement);
+            $need++ if ($requirement - $need > $FLOAT_EPSILON);
+            push @pre, sprintf('VPs: %d planned, at least %d needed to carry %.2f', $vps{$basis}, $need, $requirement)
+                if (defined $vps{$basis} && $vps{$basis} < $need);
+            if (defined $case{pool} && $case{pool} != 0)
+            {
+                my ($p) = grep { $_->{pool} == $case{pool} } @{ $out{poolMaxima} };
+                my $room = ($p && defined $p->{maximum}) ? $p->{maximum} - $p->{guarantees}{$basis} : undef;
+                push @pre, sprintf('pool %d: maximum %s, guarantees %.2f; the increment of %.2f needs a maximum of at least %.2f',
+                                   $case{pool}, _pool_units_text($p->{maximum}), $p->{guarantees}{$basis}, $inc, $p->{guarantees}{$basis} + $inc)
+                    if (defined $room && $inc > $room + $STRUCTURAL_ENT_TOLERANCE);
+            }
+            $case{prerequisites}{$basis} = \@pre;
+        }
+        push @cases, \%case;
+    }
+    my (%largest, %after);
+    foreach my $basis (qw(CurrentCycle Full))
+    {
+        my ($top) = sort { $b->{increment}{$basis} <=> $a->{increment}{$basis} || $a->{standby} cmp $b->{standby} }
+                    grep { defined $_->{increment}{$basis} } @cases;
+        next unless ($top);
+        $largest{$basis} = $top->{standby};
+        $after{$basis} = 0 + sprintf('%.2f', $out{remaining}{$basis} - $top->{increment}{$basis}) if ($out{remaining});
+    }
+    $out{takeover} = { eligible => $eligible, known => scalar(@cases), cases => \@cases, unknown => \@unknown, largest => \%largest,
+                       (%after ? (after => \%after) : ()) };
+    return \%out;
+}
+
+# The frame check as cells of cycle-footprint.csv: guarantees of this cycle by pool kind; the known single-takeover
+# check (standbys, known, largest increment and the remainder after it, this cycle and full); measured use.
+sub _frame_check_csv_cells
+{
+    my ($c) = @_;
+    return ('') x 12 unless (ref($c) eq 'HASH');
+    my $two = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? sprintf('%.2f', $v) : ''; };
+    my $t = $c->{takeover} // {};
+    my %case = map { ($_->{standby} => $_) } @{ $t->{cases} // [] };
+    my $inc = sub { my ($b) = @_; my $k = $case{ $t->{largest}{$b} // '' }; return $k ? $two->($k->{increment}{$b}) : ''; };
+    my $m = $c->{measured} // {};
+    my $observed = (($m->{status} // '') eq 'observed') ? 1 : 0;
+    return ($two->($c->{guarantees}{userPools}{CurrentCycle}), $two->($c->{guarantees}{defaultPool}{CurrentCycle}),
+            ($t->{eligible} // 0), ($t->{known} // 0), $inc->('CurrentCycle'), $two->(_safe_dig($t, 'after', 'CurrentCycle')),
+            $inc->('Full'), $two->(_safe_dig($t, 'after', 'Full')),
+            ($observed && defined $m->{highest} ? $two->($m->{highest}) : $observed ? 'per total' : 'not assessed'),
+            ($observed && defined $m->{p99} ? $two->($m->{p99}) : ''), ($observed && defined $m->{coverage} ? sprintf('%.3f', $m->{coverage}) : ''),
+            ($observed ? $m->{withoutSpare} : ''));
+}
+
+# The "Default Pool and Frame Check" lines, from a frame check. $where: 'analysis' or 'cycle'.
+sub _frame_check_lines
+{
+    my ($c, $where) = @_;
+    return () unless (ref($c) eq 'HASH');
+    my $two = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? sprintf('%.2f', $v) : '-'; };
+    my $s = sub { return ($_[0] == 1) ? '' : 's'; };
+    my $wrap = sub { return _rationale_wrap($_[0], '  ', '    ', 104); };
+    my @bases = qw(Installed Full CurrentCycle);
+    my @out = ('', '=' x 70, 'Default Pool and Frame Check', '=' x 70);
+    push @out, $wrap->('Reporting only: no LPAR figure is taken from this section. Allocations and measured use are stated apart. '
+        . ($where eq 'cycle' ? 'Made on the finalised plan of the planning cycle.' : 'The planning cycle makes it again on the finalised plans.')), '';
+    my $cap = $c->{capacity} // {};
+    my $shared = (($cap->{status} // '') eq 'agreed') ? $cap->{processors} : undef;
+    push @out, $wrap->(defined $shared
+        ? sprintf('Shared capacity: %s processing units, the shared processor capacity the frame reports (phys_cpus_pool), agreed by %d default-pool LPAR%s. '
+                  . 'It is not the frame\'s installed or activated processors.', $shared, $cap->{reporters}, $s->($cap->{reporters}))
+        : (($cap->{status} // '') eq 'conflict')
+        ? 'Shared capacity: not assessed: the default-pool LPARs report different values ('
+          . join(', ', map { sprintf('%s by %d', $_, $cap->{values}{$_}) } sort { $a <=> $b } keys %{ $cap->{values} // {} }) . ').'
+        : 'Shared capacity: not assessed: no LPAR of the default pool reports it.');
+    my $g = $c->{guarantees};
+    push @out, '', sprintf('  %-40s %10s %10s %10s', 'Guaranteed entitlements of the LPARs analysed', 'Installed', 'Full', 'Cycle');
+    push @out, sprintf('  %-40s %10s %10s %10s', sprintf('user-pool LPARs (%d, in %d pool%s)', $g->{userPools}{Count}, scalar(@{ $c->{poolMaxima} }), $s->(scalar @{ $c->{poolMaxima} })),
+                       map { $two->($g->{userPools}{$_}) } @bases);
+    push @out, sprintf('  %-40s %10s %10s %10s', sprintf('default-pool LPARs (%d)', $g->{defaultPool}{Count}), map { $two->($g->{defaultPool}{$_}) } @bases);
+    push @out, sprintf('  %-40s %10s %10s %10s', 'all LPARs analysed', map { $two->($g->{all}{$_}) } @bases);
+    if ($c->{remaining})
+    {
+        push @out, sprintf('  %-40s %10s %10s %10s', 'remaining of the shared capacity', map { $two->($c->{remaining}{$_}) } @bases);
+        my @short = grep { $c->{remaining}{$_} < -$STRUCTURAL_ENT_TOLERANCE } @bases;
+        push @out, $wrap->(sprintf('Shortfall: the guarantees exceed the shared capacity %s. As planned, these allocations cannot all be configured on the shared '
+            . 'capacity observed: the shortfall has to be resolved first (more shared capacity, or fewer or smaller guarantees). No figure has been reduced to fit.',
+            join('; ', map { sprintf('%s by %.2f', ($_ eq 'Full' ? 'at the full targets' : $_ eq 'CurrentCycle' ? 'this cycle' : 'as installed'), -$c->{remaining}{$_}) } @short))) if (@short);
+    }
+    push @out, $wrap->(sprintf('Not counted: pool reserves (not collected), dedicated processors and LPARs not analysed%s. Borrowing between '
+        . 'pools is dynamic, and a positive remainder is not a certificate that the capacity is available. The default pool has no maximum of its own: '
+        . 'its LPARs borrow up to the shared capacity. The user-pool maxima are ceilings on shared use, not reservations, and are not added up%s.',
+        ($c->{notCounted}{noPool} ? sprintf('; %d LPAR%s with no pool reported', $c->{notCounted}{noPool}, $s->($c->{notCounted}{noPool})) : ''),
+        (@{ $c->{poolMaxima} } ? ': ' . join(', ', map { sprintf('pool %d %s', $_->{pool}, _pool_units_text($_->{maximum})) } @{ $c->{poolMaxima} }) : '')));
+
+    # Measured use: apart from the allocations.
+    my $m = $c->{measured} // {};
+    push @out, '';
+    if (($m->{status} // '') ne 'observed')
+    {
+        push @out, $wrap->(sprintf('Measured use of the shared processors: not assessed: %s.', $m->{reason} // 'no frame-level observation'));
+    }
+    else
+    {
+        my $cov = defined $m->{coverage} ? sprintf('%.1f%% of the minutes of the period', 100 * $m->{coverage}) : 'coverage unknown';
+        if (@{ $m->{sizes} } == 1)
+        {
+            push @out, $wrap->(sprintf('Measured use of the shared processors (frame-level observations, one reading a minute; member and pool figures are not '
+                . 'added to it): highest credible minute %.2f, P99 %.2f, of a shared total of %s; %s observed; %d minute%s without spare capacity.%s',
+                $m->{highest}, $m->{p99}, $m->{sizes}[0]{size}, $cov, $m->{withoutSpare}, $s->($m->{withoutSpare}),
+                (($m->{inconsistentMinutes} // 0) ? sprintf(' %d minute%s left out: the shared total read was not near a whole number of processors.',
+                                                             $m->{inconsistentMinutes}, $s->($m->{inconsistentMinutes})) : '')));
+        }
+        else
+        {
+            push @out, $wrap->(sprintf('Measured use of the shared processors (frame-level observations): the shared total changed in the period, so the '
+                . 'minutes are given for each total and not combined; %s observed. %s.', $cov, join('; ', map { sprintf('Total %s: %d minutes, highest %.2f, P99 %.2f, %d without spare capacity',
+                $_->{size}, $_->{minutes}, $_->{highest}, $_->{p99}, $_->{withoutSpare}) } @{ $m->{sizes} })));
+        }
+    }
+
+    # Known single-takeover entitlement check.
+    my $t = $c->{takeover} // {};
+    push @out, '';
+    if (!($t->{eligible} // 0))
+    {
+        push @out, $wrap->('Known single-takeover entitlement check: no PowerHA standby sized as one on this frame.');
+    }
+    else
+    {
+        push @out, $wrap->(sprintf('Known single-takeover entitlement check (one takeover at a time; the other allocations stay as they are; nFit does not assume '
+            . 'ROHA or capacity on demand): %d standby%s, requirement known for %d%s.', $t->{eligible}, ($t->{eligible} == 1 ? '' : 's'), $t->{known},
+            ($t->{known} < $t->{eligible} ? '; coverage is incomplete' : '')));
+        my %case = map { ($_->{standby} => $_) } @{ $t->{cases} };
+        foreach my $basis ([ CurrentCycle => 'This cycle' ], [ Full => 'Full targets' ])
+        {
+            my $top = $case{ $t->{largest}{ $basis->[0] } // '' } or next;
+            my $text = sprintf('%s: the largest known increment is %s taking over from %s: requirement %.2f (%s), planned %.2f, increment %.2f',
+                $basis->[1], $top->{standby}, ($top->{primary} // '?'), $top->{requirement}, $top->{source}, $top->{planned}{ $basis->[0] }, $top->{increment}{ $basis->[0] });
+            my $before = $c->{remaining} ? $c->{remaining}{ $basis->[0] } : undef;
+            $text .= !defined $t->{after}{ $basis->[0] } ? '; not compared: the shared capacity is not assessed'
+                   : ($before < -$STRUCTURAL_ENT_TOLERANCE && $top->{increment}{ $basis->[0] } > $STRUCTURAL_ENT_TOLERANCE)
+                   ? sprintf('; the guarantees already exceed the shared capacity by %.2f, and the increment adds to that shortfall: %.2f', -$before, -$t->{after}{ $basis->[0] })
+                   : ($before < -$STRUCTURAL_ENT_TOLERANCE)
+                   ? sprintf('; the guarantees already exceed the shared capacity by %.2f', -$before)
+                   : sprintf('; remaining of the shared capacity after it %.2f%s', $t->{after}{ $basis->[0] }, ($t->{after}{ $basis->[0] } < -$STRUCTURAL_ENT_TOLERANCE ? ' (a shortfall)' : ''));
+            $text .= '.';
+            $text .= ' Prerequisites: ' . join('; ', @{ $top->{prerequisites}{ $basis->[0] } }) . '.' if (@{ $top->{prerequisites}{ $basis->[0] } // [] });
+            push @out, $wrap->($text);
+        }
+        push @out, $wrap->(sprintf('Requirement not known: %s.', join('; ', map { "$_->{standby} ($_->{reason})" } @{ $t->{unknown} }))) if (@{ $t->{unknown} });
+        push @out, $wrap->('This is an entitlement requirement against allocations. It does not verify that a takeover would perform: the prerequisites named, '
+            . 'the pool competition at the time and the activation of capacity are outside it.') if ($t->{known});
+    }
+    push @out, '', $wrap->('Not assessed here: seasonal runs (seasonal parity, C9), a whole-frame evacuation, and I/O transferred between VIOS in a failover.'), '';
+    return @out;
+}
+
 # The shared-processor capacity of a frame as its default-pool LPARs report it: pool_cpu of
 # pool 0, each LPAR in its current configuration state. It is not the frame's activated
 # processors: dedicated processors are outside it. Pure.
@@ -20440,6 +20806,55 @@ sub _lpar_present
     return (!defined $days || $days <= $PRESENCE_GRACE_DAYS) ? 1 : 0;
 }
 
+# The takeover requirement of each fixed standby of a frame whose primary is on another frame of the planning
+# cycle: the primary's target in the plan its frame registered in this cycle, accepted only under the checks a
+# share standby's floor passes (the same analysis end, options, files, capture and reading of the cluster).
+# No other saved plan is looked for. Pure. Returns { standby => { requirement, source } | { reason } }.
+sub _cycle_fixed_takeovers
+{
+    my ($doc, $reg, $frame_reg, $plan_of, $cycle_id) = @_;
+    my $members = (ref($doc) eq 'HASH' && ref($doc->{members}) eq 'HASH') ? $doc->{members} : {};
+    my $settings = (ref($doc->{settings}) eq 'HASH') ? $doc->{settings} : {};
+    my %out;
+    foreach my $vm (sort keys %$members)
+    {
+        my $m = $members->{$vm};
+        next unless (ref($m) eq 'HASH' && (_safe_dig($m, 'role', 'type') // '') eq 'haStandbyFixed');
+        my $primary = $m->{role}{primary};
+        next unless (defined $primary && ref($members->{$primary}) ne 'HASH');      # on this frame: the frame check reads it itself
+        my @frames = grep { $_ ne ($reg->{system} // '') && ref(_safe_dig($plan_of->($frame_reg->{$_}{plan}), 'members', $primary)) eq 'HASH' } sort keys %{ $frame_reg // {} };
+        if (!@frames)
+        {
+            $out{$vm} = { reason => "no frame analysed in this planning cycle holds its primary $primary" };
+            next;
+        }
+        my $frame = $frames[0];
+        my $peer = $frame_reg->{$frame};
+        unless (ref($reg->{peers}) eq 'HASH' && ref($reg->{peers}{$frame}) eq 'HASH'
+                && _cycle_canonical($reg->{peers}{$frame}) eq _cycle_canonical($peer->{capture}))
+        {
+            $out{$vm} = { reason => "the staged data of frame $frame read for its cluster is not the data that frame was analysed on" };
+            next;
+        }
+        my $peer_doc = $plan_of->($peer->{plan});
+        my $seen = _safe_dig($m, 'roleEvidence', 'configuration', $primary) // {};
+        my $share = _safe_dig($m, 'roleEvidence', 'sizing', 'share');
+        my $why = _ha_peer_plan_mismatch($peer_doc, $primary, {
+            end => _safe_dig($doc, 'window', 'end'), options => $settings->{options}, files => $settings->{filesSHA256},
+            guaranteePolicy => $settings->{guaranteePolicy}, contestedLevel => $settings->{contestedLevel},
+            installed => { Ent => $seen->{entitlement}, VP => $seen->{VPs} }, role => 'active',
+            members => _safe_dig($m, 'roleEvidence', 'cluster'), sizing => _safe_dig($m, 'roleEvidence', 'sizing', 'policy'),
+            # Without a share on either side the two agree (a fixed policy has none).
+            share => ($share // (defined _safe_dig($peer_doc, 'members', $primary, 'roleEvidence', 'sizing', 'share') ? 0 : -1)),
+            cycle => $cycle_id, captureVerified => 1 });
+        my $target = defined $why ? undef : _ha_target_of_member(_safe_dig($peer_doc, 'members', $primary));
+        $out{$vm} = defined $why ? { reason => "the plan of $primary on frame $frame is not used: $why" }
+                  : $target ? { requirement => $target->{Ent}, source => "the target of $primary in its plan of this planning cycle (frame $frame)" }
+                  : { reason => "the plan of $primary on frame $frame holds no target for it" };
+    }
+    return \%out;
+}
+
 # The footprint of one frame and model from its saved plan (final where the frame had a standby
 # to set). Each LPAR is counted once, at the figures the pool check counted: a VIOS at its pair
 # figure, a standby at its role figure. Pure.
@@ -20453,7 +20868,7 @@ sub _lpar_present
 #             MinCurrentCycle, Status } ] }.
 sub _cycle_footprint_frame
 {
-    my ($doc) = @_;
+    my ($doc, $takeover_lookup) = @_;
     my $members = (ref($doc) eq 'HASH' && ref($doc->{members}) eq 'HASH') ? $doc->{members} : {};
     my $number = sub { my ($v) = @_; return (defined $v && looks_like_number($v)) ? $v + 0 : undef; };
     my (%vp, %shared, %default, @pool_members, %groups, @left_days);
@@ -20543,6 +20958,8 @@ sub _cycle_footprint_frame
                            ? (Reduction => _pool_reduction_candidate($reduction_evidence->{ $pool->{PoolId} }, $pool, $reduction_members)) : ()) };
     }
     $out{pools} = \@pools;
+    # The frame check (B8) on the plan's figures, the finalised ones in a finalised cycle; the measured use as the analysis kept it.
+    $out{frameCheck} = _frame_check($members, $capacity, _safe_dig($doc, 'frame', 'measuredUse'), $end, $takeover_lookup);
     $out{joint} = $doc->{jointCheck}{results} if (ref($doc) eq 'HASH' && ref(_safe_dig($doc, 'jointCheck', 'results')) eq 'HASH');
 
     # Guaranteed allocations against the shared capacity reported. An excess is a finding; staying
@@ -20587,7 +21004,9 @@ sub _cycle_footprint_lines
     my @frame_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame State LPARs Installed_ENT Full_ENT CurrentCycle_ENT
         VIOS_Installed_ENT VIOS_Full_ENT VIOS_CurrentCycle_ENT Standby_Installed_ENT Standby_Full_ENT Standby_CurrentCycle_ENT
         Installed_VP Full_VP CurrentCycle_VP LPARs_Left LPARs_Left_Moved Left_Installed_ENT LPARs_On_Two_Frames Standbys_Unresolved Shared_Capacity Shared_Capacity_Check
-        Installed_ENT_Uncommitted Full_ENT_Uncommitted CurrentCycle_ENT_Uncommitted Assessment Not_Counted)));
+        Installed_ENT_Uncommitted Full_ENT_Uncommitted CurrentCycle_ENT_Uncommitted Assessment Not_Counted
+        UserPool_CurrentCycle_ENT DefaultPool_CurrentCycle_ENT Takeover_Standbys Takeover_Known Takeover_Largest_CurrentCycle Takeover_After_CurrentCycle
+        Takeover_Largest_Full Takeover_After_Full Measured_Highest Measured_P99 Measured_Coverage Minutes_Without_Spare)));
     my @pool_csv = (join(',', map { quote_csv($_) } qw(Cycle Model Frame Pool LPARs Maximum Installed_ENT Full_ENT CurrentCycle_ENT
         Minimum_Maximum_Full Minimum_Maximum_CurrentCycle Status Reduction_Verdict Reduction_Candidate Takeover_Provision Measured_Use_Needs
         Reduction_Reasons Reduction_Prerequisites Joint_Check Joint_Evidence Joint_Pool_Minutes Joint_Core_Minutes Outside_Hours_Pool_Minutes)));
@@ -20624,7 +21043,8 @@ sub _cycle_footprint_lines
                 (map { $cell->('All', $_) } @bases), (map { $cell->('Vios', $_) } @bases), (map { $cell->('Standby', $_) } @bases),
                 (map { $f ? $f->{vps}{$_} : '' } @bases), ($f ? ($f->{left}{Count}, $f->{left}{Moved}, $two->($f->{left}{Installed}), $f->{conflicts}) : ('', '', '', '')), ($r->{unresolved} // ''),
                 ($f && defined $capacity->{processors} ? $capacity->{processors} : ''), $check,
-                (map { ($f && $f->{uncommitted}) ? $two->($f->{uncommitted}{$_}) : '' } @bases), ($f ? $f->{assessment} : ''), ($f ? $limits : ''));
+                (map { ($f && $f->{uncommitted}) ? $two->($f->{uncommitted}{$_}) : '' } @bases), ($f ? $f->{assessment} : ''), ($f ? $limits : ''),
+                _frame_check_csv_cells($f ? $f->{frameCheck} : undef));
             push @text, sprintf('  %-14s %5s %10s %10s %10s   %-13s %s', $r->{frame}, ($f ? $f->{lpars} : ''), (map { $cell->('All', $_) } @bases),
                                 ($f ? join('/', map { $f->{vps}{$_} } @bases) : ''), $r->{state});
             next unless ($f);
@@ -20650,6 +21070,8 @@ sub _cycle_footprint_lines
                 : sprintf('    Shared capacity: %s.', ($check eq 'conflict' ? 'reported differently by the default-pool LPARs' : 'not reported'));
             push @text, _rationale_wrap("Assessment: $f->{assessment}.", '    ', '      ');
             push @text, sprintf('    %d LPAR%s with no pool reported: left out of the comparison.', $f->{noPool}, ($f->{noPool} == 1 ? '' : 's')) if ($f->{noPool});
+            # The frame check (B8): measured use and the known single-takeover check, apart from the allocations above.
+            push @text, map { "  $_" } grep { !/^={70}$|^Default Pool and Frame Check$|^$/ } _frame_check_lines($f->{frameCheck}, 'cycle') if (ref($f->{frameCheck}) eq 'HASH');
             foreach my $pool (@{ $f->{pools} })
             {
                 push @pool_csv, join(',', map { quote_csv($_) } $cycle_id, $model, $r->{frame}, ($pool->{Default} ? '0 (default)' : $pool->{Pool}),
@@ -20951,7 +21373,13 @@ sub _cycle_finalise
             my $all = _safe_dig($s, 'totals', 'All') // {};
             push @footprint_rows, { model => $model, frame => ($r ? $r->{system} : ($key =~ s/\.\Q$model\E$//r)), state => $s->{state},
                 lpars => ($r ? $r->{lpars} : undef), totals => $s->{totals}, resolved => $s->{resolved}, unresolved => $s->{unresolved},
-                footprint => ($r ? _cycle_footprint_frame($job{$key} ? $job{$key}{doc} : $plan_of->($r->{plan})) : undef) };
+                footprint => ($r ? do {
+                    # Fixed standbys whose primary is on another frame: its target from the plan that frame registered in
+                    # this cycle, under the checks a share standby's floor passes. Reporting only: no sizing follows from it.
+                    my $final_doc = $job{$key} ? $job{$key}{doc} : $plan_of->($r->{plan});
+                    my %frames_of_model = map { ($reg{$_}{system} => $reg{$_}) } keys %{ $models{$model} };
+                    _cycle_footprint_frame($final_doc, _cycle_fixed_takeovers($final_doc, $r, \%frames_of_model, $plan_of, $cycle->{id}));
+                } : undef) };
             push @summary, join(',', map { quote_csv($_) } $cycle->{id}, ($r ? $r->{system} : ($key =~ s/\.\Q$model\E$//r)), $model, $s->{state},
                 ($r ? $r->{lpars} : ''), (map { defined $all->{$_} ? sprintf('%.2f', $all->{$_}) : '' } qw(Installed CurrentCycle Target)),
                 ($s->{resolved} // ''), ($s->{unresolved} // ''), ($r ? ($r->{coverage}{start}, $r->{coverage}{end}) : ('', '')),
@@ -21004,7 +21432,9 @@ sub _publish_tactical_proposals
             contestedLevel => (_contested_level_on() ? $CONTESTED_LEVEL_RULE : 'off') },
         members => $members,
         # The frame as this run read it: the shared-processor capacity its default-pool LPARs report.
-        ((ref($FRAME_SHARED_CAPACITY) eq 'HASH') ? (frame => { sharedProcessors => $FRAME_SHARED_CAPACITY }) : ()),
+        ((ref($FRAME_SHARED_CAPACITY) eq 'HASH') ? (frame => { sharedProcessors => $FRAME_SHARED_CAPACITY,
+            # The measured use of the shared processors (B8): kept, so that the cycle need not read the samples again.
+            (%FRAME_USE ? (measuredUse => { %FRAME_USE }) : ()) }) : ()),
         # Pool reduction candidates (B6): the workload evidence of each pool, and the candidate as this analysis
         # worked it out. The finalisation of a planning cycle works the candidates out again from the evidence
         # and the finalised member figures.
@@ -31014,7 +31444,7 @@ sub _exposure_evaluate_window
     my ($cpu_files, $cpu_counts)   = _exposure_cpu_sources($exposure_context, [ [ $window_start, $window_end ] ], $tmp_dir, \%wanted);
     _subtask(sprintf('Classifying pool minutes and member busy (%d state(s))', scalar(@$trackers_aref)));
     my $physical_minutes = 0;
-    my (%pool_full, $frame_low, %pool_use);
+    my (%pool_full, $frame_low, %pool_use, %frame_use);
     my %rule = %MEMBER_EXPOSURE_RULES;
     $frame_low = 0;
     foreach my $day (int($window_start / 86400) .. int(($window_end - 1) / 86400))
@@ -31065,14 +31495,20 @@ sub _exposure_evaluate_window
         }
         foreach my $layer (values %$physical)
         {
-            $frame_low++ if (defined $layer->{idle}
-                && $layer->{idle} <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $layer->{size}) + 1e-9);
+            my $without = (defined $layer->{idle}
+                && $layer->{idle} <= _exposure_tolerance($rule{physicalScarceAbsCores}, $rule{physicalScarceRel}, $layer->{size}) + 1e-9) ? 1 : 0;
+            $frame_low += $without;
+            # The frame's measured use (B8): one reading a minute, the busy cores of the shared processors by their total.
+            next unless (defined $layer->{idle} && defined $layer->{size} && $layer->{size} > 0);
+            my $acc = $frame_use{ $layer->{size} + 0 } //= [ '', 0 ];
+            $acc->[0] .= pack('f<', max(0, $layer->{size} - $layer->{idle}));
+            $acc->[1] += $without;
         }
         _exposure_process_day($trackers_aref, $day, _exposure_read_cpu_day($cpu_files->{$day}), $minutes, $physical);
     }
     return { %$pool_counts, %$cpu_counts, physicalMinutes => $physical_minutes,
              physicalColumns => $pool_counts->{physicalColumns} // 0, poolFull => \%pool_full, frameLow => $frame_low,
-             poolUse => \%pool_use };
+             poolUse => \%pool_use, frameUse => { sizes => \%frame_use, windowMinutes => ($window_end - $window_start) / 60 } };
 }
 
 # Totals of one tracker over its days: base counts and, per threshold, the
@@ -32681,6 +33117,7 @@ sub _protection_evidence_before_sizing
 {
     my ($cache_dir, $start_obj, $end_obj, $vms_aref) = @_;
     %CUT_PROTECTION_EVIDENCE = ();
+    %FRAME_USE = ();
     my $pool_context = _pool_history_context($cache_dir);
     my ($exposure_context, $reason) = _exposure_context($cache_dir, $pool_context);
     $WIDTH_EVIDENCE_UNAVAILABLE = $reason // 'the evidence pass could not run' unless ($exposure_context || !$pool_context);
@@ -32706,6 +33143,7 @@ sub _protection_evidence_before_sizing
     _task(sprintf('Contested minutes of %d LPAR state(s) over %d UTC day(s)', scalar(uniq(map { $_->{vm} } @$trackers)),
                   ($window_end - $window_start) / 86400));
     my $window_counts = _exposure_evaluate_window($pool_context, $exposure_context, [ @$trackers, @$capped_trackers ], $window_start, $window_end);
+    %FRAME_USE = %{ _frame_use_summary($window_counts->{frameUse}) };
     foreach my $t (@$trackers)
     {
         $CUT_PROTECTION_EVIDENCE{ $t->{vm} }{$_} = $t for @{ $t->{profiles} };

@@ -136,6 +136,21 @@ class ManagedSystemPolicyTests(unittest.TestCase):
             self.assertAlmostEqual(float(F.summary_row(root, 'SYSHA1')['CurrentCycle_ENT']), total, places=2)
             # The full figure of the frame is the fixed figure itself, not one raised to a VP minimum.
             self.assertAlmostEqual(float(F.summary_row(root, 'SYSHA1')['Target_ENT']), total, places=2)
+            # The known single-takeover check (v10 B8) finds the primary's target in the plan its frame registered in this
+            # cycle, whichever frame was analysed first. A reporting dependency: the row above is the same in both orders.
+            with open(os.path.join(root, 'cycle', 'cycle-footprint.csv'), newline='') as fh:
+                frame, = [r for r in csv.DictReader(fh) if r['Frame'] == 'SYSHA1' and r['Model'] == 'state-based']
+            primary = P.load(F.outputs(root, 'SYSHA2')['plan'])['members']['hanodeB']
+            target = float(primary['profiles'][primary['planningProfile']]['entitlement'])
+            # A primary whose reductions are held counts at its held pair, as it does for a share standby's floor.
+            if (primary.get('role') or {}).get('type') == 'haHold':
+                target = max(target, float(primary['role']['entitlement']))
+            self.assertEqual((frame['Takeover_Standbys'], frame['Takeover_Known']), ('1', '1'))
+            self.assertEqual(frame['Takeover_Largest_Full'], '%.2f' % (target - 0.10))
+            footprint = ' '.join(P.text(os.path.join(root, 'cycle', 'cycle-footprint.txt')).split())
+            self.assertIn('the largest known increment is hanodeA taking over from hanodeB: requirement %.2f (the target of hanodeB in its plan of this planning cycle (frame SYSHA2))' % target, footprint)
+            self.assertIn('VPs: 1 planned, at least', footprint)
+            self.assertIn('It does not verify that a takeover would perform', footprint)
         text = ' '.join(rationale(roots[0], 'SYSHA1').split())
         self.assertIn("Sizing: fixed standby entitlement 0.10 (its managed system's default)", text)
         self.assertIn('own workload requirement %s on 1 VP, above' % own, text)

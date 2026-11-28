@@ -452,6 +452,12 @@ def evidence_methods():
         self.say('  VP width evidence (saved plans; diagnostic, counts only):')
         for serial, reg in sorted(regs.items()):
             self.width_lines(serial, reg, plans[serial])
+        self.say('  Default pool and frame check (cycle-footprint.csv; saved plans; counts only):')
+        for serial in sorted(regs):
+            self.frame_lines(cycle, serial, plans[serial])
+        self.say('  Entitlement reconciliation (saved plans, final; CSV): installed, full and this cycle:')
+        for serial, reg in sorted(regs.items()):
+            self.reconcile_lines(cycle, serial, reg, plans[serial])
         self.say('  Joint check of entitlement reductions (saved plans, final; cycle-pools.csv):')
         for serial, reg in sorted(regs.items()):
             self.joint_lines(cycle, serial, reg, plans[serial])
@@ -769,6 +775,163 @@ def evidence_methods():
             size(block), size(plan), 100.0 * size(block) / max(1, size(plan)), sum(len(e.get('readings') or []) for e in evidence.values())))
 
     Acceptance.joint_lines = joint_lines
+
+    def reconcile_lines(self, cycle, serial, reg, plan):
+        """Where a frame's entitlement goes between installed, full and this cycle: every resident LPAR once, each change
+        split into parts that add up (workload, the guarantee and protection rules, role sizing, platform and staging)."""
+        import datetime
+        members = plan.get('members') or {}
+        end = (plan.get('window') or {}).get('end')
+        grace = 2
+        found = re.search(r'^my \$PRESENCE_GRACE_DAYS\s*=\s*(\d+);', (REPO / 'nfit-profile').read_text(encoding='utf-8'), re.M)
+        if found:
+            grace = int(found.group(1))
+        def present(m):
+            last = m.get('lastSampled')
+            if (m.get('membership') or {}).get('class') == 'moved':
+                return False
+            try:
+                return (datetime.date.fromisoformat(end) - datetime.date.fromisoformat(last)).days <= grace
+            except (TypeError, ValueError):
+                return True
+        rows, no_pool = [], 0
+        for vm, m in sorted(members.items()):
+            if not isinstance(m, dict) or not present(m):
+                continue
+            pm = m.get('poolMember') or {}
+            installed = shown(pm.get('current_ent'))
+            if installed is None or shown(pm.get('pool_id')) is None:
+                no_pool += 1
+                continue
+            full = shown(pm.get('proposed_ent'))
+            full = installed if full is None else full
+            cyc = shown(pm.get('cycle_ent'))
+            cyc = installed if cyc is None else cyc
+            role = m.get('role') if isinstance(m.get('role'), dict) else {}
+            kind = 'VIOS' if (m.get('estateRole') == 'vios' or role.get('type') == 'viosPair') else \
+                   {'haStandby': 'PowerHA standby (share)', 'haStandbyFixed': 'PowerHA standby (fixed)', 'haHold': 'PowerHA node, reductions held'}.get(role.get('type'), 'ordinary')
+            profile = role.get('profile') or m.get('planningProfile')
+            p = (m.get('profiles') or {}).get(profile) or {}
+            own = shown(p.get('entitlement'))
+            parts = {'workload': 0.0, 'tier': 0.0, 'contested': 0.0, 'protection': 0.0, 'role': 0.0, 'platform': 0.0, 'unexplained': 0.0}
+            mixed = False
+            if own is None:
+                parts['unexplained'] = full - installed
+            else:
+                # What stands between the profile's own figure and the full target: a role's sizing, or the PowerVM minimum of the target VPs.
+                parts['role' if kind != 'ordinary' else 'platform'] = full - own
+                rest = own
+                cp = p.get('cutProtection') or {}
+                if cp.get('cut') and cp.get('status') == 'bound' and shown(cp.get('target')) is not None and rest > shown(cp['target']) + 0.005:
+                    parts['protection'] = rest - shown(cp['target'])
+                    rest = shown(cp['target'])
+                cf = p.get('contestedFloor') or {}
+                if cf.get('applied') and shown(cf.get('originalTarget')) is not None and shown(cf.get('finalTarget')) is not None:
+                    k = max(0.0, min(shown(cf['finalTarget']) - shown(cf['originalTarget']), rest))
+                    parts['contested'], rest = k, rest - k
+                tf = p.get('tierFloor') or {}
+                if tf and not tf.get('withheld') and shown(tf.get('own')) is not None and shown(tf.get('floor')) is not None and tf['floor'] > tf['own'] + 0.005:
+                    t = max(0.0, min(float(tf['floor']) - float(tf['own']), rest))
+                    parts['tier'], rest = t, rest - t
+                parts['workload'] = rest - installed
+                mixed = sum(1 for k in ('tier', 'contested', 'protection') if parts[k] > 0.005) > 1
+            cc = p.get('currentCycle') or {}
+            gap = cyc - full
+            binding = cc.get('binding') or []
+            if abs(gap) < 0.005:
+                why = None
+            elif kind != 'ordinary':
+                why = 'role pair this cycle'
+            elif cc.get('protectedLevelHold'):
+                why = 'held for the protected level'
+            else:
+                why = next((label for key, label in (('RATIO_GUARD', 'staging guard (VPs still coming down)'), ('PLATFORM_MINIMUM', 'PowerVM minimum of this cycle\'s VPs'),
+                                                      ('TIER_FLOOR', 'tier floor at this cycle\'s VPs'), ('COARSE_EVIDENCE', 'coarse evidence: cut held'),
+                                                      ('POOL_SIZE', 'pool maximum'), ('VP_WIDTH', 'VP width')) if key in binding),
+                           ('status %s' % cc.get('status')) if cc.get('status') in ('HOLD', 'BLOCKED') else ('reduction staged' if gap > 0 else 'increase staged'))
+            rows.append({'vm': vm, 'kind': kind, 'installed': installed, 'full': full, 'cycle': cyc, 'parts': parts, 'mixed': mixed, 'gap': gap, 'why': why,
+                         'pool': shown(pm.get('pool_id'))})
+        self.say('    Frame %s: %d resident LPARs with a pool, each counted once (%s)%s.' % (
+            serial, len(rows), ', '.join('%s %d' % (k, sum(1 for r in rows if r['kind'] == k)) for k in sorted({r['kind'] for r in rows})),
+            ('; %d without a pool left out' % no_pool) if no_pool else ''))
+        total = {b: round(sum(r[b] for r in rows), 2) for b in ('installed', 'full', 'cycle')}
+        self.say('      Entitlement: installed %.2f, full %.2f (%+.2f), this cycle %.2f (%+.2f); this cycle less full %+.2f.' % (
+            total['installed'], total['full'], total['full'] - total['installed'], total['cycle'], total['cycle'] - total['installed'], total['cycle'] - total['full']))
+        names = (('workload', 'workload requirement against the installed entitlement'), ('tier', 'tier pool-borrowing rule (guarantee floor)'),
+                 ('contested', 'contested-level floor'), ('protection', 'cut protection (protected level)'), ('role', 'role sizing (VIOS pairs, PowerHA)'),
+                 ('platform', 'PowerVM minimum of the target VPs'), ('unexplained', 'no figure for the profile in the plan'))
+        self.say('      Installed to full, by part (the parts add up to the change; raises and reductions shown apart):')
+        for key, label in names:
+            up = sum(r['parts'][key] for r in rows if r['parts'][key] > 0.005)
+            down = sum(r['parts'][key] for r in rows if r['parts'][key] < -0.005)
+            if abs(up) > 0.005 or abs(down) > 0.005:
+                self.say('        %-58s %+8.2f  (raises %+.2f on %d, reductions %+.2f on %d)' % (
+                    label, up + down, up, sum(1 for r in rows if r['parts'][key] > 0.005), down, sum(1 for r in rows if r['parts'][key] < -0.005)))
+        parts_sum = sum(sum(r['parts'].values()) for r in rows)
+        self.check(abs(parts_sum - (total['full'] - total['installed'])) < 0.02, 'frame %s: the parts add up to the change from installed to full (%+.2f)' % (serial, parts_sum))
+        mixed = [r['vm'] for r in rows if r['mixed']]
+        self.say('      LPARs where two or more of the guarantee and protection rules raised the figure (their split is by order, not separable): %d' % len(mixed))
+        by_kind = {}
+        for r in rows:
+            k = by_kind.setdefault(r['kind'], [0.0, 0.0, 0.0])
+            k[0] += r['installed']; k[1] += r['full']; k[2] += r['cycle']
+        self.say('      By kind (installed / full / cycle): %s' % '; '.join('%s %.2f / %.2f / %.2f' % (k, v[0], v[1], v[2]) for k, v in sorted(by_kind.items())))
+        by_pool = {}
+        for r in rows:
+            k = by_pool.setdefault('default pool' if r['pool'] == 0 else 'user pools', [0.0, 0.0, 0.0])
+            k[0] += r['installed']; k[1] += r['full']; k[2] += r['cycle']
+        self.say('      By pool kind (installed / full / cycle): %s' % '; '.join('%s %.2f / %.2f / %.2f' % (k, v[0], v[1], v[2]) for k, v in sorted(by_pool.items())))
+        self.say('      This cycle against the full target, by what holds the difference:')
+        reasons = {}
+        for r in rows:
+            if r['why']:
+                e = reasons.setdefault(r['why'], [0, 0.0])
+                e[0] += 1; e[1] += r['gap']
+        for why, (n, amount) in sorted(reasons.items(), key=lambda kv: -abs(kv[1][1])):
+            self.say('        %-48s %+8.2f on %d LPAR%s' % (why, amount, n, '' if n == 1 else 's'))
+        self.say('      Largest raises, installed to full (LPAR, kind: installed -> full; parts):')
+        for r in sorted(rows, key=lambda r: -(r['full'] - r['installed']))[:10]:
+            self.say('        %s, %s: %.2f -> %.2f (%+.2f); %s%s' % (r['vm'], r['kind'], r['installed'], r['full'], r['full'] - r['installed'],
+                     ', '.join('%s %+.2f' % (k, v) for k, v in r['parts'].items() if abs(v) > 0.005), '; this cycle %.2f (%s)' % (r['cycle'], r['why']) if r['why'] else ''))
+        self.say('      Largest reductions, installed to full:')
+        for r in sorted(rows, key=lambda r: (r['full'] - r['installed']))[:5]:
+            self.say('        %s, %s: %.2f -> %.2f (%+.2f); %s' % (r['vm'], r['kind'], r['installed'], r['full'], r['full'] - r['installed'],
+                     ', '.join('%s %+.2f' % (k, v) for k, v in r['parts'].items() if abs(v) > 0.005)))
+        with open(self.outputs(reg)['csv'], newline='') as fh:
+            csv_rows = {r['VM']: r for r in csv.DictReader(fh)}
+        once = all(r['vm'] in csv_rows for r in rows) and len({r['vm'] for r in rows}) == len(rows)
+        agree = all(csv_rows[r['vm']].get('NFIT - ENT') in ('', None) or abs(float(csv_rows[r['vm']]['NFIT - ENT']) - r['cycle']) < 0.006 for r in rows if r['vm'] in csv_rows)
+        self.check(once, 'frame %s: every resident LPAR is one row of the CSV and is counted once' % serial)
+        self.check(agree, 'frame %s: the entitlement counted for this cycle is the CSV figure of each row' % serial)
+
+    Acceptance.reconcile_lines = reconcile_lines
+
+    def frame_lines(self, cycle, serial, plan):
+        """The frame check as the footprint gives it, beside the measured use the saved plan keeps."""
+        rows = []
+        path = Path(cycle) / 'cycle-footprint.csv'
+        if path.is_file():
+            with open(path, newline='') as fh:
+                rows = [r for r in csv.DictReader(fh) if r.get('Frame') == serial and r.get('Model') == self.args.model]
+        if not rows or 'Takeover_Standbys' not in rows[0]:
+            self.say('    Frame %s: no frame check in the footprint.' % serial)
+            return
+        r = rows[0]
+        use = (plan.get('frame') or {}).get('measuredUse') or {}
+        self.say('    Frame %s: guarantees this cycle: user pools %s, default pool %s; remaining %s. Known single takeover: %s of %s standbys known; '
+                 'largest increment %s this cycle (remaining after it %s), %s full (after it %s). Measured use: highest %s, P99 %s, coverage %s, '
+                 '%s minutes without spare capacity%s.' % (
+                     serial, r['UserPool_CurrentCycle_ENT'], r['DefaultPool_CurrentCycle_ENT'], r.get('CurrentCycle_ENT_Uncommitted') or 'not assessed',
+                     r['Takeover_Known'], r['Takeover_Standbys'], r['Takeover_Largest_CurrentCycle'] or '-', r['Takeover_After_CurrentCycle'] or '-',
+                     r['Takeover_Largest_Full'] or '-', r['Takeover_After_Full'] or '-', r['Measured_Highest'], r['Measured_P99'] or '-',
+                     r['Measured_Coverage'] or '-', r['Minutes_Without_Spare'] or '-', '; the shared total changed in the period' if use.get('sizeChanged') else ''))
+        self.check(int(r['Takeover_Known'] or 0) <= int(r['Takeover_Standbys'] or 0), 'frame %s: known takeover requirements never exceed the standbys checked' % serial)
+        same = (use.get('status') != 'observed' and r['Measured_Highest'] == 'not assessed') or \
+               (use.get('highest') is not None and r['Measured_Highest'] == '%.2f' % use['highest']) or \
+               (use.get('sizeChanged') and r['Measured_Highest'] == 'per total')
+        self.check(same, 'frame %s: the footprint gives the measured use the analysis kept (no samples read again)' % serial)
+
+    Acceptance.frame_lines = frame_lines
 
     def width_lines(self, serial, reg, plan):
         """The width evidence kept with the plan: how many LPARs carry each label beside a VP statement, and what it costs to keep."""

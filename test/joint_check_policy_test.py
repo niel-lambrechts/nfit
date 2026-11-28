@@ -186,5 +186,26 @@ class JointCheckPolicyTest(unittest.TestCase):
         self.assertEqual(self.done['written'], {})
         self.assertNotIn('Cycle Finalisation (planning cycle', self.log)
 
+    def test_the_frame_check_reports_measured_use_and_the_known_takeover(self):
+        # B8. Measured use from the frame-level observations only (20 busy of a shared total of 64 in every minute):
+        # kept with the plan, so the cycle does not read the samples again.
+        use = self.provisional['frame']['measuredUse']
+        self.assertEqual((use['status'], use['highest'], use['p99'], use['withoutSpare'], use['coverage']), ('observed', 20, 20, 0, 1))
+        flat = re.sub(r'\s+', ' ', self.log)
+        self.assertIn('highest credible minute 20.00, P99 20.00, of a shared total of 64; 100.0% of the minutes of the period observed; 0 minutes without spare capacity.', flat)
+        # No LPAR of the default pool here: the shared capacity is not assessed, and no remainder is stated.
+        self.assertIn('Shared capacity: not assessed: no LPAR of the default pool reports it.', flat)
+        # The fixed standby's requirement is known from its primary's own target on this frame; one takeover at a time.
+        hot = float(self.provisional['members']['hot']['poolMember']['proposed_ent'])
+        self.assertRegex(flat, r'Known single-takeover entitlement check \(one takeover at a time; .*\): 1 standby, requirement known for 1\.')
+        self.assertIn('the largest known increment is quiet taking over from hot: requirement %.2f' % hot, flat)
+        self.assertIn('not compared: the shared capacity is not assessed', flat)
+        with open(os.path.join(self.root, 'cycle', 'cycle-footprint.csv'), newline='') as fh:
+            frame, = [r for r in csv.DictReader(fh) if r['Frame'] == 'SYNJP' and r['Model'] == 'state-based']
+        self.assertEqual((frame['Takeover_Standbys'], frame['Takeover_Known'], frame['Takeover_Largest_Full'], frame['Measured_Highest'], frame['Minutes_Without_Spare']),
+                         ('1', '1', '%.2f' % (hot - 0.10), '20.00', '0'))
+        # Reporting only: the rows of the CSV are as the sizing made them (the closure test above compares them).
+
+
 if __name__ == '__main__':
     unittest.main()

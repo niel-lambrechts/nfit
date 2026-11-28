@@ -40,7 +40,7 @@ foreach my $name (qw(_safe_dig _cycle_canonical _option_differences _ha_peer_pla
                      _frame_shared_capacity _cycle_footprint_frame _cycle_footprint_lines _days_before_end _lpar_present
                      _plain_day _historic_action _cycle_membership
                      _pool_whole_units _exposure_tolerance _pool_reduction_members _pool_reduction_candidate _pool_reduction_text
-                     _joint_members _joint_check_record _joint_replay _joint_completeness _joint_evidence_for_plan _joint_check_lines _joint_csv_cells
+                     _joint_members _joint_check_record _joint_replay _joint_completeness _joint_evidence_for_plan _joint_check_lines _joint_csv_cells _frame_check _frame_check_lines _frame_check_csv_cells _frame_use_summary _cycle_fixed_takeovers
                      _protected_level_outcome _protected_level_held_pair _protected_level_hold))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name\n";
@@ -52,7 +52,7 @@ my ($grace) = $src =~ /^my \$PRESENCE_GRACE_DAYS\s*=\s*(\d+);/m or die "PRESENCE
 my ($interval) = $src =~ /^my %EVIDENCE_INTERVAL\s*=\s*(\(.*?\));/m or die "EVIDENCE_INTERVAL not found\n";
 eval "package UUT; use JSON; use POSIX qw(ceil floor); use List::Util qw(sum sum0 min max uniq); use Scalar::Util qw(looks_like_number);\n"
    . join('', map { "our \$$_ = $constant{$_};\n" } sort keys %constant) . "use Time::Piece; our \$PRESENCE_GRACE_DAYS = $grace; our %EVIDENCE_INTERVAL = $interval;\n"
-   . "our %MEMBER_EXPOSURE_RULES = (localScarceAbsCores => 0.10, localScarceRel => 0.02); our %POOL_REDUCTION_RULE = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90); our %JOINT_CHECK_RULE = (version => 'joint-check-1', maxReadings => 5000);\n$code 1;"
+   . "our %MEMBER_EXPOSURE_RULES = (localScarceAbsCores => 0.10, localScarceRel => 0.02); our %POOL_REDUCTION_RULE = (minDays => 28, minCoverage => 0.99, minDayCoverage => 0.90); our %JOINT_CHECK_RULE = (version => 'joint-check-1', maxReadings => 5000); our %FRAME_USE_RULE = (wholeTolerance => 0.02);\n$code 1;"
    or die "harness eval failed: $@\n";
 
 # -- Two frames: standby sa (with x1, in pool 5 of 4.00) on FA; its primary pb on FB --
@@ -244,7 +244,7 @@ like(join(' ', map { s/^\s+//r } @$text), qr/Not counted: 1 LPAR last sampled be
 like($frames->[1], qr/,"9","8","10","1","0","19\.00","0",/, 'frame file: LPARs that left (and how many are confirmed as moved), their installed entitlement, and LPARs on two frames');
 like($all, qr/^  FC\s+not analysed$/m, 'an expected frame that was not analysed is listed without figures');
 like($all, qr/Frames analysed\s+10\.00\s+14\.00\s+12\.00\s+\(2 frames analysed; a sum of entitlements, not a capacity statement\)/, 'the sum over frames is labelled as no capacity statement');
-unlike($all, qr/\bfits\b|procure|consolidat|spare/i, 'no fit, procurement, consolidation or spare-capacity wording');
+unlike($all =~ s/minutes? without spare capacity//gr, qr/\bfits\b|procure|consolidat|spare/i, 'no fit, procurement, consolidation or spare-capacity wording (the measured minutes without spare capacity aside)');
 is(scalar(@$frames), 4, 'frame file: a header and one row per frame of the model');
 is(scalar(@$pools), 5, 'pool file: each pool of each analysed frame on its own row');
 like($pools->[2], qr/^"C1","state-based","FA","5","2","4","3\.50","4\.50","4\.00","5","4","below the full requirement","","","","","","","","","","",""$/, 'a pool row counts the LPARs still there: maximum, the three sums and the maximum each needs');
@@ -438,6 +438,61 @@ ok(!exists((grep { $_->{Pool} == 7 } @{ $plain_fp->{pools} })[0]{Reduction}), 'n
     is($same->{doc}{jointCheck}{results}{5}{state}, 'replayed', 'unchanged figures: the complete result of the analysis stands');
     is($same->{doc}{jointCheck}{results}{5}{target}{allHours}{lparMinutes}, 1, 'with its figures');
     is($same->{joint}, undef, 'and nothing is added to the rationale');
+}
+
+# -- A fixed standby's takeover requirement from its primary's plan in the cycle (v10 B8) --
+# A reporting dependency only: the standby's 0.10 and its VPs are not touched, and it is not pending.
+{
+    my $fixed_doc = sub
+    {
+        my $doc = $standby_doc->();
+        my $sa = $doc->{members}{sa};
+        delete $sa->{pendingRole};
+        $sa->{role} = { type => 'haStandbyFixed', profile => 'P-95', primary => 'pb', fixedEntitlement => 0.1, targetEntitlement => 0.1, targetVPs => 1, entitlement => 0.1, VPs => 1 };
+        $sa->{roleEvidence}{sizing} = { policy => 'standby_fixed' };
+        @{ $sa->{poolMember} }{qw(proposed_ent cycle_ent)} = (0.1, 0.1);
+        @{ $sa->{published} }{qw(entitlement VPs)} = ('0.10', 1);
+        return $doc;
+    };
+    my $fixed_primary = sub
+    {
+        my (%over) = @_;
+        my $doc = $primary_doc->(%over);
+        $doc->{members}{pb}{roleEvidence}{sizing} = { policy => 'standby_fixed' };
+        return $doc;
+    };
+    local $plan{planA} = $fixed_doc->();
+    local $plan{planB} = $fixed_primary->();
+    my $reg_fixed = { %$reg_a, pending => [] };
+    my %frames = (FA => $reg_fixed, FB => $reg_b);
+    my $look = UUT::_cycle_fixed_takeovers($plan{planA}, $reg_fixed, \%frames, $plan_of, 'C1');
+    is_deeply($look, { sa => { requirement => 6, source => 'the target of pb in its plan of this planning cycle (frame FB)' } },
+        'a compatible plan of the primary, registered in the cycle: its planning-profile target is the requirement');
+    my $fp = UUT::_cycle_footprint_frame($plan{planA}, $look);
+    my ($case) = @{ $fp->{frameCheck}{takeover}{cases} };
+    is_deeply([ $fp->{frameCheck}{takeover}{known}, $case->{requirement}, $case->{increment}{Full}, $case->{planned}{Full} ], [ 1, 6, 5.9, 0.1 ],
+        'the frame check: increment 5.90 above the fixed 0.10');
+    like(join(' ', @{ $case->{prerequisites}{Full} }), qr/VPs: 1 planned, at least 6 needed to carry 6\.00.*pool 5: maximum 4/, 'with its VP and pool prerequisites beside it');
+    is_deeply([ @{ $plan{planA}{members}{sa}{role} }{qw(entitlement VPs)}, exists $plan{planA}{members}{sa}{pendingRole} ? 1 : 0 ], [ 0.1, 1, 0 ],
+        'the standby keeps its fixed entitlement and VPs, and is not pending');
+    # Finalising the frame changes nothing of the standby: no role sizing is applied again.
+    my $f = UUT::_cycle_finalise_frame($plan{planA}, $reg_fixed, \%frames, {}, $plan_of, 'C1');
+    is_deeply([ @{ $f->{doc}{members}{sa}{role} }{qw(type entitlement VPs)}, scalar @{ $f->{standbys} } ], [ 'haStandbyFixed', 0.1, 1, 0 ], 'finalisation leaves the fixed standby as it is');
+    # Without the lookup (the analysis itself): unknown, saying where it becomes known.
+    like(UUT::_cycle_footprint_frame($plan{planA})->{frameCheck}{takeover}{unknown}[0]{reason}, qr/the finalisation of a planning cycle looks for its plan/, 'in the analysis alone it is unknown');
+    # The order in which the frames were analysed or are read makes no difference: the lookup reads registered plans only.
+    is(UUT::_cycle_canonical(UUT::_cycle_fixed_takeovers($plan{planA}, $reg_fixed, { FB => $reg_b, FA => $reg_fixed }, $plan_of, 'C1')), UUT::_cycle_canonical($look), 'the same in either order');
+    # Incompatible: other options; the primary's frame not in the cycle; another capture; no target. Each unknown, with its reason.
+    $plan{planB} = $fixed_primary->(settings => { options => { enddate => '2026-09-21', 'guarantee-policy' => 'strict' } });
+    like(UUT::_cycle_fixed_takeovers($plan{planA}, $reg_fixed, \%frames, $plan_of, 'C1')->{sa}{reason}, qr/^the plan of pb on frame FB is not used: its saved plan was made with other options$/, 'other options: not used');
+    $plan{planB} = $fixed_primary->();
+    like(UUT::_cycle_fixed_takeovers($plan{planA}, $reg_fixed, { FA => $reg_fixed }, $plan_of, 'C1')->{sa}{reason}, qr/^no frame analysed in this planning cycle holds its primary pb$/, 'no frame of the cycle holds the primary: unknown, no other saved plan looked for');
+    like(UUT::_cycle_fixed_takeovers($plan{planA}, { %$reg_fixed, peers => { FB => { %capture_b, data => { size => 11 } } } }, \%frames, $plan_of, 'C1')->{sa}{reason},
+         qr/^the staged data of frame FB read for its cluster is not the data that frame was analysed on$/, 'another capture: not used');
+    $plan{planB} = $fixed_primary->(member => { roleEvidence => { %{ $evidence->('standby') }, sizing => { policy => 'standby_fixed' } } });
+    like(UUT::_cycle_fixed_takeovers($plan{planA}, $reg_fixed, \%frames, $plan_of, 'C1')->{sa}{reason}, qr/read the cluster roles differently/, 'the primary read in another role: not used');
+    # A share standby is not looked up here: its floor is the business of the role finalisation.
+    is_deeply(UUT::_cycle_fixed_takeovers($standby_doc->(), $reg_a, \%frames, $plan_of, 'C1'), {}, 'only fixed standbys are looked up');
 }
 
 done_testing();
