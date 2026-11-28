@@ -61,7 +61,7 @@ def build_root(root):
     open(os.path.join(root, 'etc', 'nfit.seasonality.cfg'), 'w').close()
     with open(os.path.join(root, 'etc', 'nfit.vms.cfg'), 'w') as fh:           # synthetic tiers only
         fh.write(''.join(f'[{vm}]\ntier = {tier}\n' for vm, tier in TIERS.items()))
-        fh.write('[vio1]\nlpar_type = vios\nvios_peer = vio2\n[vio2]\nlpar_type = vios\n')
+        fh.write('[GLOBAL]\nvios_sizing = combined\n[vio1]\nlpar_type = vios\nvios_peer = vio2\n[vio2]\nlpar_type = vios\n')
     cache = os.path.join(root, 'stage', SERIAL)
     os.makedirs(cache)
     rows = ['Timestamp,VMName,PhysC,RunQ']

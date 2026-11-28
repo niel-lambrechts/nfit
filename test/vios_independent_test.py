@@ -2,12 +2,12 @@
 two VIOS of one system with unequal workloads (viosA the larger, uncapped; viosB capped), and one
 ordinary LPAR. The same data under each policy.
 
-  default       nothing set: combined, exactly as with vios_sizing = combined.
-  match_larger  both at the larger own target.
+  default       nothing set: match_larger, exactly as with vios_sizing = match_larger.
+  combined      each at the sum of the two own targets.
   independent   set once in [GLOBAL]: each VIOS keeps the entitlement, VPs and action of its own
                 workload, as any LPAR; the pair is kept for the report; the takeover review is an
                 estimate beside the sizing and changes no figure.
-  conflict      one VIOS independent, the other left at the default: combined applies, and the
+  conflict      one VIOS independent, the other left at the default: match_larger applies, and the
                 rationale names both settings, their sources and what applies.
 """
 import csv
@@ -94,11 +94,16 @@ class ViosIndependentTest(unittest.TestCase):
     def figures(self, case):
         return {vm: (r['NFIT - ENT'], r['NFIT - VCPU'], r['NFIT - Action']) for vm, r in self.rows[case].items()}
 
-    def test_the_default_is_combined_and_unchanged(self):
-        self.assertEqual(self.figures('default'), self.figures('combined'))
+    def test_the_default_is_match_larger(self):
+        self.assertEqual(self.figures('default'), self.figures('match_larger'))
         role = self.members['default']['viosA']['role']
-        self.assertEqual((role['type'], role['mode']), ('viosPair', 'combined'))
+        self.assertEqual((role['type'], role['mode']), ('viosPair', 'match_larger'))
         self.assertEqual(self.members['default']['viosA']['role']['targetEntitlement'], self.members['default']['viosB']['role']['targetEntitlement'])
+        # Combined, asked for, is the sum of the two own targets and above the default.
+        combined = self.members['combined']['viosA']['role']
+        self.assertEqual(combined['mode'], 'combined')
+        self.assertAlmostEqual(combined['targetEntitlement'], self.own('combined', 'viosA')['entitlement'] + self.own('combined', 'viosB')['entitlement'], places=2)
+        self.assertGreater(combined['targetEntitlement'], role['targetEntitlement'])
         self.assertNotIn('viosPolicy', self.members['default']['viosA'])
         self.assertNotIn('Independent VIOS sizing', self.rows['default']['viosA']['NFIT - Action'])
 
@@ -125,7 +130,7 @@ class ViosIndependentTest(unittest.TestCase):
             self.assertEqual(self.figures(case)['app'], self.figures('default')['app'], case)
         # The own figures of the VIOS (their profile columns) are the same under every policy; only the pair figure differs.
         planning = self.members['independent']['viosA']['planningProfile']
-        for case in ('default', 'match_larger'):
+        for case in ('default', 'combined'):
             self.assertEqual(self.rows[case]['viosA'][planning], self.rows['independent']['viosA'][planning], case)
 
     def test_the_takeover_review_is_an_estimate_beside_the_sizing(self):
@@ -144,16 +149,19 @@ class ViosIndependentTest(unittest.TestCase):
 
     def test_a_conflict_is_stated_and_the_more_protective_setting_applies(self):
         self.assertEqual(self.figures('conflict')['viosA'][:2], self.figures('default')['viosA'][:2])
-        self.assertEqual(self.members['conflict']['viosA']['role']['mode'], 'combined')
-        text = ('vios_sizing differs within the pair: viosA independent (its own stanza); viosB combined (the built-in default). '
-                'combined applies (the more protective setting); independent sizing needs both to resolve to independent')
+        self.assertEqual(self.members['conflict']['viosA']['role']['mode'], 'match_larger')
+        text = ('vios_sizing differs within the pair: viosA independent (its own stanza); viosB match_larger (the built-in default). '
+                'match_larger applies (the more protective setting); independent sizing needs both to resolve to independent')
         self.assertIn(text, self.log['conflict'])
         self.assertIn(text, re.sub(r'\s+', ' ', self.err['conflict']))
 
     def test_the_acceptance_tool_reconciles_each_vios(self):
         # The tool's VIOS block, on the saved plan and CSV of each run: the policy in force, own target, full figure and this cycle's pair.
-        from importlib.machinery import SourceFileLoader
-        tool = SourceFileLoader('pca_for_vios', os.path.join(mx.REPO, 'dev', 'planning-cycle-acceptance')).load_module()
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader('pca_for_vios', os.path.join(mx.REPO, 'dev', 'planning-cycle-acceptance'))
+        tool = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(tool)
 
         def block(case, asked):
             said, checks = [], []
@@ -173,7 +181,7 @@ class ViosIndependentTest(unittest.TestCase):
         self.assertRegex(text, r'VIOS entitlement on the frame: installed 3\.00, full \d\.\d\d, this cycle \d\.\d\d\.')
         # Under the default the pair figure is in force, and asking for independent is reported as not in force.
         text, checks = block('default', 'independent')
-        self.assertIn('viosA: policy combined;', text)
+        self.assertIn('viosA: policy match_larger;', text)
         self.assertEqual([ok for ok, _ in checks], [False], checks)
         self.assertEqual(block('default', None)[1], [])
 

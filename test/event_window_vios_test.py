@@ -34,7 +34,8 @@ class EventWindowViosTests(unittest.TestCase):
     def setUpClass(cls):
         cls.fixture = M.MemberExposureTests
         cls.fixture.roots = []
-        cls.pair = cls.seasonal(PAIR)
+        cls.pair = cls.seasonal('[GLOBAL]\nvios_sizing = combined\n' + PAIR)
+        cls.default = cls.seasonal(PAIR)
         cls.plain = cls.seasonal('')
         cls.independent = cls.seasonal('[GLOBAL]\nvios_sizing = independent\n' + PAIR)
 
@@ -111,6 +112,16 @@ class EventWindowViosTests(unittest.TestCase):
         self.assertEqual(rows['vmS']['NFIT - ENT'], self.pair['rows']['vmS']['NFIT - ENT'])
         self.assertIn('each sized on its own workload; no pair figure is applied.', ' '.join(log.split()))
         self.assertNotIn('the guarantees alone exceed the pool maximum', log)           # the pool of 4 is not charged with a pair figure
+
+    def test_the_default_aligns_the_pair_with_the_larger_event_target(self):
+        members, rows = self.default['members'], self.default['rows']
+        roles = {vm: members[vm]['role'] for vm in ('vmA', 'vmB')}
+        own = {vm: members[vm]['profiles'][roles[vm]['profile']]['entitlement'] for vm in roles}
+        for vm, role in roles.items():
+            self.assertEqual((role['type'], role['mode']), ('viosPair', 'match_larger'))
+            self.assertAlmostEqual(role['targetEntitlement'], max(own.values()), places=2)
+        self.assertEqual(rows['vmA']['NFIT - ENT'], rows['vmB']['NFIT - ENT'])
+        self.assertLess(float(rows['vmA']['NFIT - ENT']), float(self.pair['rows']['vmA']['NFIT - ENT']))
 
 
 if __name__ == '__main__':

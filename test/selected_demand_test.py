@@ -82,7 +82,7 @@ class SelectedDemandTests(unittest.TestCase):
             fh.write(CONFIG)
         # vmA and vmB are a VIOS pair: the pair is sized from its two own event targets, in both runs.
         with open(os.path.join(cls.root, 'etc', 'nfit.vms.cfg'), 'w') as fh:
-            fh.write('[vmA]\nlpar_type = vios\nvios_peer = vmB\n[vmB]\nlpar_type = vios\n')
+            fh.write('[GLOBAL]\nvios_sizing = combined\n[vmA]\nlpar_type = vios\nvios_peer = vmB\n[vmB]\nlpar_type = vios\n')
         # (--force: the case has just stored this bucket's record; the run is repeated with protection on.)
         cls.predictive = cls.run_event('ev', 'predictive', '--force')
         cls.record = cls.stored_record()

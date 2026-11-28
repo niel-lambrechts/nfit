@@ -114,8 +114,8 @@ is(UUT::_vios_pair_sentence([qw(vb vc)], { Mode => 'match_larger', Raised => 0 }
 my %set = (va => { vios_sizing => 'match_larger' }, vb => {}, vc => { vios_takeover_margin => 0.10 });
 my $settings_of = sub { $set{ $_[0] } // {} };
 my $pol = UUT::_vios_group_policy([qw(vb vd)], $settings_of, {}, 'vios_peer');
-is_deeply([ @$pol{qw(Mode Margin Conflict)} ], ['combined', 0, 0], 'policy: combined, no margin by default');
-$pol = UUT::_vios_group_policy([qw(va vd)], $settings_of, {}, 'vios_peer');
+is_deeply([ @$pol{qw(Mode Margin Conflict)} ], ['match_larger', 0, 0], 'policy: match_larger, no margin by default');
+$pol = UUT::_vios_group_policy([qw(va vd)], sub { $_[0] eq 'va' ? { vios_sizing => 'combined' } : {} }, {}, 'vios_peer');
 is_deeply([ @$pol{qw(Mode Conflict)} ], ['combined', 1], 'policy: members disagree - the more protective (combined), warned');
 $pol = UUT::_vios_group_policy([qw(va vd)], sub { { vios_sizing => 'match_larger' } }, {}, 'vios_peer');
 is($pol->{Mode}, 'match_larger', 'policy: match_larger when every member asks for it');
@@ -126,7 +126,10 @@ is_deeply([ @$pol{qw(Mode Margin)} ], ['match_larger', 0.10], 'policy: [GLOBAL] 
 $pol = UUT::_vios_group_policy([qw(vb vd ve)], $settings_of, {}, 'system');
 is($pol->{Mode}, 'independent', 'policy: three unnamed VIOS are not one takeover group');
 like($pol->{Note}, qr/name the pairs with vios_peer/, 'policy: and the planner is told why');
-is(UUT::_vios_group_policy([qw(vb vd)], $settings_of, {}, 'system')->{Mode}, 'combined', 'policy: the two VIOS of a frame are combined');
+is(UUT::_vios_group_policy([qw(vb vd)], $settings_of, {}, 'system')->{Mode}, 'match_larger', 'policy: the two VIOS of a frame are aligned with the larger');
+is(UUT::_vios_group_policy([qw(vb vd ve)], sub { {} }, { vios_sizing => 'combined' }, 'system')->{Mode}, 'independent', 'policy: three unnamed VIOS are never combined');
+is(UUT::_vios_group_policy([qw(vb vd ve)], sub { {} }, { vios_sizing => 'match_larger' }, 'system')->{Mode}, 'match_larger',
+   'policy: three unnamed VIOS are aligned only where match_larger is configured');
 
 # --- Group profile ------------------------------------------------------------------------
 is(UUT::_vios_group_profile([ { planning => 'P-99W1', label => 'P' }, { planning => 'P-99W1', label => 'P' } ]), 'P-99W1', 'profile: P without TIERs');
@@ -166,7 +169,7 @@ $pol = UUT::_vios_group_policy([qw(va vd)], $every->('independent'), {}, 'vios_p
 is_deeply([ @$pol{qw(Mode ByPolicy Conflict)} ], [ 'independent', 1, 0 ], 'independent when both VIOS resolve to it');
 is(UUT::_vios_group_policy([qw(vb vd)], sub { {} }, { vios_sizing => 'independent' }, 'system')->{Mode}, 'independent',
    'a [GLOBAL] or managed-system default gives it to a pair with no stanza of its own');
-is(UUT::_vios_group_policy([qw(vb vd)], sub { {} }, {}, 'system')->{Mode}, 'combined', 'the built-in default is still combined');
+is(UUT::_vios_group_policy([qw(vb vd)], sub { {} }, {}, 'system')->{Mode}, 'match_larger', 'the built-in default is match_larger');
 my %mixed = (va => { vios_sizing => 'independent' }, vd => { vios_sizing => 'combined' });
 $pol = UUT::_vios_group_policy([qw(va vd)], sub { $mixed{ $_[0] } }, {}, 'vios_peer');
 is_deeply([ @$pol{qw(Mode ByPolicy Conflict)} ], [ 'combined', 0, 1 ], 'independent and combined: combined applies');
