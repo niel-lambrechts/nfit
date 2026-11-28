@@ -198,4 +198,9 @@ ok((grep { /\[n2\]: standby_work_days must be a whole number/ } @{ $c->{errors} 
 ok((grep { /\[n2\]: 'standby_work_cores' has no value/ } @{ $c->{errors} }), 'a setting without a value is an error');
 is_deeply([ $c->{vms}{n1} // {}, $c->{vms}{n2} // {} ], [ {}, {} ], 'nothing is taken from a refused value');
 
+# vios_sizing = independent (v10 B17) at each level.
+$c = cfg("[GLOBAL]\nvios_sizing = independent\n[MGSYS:Frame_C]\nvios_sizing = Independent\n[v1]\nlpar_type = vios\nvios_sizing = independent\n[v2]\nvios_sizing = sometimes\n");
+is_deeply([ $c->{global}{vios_sizing}, $c->{mgsys}{Frame_C}{vios_sizing}, $c->{vms}{v1}{vios_sizing} ], [ ('independent') x 3 ], 'vios_sizing = independent is read at every level');
+ok(!defined $c->{vms}{v2}{vios_sizing}, 'an unknown vios_sizing is still not taken');
+
 done_testing();

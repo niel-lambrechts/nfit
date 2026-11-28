@@ -19,7 +19,7 @@ my $src = do { local $/; <$fh> };
 close $fh;
 my $code = '';
 for my $name (qw(_resolve_vm_tier_pattern_policy _vios_groups _align_vios_group _vios_pair_sentence
-                 _vios_group_policy _vios_group_profile _combine_vios_group
+                 _vios_group_policy _vios_group_profile _combine_vios_group _vios_takeover_review
                  _resolve_current_cycle_pair _ceil_ratio))
 {
     $src =~ /^(sub \Q$name\E\s*\{.*?^\})/ms or die "could not extract $name from $SRC\n";
@@ -159,5 +159,40 @@ like(UUT::_vios_pair_sentence(['vb'], $cb->{va}),
      'combined: the action states the sum, the margin and the target');
 my $big = UUT::_combine_vios_group([ map { { %$_, current_ent => 0.50, current_vp => 1 } } @members ], 'P-99W1', 0);
 ok($big->{va}{Pair}{Ent} <= $big->{va}{Pair}{VP} && $big->{va}{Pair}{Ent} >= 0.05 * $big->{va}{Pair}{VP}, 'combined: a valid pair from a small installed VIOS');
+
+# --- Independent VIOS sizing (v10 B17) -----------------------------------------------------
+my $every = sub { my ($mode) = @_; return sub { { vios_sizing => $mode } }; };
+$pol = UUT::_vios_group_policy([qw(va vd)], $every->('independent'), {}, 'vios_peer');
+is_deeply([ @$pol{qw(Mode ByPolicy Conflict)} ], [ 'independent', 1, 0 ], 'independent when both VIOS resolve to it');
+is(UUT::_vios_group_policy([qw(vb vd)], sub { {} }, { vios_sizing => 'independent' }, 'system')->{Mode}, 'independent',
+   'a [GLOBAL] or managed-system default gives it to a pair with no stanza of its own');
+is(UUT::_vios_group_policy([qw(vb vd)], sub { {} }, {}, 'system')->{Mode}, 'combined', 'the built-in default is still combined');
+my %mixed = (va => { vios_sizing => 'independent' }, vd => { vios_sizing => 'combined' });
+$pol = UUT::_vios_group_policy([qw(va vd)], sub { $mixed{ $_[0] } }, {}, 'vios_peer');
+is_deeply([ @$pol{qw(Mode ByPolicy Conflict)} ], [ 'combined', 0, 1 ], 'independent and combined: combined applies');
+is($pol->{ConflictText}, 'vios_sizing differs within the pair: va independent (its own stanza); vd combined (its own stanza). combined applies (the more protective setting); '
+   . 'independent sizing needs both to resolve to independent', 'the conflict names both settings, their sources and what applies');
+%mixed = (va => { vios_sizing => 'independent' }, vd => {});
+$pol = UUT::_vios_group_policy([qw(va vd)], sub { $mixed{ $_[0] } }, { vios_sizing => 'match_larger' }, 'vios_peer',
+                               sub { return $_[0] eq 'va' ? 'lpar' : 'mgsys' });
+is($pol->{Mode}, 'match_larger', 'independent and match_larger: match_larger applies');
+like($pol->{ConflictText}, qr/va independent \(its own stanza\); vd match_larger \(its managed system's stanza\)\. match_larger applies/, 'with the source of an inherited setting');
+is(UUT::_vios_group_policy([qw(va vd)], $every->('independent'), {}, 'vios_peer')->{ConflictText}, undef, 'no conflict message when they agree');
+$pol = UUT::_vios_group_policy([qw(vb vd ve)], sub { {} }, {}, 'system');
+is_deeply([ @$pol{qw(Mode ByPolicy)} ], [ 'independent', 0 ], 'three unnamed VIOS: still the ungrouped fallback, not the policy');
+
+# The takeover review: unequal own targets; an estimate, not a measurement; capped apart from uncapped.
+my $rv = UUT::_vios_takeover_review([ { vm => 'va', ownEnt => 6.77, ownVP => 7, capped => 0 }, { vm => 'vb', ownEnt => 2.10, ownVP => 3, capped => 1 } ], 0.10);
+is($rv->{estimate}, 8.87, 'the combined estimate is the sum of the two own targets');
+is_deeply($rv->{illustrative}, { combined => 19.51, match_larger => 13.54, independent => 8.87 }, 'the pair under each policy, for comparison (combined with its margin)');
+is_deeply([ @{ $rv->{members}{va} }{qw(partner ownEntitlement beyond borrowing capped vpsShort)} ], [ 'vb', 6.77, 2.1, 1, 0, 9 ], 'the uncapped VIOS: borrowing 2.10, and 9 VPs needed against 7');
+like($rv->{members}{va}{text}, qr/^carrying the work of vb as well is estimated at 8\.87 \(the sum of the two own targets; not a measured peak\), 2\.10 above its own 6\.77\. Uncapped, it would have to borrow that, which needs capacity free in its pool and on the frame at the time; neither its weight nor its VPs assures that\. Its 7 VPs cannot reach the estimate: at least 9 would be needed\.$/,
+     'uncapped: borrowing needs pool and frame capacity; weight and VPs assure nothing');
+is_deeply([ @{ $rv->{members}{vb} }{qw(borrowing capped)} ], [ 0, 1 ], 'the capped VIOS cannot borrow');
+like($rv->{members}{vb}{text}, qr/It is capped: it cannot borrow, so it cannot exceed its entitlement in a takeover\.$/, 'capped: said so, with no borrowing wording');
+like($rv->{members}{vb}{action}, qr/^It is capped and cannot borrow: a takeover of va \(combined estimate 8\.87\) is not covered\.$/, 'and on its row');
+like($rv->{members}{va}{action}, qr/^A takeover of vb would rely on borrowing 2\.10 above its entitlement \(combined estimate 8\.87, not measured\); not verified\. Its VPs cannot reach that estimate \(9 needed\)\.$/, 'the row of the uncapped VIOS');
+unlike(join(' ', map { $_->{text}, $_->{action} } values %{ $rv->{members} }), qr/guarantee|verified takeover|sufficient/i, 'no wording of a guaranteed or verified takeover');
+is(UUT::_vios_takeover_review([ { vm => 'va', ownEnt => 6.77 }, { vm => 'vb' } ], 0), undef, 'without two own targets there is no review');
 
 done_testing();

@@ -152,8 +152,12 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
 
     def test_a_fixed_figure_that_cannot_carry_the_workloads_vps_is_reported_as_not_applied(self):
         # 0.05 carries one VP and the workload needs two: not applied, and the node keeps its ordinary recommendation.
-        run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.05')
+        # The same run asks for independent VIOS sizing on both frames (one stanza carries both settings on the standby's frame).
+        run = self.tool(self.standby, self.primary, '--enddate', self.last, '--standby-fixed', self.standby + '=0.05',
+                        '--vios-sizing', self.standby + '=independent', '--vios-sizing', self.primary + '=independent')
         self.assertEqual(run.returncode, 0, run.stdout[-3000:] + run.stderr[-800:])
+        self.assertRegex(run.stdout, r'vios_sizing = independent for frame %s, in the work tree copy of nfit\.vms\.cfg only\.' % self.primary)
+        self.assertRegex(run.stdout, r'VIOS sizing \(saved plans, final; CSV\):\s+Frame sys_[0-9a-f]{6}: no VIOS in the saved plan\.')
         self.assertRegex(run.stdout, r'\[ok\] frame %s: standbys under the fixed standby entitlement 0\.05 asked for this run: 1 \(applied to 0, not applied to 1\)' % self.standby)
         self.assertIn("Sizing decision: fixed standby entitlement not applied (width); the recommendation follows this node's workload", run.stdout)
         self.assertRegex(run.stdout, r'\[ok\] vm_[0-9a-f]{6}: fixed figure not applied \(width: its own workload needs 2 VPs and 0\.05 carries at most 1 '
@@ -164,6 +168,9 @@ class PlanningCycleAcceptanceTests(unittest.TestCase):
         run = self.tool(self.standby, self.primary, '--standby-fixed', 'sys_000000=0.10')
         self.assertNotEqual(run.returncode, 0)
         self.assertIn('--standby-fixed takes one of the two frames', run.stderr)
+        run = self.tool(self.standby, self.primary, '--vios-sizing', self.primary + '=largest')
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn('--vios-sizing takes one of the two frames and a policy', run.stderr)
 
     def test_the_saved_results_are_read_again_without_a_run(self):
         run = self.tool(self.standby, self.primary, '--enddate', self.last, '--model', 'state-based', '--keep', '--work', self.root)

@@ -36,6 +36,7 @@ class EventWindowViosTests(unittest.TestCase):
         cls.fixture.roots = []
         cls.pair = cls.seasonal(PAIR)
         cls.plain = cls.seasonal('')
+        cls.independent = cls.seasonal('[GLOBAL]\nvios_sizing = independent\n' + PAIR)
 
     @classmethod
     def tearDownClass(cls):
@@ -95,6 +96,21 @@ class EventWindowViosTests(unittest.TestCase):
         # Without the pair the same pool fits, and the plan says so.
         self.assertRegex(self.plain['log'], r'\n  7\s+2\s+4\.00\s+\d+\.\d\d\s+0\s+0\.00  guarantees and relied-on borrowing fit under the pool maximum')
         self.assertIn('No pool is short at its maximum on these figures.', self.plain['log'])
+
+    def test_independent_sizing_keeps_each_event_target_in_a_seasonal_run(self):
+        # vios_sizing = independent (v10 B17), set once in [GLOBAL]: each VIOS keeps its own event target; no pair figure in the plan.
+        members, rows, log = self.independent['members'], self.independent['rows'], self.independent['log']
+        for vm in ('vmA', 'vmB'):
+            self.assertNotIn('role', members[vm])
+            self.assertEqual(members[vm]['viosPolicy']['mode'], 'independent')
+            self.assertAlmostEqual(float(rows[vm]['NFIT - ENT']), members[vm]['eventWindow']['entitlement'], places=2)
+            self.assertLess(float(rows[vm]['NFIT - ENT']), float(self.pair['rows'][vm]['NFIT - ENT']))
+            self.assertIn('Independent VIOS sizing (vios_sizing = independent): sized on its own workload, not for the work of', rows[vm]['NFIT - Action'])
+        self.assertNotEqual(rows['vmA']['NFIT - ENT'], rows['vmB']['NFIT - ENT'])
+        self.assertAlmostEqual(members['vmA']['viosPolicy']['combinedEstimate'], self.pair['members']['vmA']['role']['targetEntitlement'], places=2)
+        self.assertEqual(rows['vmS']['NFIT - ENT'], self.pair['rows']['vmS']['NFIT - ENT'])
+        self.assertIn('each sized on its own workload; no pair figure is applied.', ' '.join(log.split()))
+        self.assertNotIn('the guarantees alone exceed the pool maximum', log)           # the pool of 4 is not charged with a pair figure
 
 
 if __name__ == '__main__':

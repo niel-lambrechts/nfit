@@ -888,6 +888,7 @@ my %EVIDENCE_INTERVAL = (cadenceTolerance => 0.20, fineCadence => 1, reviewShare
 my $SYSTEM_CPU_CADENCE;
 # VIOS of the system being written that share a frame without vios_peer, three or more: not grouped.
 my @VIOS_UNGROUPED;
+my @VIOS_INDEPENDENT;      # pairs sized independently by policy (v10 B17): [ { names, review } ]
 # --guarantee-policy normal|strict. What the current cycle does with an
 # entitlement cut where the evidence is coarse (above one minute) and cannot assess
 # brief pool competition:
@@ -2576,7 +2577,11 @@ print {$LOG_FH} "  Base Planning      The entitlement demand carried out of the 
         print {$LOG_FH} "  VIOS Pairs         Both VIOS of a pair are sized the same (lpar_type, vios_peer in\n";
         print {$LOG_FH} "                     nfit.vms.cfg). combined: each can carry the sum of both own targets plus\n";
         print {$LOG_FH} "                     vios_takeover_margin, a planning scenario; match_larger: aligned with the\n";
-        print {$LOG_FH} "                     larger, takeover capacity not verified.\n";
+        print {$LOG_FH} "                     larger, takeover capacity not verified. independent: each VIOS sized on its\n";
+        print {$LOG_FH} "                     own workload, as any LPAR (both VIOS must resolve to independent; where they\n";
+        print {$LOG_FH} "                     differ the more protective setting applies and the conflict is stated). The\n";
+        print {$LOG_FH} "                     takeover review beside it is an estimate (the sum of the two own targets, not\n";
+        print {$LOG_FH} "                     a measured peak): it changes no figure and verifies no takeover.\n";
         print {$LOG_FH} "\n";
         print {$LOG_FH} "  Entitlement        Installed, current-cycle and target entitlement added up for each system,\n";
         print {$LOG_FH} "  Totals             each LPAR on its planning profile, with and without standbys and VIOS.\n";
@@ -13507,6 +13512,56 @@ sub _align_vios_group
 }
 
 # ==============================================================================
+# SUBROUTINE: _vios_takeover_review
+# PURPOSE:    What a takeover within a VIOS pair would ask of each VIOS, as a review beside the sizing
+#             (v10 B17). The combined estimate is the sum of the two own target entitlements: a planning
+#             figure, not a measured concurrent peak. Nothing is sized from this, and it verifies nothing.
+#             Also the pair's entitlement under each of the three policies, for comparison only. Pure.
+# ARGUMENTS:  1. the two members: { vm, ownEnt, ownVP, capped }  2. takeover margin of the combined policy
+# RETURNS:    undef without two own targets, else { estimate, illustrative { combined, match_larger, independent },
+#             members { VIOS => { partner, ownEntitlement, ownVPs, borrowing (0/1), beyond, capped, vpsShort,
+#             text (for the rationale), action (for the row) } } }
+# ==============================================================================
+sub _vios_takeover_review
+{
+    my ($members, $margin) = @_;
+    return undef unless (ref($members) eq 'ARRAY' && @$members == 2
+                         && !grep { !(defined $_->{ownEnt} && looks_like_number($_->{ownEnt}) && $_->{ownEnt} > 0) } @$members);
+    $margin = 0 unless (defined $margin && looks_like_number($margin));
+    my $estimate = 0 + sprintf('%.2f', $members->[0]{ownEnt} + $members->[1]{ownEnt});
+    my ($larger) = sort { $b <=> $a } map { $_->{ownEnt} } @$members;
+    my %out = (estimate => $estimate, illustrative => { combined => 0 + sprintf('%.2f', 2 * $estimate * (1 + $margin)),
+               match_larger => 0 + sprintf('%.2f', 2 * $larger), independent => $estimate });
+    foreach my $i (0, 1)
+    {
+        my ($m, $partner) = ($members->[$i], $members->[ 1 - $i ]);
+        my $own = 0 + sprintf('%.2f', $m->{ownEnt});
+        my $beyond = 0 + sprintf('%.2f', $estimate - $own);
+        my $need = int($estimate);
+        $need++ if ($estimate - $need > $FLOAT_EPSILON);
+        my $short = (defined $m->{ownVP} && looks_like_number($m->{ownVP}) && $m->{ownVP} < $need) ? $need : undef;
+        my $text = sprintf('carrying the work of %s as well is estimated at %.2f (the sum of the two own targets; not a measured peak), %.2f above its own %.2f',
+                           $partner->{vm}, $estimate, $beyond, $own);
+        my $action;
+        if ($m->{capped})
+        {
+            $text .= '. It is capped: it cannot borrow, so it cannot exceed its entitlement in a takeover';
+            $action = sprintf('It is capped and cannot borrow: a takeover of %s (combined estimate %.2f) is not covered.', $partner->{vm}, $estimate);
+        }
+        else
+        {
+            $text .= '. Uncapped, it would have to borrow that, which needs capacity free in its pool and on the frame at the time; neither its weight nor its VPs assures that';
+            $text .= sprintf('. Its %d VP%s cannot reach the estimate: at least %d would be needed', $m->{ownVP}, ($m->{ownVP} == 1 ? '' : 's'), $short) if (defined $short);
+            $action = sprintf('A takeover of %s would rely on borrowing %.2f above its entitlement (combined estimate %.2f, not measured); not verified.%s',
+                              $partner->{vm}, $beyond, $estimate, (defined $short ? sprintf(' Its VPs cannot reach that estimate (%d needed).', $short) : ''));
+        }
+        $out{members}{ $m->{vm} } = { partner => $partner->{vm}, ownEntitlement => $own, ownVPs => (defined $m->{ownVP} ? $m->{ownVP} + 0 : undef),
+            borrowing => ($m->{capped} ? 0 : 1), beyond => $beyond, capped => ($m->{capped} ? 1 : 0), vpsShort => $short, text => "$text.", action => $action };
+    }
+    return \%out;
+}
+
+# ==============================================================================
 # SUBROUTINE: _vios_pair_sentence
 # PURPOSE:    The opening of NFIT - Action for a VIOS sized with its group.
 # ARGUMENTS:  1. partner names (arrayref)
@@ -13549,16 +13604,27 @@ sub _vios_pair_sentence
 # ==============================================================================
 sub _vios_group_policy
 {
-    my ($names_aref, $settings_of, $global_href, $source) = @_;
+    my ($names_aref, $settings_of, $global_href, $source, $source_of) = @_;
     $global_href = {} unless (ref($global_href) eq 'HASH');
-    my (%modes, @margins);
+    my (%modes, @margins, @said);
     foreach my $name (@{ $names_aref // [] })
     {
         my $settings = (ref($settings_of) eq 'CODE') ? ($settings_of->($name) // {}) : {};
-        $modes{ $settings->{vios_sizing} // $global_href->{vios_sizing} // 'combined' } = 1;
+        my $mode = $settings->{vios_sizing} // $global_href->{vios_sizing} // 'combined';
+        $modes{$mode} = 1;
+        # Where the setting came from, for the conflict message ($source_of: name -> lpar | mgsys | global | built-in).
+        my $from = (ref($source_of) eq 'CODE') ? $source_of->($name)
+                 : defined $settings->{vios_sizing} ? 'lpar' : defined $global_href->{vios_sizing} ? 'global' : 'built-in';
+        push @said, sprintf('%s %s (%s)', $name, $mode, { lpar => 'its own stanza', mgsys => "its managed system's stanza", global => '[GLOBAL]',
+                                                          'built-in' => 'the built-in default' }->{ $from // '' } // 'configured');
         push @margins, $settings->{vios_takeover_margin} // $global_href->{vios_takeover_margin} // 0;
     }
-    my %policy = (Mode => ($modes{combined} ? 'combined' : 'match_larger'), Conflict => ((keys %modes) > 1 ? 1 : 0), Note => '');
+    # The more protective setting applies: combined, then match_larger; independent only where every member resolves to it.
+    my %policy = (Mode => ($modes{combined} ? 'combined' : $modes{match_larger} ? 'match_larger' : 'independent'),
+                  Conflict => ((keys %modes) > 1 ? 1 : 0), Note => '', ByPolicy => 0);
+    $policy{ByPolicy} = 1 if ($policy{Mode} eq 'independent');
+    $policy{ConflictText} = sprintf('vios_sizing differs within the pair: %s. %s applies (the more protective setting); independent sizing needs both to resolve to independent',
+                                    join('; ', @said), $policy{Mode}) if ((keys %modes) > 1);
     my %distinct_margin = map { $_ => 1 } @margins;
     $policy{Conflict} = 1 if ((keys %distinct_margin) > 1);
     $policy{Margin} = (sort { $b <=> $a } @margins, 0)[0];
@@ -13566,6 +13632,7 @@ sub _vios_group_policy
     {
         # Sharing a frame does not make three or more VIOS one takeover group.
         $policy{Mode} = 'independent';
+        $policy{ByPolicy} = 0;
         $policy{Note} = 'three or more VIOS without vios_peer: not grouped, each sized on its own workload; name the pairs with vios_peer';
     }
     return \%policy;
@@ -13720,6 +13787,7 @@ sub _apply_vios_alignment
 
     my ($aligned, %done) = (0);
     @VIOS_UNGROUPED = ();
+    @VIOS_INDEPENDENT = ();
     foreach my $vm_name (sort keys %$groups)
     {
         next if ($done{$vm_name} || !exists $row_of{$vm_name});
@@ -13740,14 +13808,43 @@ sub _apply_vios_alignment
             }
         }
         my $policy = _vios_group_policy(\@names, \&_vms_config_settings, _vms_config_defaults($CURRENT_MGSYS),
-            $groups->{$vm_name}{Source});
+            $groups->{$vm_name}{Source}, sub { return (_policy_setting($_[0], $CURRENT_MGSYS, 'vios_sizing'))[1]; });
         printf STDERR "    [WARN] VIOS group %s: members set different vios_sizing or margins; %s with margin %.2f applies\n",
             join(', ', @names), $policy->{Mode}, $policy->{Margin} if ($policy->{Conflict});
+        printf STDERR "    [WARN] VIOS group %s: %s\n", join(', ', @names), $policy->{ConflictText} if (defined $policy->{ConflictText});
+        # The takeover review of the pair (B17): reporting only, whatever the policy.
+        my $review = (@members == 2) ? _vios_takeover_review([ map {
+            my $m = $_;
+            my $own = (defined $m->{planning} && ref($m->{values}{ $m->{planning} }) eq 'HASH') ? $m->{values}{ $m->{planning} } : {};
+            { vm => $m->{vm}, ownEnt => $own->{target_ent}, ownVP => $own->{target_vp},
+              capped => (($map_ref->{ $m->{vm} }{Configuration}{is_capped} // 0) ? 1 : 0) }
+        } @members ], $policy->{Margin}) : undef;
+        if ($policy->{Mode} eq 'independent' && $policy->{ByPolicy})
+        {
+            # Independent by policy: each VIOS keeps the entitlement, VPs and action of its own workload, as any LPAR.
+            # The pair is kept for reporting; nothing is imposed on its sizing.
+            push @VIOS_INDEPENDENT, { names => [ @names ], review => $review, source => $groups->{$vm_name}{Source} };
+            foreach my $member (@members)
+            {
+                my $cells = $row_of{ $member->{vm} }[2];
+                my ($partner) = grep { $_ ne $member->{vm} } @names;
+                my $line = ($review && $review->{members}{ $member->{vm} }) ? $review->{members}{ $member->{vm} }{action} : '';
+                $cells->{'NFIT - Action'} = join(' ', grep { defined $_ && $_ ne '' } ($cells->{'NFIT - Action'},
+                    sprintf('Independent VIOS sizing (vios_sizing = independent): sized on its own workload, not for the work of %s.', $partner // 'its partner'), $line))
+                    if (ref($cells) eq 'HASH');
+                $map_ref->{ $member->{vm} }{CoreResults}{ViosPolicy} = { Mode => 'independent', Partners => [ grep { $_ ne $member->{vm} } @names ] };
+                $proposals->{ $member->{vm} }{viosPolicy} = { mode => 'independent', partners => [ grep { $_ ne $member->{vm} } @names ],
+                    ($review ? (takeoverReview => $review->{members}{ $member->{vm} }, combinedEstimate => $review->{estimate}) : ()) }
+                    if (defined $proposals && ref($proposals->{ $member->{vm} }) eq 'HASH');
+            }
+            next;
+        }
         if ($policy->{Mode} eq 'independent')
         {
             push @VIOS_UNGROUPED, [ @names ];
             next;
         }
+        $policy->{Note} = join('. ', grep { defined $_ && $_ ne '' } ($policy->{ConflictText}, $policy->{Note})) if (defined $policy->{ConflictText});
         my $result = {};
         if ($policy->{Mode} eq 'combined')
         {
@@ -13787,7 +13884,7 @@ sub _apply_vios_alignment
                     && $pair->{Status} ne 'STAGED');
             my $action = join(' ', @action);
             $cells->{'NFIT - Action'} = $event_window ? "Event window: $action" : $action;
-            $map_ref->{ $member->{vm} }{CoreResults}{RoleResult} = { %$r, Source => 'VIOS_PAIR',
+            $map_ref->{ $member->{vm} }{CoreResults}{RoleResult} = { %$r, Source => 'VIOS_PAIR', Review => $review,
                 Partners => \@partners, GroupSource => $groups->{ $member->{vm} }{Source} };
             if (defined $proposals && ref($proposals->{ $member->{vm} }) eq 'HASH')
             {
@@ -13819,7 +13916,7 @@ sub _log_vios_pairs
     my @aligned = grep { ref($map_ref->{$_}) eq 'HASH' && ref($map_ref->{$_}{CoreResults}) eq 'HASH'
                          && ref($map_ref->{$_}{CoreResults}{RoleResult}) eq 'HASH'
                          && ($map_ref->{$_}{CoreResults}{RoleResult}{Source} // '') eq 'VIOS_PAIR' } @$vm_order_aref;
-    return 0 unless (@aligned || @VIOS_UNGROUPED);
+    return 0 unless (@aligned || @VIOS_UNGROUPED || @VIOS_INDEPENDENT);
     my $pair_text = sub
     {
         my ($ent, $vps) = @_;
@@ -13834,6 +13931,23 @@ sub _log_vios_pairs
     push @out, '  Both VIOS entitlements are configured and both count as guarantees. match_larger: each is';
     push @out, "  aligned with the larger; takeover capacity not verified. The profile columns of the CSV";
     push @out, "  keep each VIOS's own figures; NFIT - ENT, NFIT - VCPU and NFIT - Action carry the result.";
+    push @out, '  independent: each VIOS is sized on its own workload, as any LPAR; the pair is kept for this report.';
+    push @out, '  Under every policy the takeover review below is a planning estimate beside the sizing: combined';
+    push @out, '  sizing provisions entitlement against that estimate, and no policy verifies how a takeover performs.';
+    my $review_lines = sub
+    {
+        my ($review, $mode) = @_;
+        return () unless (ref($review) eq 'HASH');
+        my @lines;
+        if ($mode ne 'combined')
+        {
+            push @lines, _rationale_wrap("Takeover review, $_: $review->{members}{$_}{text}", '      ', '        ', 104) for sort keys %{ $review->{members} };
+        }
+        my $i = $review->{illustrative};
+        push @lines, _rationale_wrap(sprintf('Entitlement of the pair at the full targets under each policy, for comparison only (illustrative; not a recommendation): '
+            . 'combined %.2f, match_larger %.2f, independent %.2f. In force: %s.', $i->{combined}, $i->{match_larger}, $i->{independent}, $mode), '      ', '        ', 104);
+        return @lines;
+    };
     my %shown;
     foreach my $vm_name (@aligned)
     {
@@ -13851,7 +13965,8 @@ sub _log_vios_pairs
                 join(' + ', map { sprintf('%.2f', $_) } @{ $first->{OwnTargets} // [] }),
                 int(100 * ($first->{Margin} // 0) + 0.5), $pair_text->($first->{TargetEnt}, $first->{TargetVP}));
         }
-        push @out, "      $first->{Note}" if (($first->{Note} // '') ne '');
+        push @out, _rationale_wrap($first->{Note}, '      ', '        ', 104) if (($first->{Note} // '') ne '');
+        push @out, $review_lines->($first->{Review}, $first->{Mode} // '');
         foreach my $name (@names)
         {
             my $r = (ref($map_ref->{$name}) eq 'HASH') ? $map_ref->{$name}{CoreResults}{RoleResult} : undef;
@@ -13862,6 +13977,18 @@ sub _log_vios_pairs
                 $pair_text->($r->{OwnTargetEnt}, $r->{OwnTargetVP}), $outcome,
                 $pair_text->($r->{Pair}{Ent}, $r->{Pair}{VP}));
         }
+    }
+    foreach my $pair (@VIOS_INDEPENDENT)
+    {
+        my @names = @{ $pair->{names} };
+        push @out, '', sprintf('    %s (%s)', join(', ', @names), (($pair->{source} // '') eq 'vios_peer' ? 'named by vios_peer' : 'the two VIOS of this system'));
+        push @out, '      independent (vios_sizing = independent for both): each sized on its own workload; no pair figure is applied.';
+        foreach my $name (@names)
+        {
+            my $own = (ref($pair->{review}) eq 'HASH') ? $pair->{review}{members}{$name} : undef;
+            push @out, sprintf('      %-24s own target %s', $name, $pair_text->($own->{ownEntitlement}, $own->{ownVPs})) if ($own);
+        }
+        push @out, $review_lines->($pair->{review}, 'independent');
     }
     foreach my $names (@VIOS_UNGROUPED)
     {
@@ -34647,7 +34774,7 @@ sub parse_vms_config
     my %global_keys = map { $_ => 1 } qw(ha_sizing standby_share standby_entitlement vios_sizing vios_takeover_margin
                                          standby_work_cores standby_work_hours standby_work_days);
     my %choices     = (ha_role => [qw(auto active standby)], lpar_type => [qw(lpar vios)],
-                       ha_sizing => [qw(independent standby_share standby_fixed)], vios_sizing => [qw(combined match_larger)]);
+                       ha_sizing => [qw(independent standby_share standby_fixed)], vios_sizing => [qw(combined match_larger independent)]);
 
     my $fh;
     if (!open($fh, '<:encoding(utf8)', $filepath))
